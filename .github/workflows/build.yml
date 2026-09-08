@@ -51,3 +51,28 @@ jobs:
         working-directory: pi-beads
         run: |
           docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/danielhstahl/pi-beads:${{ github.event.release.tag_name }} -f Dockerfile . --push
+
+  build_beads_ui:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup buildx docker
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: generate docker
+        working-directory: pi-beads
+        run: |
+          docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/danielhstahl/bd-ui:${{ github.event.release.tag_name }} -f bdui.Dockerfile . --push
