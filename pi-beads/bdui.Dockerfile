@@ -9,7 +9,9 @@ RUN addgroup --system appgroup && \
 RUN chown -R root:root /app && chmod -R 755 /app
 
 RUN npm install -g --ignore-scripts beads-ui
+COPY bdui.entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 # Switch to the non-root user
 USER appuser
 WORKDIR /workspace
-CMD ["bdui", "start"]
+CMD ["/app/entrypoint.sh"]
