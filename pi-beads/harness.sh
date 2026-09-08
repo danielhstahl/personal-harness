@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-TAG="v0.0.3"
+TAG="v0.0.4"
 
 # sanitize PWD into something safe for docker names, and make it unique
 # even if two dirs share a basename
@@ -23,9 +23,10 @@ docker rm -f $UI_NAME >/dev/null 2>&1 || true
 
 # start the UI in the background
 # let docker pick a free host port instead of hardcoding one
+# only apply to localhost/loopback (don't expose beyond machine)
 docker run -d --rm \
   --name $UI_NAME \
-  -p 0:3000 \
+  -p 127.0.0.1::3000 \
   --add-host=host.docker.internal:host-gateway \
   -v $VOLUME:/workspace/.beads \
   ghcr.io/danielhstahl/bd-ui:$TAG
