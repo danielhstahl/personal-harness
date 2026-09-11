@@ -38,6 +38,7 @@ echo "beads-ui running at http://localhost:$BD_UI_PORT"
 trap "docker stop $UI_NAME >/dev/null 2>&1" EXIT
 
 # run the actual pi harness
+# put models.json in $HOME/.pi/agent
 docker run --rm -it \
   -v "$PWD:/workspace" \
   --add-host=host.docker.internal:host-gateway \
