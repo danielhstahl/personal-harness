@@ -20,6 +20,7 @@ RUN chmod +x /app/entrypoint.sh
 
 # install beads
 RUN npm install -g @beads/bd
+RUN mkdir -p /workspace/.beads && chown -R appuser:appgroup /workspace
 # Switch to the non-root user
 USER appuser
 RUN mkdir -p $PLAYWRIGHT_BROWSERS_PATH
