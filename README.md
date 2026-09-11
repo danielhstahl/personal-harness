@@ -2,6 +2,8 @@
 
 This is a repository with my personal configurations and docker containers for agentic coding.
 
+[models.json](./models.json) and [AGENTS.md](./AGENTS.md) should go in your .pi/agents directory.
+
 ### pi-beads
 [pi-beads](./pi-beads) contains my currently preferred harness.  This uses [pi.dev](https://pi.dev) with [beads](https://beads.gascity.com/) to create an organized, long-running, and resilient agent.  I use local LLMs so all agent calls need to be sequential for performance, and this combination fits the bill perfectly.  The Agent can create new tickets and pick them up later to work.  If the Agent fails for any reason, it will pick right back up from the last state of the beads Kanban board.
 

@@ -1,0 +1,23 @@
+{
+  "providers": {
+    "llamacpp": {
+      "baseUrl": "http://<yoururl>:8080",
+      "api": "anthropic-messages",
+      "apiKey": "",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "thinkingFormat": "qwen-chat-template",
+        "thinkingTokenBudgetField": "thinking_budget_tokens"
+      },
+      "models": [
+        {
+          "id": "<yourmodelid>",
+          "reasoning": true,
+          "maxTokens": 16384,
+          "contextWindow": 128000
+        }
+      ]
+    }
+  }
+}
