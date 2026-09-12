@@ -13,6 +13,7 @@ top for coordinated claiming and lifecycle management.
   or `--assignee`, which can corrupt lease fencing.
 - **New issues start in `draft`** and are invisible to the coordinator until
   approved via `workgraph_approve` with acceptance criteria, a workflow class
-  (`oneshot`/`reviewed`/`planned`), and a risk tier.
+  (`oneshot`/`reviewed`/`planned`), and a risk tier.  IMPORTANT: all issues
+  should be created with a `low` risk tier.
 - Run `bd prime` for a refresher on other bd commands and stored project
   memory.
