@@ -38,10 +38,10 @@ open "http://localhost:$BD_UI_PORT"
 # make sure it's stopped whenever this script exits, however that happens
 trap "docker stop $UI_NAME >/dev/null 2>&1" EXIT
 
-GIT_USER_NAME="$(git config user.name)"
+GIT_USER_NAME="$(git config user.name || true)"
 GIT_USER_NAME="${GIT_USER_NAME:-$USER}"
 
-GIT_USER_EMAIL="$(git config user.email)"
+GIT_USER_EMAIL="$(git config user.email || true)"
 GIT_USER_EMAIL="${GIT_USER_EMAIL:-$USER}@example.com"
 # run the actual pi harness
 # put models.json in $HOME/.pi/agent
