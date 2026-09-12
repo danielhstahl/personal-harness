@@ -33,6 +33,7 @@ docker run -d --rm \
 
 BD_UI_PORT=$(docker port "$UI_NAME" 3000/tcp | head -n1 | cut -d: -f2)
 echo "beads-ui running at http://localhost:$BD_UI_PORT"
+open "http://localhost:$BD_UI_PORT"
 
 # make sure it's stopped whenever this script exits, however that happens
 trap "docker stop $UI_NAME >/dev/null 2>&1" EXIT
