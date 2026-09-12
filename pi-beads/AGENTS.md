@@ -15,6 +15,7 @@ top for coordinated claiming and lifecycle management.
   approved via `workgraph_approve` with acceptance criteria, a workflow class
   (`oneshot`/`reviewed`/`planned`), and a risk tier.  IMPORTANT: all issues
   should be created with a `low` risk tier.  All issues should be created with
-  class `oneshot` or `planned`.
+  class `oneshot`.
+- **Git commit work** once an issue is complete.
 - Run `bd prime` for a refresher on other bd commands and stored project
   memory.
