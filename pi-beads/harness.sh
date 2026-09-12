@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-TAG="v0.0.6"
+TAG="v0.0.7"
 
 # sanitize PWD into something safe for docker names, and make it unique
 # even if two dirs share a basename
@@ -37,6 +37,11 @@ echo "beads-ui running at http://localhost:$BD_UI_PORT"
 # make sure it's stopped whenever this script exits, however that happens
 trap "docker stop $UI_NAME >/dev/null 2>&1" EXIT
 
+GIT_USER_NAME="$(git config user.name)"
+GIT_USER_NAME="${GIT_USER_NAME:-$USER}"
+
+GIT_USER_EMAIL="$(git config user.email)"
+GIT_USER_EMAIL="${GIT_USER_EMAIL:-$USER}@example.com"
 # run the actual pi harness
 # put models.json in $HOME/.pi/agent
 docker run --rm -it \
@@ -44,4 +49,6 @@ docker run --rm -it \
   --add-host=host.docker.internal:host-gateway \
   -v $HOME/.pi/agent:/home/appuser/.pi/agent \
   -v $VOLUME:/workspace/.beads \
+  -e GIT_USER_NAME="$GIT_USER_NAME" \
+  -e GIT_USER_EMAIL="$GIT_USER_EMAIL" \
   ghcr.io/danielhstahl/pi-beads:$TAG

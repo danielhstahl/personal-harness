@@ -14,6 +14,7 @@ top for coordinated claiming and lifecycle management.
 - **New issues start in `draft`** and are invisible to the coordinator until
   approved via `workgraph_approve` with acceptance criteria, a workflow class
   (`oneshot`/`reviewed`/`planned`), and a risk tier.  IMPORTANT: all issues
-  should be created with a `low` risk tier.
+  should be created with a `low` risk tier.  All issues should be created with
+  class `oneshot` or `planned`.
 - Run `bd prime` for a refresher on other bd commands and stored project
   memory.
