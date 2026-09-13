@@ -1,14 +1,12 @@
 {
   "providers": {
     "llamacpp": {
-      "baseUrl": "http://<yoururl>:8080",
-      "api": "anthropic-messages",
-      "apiKey": "",
+      "baseUrl": "http://<yoururl>:8081",
+      "api": "openai-completions",
+      "apiKey": "hello",
       "compat": {
         "supportsDeveloperRole": false,
-        "supportsReasoningEffort": false,
-        "thinkingFormat": "qwen-chat-template",
-        "thinkingTokenBudgetField": "thinking_budget_tokens"
+        "supportsReasoningEffort": false
       },
       "models": [
         {
