@@ -1,7 +1,7 @@
 # https://pi.dev/docs/latest/containerization
 FROM nikolaik/python-nodejs:python3.14-nodejs25-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash ca-certificates git ripgrep curl gcc \
+    && apt-get install -y --no-install-recommends bash ca-certificates git ripgrep curl gcc unzip xz-utils zip libglu1-mesa \
     && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /app
 ENV NPM_CONFIG_PREFIX=/app/.npm-global

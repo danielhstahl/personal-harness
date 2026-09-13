@@ -16,6 +16,7 @@ top for coordinated claiming and lifecycle management.
   (`oneshot`/`reviewed`/`planned`), and a risk tier.  IMPORTANT: all issues
   should be created with a `low` risk tier.  All issues should be created with
   class `oneshot`.
+- **Child issues must be completed** before dispatching their parent.
 - **Git commit work** once an issue is complete.
 - Run `bd prime` for a refresher on other bd commands and stored project
   memory.
