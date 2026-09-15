@@ -2,7 +2,7 @@
 
 This is a repository with my personal configurations and docker containers for agentic coding.
 
-[models.json](./models.json) should go in your .pi/agents directory.  This assumes a fully "compliant" `anthropic-messages` api.  If you are connecting to llamacpp or any other engine that generates reasoning tokens in `reasoning_content` keys, use something like this in your `campat` object: 
+[models.json](./models.json) should go in your .pi/agents directory.  This assumes a fully "compliant" `anthropic-messages` api.  If you are connecting to any engine that does not parse reasoning into seperate message types, use something like this in your `campat` object: 
 
 ```json
 "thinkingFormat": "qwen-chat-template",
@@ -12,7 +12,11 @@ This is a repository with my personal configurations and docker containers for a
 The backend api can be set to openai or anthropic:
 
 ```json
-"api": "openai-completions", //or "anthropic-messages",
+"api": "openai-completions", 
+```
+or
+```json
+"api":  "anthropic-messages",
 ```
 
 Note that this harness does not work well if the following two conditions are both met:
