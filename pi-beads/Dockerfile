@@ -10,6 +10,12 @@ ENV BEADS_DIR=/workspace/.beads
 
 RUN addgroup --system appgroup && \
     adduser --system --ingroup appgroup appuser --home /home/appuser
+
+## Flutter
+ENV PATH="$PATH:/app/flutter/bin"
+ENV FLUTTER_VERSION=3.47.4
+RUN git clone https://github.com/flutter/flutter.git -b ${FLUTTER_VERSION} --depth 1 /app/flutter
+
 # put playwright path in somewhere the user can write
 ENV PLAYWRIGHT_BROWSERS_PATH=/home/appuser/playwright
 # Set all of /app to root:root, read-only for appuser
