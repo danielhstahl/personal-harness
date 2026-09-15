@@ -2,7 +2,11 @@
 
 This is a repository with my personal configurations and docker containers for agentic coding.
 
-[models.json](./models.json) should go in your .pi/agents directory.  This assumes a fully "compliant" `anthropic-messages` api.  If you are connecting to any engine that does not parse reasoning into seperate message types, use something like this in your `campat` object: 
+### Global configuration
+
+[models.json](./models.json) should go in your .pi/agents directory.  
+
+If you are connecting to any engine that does not parse reasoning into seperate message types, use something like this in your `campat` object: 
 
 ```json
 "thinkingFormat": "qwen-chat-template",
@@ -23,7 +27,6 @@ Note that this harness does not work well if the following two conditions are bo
 * `litellm` is used to proxy
 * `litellm`'s backend uses `hosted_vllm/<model>`
 There appears to be a bug that causes tool calls to not consistently be parsed, resulting in premature halting of `pi.dev`.  
-
 
 ### pi-beads
 [pi-beads](./pi-beads) contains my currently preferred harness.  This uses [pi.dev](https://pi.dev) with [beads](https://beads.gascity.com/) to create an organized, long-running, and resilient agent.  I use local LLMs so all agent calls need to be sequential for performance, and this combination fits the bill perfectly.  The Agent can create new tickets and pick them up later to work.  If the Agent fails for any reason, it will pick right back up from the last state of the beads Kanban board.  Instructions for pi-beads are in [AGENTS.md](./pi-beads/AGENTS.md) which should go in your .pi/agents directory.
