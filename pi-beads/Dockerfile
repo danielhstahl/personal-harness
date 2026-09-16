@@ -36,6 +36,10 @@ ENV PATH="$PATH:/home/appuser/flutter/bin"
 ENV FLUTTER_VERSION=3.47.4
 RUN git clone https://github.com/flutter/flutter.git -b ${FLUTTER_VERSION} --depth 1 /home/appuser/flutter
 
+## Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/home/appuser/.cargo/bin:${PATH}"
+
 # uses beads to handle work
 RUN pi install npm:pi-workgraph
 WORKDIR /workspace
