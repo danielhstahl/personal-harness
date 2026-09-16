@@ -6,18 +6,16 @@ RUN apt-get update \
 RUN mkdir -p /app
 ENV NPM_CONFIG_PREFIX=/app/.npm-global
 ENV PATH=$PATH:/app/.npm-global/bin
-ENV BEADS_DIR=/workspace/.beads
+
 
 RUN addgroup --system appgroup && \
     adduser --system --ingroup appgroup appuser --home /home/appuser
 
-## Flutter
-ENV PATH="$PATH:/app/flutter/bin"
-ENV FLUTTER_VERSION=3.47.4
-RUN git clone https://github.com/flutter/flutter.git -b ${FLUTTER_VERSION} --depth 1 /app/flutter
+
 
 # put playwright path in somewhere the user can write
 ENV PLAYWRIGHT_BROWSERS_PATH=/home/appuser/playwright
+ENV BEADS_DIR=/home/appuser/.beads
 # Set all of /app to root:root, read-only for appuser
 RUN chown -R root:root /app && chmod -R 755 /app
 RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
@@ -26,10 +24,16 @@ RUN chmod +x /app/entrypoint.sh
 
 # install beads
 RUN npm install -g @beads/bd
-RUN mkdir -p /workspace/.beads && chown -R appuser:appgroup /workspace
+RUN chown -R appuser:appgroup /workspace
 # Switch to the non-root user
 USER appuser
 RUN mkdir -p $PLAYWRIGHT_BROWSERS_PATH
+RUN mkdir -p $BEADS_DIR
+## Flutter
+ENV PATH="$PATH://home/appuser/flutter/bin"
+ENV FLUTTER_VERSION=3.47.4
+RUN git clone https://github.com/flutter/flutter.git -b ${FLUTTER_VERSION} --depth 1 /home/appuser/flutter
+
 # uses beads to handle work
 RUN pi install npm:pi-workgraph
 WORKDIR /workspace

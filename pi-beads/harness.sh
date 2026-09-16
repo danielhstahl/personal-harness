@@ -49,7 +49,7 @@ docker run --rm -it \
   -v "$PWD:/workspace" \
   --add-host=host.docker.internal:host-gateway \
   -v $HOME/.pi/agent:/home/appuser/.pi/agent \
-  -v $VOLUME:/workspace/.beads \
+  -v $VOLUME:/home/appuser/.beads \
   -e GIT_USER_NAME="$GIT_USER_NAME" \
   -e GIT_USER_EMAIL="$GIT_USER_EMAIL" \
   ghcr.io/danielhstahl/pi-beads:$TAG
