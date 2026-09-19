@@ -328,14 +328,23 @@ describe("idle mode returns raw input", () => {
     assert.ok(!(outcome as { text: string }).text.includes("\t"));
   });
 
-  it("passes multi-line input through as one piece", async () => {
+  it("passes multi-line, markdown-ish input through as one exact piece", async () => {
     const h = harness();
     await settle();
-    // ctrl+j is `tui.input.newLine` in pi's default map.
-    h.term.input("first line\nsecond line\r");
+    // ctrl+j / \n is `tui.input.newLine` in pi's default map.
+    const typed = [
+      "Fix the flaky tests,",
+      "then add `--json` to every bd call,",
+      "and write the handoff.",
+      "",
+      "  - indented bullet with trailing spaces   ",
+    ].join("\n");
+    h.term.input(`${typed}\r`);
     assert.deepEqual(await h.pending, {
       kind: "input",
-      text: "first line\nsecond line",
+      // Interior blank lines, indentation and punctuation survive exactly; only
+      // pi's own trailing trim applies.
+      text: typed.replace(/\s+$/u, ""),
     });
   });
 
@@ -803,6 +812,37 @@ describe("idle mode leaves the loop's boundaries alone", () => {
   it("is not the rpc transport path", () => {
     assert.ok(!source.includes("--mode rpc"));
     assert.ok(!source.includes("RpcClient"));
+  });
+
+  it("styles nothing itself — every escape comes from a pi theme function", () => {
+    // No hand-rolled colour, cursor or clearing sequence. If this fails, someone
+    // painted instead of asking the theme.
+    assert.ok(!source.includes("\\x1b"), "escaped-ESC literal in idle.ts");
+    assert.ok(!source.includes("\\u001b"), "unicode-escaped ESC in idle.ts");
+    assert.ok(
+      !source.includes(String.fromCharCode(27)),
+      "raw ESC character in idle.ts",
+    );
+    assert.ok(!/\\d+;?\d*m/u.test(source), "SGR-looking literal in idle.ts");
+  });
+
+  it("renders with pi's own components, editor and theme", () => {
+    for (const required of [
+      'from "@earendil-works/pi-tui"',
+      'from "@earendil-works/pi-coding-agent"',
+      "CustomEditor",
+      "TuiMainScreen",
+      "ProcessTerminal",
+      "initTheme",
+      "getSelectListTheme",
+      "CombinedAutocompleteProvider",
+    ]) {
+      assert.ok(source.includes(required), `idle.ts should use ${required}`);
+    }
+    // …and not a substitute line editor.
+    for (const banned of ["readline", "inquirer", "prompts(", "tty.read"] as const) {
+      assert.ok(!source.includes(banned), `idle.ts must not use ${banned}`);
+    }
   });
 });
 
