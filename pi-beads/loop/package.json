@@ -1,0 +1,39 @@
+{
+  "name": "pi-beads-loop",
+  "version": "0.1.0",
+  "description": "Hyper-opinionated agent loop with pi",
+  "keywords": [
+    "pi",
+    "harness",
+    "beads",
+    "agent"
+  ],
+  "license": "ISC",
+  "author": "Daniel Stahl",
+  "type": "module",
+  "main": "./dist/main.js",
+  "bin": {
+    "pi-beads-loop": "./dist/main.js"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "dev": "tsx src/main.ts",
+    "start": "node dist/main.js",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "clean": "rm -rf dist",
+    "prepack": "npm run clean && npm run build"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-tui": "0.85.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3"
+  }
+}
