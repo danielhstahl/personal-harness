@@ -480,6 +480,17 @@ test("a single small request yields exactly one issue, not a spray", async () =>
   assert.equal(board.childCreates().length, 1);
   assert.equal(agent.calls(), 1);
   assert.equal(outcome.created[0]?.title, "Fix the typo in the README");
+  // Nothing was padded on: the created set is exactly what was proposed, so the
+  // model inventing "and also set up a wiki" would show up as a mismatch rather
+  // than a quietly larger board.
+  const proposal = await createSplitter({
+    agent: fakeAgent([[rawIssue({ title: "Fix the typo in the README" })]]).port,
+    beads: fakeBoard("single2").client,
+  }).propose("fix the typo in the README");
+  assert.deepEqual(
+    outcome.created.map((entry) => entry.title),
+    proposal.items.map((item) => item.title),
+  );
   // The only other create is the epic that carries the request verbatim.
   assert.equal(board.specs.length, 2);
   assert.equal(board.specs[0]?.type, "epic");
@@ -661,6 +672,64 @@ test("batch-local depends_on become real bd ids, read back through the adapter",
   assert.ok(
     order.indexOf(`createIssue:${b.title}`) < order.indexOf(`createIssue:${c.title}`),
     order.join(" | "),
+  );
+});
+
+test("the acceptance shape: README + LICENSE + CI, deps intact, read back through the adapter", async () => {
+  // The case named in the ticket: three issues, an ordering between them, each
+  // with its own acceptance criteria and priority, surviving creation intact.
+  const agent = fakeAgent([
+    [
+      rawIssue({
+        title: "Write the README",
+        description: "What the loop is, how to run it, the two modes.",
+        acceptance_criteria: "A reader can start the loop from the README alone.",
+        priority: 1,
+      }),
+      rawIssue({
+        title: "Add a LICENSE",
+        description: "Pick and commit the project's license file.",
+        acceptance_criteria: "A OSI-approved LICENSE exists at the repo root.",
+        priority: 2,
+      }),
+      rawIssue({
+        title: "Wire CI to run the test suite",
+        description: "CI runs typecheck and the tests on every push.",
+        acceptance_criteria: "A push with a failing test is blocked by CI.",
+        priority: 1,
+        depends_on: [0, 1],
+      }),
+    ],
+  ]);
+  const board = fakeBoard("ac");
+
+  const outcome = await createSplitter({ agent: agent.port, beads: board.client }).split(
+    "we need a README, a LICENSE and CI wiring",
+  );
+
+  assert.equal(outcome.kind, "created", describeSplitFailure(outcome));
+  assert.equal(outcome.created.length, 3);
+
+  const [readme, license, ci] = outcome.created;
+  assert.ok(readme && license && ci);
+
+  for (const entry of outcome.created) {
+    const issue = board.issue(entry.id);
+    assert.ok(issue, `${entry.id} should exist`);
+    assert.ok((issue!.acceptance_criteria ?? "").trim().length > 0, `${entry.id} needs acceptance`);
+    assert.ok(issue!.priority >= 0 && issue!.priority <= 4, `${entry.id} needs a priority`);
+  }
+
+  // The intra-batch ordering is real, and expressed with the ids that were made.
+  assert.equal(dependsOn(board.issue(ci.id)!, readme.id), true);
+  assert.equal(dependsOn(board.issue(ci.id)!, license.id), true);
+  assert.deepEqual(normaliseDependencies(board.issue(readme.id)!), []);
+  assert.deepEqual(normaliseDependencies(board.issue(license.id)!), []);
+
+  // And the created set is exactly the proposed set — the splitter added nothing.
+  assert.deepEqual(
+    outcome.created.map((entry) => entry.title),
+    ["Write the README", "Add a LICENSE", "Wire CI to run the test suite"],
   );
 });
 
