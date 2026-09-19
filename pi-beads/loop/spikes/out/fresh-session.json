@@ -1,0 +1,78 @@
+[
+  {
+    "n": 1,
+    "prompt": "Write a Python function `fib(n)` that returns the nth Fibonacci number.",
+    "sessionId": "01a0ba11-e1e0-7547-89a7-b0b3539fae04",
+    "messagesBefore": 0,
+    "messagesAfter": 2,
+    "deltas": 43,
+    "inputTokens": 0,
+    "cacheRead": 105,
+    "cacheWrite": 0,
+    "totalContextTokens": 105,
+    "sessionCreateMs": 3,
+    "firstDeltaMs": 1812,
+    "totalMs": 2920,
+    "text": "```python\ndef fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\n```",
+    "rendered_plain": [
+      "\u001b]133;A\u0007",
+      " Thinking...                                                                            ",
+      "",
+      " ```python                                                                              ",
+      "   def fib(n):                                                                          ",
+      "       a, b = 0, 1                                                                      ",
+      "       for _ in range(n):                                                               ",
+      "           a, b = b, a + b                                                              ",
+      "       return a                                                                         ",
+      "\u001b]133;B\u0007\u001b]133;C\u0007 ```                                                                                    "
+    ]
+  },
+  {
+    "n": 2,
+    "prompt": "Write a TypeScript function `reverse(s: string): string` that returns the string reversed.",
+    "sessionId": "01a0ba11-ed5b-7547-89a7-b0b5109041bd",
+    "messagesBefore": 0,
+    "messagesAfter": 2,
+    "deltas": 28,
+    "inputTokens": 0,
+    "cacheRead": 108,
+    "cacheWrite": 0,
+    "totalContextTokens": 108,
+    "sessionCreateMs": 1,
+    "firstDeltaMs": 3428,
+    "totalMs": 4102,
+    "text": "```typescript\nexport function reverse(s: string): string {\n  return Array.from(s).reverse().join('');\n}\n```",
+    "rendered_plain": [
+      "\u001b]133;A\u0007",
+      " Thinking...                                                                            ",
+      "",
+      " ```typescript                                                                          ",
+      "   export function reverse(s: string): string {                                         ",
+      "     return Array.from(s).reverse().join('');                                           ",
+      "   }                                                                                    ",
+      "\u001b]133;B\u0007\u001b]133;C\u0007 ```                                                                                    "
+    ]
+  },
+  {
+    "n": 3,
+    "prompt": "Earlier in this session you were asked to write some code. In one short sentence, state exactly what code you were asked for. If you have no record of any such request, reply with exactly: UNKNOWN",
+    "sessionId": "01a0ba11-fd6f-7547-89a7-b0b7574faca0",
+    "messagesBefore": 0,
+    "messagesAfter": 2,
+    "deltas": 1,
+    "inputTokens": 125,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "totalContextTokens": 125,
+    "sessionCreateMs": 1,
+    "firstDeltaMs": 3044,
+    "totalMs": 3045,
+    "text": "UNKNOWN",
+    "rendered_plain": [
+      "\u001b]133;A\u0007",
+      " Thinking...                                                                            ",
+      "",
+      "\u001b]133;B\u0007\u001b]133;C\u0007 UNKNOWN                                                                                "
+    ]
+  }
+]

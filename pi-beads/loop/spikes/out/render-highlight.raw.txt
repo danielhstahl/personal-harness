@@ -1,0 +1,58 @@
+--- highlightCode(typescript) ---
+[38;5;65m// fib with memoisation[39m
+[38;5;74mfunction[39m[38;5;187m [39m[38;5;187mfib[39m[38;5;187m([39m[38;5;153mn: [39m[38;5;79mnumber[39m[38;5;153m, memo = [39m[38;5;74mnew[39m[38;5;153m [39m[38;5;79mMap[39m[38;5;153m<[39m[38;5;79mnumber[39m[38;5;153m, [39m[38;5;79mnumber[39m[38;5;153m>()[39m[38;5;187m): [39m[38;5;187mnumber[39m[38;5;187m [39m{
+	[38;5;74mif[39m (n <= [38;5;151m1[39m) [38;5;74mreturn[39m n;
+	[38;5;74mif[39m (memo.has(n)) [38;5;74mreturn[39m memo.get(n)!;
+	[38;5;74mconst[39m value = fib(n - [38;5;151m1[39m, memo) + fib(n - [38;5;151m2[39m, memo);
+	memo.set(n, value);
+	[38;5;74mreturn[39m value;
+}
+--- highlightCode(python) ---
+[38;5;74mdef[39m[38;5;187m [39m[38;5;187mgreet[39m[38;5;187m([39m[38;5;153mname[39m[38;5;187m):[39m
+    [38;5;174m"""Say hello."""[39m
+    [38;5;74mreturn[39m [38;5;174mf"hello [39m[38;5;174m{name}[39m[38;5;174m"[39m  [38;5;65m# interpolated[39m
+--- Markdown(doc) @ 78 cols ---
+[38;5;222m[1mLoop iteration 4[22m[39m                                                              
+                                                                              
+Working [1mworkspace-5yn.3[22m on the beads adapter.                                 
+                                                                              
+Key rule: never trust [38;5;109mbd[39m exit codes blindly.                                  
+                                                                              
+[38;5;244m```typescript[39m                                                                 
+  [38;5;65m// fib with memoisation[39m                                                     
+  [38;5;74mfunction[39m[38;5;187m [39m[38;5;187mfib[39m[38;5;187m([39m[38;5;153mn: [39m[38;5;79mnumber[39m[38;5;153m, memo = [39m[38;5;74mnew[39m[38;5;153m [39m[38;5;79mMap[39m[38;5;153m<[39m[38;5;79mnumber[39m[38;5;153m, [39m[38;5;79mnumber[39m[38;5;153m>()[39m[38;5;187m): [39m[38;5;187mnumber[39m[38;5;187m [39m{         
+     [38;5;74mif[39m (n <= [38;5;151m1[39m) [38;5;74mreturn[39m n;                                                    
+     [38;5;74mif[39m (memo.has(n)) [38;5;74mreturn[39m memo.get(n)!;                                    
+     [38;5;74mconst[39m value = fib(n - [38;5;151m1[39m, memo) + fib(n - [38;5;151m2[39m, memo);                       
+     memo.set(n, value);                                                      
+     [38;5;74mreturn[39m value;                                                            
+  }                                                                           
+[38;5;244m```[39m                                                                           
+                                                                              
+[38;5;109m- [39mcommit first                                                                
+[38;5;109m- [39mremember second                                                             
+[38;5;109m- [39mclose last                                                                  
+--- AssistantMessageComponent @ 78 cols ---
+]133;A
+ [3m[38;5;244mThe user wants a fenced code block.[39m[23m                                          
+
+ [38;5;222m[1mLoop iteration 4[22m[39m                                                             
+                                                                              
+ Working [1mworkspace-5yn.3[22m on the beads adapter.                                
+                                                                              
+ Key rule: never trust [38;5;109mbd[39m exit codes blindly.                                 
+                                                                              
+ [38;5;244m```typescript[39m                                                                
+   [38;5;65m// fib with memoisation[39m                                                    
+   [38;5;74mfunction[39m[38;5;187m [39m[38;5;187mfib[39m[38;5;187m([39m[38;5;153mn: [39m[38;5;79mnumber[39m[38;5;153m, memo = [39m[38;5;74mnew[39m[38;5;153m [39m[38;5;79mMap[39m[38;5;153m<[39m[38;5;79mnumber[39m[38;5;153m, [39m[38;5;79mnumber[39m[38;5;153m>()[39m[38;5;187m): [39m[38;5;187mnumber[39m[38;5;187m [39m{        
+      [38;5;74mif[39m (n <= [38;5;151m1[39m) [38;5;74mreturn[39m n;                                                   
+      [38;5;74mif[39m (memo.has(n)) [38;5;74mreturn[39m memo.get(n)!;                                   
+      [38;5;74mconst[39m value = fib(n - [38;5;151m1[39m, memo) + fib(n - [38;5;151m2[39m, memo);                      
+      memo.set(n, value);                                                     
+      [38;5;74mreturn[39m value;                                                           
+   }                                                                          
+ [38;5;244m```[39m                                                                          
+                                                                              
+ [38;5;109m- [39mcommit first                                                               
+ [38;5;109m- [39mremember second                                                            
+]133;B]133;C [38;5;109m- [39mclose last                                                                 

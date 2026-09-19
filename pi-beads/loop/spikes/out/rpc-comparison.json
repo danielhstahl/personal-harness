@@ -1,0 +1,28 @@
+{
+  "rpc": {
+    "mode": "pi --mode rpc (subprocess over pipes, correctly spelled args)",
+    "started": true,
+    "time_to_first_text_delta_ms": 649,
+    "total_ms": 839,
+    "events_received": 36,
+    "text_deltas": 9,
+    "event_types": {
+      "response": 1,
+      "agent_start": 1,
+      "turn_start": 1,
+      "message_start": 2,
+      "message_end": 2,
+      "message_update": 26,
+      "turn_end": 1,
+      "agent_end": 1,
+      "agent_settled": 1
+    }
+  },
+  "scaffold_argv_replay": {
+    "mode": "scaffold form: spawn(\"pi\", [\" --mode\", \"rpc\", ...])",
+    "exit_status": 143,
+    "stdout_bytes": 0,
+    "stderr_excerpt": ""
+  },
+  "note": "A working RPC round trip requires a hand-maintained JSONL framing layer plus a subprocess lifecycle to supervise, and still hands the caller raw JSON events that must be re-mapped onto pi's components by hand. The in-process SDK skips both layers and exposes those components directly."
+}
