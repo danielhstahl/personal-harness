@@ -395,19 +395,38 @@ test("assertClaimFreeArgs refuses claim and assignee flags", () => {
   assert.doesNotThrow(() => assertClaimFreeArgs(["list", "--json", "--status", "in_progress"]));
 });
 
-test("only beads.ts may spawn processes anywhere in src/", () => {
+/**
+ * Only these two modules may spawn anything, and only for one named read-only
+ * purpose each. The invariant is not "beads.ts is special" — it is "process
+ * creation is confined to named adapters, so there is a short list to audit
+ * and everything else has to go through them".
+ */
+const SPAWN_ALLOWLIST: Readonly<Record<string, string>> = {
+  "beads.ts": "bd, the issue tracker",
+  "repo.ts": "git, read-only snapshotting",
+};
+
+test("only the named adapter modules may spawn processes anywhere in src/", () => {
   for (const file of readdirSync(SRC_DIR).filter((f) => f.endsWith(".ts"))) {
-    if (file === "beads.ts") continue;
     const text = readFileSync(join(SRC_DIR, file), "utf8");
+    const allowed = SPAWN_ALLOWLIST[file] !== undefined;
+    const usesChildProcess = /child_process/.test(text);
+    const spawns = /\b(execFile|spawnSync|spawn)\s*\(/.test(text);
+
+    if (!allowed) {
+      assert.equal(
+        usesChildProcess,
+        false,
+        `${file} must not import child_process — process access is confined to ${Object.keys(SPAWN_ALLOWLIST).join(", ")}`,
+      );
+      assert.equal(spawns, false, `${file} must not spawn processes directly`);
+      continue;
+    }
+    // An allowlisted file must actually still be an adapter, not a stale entry.
     assert.equal(
-      /child_process/.test(text),
-      false,
-      `${file} must not import child_process — all bd access goes through src/beads.ts`,
-    );
-    assert.equal(
-      /\b(execFile|spawnSync|spawn)\s*\(/.test(text),
-      false,
-      `${file} must not spawn processes directly`,
+      usesChildProcess || spawns,
+      true,
+      `${file} is allowlisted (${SPAWN_ALLOWLIST[file]}) but spawns nothing — drop it from the allowlist`,
     );
   }
 });
