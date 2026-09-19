@@ -24,6 +24,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
+    "spike:idle": "tsx spikes/4-idle-pty.ts",
     "clean": "rm -rf dist",
     "prepack": "npm run clean && npm run build"
   },

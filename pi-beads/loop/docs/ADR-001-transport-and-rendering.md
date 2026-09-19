@@ -212,13 +212,82 @@ must be written down before the current one dies: the `bd remember` handoff in t
 finalize step (→ workspace-5yn.8) is load-bearing, not a nicety. Spike 2's `UNKNOWN`
 is the proof that nothing else will remember for us.
 
+## Resolved in workspace-5yn.6: what the idle surface actually does about theme
+
+The open question above — "follow the user theme or pin one" — is settled, and
+settling it turned up three things worth writing down before someone meets them
+again.
+
+**Theme: follow pi's configured theme; `LOOP_THEME` pins.** `initTheme(name)`
+reads the user's `settings.json` when given no name, and silently falls back to
+`"dark"` if that cannot be resolved — so following the user costs nothing and
+never fails hard. `LOOP_THEME` exists for the cases where a pinned look is the
+point: screenshots, a demo machine, or a terminal whose configured theme is
+unreadable. Resolution lives in `resolveIdleThemeName(env, explicit)` with the
+environment as an *explicit default argument*, so the decision is visible at the
+call site and testable without touching `process.env`. Precedence: explicit
+option > `LOOP_THEME` > pi's configured theme > pi's `"dark"` fallback.
+
+Highlights come from pi's own theme functions (`getSelectListTheme()` roles,
+`rawKeyHint()`), never hand-rolled ANSI — which is the whole reason this ADR
+chose the SDK.
+
+**Gotcha 1: the installed tree carries two copies of `pi-tui`.** Ours at the
+top level, another nested under `pi-coding-agent`. Two module instances means two
+*separate* keybinding globals, and pi's `keyHint()` / `keyText()` helpers read
+pi's copy. Register `app.*` actions with our `setKeybindings()` and `keyHint()
+still returns an empty key name — silently, no error. The fix is to source the
+key names from our own registry (`idleKeyNames()`) and hand the string to pi's
+`rawKeyHint(key, description)`, which themes it exactly the way pi does without
+reading a global we do not control.
+
+**Gotcha 2: pi's app-level keybinding table is not importable.** The `KEYBINDINGS`
+module with `app.clear` / `app.exit` / `app.interrupt` is not in the package's
+`exports` map, so `idle.ts` mirrors those three ids (`IDLE_APP_KEYBINDINGS`)
+rather than deep-importing a private path. The trade is explicit: if pi renames
+an app action, the mirror drifts — but the drift shows up as a behaviour test
+failure (Ctrl+C stops clearing/arming), which is a better guard than a fragile
+import path that breaks the whole build on any internal reshuffle. User remaps
+are still honoured: `loadUserIdleKeybindings()` reads the user's
+`keybindings.json` and copies in only the idle-owned ids, tolerating junk.
+
+**Gotcha 3: `CustomEditor`'s keybinding parameter is nominal.** Its `private
+keybindings` field makes the class structurally incompatible with our own
+manager, and the package does not export a usable subclass constructor, so the
+one boundary needs a cast (`asEditorKeybindings`, via
+`ConstructorParameters<typeof CustomEditor>[2]`). Confined to that function on
+purpose: one documented cast instead of type surgery spread through the module.
+
+**Also learned, and now tested rather than assumed**
+
+- Input must arrive as *complete key sequences*. `ProcessTerminal` runs bytes
+  through pi-tui's `StdinBuffer` before the editor sees them, so `"hello\r"` is
+  six events. A test double that passes the whole string in one event makes
+  `matches(data, "tui.input.submit")` false and Enter silently stops working —
+  the fake terminal reuses `StdinBuffer` for exactly this reason.
+- Renders are scheduled `nextTick` + a frame timer, so tests must let real time
+  pass; `setImmediate` alone can assert against a frame that has not painted.
+- "What is on screen now" is the latest *diff* frame, not the whole write buffer.
+  Assertions about text disappearing (Ctrl+C clearing the input) have to compare
+  against a bookmarked delta.
+- Pi's `submitValue()` trims, and Tab belongs to autocomplete. So surrounding
+  whitespace and literal tabs never reach the loop, and neither is our
+  normalisation to hide.
+
+Live evidence: `spikes/out/4-idle-pty.txt` (produce with `npm run spike:idle`)
+— a real pty, real Enter submit returning `{"kind":"input",…}`, double Ctrl+C
+returning `{"kind":"exit","reason":"command"}`, `stty` confirming the tty is
+cooked again afterwards, and the cursor left visible.
+
 ## Follow-ups
 
 - Loader policy per mode: idle (interactive-ish, ambient extensions acceptable)
   vs work (locked down, reproducible) — decide in workspace-5yn.5 / .11.
-- Confirm `ToolExecutionComponent` covers the beads/git tool output shapes, and
-  settle the collapsed-summary format in workspace-5yn.10.
-- Rendering is theme-driven from `~/.pi/agent/settings.json` via
-  `initTheme(name)`; decide whether the loop follows the user theme or pins one.
+- ~~Confirm `ToolExecutionComponent` covers the beads/git tool output shapes, and
+  settle the collapsed-summary format in workspace-5yn.10.~~ Still open for work
+  mode; the idle surface needs no tool rendering (it makes no model calls).
+- ~~Rendering is theme-driven from `~/.pi/agent/settings.json` via
+  `initTheme(name)`; decide whether the loop follows the user theme or pins
+  one.~~ Decided above: follow the user theme, `LOOP_THEME` pins.
 - If a future requirement forces the agent out of process, revisit
   `RpcClient` — but re-read the RPC event-marshal count above first.
