@@ -201,6 +201,28 @@ test("addDep, setStatus and closeIssue build the expected argv", async () => {
   ]);
 });
 
+test("appendNote appends to the notes field with `bd note`, never replacing it", async () => {
+  const noted = harness("noted");
+  const issue = await noted.client.appendNote("fake-1", "Human request, verbatim:\nship the loop");
+
+  assert.deepEqual(noted.calls()[0]?.argv, [
+    "note",
+    "fake-1",
+    "Human request, verbatim:\nship the loop",
+    "--json",
+  ]);
+  // The echoed note is what real bd stores; nothing here rewrites it.
+  assert.equal(issue.notes, "Human request, verbatim:\nship the loop");
+
+  // An empty id or empty text is refused before a child is spawned: `bd note "" x`
+  // is exactly the kind of call that lands on someone else's issue.
+  const empty = harness("noted");
+  await assert.rejects(() => empty.client.appendNote("", "text"), isBdError("invalid-arguments"));
+  await assert.rejects(() => empty.client.appendNote("   ", "text"), isBdError("invalid-arguments"));
+  await assert.rejects(() => empty.client.appendNote("fake-1", "  "), isBdError("invalid-arguments"));
+  assert.equal(empty.calls().length, 0, "a refused note must not spawn bd");
+});
+
 test("remember and recall round-trip through --json", async () => {
   const store = harness("remembered");
   await store.client.remember("iteration 3 finished the adapter", "loop-handoff");
@@ -337,6 +359,7 @@ test("every mutating method still forces BD_LAST_TOUCHED_FALLBACK=0", async () =
     { name: "getIssue", run: (c) => c.getIssue("fake-1") },
     { name: "createIssue", run: (c) => c.createIssue({ title: "t" }) },
     { name: "addDep", run: (c) => c.addDep("fake-2", "fake-1") },
+    { name: "appendNote", run: (c) => c.appendNote("fake-1", "a note") },
     { name: "setStatus", run: (c) => c.setStatus("fake-1", "in_progress") },
     { name: "closeIssue", run: (c) => c.closeIssue("fake-1", "done") },
     { name: "remember", run: (c) => c.remember("text", "k") },

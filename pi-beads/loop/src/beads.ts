@@ -93,6 +93,8 @@ export interface Issue {
   issue_type: string;
   description?: string;
   acceptance_criteria?: string;
+  /** `bd note` output. Read here; written only through {@link BdClient.appendNote}. */
+  notes?: string;
   owner?: string;
   created_at?: string;
   updated_at?: string;
@@ -210,6 +212,15 @@ export interface BdClient {
   createIssue(spec: NewIssueSpec): Promise<Issue>;
   /** Make `id` depend on `dependsOnId` (default edge type `blocks`). */
   addDep(id: string, dependsOnId: string, type?: string): Promise<void>;
+  /**
+   * `bd note <id> <text>` — append to the issue's notes field.
+   *
+   * Append-only on purpose: the splitter records the human's original wording
+   * with it, and an append cannot clobber a note that is already there (a
+   * replacement would make "what did the human actually ask for?" depend on
+   * which run wrote last).
+   */
+  appendNote(id: string, text: string): Promise<Issue>;
   setStatus(id: string, status: IssueStatus, options?: SetStatusOptions): Promise<Issue>;
   closeIssue(id: string, reason?: string): Promise<Issue>;
   remember(text: string, key?: string): Promise<void>;
@@ -525,6 +536,25 @@ export function createBdClient(options: BdClientOptions = {}): BdClient {
       await call(argv);
     },
 
+    async appendNote(id: string, text: string): Promise<Issue> {
+      const argv = [
+        "note",
+        requireId(id, "issue id", ["note"]),
+        requireId(text, "note text", ["note"]),
+        "--json",
+      ];
+      const parsed = await call(argv);
+      const [issue] = asIssues(parsed ?? []);
+      if (!issue) {
+        throw new BdError({
+          kind: "non-json",
+          message: `bd note for ${id} returned no parsable issue`,
+          argv,
+        });
+      }
+      return issue;
+    },
+
     async setStatus(id: string, status: IssueStatus, setStatusOptions: SetStatusOptions = {}): Promise<Issue> {
       if (!ISSUE_STATUSES.includes(status)) {
         throw new BdError({
@@ -616,6 +646,7 @@ export const listInProgress = defaultBdClient.listInProgress;
 export const getIssue = defaultBdClient.getIssue;
 export const createIssue = defaultBdClient.createIssue;
 export const addDep = defaultBdClient.addDep;
+export const appendNote = defaultBdClient.appendNote;
 export const setStatus = defaultBdClient.setStatus;
 export const closeIssue = defaultBdClient.closeIssue;
 export const remember = defaultBdClient.remember;

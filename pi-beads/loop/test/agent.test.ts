@@ -276,6 +276,9 @@ function beadsStub(issue: Issue | null, memories: Record<string, string> = {}): 
     async addDep() {
       return notImplemented("addDep");
     },
+    async appendNote() {
+      return notImplemented("appendNote");
+    },
     async setStatus() {
       return notImplemented("setStatus");
     },
@@ -406,6 +409,9 @@ test("the second iteration in the same process starts with an empty history", as
         throw new Error("must not be called");
       },
       async addDep() {
+        throw new Error("must not be called");
+      },
+      async appendNote() {
         throw new Error("must not be called");
       },
       async setStatus() {

@@ -109,6 +109,37 @@ function stringArray(value: unknown): string[] | null {
 }
 
 /**
+ * Dependency entries for a proposed split.
+ *
+ * Under the split protocol these are batch positions — integers, or numeric
+ * strings (`"0"`, `"#2"`) — because no bd ids exist yet. This function does not
+ * enforce that; it only refuses what cannot be a dependency at all (an object, a
+ * boolean, `-1`, `1.5`) and passes strings through untouched.
+ *
+ * The division is deliberate: `.5` keeps the payload honest, `src/split.ts` is
+ * the single authority on what a valid split *means*. Enforcing position
+ * semantics here too would leave two places to keep in step, and the stricter one
+ * would win silently.
+ */
+function depArray(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const out: string[] = [];
+  for (const entry of value) {
+    if (typeof entry === "number") {
+      if (!Number.isInteger(entry) || entry < 0) return null;
+      out.push(String(entry));
+    } else if (typeof entry === "string") {
+      const text = entry.trim();
+      if (text === "") return null;
+      out.push(text);
+    } else {
+      return null;
+    }
+  }
+  return out;
+}
+
+/**
  * Accept either spelling of the multi-word fields. Models drift between
  * `changed_files` and `changedFiles`; silently dropping one would lose the file
  * list from the commit, so both are read and the snake_case form wins.
@@ -226,8 +257,21 @@ export function validateSplitPayload(raw: unknown):
       }
     }
 
-    const deps = stringArray(pick(item, "deps", "depends_on") as unknown);
-    if (deps !== null && deps.length > 0) spec.deps = deps;
+    const depsValue = pick(item, "depends_on", "deps");
+    if (depsValue !== undefined && depsValue !== null) {
+      const deps = depArray(depsValue);
+      if (deps === null) {
+        // Present but unreadable is reported, not dropped: a silently missing
+        // ordering constraint produces work in the wrong order, which looks like
+        // the loop working correctly.
+        problems.push(
+          `issue #${index + 1} \`depends_on\` must be an array of batch positions ` +
+            `(integers like 0, or strings like "0"/"#0")`,
+        );
+      } else if (deps.length > 0) {
+        spec.deps = deps;
+      }
+    }
 
     specs.push(spec);
   });
@@ -808,6 +852,11 @@ Each issue needs:
 - \`acceptance\`: how to tell it is done.
 - \`priority\`: integer 0 (urgent) to 4 (later).
 - \`type\`: task, feature, bug, spike or decision.
+- \`depends_on\`: the 0-based **positions** of other issues in this same array
+  that must be finished before this one can start, e.g. \`[0]\` or \`[0, 1]\`.
+  Positions, never ids — no ids exist yet. Omit it when nothing is needed, and
+  never list an issue's own position. Two issues that can be worked in parallel
+  have no dependency between them.
 
 Keep it to the smallest number of issues that is still honest about the work. Do
 not start implementing any of it here.`;
@@ -868,6 +917,14 @@ const REPORT_SPLIT_PARAMS = Type.Object({
       acceptance: Type.Optional(Type.String({ description: "How to tell it is done." })),
       priority: Type.Optional(Type.Integer({ minimum: 0, maximum: 4 })),
       type: Type.Optional(Type.String({ description: "task|feature|bug|spike|decision." })),
+      depends_on: Type.Optional(
+        Type.Array(Type.Union([Type.Integer({ minimum: 0 }), Type.String()]), {
+          description:
+            "0-based positions of OTHER issues in this same array that this one " +
+            "needs finished first, e.g. [0] or [0, 1]. Positions, not bd ids — " +
+            "no ids exist yet. Omit when nothing is needed.",
+        }),
+      ),
     }),
     { minItems: 1, description: "The proposed work items." },
   ),

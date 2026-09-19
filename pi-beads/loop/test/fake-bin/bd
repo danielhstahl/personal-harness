@@ -94,6 +94,17 @@ switch (scenario) {
     process.exit(0);
     break;
 
+  // Real `bd note <id> <text> --json` answers with the issue, notes included.
+  case "noted":
+    out(
+      JSON.stringify({
+        ...issue("fake-1", "ready one", "open"),
+        notes: argv[2] ?? "",
+      }),
+    );
+    process.exit(0);
+    break;
+
   case "closed":
     out(JSON.stringify([issue("fake-1", "ready one", "closed")]));
     process.exit(0);
