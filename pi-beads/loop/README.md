@@ -28,13 +28,36 @@ arrives in `workspace-5yn.4`–`.9`.
 ## Layout
 
 ```
-src/main.ts     entry point (currently a toolchain smoke run, see header comment)
-src/beads.ts    the ONLY module that shells out to `bd` (typed, side-effect-safe)
-src/format.ts   one-line plain-log summaries — NOT the renderer (see ADR-001)
-docs/           ADR-001: transport + rendering decision
-spikes/         throwaway prototypes + captured evidence backing ADR-001
-test/           adapter tests + the fake `bd` shim (test/fake-bin/bd)
+src/main.ts          entry point (currently a toolchain smoke run, see header comment)
+src/orchestrator.ts  the loop's decision layer: pure, effects-as-data, no I/O at all
+src/beads.ts         the ONLY module that shells out to `bd` (typed, side-effect-safe)
+src/format.ts        one-line plain-log summaries — NOT the renderer (see ADR-001)
+docs/               ADR-001: transport + rendering decision
+spikes/             throwaway prototypes + captured evidence backing ADR-001
+test/               adapter tests (fake `bd` shim) + orchestrator transition tests
 ```
+
+## The loop machine
+
+`src/orchestrator.ts` is a reducer: `step(state, event) -> { state, effects }`.
+It decides; it never *does*. Nothing in it touches a file, socket, process, the
+clock or the environment — the compiled JS for that file contains zero imports —
+so the whole loop is testable with no board and no pi.
+
+States: `init → check_work`, then `idle` / `split` / `pick` / `work` /
+`finalize` / `restart` back to `check_work`; `done` and `aborted` are terminal.
+Every side effect leaves as data (`beads.*`, `agent.*`, `vcs.commit`, `ui.*`,
+`drop_context`), and the interpreter in workspace-5yn.9 is a dispatch loop over
+`OrchestratorPorts` — the only place those decisions touch the world.
+
+`restart` is a real state that emits `drop_context`. Per ADR-001 that boundary is
+what buys "no context carried between iterations" — a fresh agent session, not a
+compacted one — so it shows up in every trace instead of being a back-edge a later
+refactor can shortcut into a warm state.
+
+A rejected transition is provably inert: it emits no effects and hands back the
+same state object. The test suite walks the full state × event cross-product, so
+"undefined behaviour" is not an option anywhere in the loop.
 
 ## Reading `bd`'s dependency shapes
 
@@ -58,3 +81,18 @@ In one line each:
 
 Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`,
 `LOOP_WIDTH`.
+
+## Scratch beads DB (for live / integration checks)
+
+Never run a live check against a real board. `bd` resolves its database from
+`BEADS_DIR`, so an isolated one is a single env var away:
+
+```sh
+mkdir -p /tmp/loop-live/.beads
+scratch=$(mktemp -d) && cd "$scratch" && git init -q .
+BEADS_DIR=/tmp/loop-live/.beads BD_NON_INTERACTIVE=1 bd init --prefix live
+BEADS_DIR=/tmp/loop-live/.beads bd list --json   # prove you are isolated
+```
+
+`src/beads.ts` forwards `BEADS_DIR` through its `env` option, which is how the
+live pass exercised real bd 1.3.0 without touching `~/.beads`.
