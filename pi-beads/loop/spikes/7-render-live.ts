@@ -215,6 +215,35 @@ async function runChild(caseName: string): Promise<void> {
     return;
   }
 
+  if (caseName === "quiet") {
+    // The heartbeat's own case, and the one no unit test can prove: a surface
+    // held while nothing happens. One real tool call in flight, then three
+    // seconds in which no event of any kind is fed.
+    presenter.setContext({
+      issueId: "workspace-cog",
+      phase: "work",
+      model: "llamacpp/qwen3-coder",
+      thinkingLevel: "medium",
+    });
+    presenter.acquire();
+    presenter.feed(
+      agentEvent({
+        type: "tool_execution_start",
+        toolCallId: "t1",
+        toolName: "bash",
+        args: { command: "npm test" },
+      }),
+    );
+    await sleep(100);
+    process.stdout.write(`SPIKE-QUIET before=${presenter.stats().paints}\n`);
+    await sleep(3_000);
+    process.stdout.write(`SPIKE-QUIET after=${presenter.stats().paints}\n`);
+    presenter.release();
+    presenter.dispose();
+    process.stdout.write("SPIKE-DONE quiet\n");
+    return;
+  }
+
   // "stream" and "expand" share the script; expand just waits for the keypress.
   await streamScript(presenter);
   if (caseName === "expand") {
@@ -311,7 +340,7 @@ function printable(text: string): string {
 
 async function drive(): Promise<void> {
   mkdirSync(outDir, { recursive: true });
-  const cases = ["stream", "expand", "failure"];
+  const cases = ["stream", "expand", "failure", "quiet"];
   const results: CaseResult[] = [];
   for (const name of cases) {
     // eslint-disable-next-line no-await-in-loop -- one pty at a time, by design
@@ -374,6 +403,30 @@ async function drive(): Promise<void> {
     [
       "failure: the failure is painted in a theme colour, not plain text",
       raw("failure").includes("\x1b[38;5;") || raw("failure").includes("\x1b[31m"),
+    ],
+    [
+      "quiet: the surface repainted with no event fed at all",
+      (() => {
+        const text = stripped("quiet");
+        const before = Number(/SPIKE-QUIET before=(\d+)/u.exec(text)?.[1] ?? NaN);
+        const after = Number(/SPIKE-QUIET after=(\d+)/u.exec(text)?.[1] ?? NaN);
+        return Number.isFinite(before) && Number.isFinite(after) && after - before >= 2;
+      })(),
+    ],
+    [
+      "quiet: the footer's elapsed field visibly advanced through the silence",
+      flat("quiet").includes("elapsed 00:02") && flat("quiet").includes("elapsed 00:03"),
+    ],
+    [
+      "quiet: those were real erase-and-redraw frames after the marker, not a dump",
+      (() => {
+        const stream = raw("quiet");
+        const marker = stream.indexOf("SPIKE-QUIET before=");
+        return (
+          marker >= 0 &&
+          (stream.slice(marker).match(/\x1b\[2K/gu) ?? []).length > 1
+        );
+      })(),
     ],
     [
       "teardown: no footer line survives after the child's DONE marker",

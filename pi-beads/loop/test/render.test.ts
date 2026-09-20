@@ -20,6 +20,7 @@
  *   rule 11  no hand-rolled ANSI, verified over comment-stripped source
  *   rule 12  composition: ordering and theme-styled warnings
  *   rule 13  timeout, abort and failure rendered as themselves
+ *   rule 14  the heartbeat: a held surface repaints the clock between events
  */
 
 import assert from "node:assert/strict";
@@ -209,6 +210,7 @@ function presenterHarness(
     columns?: number;
     tty?: boolean;
     coalesceMs?: number;
+    heartbeatMs?: number;
     collapsedPreviewLines?: number;
     maxExpandedChars?: number;
     expandKey?: string;
@@ -224,6 +226,7 @@ function presenterHarness(
     now: time.now,
     schedule: time.schedule,
     coalesceMs: options.coalesceMs ?? 33,
+    heartbeatMs: options.heartbeatMs ?? 500,
     collapsedPreviewLines: options.collapsedPreviewLines ?? 2,
     maxExpandedChars: options.maxExpandedChars ?? 4_000,
     expandKey: options.expandKey,
@@ -725,7 +728,9 @@ describe("rule 2: deltas render incrementally and corrupt nothing", () => {
 
 describe("rule 3: frame cost is bounded by the coalescing window, not by tokens", () => {
   it("N deltas inside one window cost exactly one paint", () => {
-    const h = presenterHarness({ coalesceMs: 33 });
+    // The heartbeat is rule 14's subject. Here the count that matters is the
+    // coalescing window's alone, so it is turned off.
+    const h = presenterHarness({ coalesceMs: 33, heartbeatMs: 0 });
     const before = h.presenter.stats().paints;
     const chunks = cumulativeChunks(REPLY, 200);
     for (const chunk of chunks) {
@@ -758,7 +763,7 @@ describe("rule 3: frame cost is bounded by the coalescing window, not by tokens"
     );
   });
 
-  it("flushSync paints once and leaves nothing pending", () => {
+  it("flushSync paints now and leaves no paint pending", () => {
     const h = presenterHarness();
     for (const chunk of cumulativeChunks(REPLY, 50)) {
       h.presenter.feed(assistantEvent("message_update", chunk));
@@ -766,6 +771,146 @@ describe("rule 3: frame cost is bounded by the coalescing window, not by tokens"
     const paintsBefore = h.presenter.stats().paints;
     h.presenter.flushSync();
     assert.equal(h.presenter.stats().paints - paintsBefore, 1);
+    assert.equal(h.presenter.stats().paintPending, false);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// rule 14 — the heartbeat: a surface we hold repaints between events
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe("rule 14: the clock repaints the frame without outrunning the budget", () => {
+  /** A work unit on screen: the footer clock running, one call in flight. */
+  const startWork = (h: PresenterHarness): void => {
+    h.presenter.setContext({ issueId: "ws.5", phase: "work" });
+    h.presenter.feed(toolStart("t1", "bash", { command: "npm test" }));
+    h.presenter.flushSync();
+  };
+
+  /** One beat plus the frame it scheduled: two timers, beat first. */
+  const beat = (h: PresenterHarness): void => {
+    h.time.fire();
+    h.time.fire();
+  };
+
+  it("elapsed advances when no event arrives at all", () => {
+    const h = presenterHarness({ heartbeatMs: 500 });
+    startWork(h);
+    assert.match(h.footerLine(), /elapsed 00:00/u);
+    const before = h.presenter.stats().paints;
+
+    h.time.advance(1_000);
+    beat(h);
+
+    assert.ok(
+      h.presenter.stats().paints > before,
+      "a surface held through a silent second must still repaint",
+    );
+    assert.match(h.footerLine(), /elapsed 00:01/u);
+  });
+
+  it("a beat repaints through the coalescing path, never inline", () => {
+    const h = presenterHarness({ heartbeatMs: 500, coalesceMs: 33 });
+    startWork(h);
+    h.time.advance(1_000);
+    const before = h.presenter.stats().paints;
+    h.time.fire();
+    assert.equal(h.presenter.stats().paints, before, "the beat asked, it did not write");
+    h.time.fire();
+    assert.equal(h.presenter.stats().paints - before, 1, "one frame at the window boundary");
+  });
+
+  it("a beat whose footer text has not moved asks for no frame", () => {
+    const h = presenterHarness({ heartbeatMs: 500 });
+    startWork(h);
+    const before = h.presenter.stats().paints;
+    h.time.advance(400);
+    h.time.fire();
+    assert.equal(h.presenter.stats().paints, before, "00:00 again is not a change");
+    assert.ok(h.time.pending() >= 1, "and the beat re-armed for the next one");
+  });
+
+  it("ten quiet seconds cost at most one frame each", () => {
+    const h = presenterHarness({ heartbeatMs: 500 });
+    startWork(h);
+    const before = h.presenter.stats().paints;
+    for (let second = 0; second < 10; second += 1) {
+      h.time.advance(1_000);
+      beat(h);
+    }
+    const painted = h.presenter.stats().paints - before;
+    assert.ok(
+      painted >= 9,
+      `${painted} frames in ten seconds: the clock is not being kept`,
+    );
+    assert.ok(
+      painted <= 10,
+      `${painted} frames in ten seconds: the heartbeat outran the clock it reports`,
+    );
+  });
+
+  it("release stops the heartbeat: no timer held, nothing painted after", () => {
+    const h = presenterHarness({ heartbeatMs: 500 });
+    startWork(h);
+    h.presenter.release();
+    assert.equal(h.time.pending(), 0, "a released presenter holds no timer");
+    const before = h.presenter.stats().paints;
+    h.time.advance(5_000);
+    beat(h);
+    assert.equal(
+      h.presenter.stats().paints,
+      before,
+      "nothing paints on a surface we no longer hold",
+    );
+  });
+
+  it("dispose leaves no timer behind", () => {
+    const h = presenterHarness({ heartbeatMs: 100 });
+    startWork(h);
+    h.presenter.dispose();
+    assert.equal(h.time.pending(), 0);
+  });
+
+  it("a presenter that never took the surface schedules nothing", () => {
+    const h = presenterHarness({ heartbeatMs: 100, live: false });
+    startWork(h);
+    assert.equal(h.time.pending(), 0, "no surface, no heartbeat");
+    // And firing whatever the clock has cannot make it paint: idle owns that
+    // terminal, and two surfaces must never be repainting the same tty.
+    h.time.advance(3_000);
+    h.time.fire();
+    assert.equal(h.presenter.stats().paints, 0);
+  });
+
+  it("heartbeatMs 0 turns the heartbeat off outright", () => {
+    const h = presenterHarness({ heartbeatMs: 0 });
+    startWork(h);
+    assert.equal(h.time.pending(), 0, "an explicit zero means no timer at all");
+  });
+
+  it("flushSync paints now but does not kill the heartbeat", () => {
+    const h = presenterHarness({ heartbeatMs: 500 });
+    startWork(h);
+    h.presenter.flushSync();
+    assert.equal(
+      h.presenter.stats().paintPending,
+      false,
+      "the flush consumed the pending frame",
+    );
+    h.time.advance(1_000);
+    h.time.fire();
+    h.time.fire();
+    assert.match(
+      h.footerLine(),
+      /elapsed 00:01/u,
+      "the surface is still ours, so the clock is still being kept",
+    );
+  });
+
+  it("the plain path holds no heartbeat — there is nothing to repaint", () => {
+    const h = presenterHarness({ heartbeatMs: 100, tty: false });
+    startWork(h);
+    assert.equal(h.presenter.path, "plain");
     assert.equal(h.time.pending(), 0);
   });
 });

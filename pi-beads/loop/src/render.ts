@@ -564,6 +564,14 @@ export interface WorkPresenterOptions {
   readonly schedule?: (run: () => void, ms: number) => () => void;
   /** Frame coalescing window in ms. Default 33 — a *burst* costs one frame. */
   readonly coalesceMs?: number;
+  /**
+   * Repaint cadence while the live surface is held, in ms. Default 500. Without
+   * one, a frame only appears when an event arrives — so the footer's elapsed
+   * field stops moving during a long tool call or a slow first token. A tick is
+   * not a paint: it goes through the coalescing path and repaints only when
+   * time-derived content has actually changed. 0 disables the heartbeat.
+   */
+  readonly heartbeatMs?: number;
   readonly theme?: PresenterTheme;
   readonly themeName?: string;
   readonly keybindings?: KeybindingsManager;
@@ -584,6 +592,8 @@ export interface PresenterStats {
   readonly plainWrites: number;
   readonly blocks: number;
   readonly coalescedTicks: number;
+  /** A frame has been asked for and has not been drawn yet. */
+  readonly paintPending: boolean;
   readonly live: boolean;
   readonly expanded: boolean;
 }
@@ -609,6 +619,7 @@ export interface WorkPresenter {
 }
 
 const DEFAULT_COALESCE_MS = 33;
+const DEFAULT_HEARTBEAT_MS = 500;
 const DEFAULT_COLLAPSED_LINES = 2;
 const DEFAULT_MAX_EXPANDED_CHARS = 4_000;
 const DEFAULT_PLAIN_WIDTH = 80;
@@ -786,6 +797,11 @@ class Presenter implements WorkPresenter {
 
   private dirty = false;
   private cancelTimer: (() => void) | null = null;
+  /** The re-arming heartbeat timer, live only while the surface is held. */
+  private heartbeatCancel: (() => void) | null = null;
+  private heartbeatMs: number;
+  /** Elapsed text as of the last footer sync, so a tick can tell if time moved. */
+  private lastElapsed = "";
   private paints = 0;
   private ticks = 0;
   private plainWrites = 0;
@@ -800,6 +816,7 @@ class Presenter implements WorkPresenter {
     this.now = options.now ?? ((): number => Date.now());
     this.schedule = options.schedule ?? defaultSchedule;
     this.coalesceMs = options.coalesceMs ?? DEFAULT_COALESCE_MS;
+    this.heartbeatMs = Math.max(0, options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS);
     this.plainWidth = options.plainWidth ?? DEFAULT_PLAIN_WIDTH;
     this.terminalFactory =
       options.terminal !== undefined
@@ -888,11 +905,15 @@ class Presenter implements WorkPresenter {
     this.footer.show();
     this.syncFooter();
     this.paint();
+    // The surface is ours and the clock is still running: keep it honest between
+    // events. Stopped again by release(), so idle never inherits our timer.
+    this.armHeartbeat();
   }
 
   /** Hand the terminal over: flush, drop the footer, stop painting. */
   release(): void {
     if (this.closed) return;
+    this.stopHeartbeat();
     if (this.path === "plain") {
       this.emitPlainTail(true);
       this.emitPlainFooter(true);
@@ -1296,10 +1317,44 @@ class Presenter implements WorkPresenter {
   }
 
   private syncFooter(): void {
+    const elapsed = this.elapsedMs();
+    this.lastElapsed = formatElapsed(elapsed);
     this.footer.setFields(
       { ...this.fields, tokensIn: this.tokensIn, tokensOut: this.tokensOut },
-      this.elapsedMs(),
+      elapsed,
     );
+  }
+
+  /**
+   * Arm the next heartbeat. Re-arms itself rather than using setInterval, so the
+   * injected scheduler is the only timer source and a test can drive the clock
+   * by hand. One timer at a time, always cancelled on release and dispose.
+   */
+  private armHeartbeat(): void {
+    if (this.closed || this.heartbeatCancel !== null || this.heartbeatMs <= 0) return;
+    this.heartbeatCancel = this.schedule(() => {
+      this.heartbeatCancel = null;
+      this.onHeartbeat();
+    }, this.heartbeatMs);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatCancel !== null) {
+      this.heartbeatCancel();
+      this.heartbeatCancel = null;
+    }
+  }
+
+  /**
+   * One beat of the clock. A tick is not a paint: if nothing time-derived on the
+   * footer moved since the last sync, no frame is requested. This keeps the cost
+   * of an idle-but-attached surface at zero paints, and the ceiling at one per
+   * second — the resolution `elapsed` is rendered at.
+   */
+  private onHeartbeat(): void {
+    if (this.closed || !this.live) return;
+    if (formatElapsed(this.elapsedMs()) !== this.lastElapsed) this.markDirty();
+    this.armHeartbeat();
   }
 
   private elapsedMs(): number | undefined {
@@ -1394,6 +1449,7 @@ class Presenter implements WorkPresenter {
       plainWrites: this.plainWrites,
       blocks: this.blocks.length,
       coalescedTicks: this.ticks,
+      paintPending: this.dirty,
       live: this.live,
       expanded: this.expandedAll,
     };
@@ -1401,9 +1457,11 @@ class Presenter implements WorkPresenter {
 
   dispose(): void {
     if (this.closed) return;
+    this.stopHeartbeat();
     this.release();
     this.closed = true;
     this.cancelPending();
+    this.stopHeartbeat();
     this.body.clear();
     this.surface.clear();
     this.tools.clear();
@@ -1452,6 +1510,7 @@ export function createNullPresenter(): WorkPresenter {
       plainWrites: 0,
       blocks: 0,
       coalescedTicks: 0,
+      paintPending: false,
       live: false,
       expanded: false,
     }),

@@ -12,6 +12,9 @@ PASS  stream: the settled tool line reads ✓ and the result collapsed with a co
 PASS  expand: a real ctrl+o revealed the hidden lines
 PASS  failure: the abort and the timeout are both on screen
 PASS  failure: the failure is painted in a theme colour, not plain text
+PASS  quiet: the surface repainted with no event fed at all
+PASS  quiet: the footer's elapsed field visibly advanced through the silence
+PASS  quiet: those were real erase-and-redraw frames after the marker, not a dump
 PASS  teardown: no footer line survives after the child's DONE marker
 PASS  teardown: the cursor is left visible (last cursor sequence is ?25h)
 PASS  stream: the paint used real repaint sequences, not a single dump
@@ -45,13 +48,10 @@ llamacpp/qwen3-coder · thinking medium · keys ctrl+o toggle tool output
  issue workspace-5yn.10 · phase work · elapsed 00:00 · tokens 1428→512 · model  
 llamacpp/qwen3-coder · thinking medium · keys ctrl+o toggle tool output         
  issue workspace-5yn.10 · phase work · elapsed 00:01 · tokens 1428→512 · model  
-[<uSPIKE-DONE stream expanded=false paints=4
-Script done on 2026-09-20 19:19:34+00:00 [COMMAND_EXIT_CODE="0"]
+[<uSPIKE-DONE stream expanded=false paints=5
+Script done on 2026-09-20 20:39:27+00:00 [COMMAND_EXIT_CODE="0"]
 
 ### expand
-   }                                                                            
- ```                                                                            
- … bash $ npm test
  issue workspace-5yn.10 · phase work · elapsed 00:00 · tokens 1428→512 · model  
 llamacpp/qwen3-coder · thinking medium · keys ctrl+o toggle tool output         
  ✓ bash $ npm test
@@ -60,6 +60,7 @@ llamacpp/qwen3-coder · thinking medium · keys ctrl+o toggle tool output
    +10 more lines (ctrl+o toggle tool output)
  issue workspace-5yn.10 · phase work · elapsed 00:00 · tokens 1428→512 · model  
 llamacpp/qwen3-coder · thinking medium · keys ctrl+o toggle tool output         
+ issue workspace-5yn.10 · phase work · elapsed 00:01 · tokens 1428→512 · model  
    test 03 ok — assertionassertionassertion
    test 04 ok — assertionassertionassertion
    test 05 ok — assertionassertionassertion
@@ -70,14 +71,16 @@ llamacpp/qwen3-coder · thinking medium · keys ctrl+o toggle tool output
    test 10 ok — assertionassertionassertion
    test 11 ok — assertionassertionassertion
    test 12 ok — assertionassertionassertion
+ issue workspace-5yn.10 · phase work · elapsed 00:01 · tokens 1428→512 · model  
+llamacpp/qwen3-coder · thinking medium · keys ctrl+o toggle tool output         
  committed 2 files                                                              
  issue workspace-5yn.10 · phase work · elapsed 00:01 · tokens 1428→512 · model  
 llamacpp/qwen3-coder · thinking medium · keys ctrl+o toggle tool output         
-[<uSPIKE-DONE expand expanded=true paints=5
-Script done on 2026-09-20 19:19:36+00:00 [COMMAND_EXIT_CODE="0"]
+[<uSPIKE-DONE expand expanded=true paints=7
+Script done on 2026-09-20 20:39:30+00:00 [COMMAND_EXIT_CODE="0"]
 
 ### failure
-Script started on 2026-09-20 19:19:36+00:00 [COMMAND="'/usr/local/bin/node' '/workspace/pi-beads/loop/spikes/7-render-live.ts' child 'failure'" <not executed on terminal>]
+Script started on 2026-09-20 20:39:30+00:00 [COMMAND="'/usr/local/bin/node' '/workspace/pi-beads/loop/spikes/7-render-live.ts' child 'failure'" <not executed on terminal>]
 [>7u issue workspace-5yn.10 · phase work · elapsed 00:00 · tokens —→— · model       
 llamacpp/qwen3-coder · thinking medium · keys ctrl+o toggle tool output         
  I was midway through the                                                       
@@ -94,7 +97,20 @@ llamacpp/qwen3-coder · thinking medium · keys ctrl+o toggle tool output
  issue workspace-5yn.10 · phase work · elapsed 00:00 · tokens —→— · model       
 llamacpp/qwen3-coder · thinking medium · keys ctrl+o toggle tool output         
 [<uSPIKE-DONE failure
-Script done on 2026-09-20 19:19:38+00:00 [COMMAND_EXIT_CODE="0"]
+Script done on 2026-09-20 20:39:31+00:00 [COMMAND_EXIT_CODE="0"]
+
+### quiet
+Script started on 2026-09-20 20:39:31+00:00 [COMMAND="'/usr/local/bin/node' '/workspace/pi-beads/loop/spikes/7-render-live.ts' child 'quiet'" <not executed on terminal>]
+[>7u issue workspace-cog · phase work · elapsed 00:00 · tokens —→— · model          
+llamacpp/qwen3-coder · thinking medium · keys ctrl+o toggle tool output         
+ … bash $ npm test
+ issue workspace-cog · phase work · elapsed 00:00 · tokens —→— · model          
+llamacpp/qwen3-coder · thinking medium · keys ctrl+o toggle tool output         SPIKE-QUIET before=2
+ issue workspace-cog · phase work · elapsed 00:01 · tokens —→— · model          
+ issue workspace-cog · phase work · elapsed 00:02 · tokens —→— · model          
+ issue workspace-cog · phase work · elapsed 00:03 · tokens —→— · model          SPIKE-QUIET after=5
+[<uSPIKE-DONE quiet
+Script done on 2026-09-20 20:39:35+00:00 [COMMAND_EXIT_CODE="0"]
 
 ### plain
  issue workspace-5yn.10 · phase work · elapsed 00:00 · tokens —→— · model llamacpp/qwen3-coder · thinking medium · keys ctrl+o toggle tool output
