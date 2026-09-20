@@ -5,7 +5,7 @@
  * exact spawn call the current scaffold uses to demonstrate that it does not
  * work at all.
  *
- * Run:  cd spikes && npx tsx 3-rpc-comparison.ts
+ * Run:  cd spikes && node 3-rpc-comparison.ts
  */
 import { spawn, spawnSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";

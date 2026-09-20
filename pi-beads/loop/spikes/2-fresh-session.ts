@@ -5,7 +5,7 @@
  * per iteration" really give us a clean context slate — and does the streamed
  * reply render through the same highlighted path as spike 1?
  *
- * Run:  cd spikes && FORCE_COLOR=3 npx tsx 2-fresh-session.ts
+ * Run:  cd spikes && FORCE_COLOR=3 node 2-fresh-session.ts
  *
  * Requires the local model endpoint from ~/.pi/agent/models.json to be reachable.
  * Exits non-zero if any assertion fails.

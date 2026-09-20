@@ -11,7 +11,7 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import type { Issue, IssueStatus, NewIssueSpec } from "../src/beads.js";
+import type { Issue, IssueStatus, NewIssueSpec } from "../src/beads.ts";
 import {
   EFFECT_KINDS,
   EVENT_TYPES,
@@ -27,7 +27,7 @@ import {
   type OrchestratorEvent,
   type OrchestratorState,
   type StepResult,
-} from "../src/orchestrator.js";
+} from "../src/orchestrator.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ORCHESTRATOR_SRC = join(HERE, "..", "src", "orchestrator.ts");
@@ -836,7 +836,7 @@ test("purity: no I/O, no clock, no randomness, no environment access", () => {
 test("purity: the only module it can even name is beads, as a type", () => {
   const code = codeOnly(readFileSync(ORCHESTRATOR_SRC, "utf8"));
   const specifiers = [...code.matchAll(/from\s+"([^"]+)"/gu)].map((m) => m[1] as string);
-  assert.deepEqual(specifiers, ["./beads.js"]);
+  assert.deepEqual(specifiers, ["./beads.ts"]);
 });
 
 // ── reference safety ─────────────────────────────────────────────────────────

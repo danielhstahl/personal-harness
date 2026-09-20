@@ -73,7 +73,7 @@
  * raw `depends_on_id` read (bd's `bd show` shape does not have one, which fails
  * open as "not blocked").
  */
-import type { Issue, IssueStatus, NewIssueSpec } from "./beads.js";
+import type { Issue, IssueStatus, NewIssueSpec } from "./beads.ts";
 
 /** Every state the machine can be in. Nothing outside this list is reachable. */
 export const STATE_NAMES = [
@@ -1108,7 +1108,7 @@ function pendingFinalizeEffect(
  * a *type only*, so this module cannot reach the board even by accident.
  */
 export interface OrchestratorPorts {
-  readonly beads: import("./beads.js").BdClient;
+  readonly beads: import("./beads.ts").BdClient;
   readonly agent: {
     split(text: string): Promise<NewIssueSpec[]>;
     run(issueId: string): Promise<unknown>;

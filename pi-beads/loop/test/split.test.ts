@@ -26,9 +26,9 @@ import {
   type BdClient,
   type Issue,
   type NewIssueSpec,
-} from "../src/beads.js";
-import { buildSplitPrompt, validateSplitPayload } from "../src/agent.js";
-import { createInitialState, step } from "../src/orchestrator.js";
+} from "../src/beads.ts";
+import { buildSplitPrompt, validateSplitPayload } from "../src/agent.ts";
+import { createInitialState, step } from "../src/orchestrator.ts";
 import {
   buildRetryRequest,
   createSplitLedger,
@@ -56,7 +56,7 @@ import {
   type SplitOutcome,
   type SplitProblem,
   type SplitValidationConfig,
-} from "../src/split.js";
+} from "../src/split.ts";
 
 // ── fakes ───────────────────────────────────────────────────────────────
 
@@ -1036,8 +1036,8 @@ test("the splitter has no claim path, no memory writes, and no process or model 
   }
 
   // It reaches bd only through the adapter, and the machine only through its types.
-  assert.match(source, /from "\.\/beads\.js"/);
-  assert.match(source, /from "\.\/orchestrator\.js"/);
+  assert.match(source, /from "\.\/beads\.ts"/);
+  assert.match(source, /from "\.\/orchestrator\.ts"/);
 });
 
 test("portFromAgentRunner wires a .5-shaped runner without importing it", async () => {

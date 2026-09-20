@@ -37,7 +37,7 @@ import {
   type BdClient,
   type IssueStatus,
   type NewIssueSpec,
-} from "../src/beads.js";
+} from "../src/beads.ts";
 import {
   createInitialState,
   handoffKeyFor,
@@ -45,7 +45,7 @@ import {
   type OrchestratorEvent,
   type StepResult,
   type OrchestratorState,
-} from "../src/orchestrator.js";
+} from "../src/orchestrator.ts";
 import {
   COMMIT_TRAILER,
   createDefaultGitRunner,
@@ -54,7 +54,7 @@ import {
   type CommitBlock,
   type CommitPlan,
   type GitWriter,
-} from "../src/vcs.js";
+} from "../src/vcs.ts";
 import {
   createFinalizer,
   describeFinalizeFailure,
@@ -65,7 +65,7 @@ import {
   UNRESOLVED_HASH,
   validateFinalizeRequest,
   type FinalizeRequest,
-} from "../src/finalize.js";
+} from "../src/finalize.ts";
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -1482,9 +1482,9 @@ test("rule 18: src/finalize.ts spawns nothing and calls no model", () => {
 
   // It reaches the outside world only through the two adapters and the machine's
   // own vocabulary.
-  assert.match(source, /from "\.\/beads\.js"/);
-  assert.match(source, /from "\.\/vcs\.js"/);
-  assert.match(source, /from "\.\/orchestrator\.js"/);
+  assert.match(source, /from "\.\/beads\.ts"/);
+  assert.match(source, /from "\.\/vcs\.ts"/);
+  assert.match(source, /from "\.\/orchestrator\.ts"/);
 });
 
 test("rule 20: the git writer never bypasses hooks, forces, sweeps, or pushes", () => {

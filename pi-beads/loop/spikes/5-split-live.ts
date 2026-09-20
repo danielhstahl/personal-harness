@@ -12,7 +12,7 @@
  *   - `depends_on` positions that came from the model become real bd ids;
  *   - every issue has acceptance criteria and a priority.
  *
- * Run: `npx tsx spikes/5-split-live.ts`
+ * Run: `node spikes/5-split-live.ts`
  */
 
 import { spawnSync } from "node:child_process";
@@ -21,9 +21,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { createBdClient, dependsOn, normaliseDependencies } from "../src/beads.js";
-import { createAgentRunner } from "../src/agent.js";
-import { createSplitter, portFromAgentRunner, describeSplitFailure, createdIds } from "../src/split.js";
+import { createBdClient, dependsOn, normaliseDependencies } from "../src/beads.ts";
+import { createAgentRunner } from "../src/agent.ts";
+import { createSplitter, portFromAgentRunner, describeSplitFailure, createdIds } from "../src/split.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const outDir = process.env.LOOP_SPIKE_OUT ?? join(here, "out");

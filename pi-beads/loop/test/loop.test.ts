@@ -26,17 +26,17 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { buildApp } from "../src/app.js";
-import { createAgentRunner } from "../src/agent.js";
-import { BdError } from "../src/beads.js";
-import { createFinalizer } from "../src/finalize.js";
-import { normaliseDependencies } from "../src/beads.js";
-import { HANDLED_EFFECT_KINDS, runLoop } from "../src/loop.js";
-import type { LoopLogEntry, LoopPorts } from "../src/loop.js";
-import { EFFECT_KINDS, failureKeyFor, handoffKeyFor, step } from "../src/orchestrator.js";
-import type { OrchestratorEvent, OrchestratorState, StepResult } from "../src/orchestrator.js";
-import { createSplitter } from "../src/split.js";
-import { createGitWriter } from "../src/vcs.js";
+import { buildApp } from "../src/app.ts";
+import { createAgentRunner } from "../src/agent.ts";
+import { BdError } from "../src/beads.ts";
+import { createFinalizer } from "../src/finalize.ts";
+import { normaliseDependencies } from "../src/beads.ts";
+import { HANDLED_EFFECT_KINDS, runLoop } from "../src/loop.ts";
+import type { LoopLogEntry, LoopPorts } from "../src/loop.ts";
+import { EFFECT_KINDS, failureKeyFor, handoffKeyFor, step } from "../src/orchestrator.ts";
+import type { OrchestratorEvent, OrchestratorState, StepResult } from "../src/orchestrator.ts";
+import { createSplitter } from "../src/split.ts";
+import { createGitWriter } from "../src/vcs.ts";
 import {
   createScriptBoard,
   doneParams,
@@ -47,8 +47,8 @@ import {
   scriptedIdle,
   scriptedSignals,
   splitWireItem,
-} from "./loop-support.js";
-import type { FakeScript, ScriptBoard } from "./loop-support.js";
+} from "./loop-support.ts";
+import type { FakeScript, ScriptBoard } from "./loop-support.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const readSource = (name: string): string =>

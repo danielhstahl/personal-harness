@@ -18,9 +18,9 @@ arrives in `workspace-5yn.4`–`.9`.
 
 | Command | What it does |
 | --- | --- |
-| `npm run dev` | `tsx src/main.ts` — run the entry point without building |
+| `npm run dev` | `node src/main.ts` — run the TypeScript sources directly, no build step |
 | `npm run typecheck` | `tsc -p tsconfig.json --noEmit` (strict; must stay clean) |
-| `npm test` | `node --import tsx --test test/*.test.ts` — adapter tests against a fake `bd` shim |
+| `npm test` | `node --test test/*.test.ts` — adapter tests against a fake `bd` shim |
 | `npm run build` | `tsc -p tsconfig.build.json` → `dist/` |
 | `npm start` | `node dist/main.js` |
 | `npm run clean` | remove `dist/` |

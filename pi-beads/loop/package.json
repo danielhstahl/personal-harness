@@ -19,14 +19,14 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "dev": "tsx src/main.ts",
+    "dev": "node src/main.ts",
     "start": "node dist/main.js",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test test/*.test.ts",
-    "spike:idle": "tsx spikes/4-idle-pty.ts",
-    "spike:split": "tsx spikes/5-split-live.ts",
-    "spike:render": "tsx spikes/7-render-live.ts",
+    "test": "node --test test/*.test.ts",
+    "spike:idle": "node spikes/4-idle-pty.ts",
+    "spike:split": "node spikes/5-split-live.ts",
+    "spike:render": "node spikes/7-render-live.ts",
     "clean": "rm -rf dist",
     "prepack": "npm run clean && npm run build"
   },
@@ -38,7 +38,6 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.2",
-    "tsx": "^4.23.13",
     "typescript": "^5.9.3"
   }
 }

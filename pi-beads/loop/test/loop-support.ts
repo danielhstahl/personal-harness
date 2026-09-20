@@ -22,13 +22,13 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { AgentSessionLike, SessionFactory, SessionSpec } from "../src/agent.js";
-import { BdError } from "../src/beads.js";
-import type { BdClient, Issue, IssueStatus, NewIssueSpec } from "../src/beads.js";
-import type { IdleOutcome } from "../src/idle.js";
-import type { LoopIdlePort, LoopUi } from "../src/loop.js";
-import { createGitWriter } from "../src/vcs.js";
-import type { GitWriter } from "../src/vcs.js";
+import type { AgentSessionLike, SessionFactory, SessionSpec } from "../src/agent.ts";
+import { BdError } from "../src/beads.ts";
+import type { BdClient, Issue, IssueStatus, NewIssueSpec } from "../src/beads.ts";
+import type { IdleOutcome } from "../src/idle.ts";
+import type { LoopIdlePort, LoopUi } from "../src/loop.ts";
+import { createGitWriter } from "../src/vcs.ts";
+import type { GitWriter } from "../src/vcs.ts";
 
 // ── board ───────────────────────────────────────────────────────────────────
 
@@ -327,6 +327,7 @@ interface LooseTool {
 let fakeSessionSeq = 0;
 
 export class FakeSession implements AgentSessionLike {
+  readonly spec: SessionSpec;
   readonly sessionId: string;
   readonly sessionFile: string | undefined = undefined;
   messages: ChatMessage[] = [];
@@ -335,12 +336,12 @@ export class FakeSession implements AgentSessionLike {
   abortCalls = 0;
   disposeCalls = 0;
 
+  private readonly script: FakeScript;
   private releaseGate: (() => void) | null = null;
 
-  constructor(
-    readonly spec: SessionSpec,
-    private readonly script: FakeScript,
-  ) {
+  constructor(spec: SessionSpec, script: FakeScript) {
+    this.spec = spec;
+    this.script = script;
     fakeSessionSeq += 1;
     this.sessionId = `fake-session-${fakeSessionSeq}`;
     this.kinds.push(spec.kind);

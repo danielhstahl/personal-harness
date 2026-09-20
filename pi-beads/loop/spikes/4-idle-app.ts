@@ -15,7 +15,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { createIdleMode } from "../src/idle.js";
+import { createIdleMode } from "../src/idle.ts";
 
 const mode = process.argv[2] ?? "submit";
 

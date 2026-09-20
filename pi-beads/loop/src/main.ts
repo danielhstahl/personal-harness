@@ -11,10 +11,10 @@
  */
 import { pathToFileURL } from "node:url";
 
-import { runApp } from "./app.js";
-import type { AppConfig } from "./app.js";
-import { LoopError } from "./loop.js";
-import type { LoopResult } from "./loop.js";
+import { runApp } from "./app.ts";
+import type { AppConfig } from "./app.ts";
+import { LoopError } from "./loop.ts";
+import type { LoopResult } from "./loop.ts";
 
 /**
  * The one environment-reading site in this module.

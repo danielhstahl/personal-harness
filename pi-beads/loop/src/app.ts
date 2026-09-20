@@ -10,22 +10,22 @@
  * The rule this file exists to satisfy: `src/main.ts` wires, it does not
  * decide. Anything that could be configured is configured here, once.
  */
-import { createAgentRunner } from "./agent.js";
-import type { AgentRunner, WorkOutcome } from "./agent.js";
-import { createBdClient } from "./beads.js";
-import type { BdClient } from "./beads.js";
-import { createFinalizer, describeFinalizeFailure, isFinalized } from "./finalize.js";
-import type { FinalizeOutcome, FinalizeRequest } from "./finalize.js";
-import { createIdleMode } from "./idle.js";
-import type { IdleStatus } from "./idle.js";
-import { createNullPresenter, createWorkPresenter, describeOutcome } from "./render.js";
-import type { WorkPresenter } from "./render.js";
-import { runLoop } from "./loop.js";
-import type { LoopConfig, LoopIdlePort, LoopPorts, LoopResult, LoopUi } from "./loop.js";
-import { createSplitter, portFromAgentRunner } from "./split.js";
-import type { Splitter } from "./split.js";
-import { createGitWriter } from "./vcs.js";
-import type { GitWriter } from "./vcs.js";
+import { createAgentRunner } from "./agent.ts";
+import type { AgentRunner, WorkOutcome } from "./agent.ts";
+import { createBdClient } from "./beads.ts";
+import type { BdClient } from "./beads.ts";
+import { createFinalizer, describeFinalizeFailure, isFinalized } from "./finalize.ts";
+import type { FinalizeOutcome, FinalizeRequest } from "./finalize.ts";
+import { createIdleMode } from "./idle.ts";
+import type { IdleStatus } from "./idle.ts";
+import { createNullPresenter, createWorkPresenter, describeOutcome } from "./render.ts";
+import type { WorkPresenter } from "./render.ts";
+import { runLoop } from "./loop.ts";
+import type { LoopConfig, LoopIdlePort, LoopPorts, LoopResult, LoopUi } from "./loop.ts";
+import { createSplitter, portFromAgentRunner } from "./split.ts";
+import type { Splitter } from "./split.ts";
+import { createGitWriter } from "./vcs.ts";
+import type { GitWriter } from "./vcs.ts";
 
 export interface AppConfig extends LoopConfig {
   /** Repository and board live here. */

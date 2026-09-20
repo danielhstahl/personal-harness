@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
-import { createRepoReader, formatRepoSnapshot, RepoError } from "../src/repo.js";
+import { createRepoReader, formatRepoSnapshot, RepoError } from "../src/repo.ts";
 
 const tempDirs: string[] = [];
 

@@ -52,12 +52,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import type { BdClient, Issue, NewIssueSpec } from "./beads.js";
-import { BdError, normaliseDependencies } from "./beads.js";
-import { failureKeyFor, handoffKeyFor } from "./orchestrator.js";
-import type { OrchestratorEvent } from "./orchestrator.js";
-import { createRepoReader, formatRepoSnapshot, RepoError } from "./repo.js";
-import type { RepoSnapshot } from "./repo.js";
+import type { BdClient, Issue, NewIssueSpec } from "./beads.ts";
+import { BdError, normaliseDependencies } from "./beads.ts";
+import { failureKeyFor, handoffKeyFor } from "./orchestrator.ts";
+import type { OrchestratorEvent } from "./orchestrator.ts";
+import { createRepoReader, formatRepoSnapshot, RepoError } from "./repo.ts";
+import type { RepoSnapshot } from "./repo.ts";
 
 /** Avoid the phantom-dependency import: borrow the SDK's own level type. */
 type ThinkingLevel = NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
@@ -1500,7 +1500,7 @@ export function asSessionPort(runner: AgentRunner): OrchestratorPortsSession {
   };
 }
 
-type OrchestratorPortsAgent = import("./orchestrator.js").OrchestratorPorts["agent"];
-type OrchestratorPortsSession = import("./orchestrator.js").OrchestratorPorts["session"];
+type OrchestratorPortsAgent = import("./orchestrator.ts").OrchestratorPorts["agent"];
+type OrchestratorPortsSession = import("./orchestrator.ts").OrchestratorPorts["session"];
 
 export type { BdClient, Issue, NewIssueSpec, RepoSnapshot };

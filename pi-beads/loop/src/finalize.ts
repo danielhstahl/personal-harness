@@ -52,12 +52,12 @@
  *   no conversational context — so the note is written to be self-sufficient:
  *   issue, hash, exact paths, what changed, what was decided, what is next.
  */
-import { BdError, closeArgv, rememberArgv } from "./beads.js";
-import type { BdClient } from "./beads.js";
-import { COMMIT_TRAILER, VcsError } from "./vcs.js";
-import type { CommitPlan, GitCommand, GitWriter, RefusedPath, SkippedPath } from "./vcs.js";
-import { handoffKeyFor } from "./orchestrator.js";
-import type { OrchestratorEvent, FinalizeStage } from "./orchestrator.js";
+import { BdError, closeArgv, rememberArgv } from "./beads.ts";
+import type { BdClient } from "./beads.ts";
+import { COMMIT_TRAILER, VcsError } from "./vcs.ts";
+import type { CommitPlan, GitCommand, GitWriter, RefusedPath, SkippedPath } from "./vcs.ts";
+import { handoffKeyFor } from "./orchestrator.ts";
+import type { OrchestratorEvent, FinalizeStage } from "./orchestrator.ts";
 
 /** The three stages, in the only order they may run. */
 export type { FinalizeStage };

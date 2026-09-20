@@ -31,7 +31,7 @@
  *     amnesia contract, measured rather than asserted;
  *   - the run ends back at idle, exits clean, disposes every session.
  *
- * Run: `npx tsx spikes/6-loop-live.ts`   (needs a working model credential)
+ * Run: `node spikes/6-loop-live.ts`   (needs a working model credential)
  * Env:  LOOP_LIVE_REQUEST to change what the scripted human asks for.
  */
 
@@ -42,14 +42,14 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { createAgentRunner, defaultSessionFactory, messageText } from "../src/agent.js";
-import type { AgentSessionLike, SessionSpec } from "../src/agent.js";
-import { createBdClient } from "../src/beads.js";
-import { buildApp } from "../src/app.js";
-import { createFinalizer } from "../src/finalize.js";
-import type { FinalizeOutcome, FinalizeRequest } from "../src/finalize.js";
-import type { IdleOutcome } from "../src/idle.js";
-import { createGitWriter } from "../src/vcs.js";
+import { createAgentRunner, defaultSessionFactory, messageText } from "../src/agent.ts";
+import type { AgentSessionLike, SessionSpec } from "../src/agent.ts";
+import { createBdClient } from "../src/beads.ts";
+import { buildApp } from "../src/app.ts";
+import { createFinalizer } from "../src/finalize.ts";
+import type { FinalizeOutcome, FinalizeRequest } from "../src/finalize.ts";
+import type { IdleOutcome } from "../src/idle.ts";
+import { createGitWriter } from "../src/vcs.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const outDir = process.env.LOOP_SPIKE_OUT ?? join(here, "out");

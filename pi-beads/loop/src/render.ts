@@ -51,8 +51,8 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 
-import { formatToolArgs, formatToolResult, indentContent } from "./format.js";
-import type { RunnerEvent } from "./agent.js";
+import { formatToolArgs, formatToolResult, indentContent } from "./format.ts";
+import type { RunnerEvent } from "./agent.ts";
 
 // ── theme ────────────────────────────────────────────────────────────────────
 
@@ -260,13 +260,13 @@ export type ToolStatus = "pending" | "ok" | "error";
 /** One line the loop said (`say` / `warn`), themed by level. */
 class NoticeBlock implements Component {
   readonly kind = "notice" as const;
+  readonly level: NoticeLevel;
+  readonly text: string;
   private readonly view: Text;
 
-  constructor(
-    readonly level: NoticeLevel,
-    readonly text: string,
-    theme: PresenterTheme,
-  ) {
+  constructor(level: NoticeLevel, text: string, theme: PresenterTheme) {
+    this.level = level;
+    this.text = text;
     const role: PresenterRole =
       level === "error" ? "error" : level === "warn" ? "warning" : "text";
     this.view = new Text(theme.color(role, text), 1, 0);
@@ -340,6 +340,10 @@ interface ToolViewOptions {
  */
 class ToolBlock implements Component {
   readonly kind = "tool" as const;
+  readonly callId: string;
+  readonly name: string;
+  private readonly theme: PresenterTheme;
+  private readonly view: ToolViewOptions;
   private args: unknown;
   private status: ToolStatus = "pending";
   private result: unknown;
@@ -347,13 +351,17 @@ class ToolBlock implements Component {
   private isExpanded: boolean;
 
   constructor(
-    readonly callId: string,
-    readonly name: string,
+    callId: string,
+    name: string,
     args: unknown,
-    private readonly theme: PresenterTheme,
-    private readonly view: ToolViewOptions,
+    theme: PresenterTheme,
+    view: ToolViewOptions,
     expanded = false,
   ) {
+    this.callId = callId;
+    this.name = name;
+    this.theme = theme;
+    this.view = view;
     this.args = args;
     this.isExpanded = expanded;
   }
@@ -468,12 +476,11 @@ class ToolBlock implements Component {
 /** One honest line for anything the presenter has no richer rendering for. */
 class EventBlock implements Component {
   readonly kind = "event" as const;
+  readonly text: string;
   private readonly view: Text;
 
-  constructor(
-    readonly text: string,
-    theme: PresenterTheme,
-  ) {
+  constructor(text: string, theme: PresenterTheme) {
+    this.text = text;
     this.view = new Text(theme.color("dim", text), 1, 0);
   }
 
@@ -495,14 +502,16 @@ export type RenderBlock = NoticeBlock | AssistantBlock | ToolBlock | EventBlock;
  * is the last thing to go and does not sit in scrollback pretending to be current.
  */
 class FooterBlock implements Component {
+  private readonly theme: PresenterTheme;
+  private readonly legend: string;
   private line = "";
   private visible = true;
   private readonly view = new Text("", 0, 0);
 
-  constructor(
-    private readonly theme: PresenterTheme,
-    private readonly legend: string,
-  ) {}
+  constructor(theme: PresenterTheme, legend: string) {
+    this.theme = theme;
+    this.legend = legend;
+  }
 
   show(): void {
     this.visible = true;

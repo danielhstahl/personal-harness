@@ -20,7 +20,7 @@ import {
   normaliseDependencies,
   type BdClient,
   type Issue,
-} from "../src/beads.js";
+} from "../src/beads.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC_DIR = join(HERE, "..", "src");

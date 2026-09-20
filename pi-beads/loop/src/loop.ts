@@ -57,14 +57,14 @@
  * own, drops every session at `drop_context`, and starts the next iteration
  * from a board read. See rule 6/7 in `test/loop.test.ts`.
  */
-import { BdError } from "./beads.js";
-import type { BdClient, Issue } from "./beads.js";
-import type { AgentRunner, WorkOutcome } from "./agent.js";
-import { toWorkEvent } from "./agent.js";
-import type { FinalizeOutcome, FinalizeRequest } from "./finalize.js";
-import { describeFinalizeFailure, toFinalizeEvents } from "./finalize.js";
-import type { IdleOutcome } from "./idle.js";
-import { createInitialState, failureKeyFor, handoffKeyFor, step } from "./orchestrator.js";
+import { BdError } from "./beads.ts";
+import type { BdClient, Issue } from "./beads.ts";
+import type { AgentRunner, WorkOutcome } from "./agent.ts";
+import { toWorkEvent } from "./agent.ts";
+import type { FinalizeOutcome, FinalizeRequest } from "./finalize.ts";
+import { describeFinalizeFailure, toFinalizeEvents } from "./finalize.ts";
+import type { IdleOutcome } from "./idle.ts";
+import { createInitialState, failureKeyFor, handoffKeyFor, step } from "./orchestrator.ts";
 import type {
   AgentRunEffect,
   CloseIssueEffect,
@@ -78,15 +78,15 @@ import type {
   SetStatusEffect,
   StepResult,
   VcsCommitEffect,
-} from "./orchestrator.js";
-import type { SplitLedger, Splitter, SplitProposal } from "./split.js";
+} from "./orchestrator.ts";
+import type { SplitLedger, Splitter, SplitProposal } from "./split.ts";
 import {
   createSplitLedger,
   formatSplitProblem,
   recordHumanRequest,
   toNewIssueSpecs,
-} from "./split.js";
-import type { GitWriter } from "./vcs.js";
+} from "./split.ts";
+import type { GitWriter } from "./vcs.ts";
 
 // ── the seam: what the loop needs from outside ───────────────────────────────
 

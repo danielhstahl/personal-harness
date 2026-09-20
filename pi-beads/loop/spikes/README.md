@@ -14,9 +14,9 @@ dependency set.
 cd pi-beads/loop/spikes
 npm install
 
-npx tsx 1-render-highlight.ts     # offline, deterministic, no model needed
-FORCE_COLOR=3 npx tsx 2-fresh-session.ts   # live model, 3 iterations
-npx tsx 3-rpc-comparison.ts      # subprocess RPC path, for the rejected alternative
+node 1-render-highlight.ts     # offline, deterministic, no model needed
+FORCE_COLOR=3 node 2-fresh-session.ts   # live model, 3 iterations
+node 3-rpc-comparison.ts      # subprocess RPC path, for the rejected alternative
 ```
 
 Each exits non-zero if its assertions fail. `FORCE_COLOR=3` is needed for spike 2

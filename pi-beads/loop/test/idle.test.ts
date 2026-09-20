@@ -23,7 +23,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 
-import type { IdleOutcome, IdleSignalAdapter, IdleStatus } from "../src/idle.js";
+import type { IdleOutcome, IdleSignalAdapter, IdleStatus } from "../src/idle.ts";
 import {
   IDLE_APP_KEYBINDINGS,
   IDLE_SLASH_COMMANDS,
@@ -39,7 +39,7 @@ import {
   renderIdleStatusLine,
   resolveIdleThemeName,
   type IdleHandle,
-} from "../src/idle.js";
+} from "../src/idle.ts";
 
 // ── fakes ────────────────────────────────────────────────────────────────────
 

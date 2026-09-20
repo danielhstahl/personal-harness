@@ -51,9 +51,9 @@
  * exists" is a worse failure than a visible duplicate. Callers must not retry a
  * split blindly.
  */
-import { BdError } from "./beads.js";
-import type { BdClient, NewIssueSpec } from "./beads.js";
-import type { OrchestratorEvent } from "./orchestrator.js";
+import { BdError } from "./beads.ts";
+import type { BdClient, NewIssueSpec } from "./beads.ts";
+import type { OrchestratorEvent } from "./orchestrator.ts";
 
 // ── the wire shape ──────────────────────────────────────────────────────────
 

@@ -4,7 +4,7 @@
  * Question it answers: can we get pi.dev's syntax highlighting without running
  * pi's InteractiveMode, by reusing pi's own theme + markdown renderer?
  *
- * Run:  cd spikes && FORCE_COLOR=3 npx tsx 1-render-highlight.ts
+ * Run:  cd spikes && FORCE_COLOR=3 node 1-render-highlight.ts
  *
  * Exits non-zero if any assertion fails.
  */

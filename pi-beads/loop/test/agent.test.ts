@@ -32,7 +32,7 @@ import {
   validateVerdict,
   WORK_CONTEXT_SECTIONS,
   WORK_OUTCOME_KINDS,
-} from "../src/agent.js";
+} from "../src/agent.ts";
 import type {
   AgentSessionLike,
   RunnerSessionKind,
@@ -40,14 +40,14 @@ import type {
   SessionSpec,
   WorkContextSectionName,
   WorkOutcome,
-} from "../src/agent.js";
-import { BdError } from "../src/beads.js";
-import { RepoError } from "../src/repo.js";
-import type { RepoReaderLike } from "../src/agent.js";
-import type { BdClient, Issue } from "../src/beads.js";
-import { failureKeyFor, handoffKeyFor } from "../src/orchestrator.js";
-import type { OrchestratorPorts } from "../src/orchestrator.js";
-import type { RepoSnapshot } from "../src/repo.js";
+} from "../src/agent.ts";
+import { BdError } from "../src/beads.ts";
+import { RepoError } from "../src/repo.ts";
+import type { RepoReaderLike } from "../src/agent.ts";
+import type { BdClient, Issue } from "../src/beads.ts";
+import { failureKeyFor, handoffKeyFor } from "../src/orchestrator.ts";
+import type { OrchestratorPorts } from "../src/orchestrator.ts";
+import type { RepoSnapshot } from "../src/repo.ts";
 
 const SRC_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "src");
 

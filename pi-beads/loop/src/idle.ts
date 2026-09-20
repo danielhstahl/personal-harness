@@ -374,12 +374,17 @@ export function renderIdleStatusLine(
  * stays up.
  */
 class StatusLineComponent implements Component {
+  private readonly status: () => IdleStatus | Promise<IdleStatus>;
+  private readonly theme: IdleTextTheme;
   private line = "";
 
   constructor(
-    private readonly status: () => IdleStatus | Promise<IdleStatus>,
-    private readonly theme: IdleTextTheme,
-  ) {}
+    status: () => IdleStatus | Promise<IdleStatus>,
+    theme: IdleTextTheme,
+  ) {
+    this.status = status;
+    this.theme = theme;
+  }
 
   current(): string {
     return this.line;
@@ -435,7 +440,14 @@ export function idleKeyNames(
  * for, so a resize re-renders it correctly with no cache to invalidate.
  */
 class HintLineComponent implements Component {
-  constructor(private readonly keybindings: KeybindingsManager) {}
+  // An explicit field, not a TS parameter property: the node type-stripper only
+  // erases annotations, and a `constructor(private readonly x: T)` shorthand is
+  // code generation, not type information. Same shape, one honest assignment.
+  private readonly keybindings: KeybindingsManager;
+
+  constructor(keybindings: KeybindingsManager) {
+    this.keybindings = keybindings;
+  }
 
   invalidate(): void {}
 

@@ -15,6 +15,13 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
 
+    /* Source imports name the .ts file they are written in, so node can run the
+       sources directly (type stripping needs the literal extension).
+       rewriteRelativeImportExtensions makes `tsc` emit ./x.js for them, so the
+       built package is unchanged by that choice. */
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,

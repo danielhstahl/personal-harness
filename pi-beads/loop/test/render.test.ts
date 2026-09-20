@@ -42,9 +42,9 @@ import {
   rawKeyHint,
 } from "@earendil-works/pi-coding-agent";
 
-import type { RunnerEvent, WorkOutcome } from "../src/agent.js";
-import { buildApp } from "../src/app.js";
-import { createIdleMode } from "../src/idle.js";
+import type { RunnerEvent, WorkOutcome } from "../src/agent.ts";
+import { buildApp } from "../src/app.ts";
+import { createIdleMode } from "../src/idle.ts";
 import {
   MISSING,
   PRESENTER_ROLES,
@@ -57,7 +57,7 @@ import {
   formatTokenPair,
   joinFooter,
   type WorkPresenter,
-} from "../src/render.js";
+} from "../src/render.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const sourceOf = (name: string): string =>
@@ -1314,8 +1314,8 @@ describe("rule 10: nothing in src/format.ts is dead", () => {
 
   it("format.ts has exports and all of them are reachable through the presenter", () => {
     const importMatch =
-      /import\s*\{([^}]*)\}\s*from\s*"\.\/format\.js"/u.exec(renderSource);
-    assert.ok(importMatch, "render.ts must import from ./format.js");
+      /import\s*\{([^}]*)\}\s*from\s*"\.\/format\.ts"/u.exec(renderSource);
+    assert.ok(importMatch, "render.ts must import from ./format.ts");
     const imported = new Set(
       (importMatch?.[1] ?? "")
         .split(",")
