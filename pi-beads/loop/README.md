@@ -29,7 +29,8 @@ arrives in `workspace-5yn.4`–`.9`.
 
 ```
 src/main.ts          entry point: reads the environment, calls runApp. Nothing else.
-src/app.ts           composition root: builds the real adapters, runs the loop
+src/app.ts           composition root: builds the real adapters, runs the loop, and
+                     owns the one-idle-surface-per-turn rule (see perTurnIdle)
 src/loop.ts          the interpreter: executes the machine's effects, decides nothing
 src/orchestrator.ts  the loop's decision layer: pure, effects-as-data, no I/O at all
 src/agent.ts         one pi AgentSession per iteration; fresh in, disposed out, verdicts only
@@ -37,7 +38,9 @@ src/split.ts         SPLIT — a request in, a recorded epic plus ordered childr
 src/finalize.ts      FINALIZE — commit, then remember, then close; or nothing at all
 src/vcs.ts           the ONLY module that shells out to `git` (typed, side-effect-safe)
 src/beads.ts         the ONLY module that shells out to `bd` (typed, side-effect-safe)
-src/idle.ts          the idle surface: pi's own TUI input, clean exits, raw text back
+src/idle.ts          the idle surface: pi's own TUI input, clean exits, raw text back.
+                     Single-shot by contract — one surface answers once, then it is
+                     torn down, so the root builds a fresh one per idle turn
 src/format.ts        one-line plain-log summaries — NOT the renderer (see ADR-001)
 docs/               ADR-001: transport + rendering decision
 spikes/             throwaway prototypes + captured evidence backing ADR-001

@@ -17,7 +17,7 @@ import type { BdClient } from "./beads.ts";
 import { createFinalizer, describeFinalizeFailure, isFinalized } from "./finalize.ts";
 import type { FinalizeOutcome, FinalizeRequest } from "./finalize.ts";
 import { createIdleMode } from "./idle.ts";
-import type { IdleStatus } from "./idle.ts";
+import type { IdleHandle, IdleOutcome, IdleStatus } from "./idle.ts";
 import { createNullPresenter, createWorkPresenter, describeOutcome } from "./render.ts";
 import type { WorkPresenter } from "./render.ts";
 import { runLoop } from "./loop.ts";
@@ -47,6 +47,12 @@ export interface AppConfig extends LoopConfig {
     readonly splitter?: Splitter;
     readonly finalizer?: { finalize(request: FinalizeRequest): Promise<FinalizeOutcome> };
     readonly idle?: LoopIdlePort;
+    /**
+     * Substitute the *kind* of idle surface without substituting the port, so
+     * a test can hand in handles that model a single-shot teardown and still
+     * watch the lifecycle this root applies. Ignored when `idle` is given.
+     */
+    readonly idleFactory?: () => IdleHandle;
     readonly ui?: LoopUi;
     readonly signals?: LoopPorts["signals"];
     /**
@@ -85,6 +91,102 @@ function leftBehindFor(outcome: WorkOutcome): string | undefined {
     default:
       return undefined;
   }
+}
+
+/**
+ * A {@link LoopIdlePort} that guarantees the optional members: the per-turn
+ * port always has a surface to repaint and always has something it can tear
+ * down, so a caller may call them without a `?.` and know it reached one.
+ */
+export interface PerTurnIdlePort extends LoopIdlePort {
+  next(): Promise<IdleOutcome>;
+  refresh(): void;
+  dispose(): Promise<void>;
+}
+
+/**
+ * A per-turn idle port over a handle factory.
+ *
+ * `src/idle.ts` is single-shot by contract, and deliberately so: any
+ * resolution of `next()` — a submitted line or an exit — runs teardown, and a
+ * later `next()` on the same handle rejects `already-finished`. The machine
+ * comes back to idle every time a work cycle ends, which over the life of a
+ * session is many times. So the composition root must not hold *an* idle mode;
+ * it holds the current one and knows how to make the next.
+ *
+ * Handing the whole port to a fake hides this entirely — which is exactly how
+ * the bug survived a green suite. A fake that never dies is a fake that never
+ * gets asked the question.
+ */
+export function perTurnIdle(makeIdle: () => IdleHandle): PerTurnIdlePort {
+  let current: IdleHandle | undefined;
+  /**
+   * The turn that is open right now. Worth its own slot because the real
+   * surface's `next()` overwrites its internal resolver: a second call while
+   * one is pending would orphan the first waiter forever. Handing back the same
+   * promise makes a re-entrant ask harmless instead of fatal.
+   */
+  let open: Promise<IdleOutcome> | undefined;
+
+  /** Forget a surface that is out of service, so the next ask builds a new one. */
+  function retire(handle: IdleHandle): void {
+    if (current === handle) current = undefined;
+  }
+
+  return {
+    next: async () => {
+      if (open !== undefined) return open;
+      if (current === undefined || current.finished) current = makeIdle();
+      const handle = current;
+      let asked: Promise<IdleOutcome>;
+      try {
+        asked = Promise.resolve(handle.next());
+      } catch (error) {
+        // A surface that throws on the ask is not a surface to keep.
+        retire(handle);
+        throw error;
+      }
+      const turn = asked.then(
+        (outcome) => {
+          // Whatever it answered with — a submitted line or an exit — this
+          // surface has run its one turn. Do not let the next turn inherit it.
+          open = undefined;
+          retire(handle);
+          return outcome;
+        },
+        (error: unknown) => {
+          // Same for a surface that failed to boot: drop it, and let the next
+          // turn make a real one rather than inherit a dead end.
+          open = undefined;
+          retire(handle);
+          throw error;
+        },
+      );
+      open = turn;
+      return turn;
+    },
+    /**
+     * A refresh repaints a surface that exists; it must never build one. The
+     * status line is polled before the prompt is up, and booting a terminal to
+     * repaint nothing would take the keyboard for no reason.
+     */
+    refresh: async () => {
+      if (current !== undefined && !current.finished) current.refresh();
+    },
+    dispose: async () => {
+      const handle = current;
+      current = undefined;
+      try {
+        await handle?.dispose();
+      } finally {
+        // A turn that was still open on the surface we just tore down is
+        // dropped, never handed out again — and it is dropped *after* the
+        // teardown settles, so no new surface can be built and attached while
+        // the old one is still coming down.
+        open = undefined;
+      }
+    },
+  };
 }
 
 /**
@@ -244,16 +346,21 @@ export function buildApp(config: AppConfig): App {
     }
   }
 
-  const baseIdle: LoopIdlePort =
-    overrides.idle ??
-    (() => {
-      const handle = createIdleMode({ status: statusProvider, cwd: config.cwd, themeName: config.themeName });
-      return {
-        next: () => handle.next(),
-        refresh: () => handle.refresh(),
-        dispose: () => handle.dispose(),
-      };
-    })();
+  /**
+   * How an idle surface gets made. The real one in production; a test can hand
+   * in a different handle kind and still be exercising the rule that matters,
+   * which is the one below — a new surface per turn.
+   */
+  const makeIdle: () => IdleHandle =
+    overrides.idleFactory ??
+    ((): IdleHandle =>
+      createIdleMode({
+        status: statusProvider,
+        cwd: config.cwd,
+        themeName: config.themeName,
+      }));
+
+  const baseIdle: LoopIdlePort = overrides.idle ?? perTurnIdle(makeIdle);
 
   /**
    * The handoff, applied to *whatever* idle port we resolved — real or

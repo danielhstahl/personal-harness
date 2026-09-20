@@ -26,7 +26,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { buildApp } from "../src/app.ts";
+import { buildApp, perTurnIdle } from "../src/app.ts";
 import { createAgentRunner } from "../src/agent.ts";
 import { BdError } from "../src/beads.ts";
 import { createFinalizer } from "../src/finalize.ts";
@@ -36,6 +36,10 @@ import type { LoopLogEntry, LoopPorts } from "../src/loop.ts";
 import { EFFECT_KINDS, failureKeyFor, handoffKeyFor, step } from "../src/orchestrator.ts";
 import type { OrchestratorEvent, OrchestratorState, StepResult } from "../src/orchestrator.ts";
 import { createSplitter } from "../src/split.ts";
+import { createIdleMode, IdleError } from "../src/idle.ts";
+import type { IdleHandle, IdleOutcome } from "../src/idle.ts";
+import { createNullPresenter } from "../src/render.ts";
+import type { WorkPresenter } from "../src/render.ts";
 import { createGitWriter } from "../src/vcs.ts";
 import {
   createScriptBoard,
@@ -49,6 +53,7 @@ import {
   splitWireItem,
 } from "./loop-support.ts";
 import type { FakeScript, ScriptBoard } from "./loop-support.ts";
+import { FakeSignals, FakeTerminal, settle } from "./idle-fakes.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const readSource = (name: string): string =>
@@ -766,6 +771,378 @@ test("buildApp wires the same loop from config, with every adapter replaceable",
     assert.equal(result.kind, "done");
     assert.equal(h.repo.commitCount(), 3, "the composed app walked the whole loop too");
     assert.equal(app.ports.beads, h.board, "the ports are the ones handed in, not secretly rebuilt");
+  } finally {
+    h.dispose();
+  }
+});
+
+// ── the idle surface is per turn (workspace-aek) ─────────────────────────────
+
+/**
+ * A handle carrying the real module's one fatal habit: whatever it answers, it
+ * is dead afterwards. `finished` flips when `next()` resolves, the way
+ * `finishAndResolve()` → `teardown()` does in `src/idle.ts` — and a repaint
+ * after that is an error, not a no-op, so a wrong lifecycle is caught rather
+ * than silently painted over.
+ */
+class OneShotIdle implements IdleHandle {
+  readonly turn: number;
+  finished = false;
+  nextCalls = 0;
+  refreshes = 0;
+  disposeCalls = 0;
+  /** Unused here; the real surface counts paints, the port never reads them. */
+  readonly renderCount = 0;
+  private readonly outcome: IdleOutcome;
+  private readonly gate: Promise<void>;
+  private release!: () => void;
+
+  constructor(turn: number, outcome: IdleOutcome) {
+    this.turn = turn;
+    this.outcome = outcome;
+    this.gate = new Promise<void>((resolve) => {
+      this.release = resolve;
+    });
+  }
+
+  /** The submit, or the exit: the thing that ends this surface's life. */
+  answer(): void {
+    this.release();
+  }
+
+  async next(): Promise<IdleOutcome> {
+    if (this.finished) {
+      // The real module's exact habit, kept because the whole point of this
+      // fake is that reuse is refused rather than quietly tolerated.
+      return Promise.reject(
+        new IdleError(
+          "already-finished",
+          "idle mode is already torn down; build a new one instead of waiting on a dead surface",
+        ),
+      );
+    }
+    this.nextCalls += 1;
+    await this.gate;
+    this.finished = true;
+    return this.outcome;
+  }
+
+  refresh(): void {
+    if (this.finished) throw new Error(`turn ${this.turn}: repaint after teardown`);
+    this.refreshes += 1;
+  }
+
+  async dispose(): Promise<void> {
+    if (this.finished) return;
+    this.disposeCalls += 1;
+    this.finished = true;
+    this.release();
+  }
+}
+
+function turnLedger(outcomes: readonly IdleOutcome[]): {
+  made: OneShotIdle[];
+  factory: () => OneShotIdle;
+} {
+  const made: OneShotIdle[] = [];
+  const queue = [...outcomes];
+  return {
+    made,
+    factory: (): OneShotIdle => {
+      const handle = new OneShotIdle(
+        made.length + 1,
+        queue.shift() ?? { kind: "exit", reason: "command" },
+      );
+      made.push(handle);
+      return handle;
+    },
+  };
+}
+
+/**
+ * A surface out of the ledger that isn't there is a failed assertion, not a
+ * crash in the middle of the next one.
+ */
+function at(handles: readonly OneShotIdle[], index: number): OneShotIdle {
+  const handle = handles[index];
+  assert.ok(handle !== undefined, `surface ${index} was never made (${handles.length} made)`);
+  return handle;
+}
+
+/**
+ * The presenter, wrapped so the composition's *ordering* is visible: who holds
+ * the terminal, and when. It renders nothing — the assertion is about handoff,
+ * not pixels.
+ */
+function recordingPresenter(inner: WorkPresenter, ledger: string[]): WorkPresenter {
+  return {
+    get isLive(): boolean {
+      return inner.isLive;
+    },
+    get path(): "live" | "plain" {
+      return inner.path;
+    },
+    feed: (event) => inner.feed(event),
+    notice: (level, text) => inner.notice(level, text),
+    say: (text) => inner.say(text),
+    warn: (text) => inner.warn(text),
+    setContext: (patch) => inner.setContext(patch),
+    setExpanded: (expanded) => inner.setExpanded(expanded),
+    toggleExpanded: () => inner.toggleExpanded(),
+    acquire: () => {
+      ledger.push("presenter:acquire");
+      inner.acquire();
+    },
+    release: () => {
+      ledger.push("presenter:release");
+      inner.release();
+    },
+    flushSync: () => inner.flushSync(),
+    captureFrame: () => inner.captureFrame(),
+    capturePlain: () => inner.capturePlain(),
+    stats: () => inner.stats(),
+    dispose: () => {
+      ledger.push("presenter:dispose");
+      inner.dispose();
+    },
+  };
+}
+
+test("answering spends the idle surface, and the next turn is handed a new one", async () => {
+  const { made, factory } = turnLedger([
+    { kind: "input", text: "first" },
+    { kind: "input", text: "second" },
+  ]);
+  const port = perTurnIdle(factory);
+
+  const firstAsk = port.next();
+  await settle(1);
+  assert.equal(made.length, 1, "the turn built one surface");
+  at(made, 0).answer();
+  assert.equal((await firstAsk).kind, "input");
+  assert.equal(at(made, 0).finished, true, "the answer tore the surface down");
+
+  // This second ask is what used to kill a session: it reached the spent
+  // handle and came back `already-finished`, out through cli() as a fatal.
+  const secondAsk = port.next();
+  await settle(1);
+  assert.equal(made.length, 2, "a fresh surface was built rather than waited on");
+  assert.equal(at(made, 1).turn, 2);
+  at(made, 1).answer();
+  assert.equal(
+    (await secondAsk).kind,
+    "input",
+    "the next turn answers, and answers on a live surface",
+  );
+  assert.equal(at(made, 0).nextCalls, 1, "the dead handle was asked exactly once, ever");
+});
+
+test("an exit spends the surface the same way an input does", async () => {
+  const { made, factory } = turnLedger([
+    { kind: "exit", reason: "command" },
+    { kind: "input", text: "back for more" },
+  ]);
+  const port = perTurnIdle(factory);
+
+  const firstAsk = port.next();
+  await settle(1);
+  at(made, 0).answer();
+  assert.equal((await firstAsk).kind, "exit");
+  assert.equal(at(made, 0).finished, true, "exit tears it down too");
+
+  const secondAsk = port.next();
+  await settle(1);
+  at(made, 1).answer();
+  const second = await secondAsk;
+  assert.equal(made.length, 2, "the following turn is a new surface, not a corpse");
+  assert.equal(second.kind, "input");
+  if (second.kind === "input") {
+    assert.equal(second.text, "back for more", "the new surface takes the next thing said");
+  }
+});
+
+test("a second ask while a turn is open reuses it instead of orphaning the first", async () => {
+  const { made, factory } = turnLedger([{ kind: "input", text: "only one" }]);
+  const port = perTurnIdle(factory);
+
+  const first = port.next();
+  await settle(1);
+  // The real surface overwrites its resolver on every `next()`, so a second
+  // call on the same handle would leave the first waiter pending forever.
+  const second = port.next();
+  assert.equal(made.length, 1, "an open turn does not open a second surface");
+  at(made, 0).answer();
+  assert.deepEqual(await first, { kind: "input", text: "only one" });
+  assert.deepEqual(await second, { kind: "input", text: "only one" });
+  assert.equal(at(made, 0).nextCalls, 1, "the live handle was asked once, not twice");
+});
+
+test("a surface that cannot answer is dropped, not carried into the next turn", async () => {
+  const { made, factory } = turnLedger([{ kind: "input", text: "after the failure" }]);
+  let calls = 0;
+  const flaky = (): IdleHandle => {
+    calls += 1;
+    if (calls > 1) return factory();
+    return {
+      next: (): Promise<IdleOutcome> => Promise.reject(new Error("boot-failed")),
+      refresh: (): void => undefined,
+      dispose: async (): Promise<void> => undefined,
+      finished: false,
+      renderCount: 0,
+    };
+  };
+  const port = perTurnIdle(flaky);
+
+  await assert.rejects(port.next(), /boot-failed/);
+  const recovered = port.next();
+  await settle(1);
+  at(made, 0).answer();
+  assert.equal((await recovered).kind, "input", "the next turn is a live surface");
+  assert.equal(calls, 2, "the broken surface was replaced, not retried");
+});
+
+test("a refresh repaints the live surface and never takes the keyboard for itself", async () => {
+  const { made, factory } = turnLedger([{ kind: "input", text: "x" }]);
+  const port = perTurnIdle(factory);
+
+  await port.refresh();
+  assert.equal(made.length, 0, "a status repaint must not boot a terminal");
+
+  const pending = port.next();
+  await settle(1);
+  await port.refresh();
+  assert.equal(at(made, 0).refreshes, 1, "the surface that is up gets the repaint");
+  at(made, 0).answer();
+  await pending;
+
+  await port.refresh();
+  assert.equal(made.length, 1, "a spent surface is not replaced by a refresh");
+});
+
+test("dispose disposes the current surface exactly once and forgets it", async () => {
+  const { made, factory } = turnLedger([{ kind: "input", text: "x" }]);
+  const port = perTurnIdle(factory);
+
+  const pending = port.next();
+  await port.dispose();
+  await pending;
+  assert.equal(at(made, 0).disposeCalls, 1);
+
+  await port.dispose();
+  assert.equal(made.length, 1, "a second dispose builds nothing");
+  assert.equal(at(made, 0).disposeCalls, 1, "and does not re-dispose what is gone");
+});
+
+test("a real idle surface boots again for the second turn and answers it", async () => {
+  const terms: FakeTerminal[] = [];
+  const port = perTurnIdle(() => {
+    const term = new FakeTerminal(80, 24);
+    terms.push(term);
+    return createIdleMode({
+      terminal: term as never,
+      signals: new FakeSignals() as never,
+      status: async () => ({ ready: 0, inProgress: 0 }),
+      goodbye: () => undefined,
+    });
+  });
+
+  const first = port.next();
+  await settle();
+  assert.equal(terms.length, 1, "the first turn built its surface");
+  terms[0]!.input("the first thing on my mind\r");
+  assert.equal((await first).kind, "input");
+
+  const second = port.next();
+  await settle();
+  assert.equal(terms.length, 2, "the second turn built its own surface");
+  assert.equal(
+    terms[1]!.calls.filter((call) => call === "start").length,
+    1,
+    "the new surface was started, not merely allocated",
+  );
+  terms[1]!.input("the second thing\r");
+  const answered = await second;
+  assert.equal(answered.kind, "input");
+  if (answered.kind === "input") {
+    assert.equal(answered.text, "the second thing", "the live prompt took the typing");
+  }
+  await port.dispose();
+});
+
+test("a work cycle hands the run back to a live idle surface, twice over", async () => {
+  const h = harness({ scripts: WORK_SCRIPTS, idleTexts: [] });
+  prepareWalk(h);
+  const { made, factory } = turnLedger([
+    { kind: "input", text: SPLIT_REQUEST },
+    { kind: "exit", reason: "command" },
+  ]);
+  // A ledger of who holds the terminal, in the order things happened. The
+  // presenter is recorded but not rendering — this test is about who is
+  // attached when, not about pixels.
+  const ledger: string[] = [];
+  const presenter = recordingPresenter(createNullPresenter(), ledger);
+  // Answer each surface as it is made: the turn is taken when the machine asks.
+  const instant = (): IdleHandle => {
+    const handle = factory();
+    ledger.push(`idle:attach:${handle.turn}`);
+    handle.answer();
+    return handle;
+  };
+  try {
+    const app = buildApp({
+      cwd: h.repo.dir,
+      overrides: {
+        beads: h.board,
+        git: h.repo.writer,
+        runner: h.runner,
+        splitter: h.splitter,
+        finalizer: h.finalizer,
+        // The production line, with only the handle kind substituted: the root
+        // still applies its own per-turn rule.
+        idleFactory: instant,
+        presenter,
+        ui: h.ui,
+        signals: h.signals.adapter,
+      },
+    });
+    const result = await app.run();
+    assert.equal(
+      result.kind,
+      "done",
+      `the walk finished instead of dying: ${JSON.stringify(result.transcript.rejections)}`,
+    );
+    assert.equal(h.repo.commitCount(), 3, "the work cycle really ran between the two turns");
+    assert.equal(made.length, 2, "idle was asked twice, and got a surface twice");
+    assert.equal(at(made, 1).nextCalls, 1, "the second surface was answered, not skipped");
+    assert.deepEqual(
+      result.transcript.rejections.filter((record) =>
+        /already.?finished|already torn down/i.test(`${record.code} ${record.message}`),
+      ),
+      [],
+      "no dead-surface error escaped the loop",
+    );
+
+    // One terminal, two surfaces: every attach happened with the work presenter
+    // already released, so the two were never attached at the same time.
+    const attaches = ledger.filter((entry) => entry.startsWith("idle:attach:") );
+    assert.equal(attaches.length, 2, `both idle turns attached: ${ledger.join(" → ")}`);
+    let held = false;
+    for (const entry of ledger) {
+      if (entry === "presenter:acquire") {
+        held = true;
+      } else if (entry === "presenter:release") {
+        held = false;
+      } else if (entry.startsWith("idle:attach:")) {
+        assert.ok(
+          !held,
+          `${entry} while the work presenter still held the surface: ${ledger.join(" → ")}`,
+        );
+      }
+    }
+    assert.ok(
+      ledger.indexOf("presenter:release") < ledger.indexOf(attaches[0]!),
+      `the presenter came down before the first idle went up: ${ledger.join(" → ")}`,
+    );
   } finally {
     h.dispose();
   }
