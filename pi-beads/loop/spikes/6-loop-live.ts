@@ -204,6 +204,9 @@ function main(): void {
         say: (text: string) => log(`  [ui] ${text}`),
         warn: (text: string) => log(`  [ui warn] ${text}`),
       },
+      // This spike's transcript IS its evidence; a live surface would paint over
+      // it. `null` keeps the composition identical and the terminal untouched.
+      presenter: null,
     },
   });
 

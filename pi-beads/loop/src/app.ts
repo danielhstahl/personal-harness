@@ -11,13 +11,15 @@
  * decide. Anything that could be configured is configured here, once.
  */
 import { createAgentRunner } from "./agent.js";
-import type { AgentRunner } from "./agent.js";
+import type { AgentRunner, WorkOutcome } from "./agent.js";
 import { createBdClient } from "./beads.js";
 import type { BdClient } from "./beads.js";
-import { createFinalizer } from "./finalize.js";
+import { createFinalizer, describeFinalizeFailure, isFinalized } from "./finalize.js";
 import type { FinalizeOutcome, FinalizeRequest } from "./finalize.js";
 import { createIdleMode } from "./idle.js";
 import type { IdleStatus } from "./idle.js";
+import { createNullPresenter, createWorkPresenter, describeOutcome } from "./render.js";
+import type { WorkPresenter } from "./render.js";
 import { runLoop } from "./loop.js";
 import type { LoopConfig, LoopIdlePort, LoopPorts, LoopResult, LoopUi } from "./loop.js";
 import { createSplitter, portFromAgentRunner } from "./split.js";
@@ -47,13 +49,42 @@ export interface AppConfig extends LoopConfig {
     readonly idle?: LoopIdlePort;
     readonly ui?: LoopUi;
     readonly signals?: LoopPorts["signals"];
+    /**
+     * The work-stream surface (`.10`). Pass one to drive or observe it from a
+     * test; pass `null` for a run that must not own the terminal at all — a
+     * log-only spike, where a live surface would paint over the transcript.
+     */
+    readonly presenter?: WorkPresenter | null;
   };
 }
 
 /** The assembled loop, with its adapters visible for assertions and shutdown. */
 export interface App {
   readonly ports: LoopPorts;
+  /** The work-stream presenter: live while work runs, down when idle is up. */
+  readonly presenter: WorkPresenter;
   run(): Promise<LoopResult>;
+}
+
+/** What a finished work unit left on disk, in the few words the footer has room for. */
+function leftBehindFor(outcome: WorkOutcome): string | undefined {
+  switch (outcome.kind) {
+    case "done":
+    case "incomplete": {
+      const files = outcome.verdict.changedFiles;
+      return files.length === 0
+        ? "no changed files claimed"
+        : `${files.length} changed file(s) claimed: ${files.slice(0, 3).join(", ")}`;
+    }
+    case "malformed-verdict":
+      return `${outcome.problems.length} problem(s) with the verdict block`;
+    case "timeout":
+      return outcome.settledAfterAbort
+        ? "budget expired; session settled after abort"
+        : "budget expired; session still running when we stopped waiting";
+    default:
+      return undefined;
+  }
 }
 
 /**
@@ -72,14 +103,76 @@ export function buildApp(config: AppConfig): App {
     authorEmail: config.authorEmail ?? "pi-loop@localhost",
   });
 
-  const runner =
+  // ── the work-stream surface (`.10`) ───────────────────────────────────
+  //
+  // One presenter, built once, fed from three places: the runner's `onEvent`
+  // seam, the loop's `ui` port, and the footer context this root supplies from
+  // the calls the loop already makes. It never decides anything — the loop tells
+  // it what is running by calling `run(issueId)`.
+  const presenter: WorkPresenter =
+    overrides.presenter === null
+      ? createNullPresenter()
+      : overrides.presenter ?? createWorkPresenter({ themeName: config.themeName });
+
+  /**
+   * Only one surface may hold the terminal at a time. While the idle prompt is
+   * up it owns the keyboard, so the presenter must not take the live path —
+   * its text still goes out, as plain lines, in order.
+   */
+  let idleHoldsTerminal = false;
+
+  function takeWorkSurface(): void {
+    if (idleHoldsTerminal) return;
+    presenter.acquire();
+  }
+
+  function handSurfaceOver(): void {
+    presenter.release();
+  }
+
+  const baseRunner =
     overrides.runner ??
     createAgentRunner({
       beads,
       cwd: config.cwd,
       modelRef: config.modelRef,
       timeoutMs: config.workTimeoutMs,
+      // The streaming half of the seam: every runner event lands on the
+      // presenter, which is the only thing that draws them.
+      onEvent: (event) => presenter.feed(event),
     });
+
+  /**
+   * The runner, wrapped so the surface knows what it is watching and says what
+   * happened when the unit ends. The decorators read facts the caller supplied
+   * (`issueId` in, `WorkOutcome` out); they add no state machine of their own.
+   */
+  const runner: AgentRunner = {
+    run: async (issueId: string): Promise<WorkOutcome> => {
+      presenter.setContext({ issueId, phase: "work" });
+      takeWorkSurface();
+      const outcome = await baseRunner.run(issueId);
+      const said = describeOutcome({
+        kind: outcome.kind,
+        issueId: outcome.issueId,
+        message: outcome.kind === "error" ? outcome.message : undefined,
+        budgetMs: outcome.kind === "timeout" ? outcome.budgetMs : undefined,
+        settledAfterAbort:
+          outcome.kind === "timeout" ? outcome.settledAfterAbort : undefined,
+        leftBehind: leftBehindFor(outcome),
+      });
+      presenter.notice(said.level, said.text);
+      return outcome;
+    },
+    split: async (text: string) => {
+      presenter.setContext({ phase: "split" });
+      takeWorkSurface();
+      return baseRunner.split(text);
+    },
+    dispose: (): Promise<number> => baseRunner.dispose(),
+    liveSessionIds: (): readonly string[] => baseRunner.liveSessionIds(),
+    stats: () => baseRunner.stats(),
+  };
 
   const splitter =
     overrides.splitter ??
@@ -88,16 +181,46 @@ export function buildApp(config: AppConfig): App {
       epicTitle: config.epicTitle,
     });
 
-  const finalizer =
+  const baseFinalizer =
     overrides.finalizer ??
     createFinalizer({ vcs: git, beads }, {
       dryRun: config.dryRun === true,
       onPlan: (line: string) => ui.say(line),
     });
 
+  /**
+   * The finalize step is part of the stream too: the footer says so while it
+   * runs, and the outcome is stated in its own colour instead of vanishing
+   * into a return value nobody reads.
+   */
+  const finalizer = {
+    async finalize(request: FinalizeRequest): Promise<FinalizeOutcome> {
+      presenter.setContext({ issueId: request.issueId, phase: "finalize" });
+      takeWorkSurface();
+      const outcome = await baseFinalizer.finalize(request);
+      presenter.notice(
+        isFinalized(outcome) || outcome.kind === "planned" ? "info" : "error",
+        describeFinalizeFailure(outcome),
+      );
+      return outcome;
+    },
+  };
+
+  /**
+   * The loop's text goes through the same surface as the agent's, so a `say`
+   * after a tool summary lands *below* it rather than racing past it. Override
+   * it wholesale and the presenter is simply not fed — that is the caller's
+   * choice, not a fallback hidden in here.
+   */
   const ui: LoopUi = overrides.ui ?? {
-    say: (text: string) => void process.stdout.write(`${text}\n`),
-    warn: (text: string) => void process.stderr.write(`warning: ${text}\n`),
+    say: (text: string) => {
+      takeWorkSurface();
+      presenter.say(text);
+    },
+    warn: (text: string) => {
+      takeWorkSurface();
+      presenter.warn(text);
+    },
   };
 
   /**
@@ -121,7 +244,7 @@ export function buildApp(config: AppConfig): App {
     }
   }
 
-  const idle: LoopIdlePort =
+  const baseIdle: LoopIdlePort =
     overrides.idle ??
     (() => {
       const handle = createIdleMode({ status: statusProvider, cwd: config.cwd, themeName: config.themeName });
@@ -131,6 +254,31 @@ export function buildApp(config: AppConfig): App {
         dispose: () => handle.dispose(),
       };
     })();
+
+  /**
+   * The handoff, applied to *whatever* idle port we resolved — real or
+   * injected — so the two surfaces can never both be attached to the terminal:
+   * the work presenter is released before idle comes up, and taken back only
+   * once idle is gone.
+   */
+  const idle: LoopIdlePort = {
+    next: async () => {
+      handSurfaceOver();
+      idleHoldsTerminal = true;
+      try {
+        return await baseIdle.next();
+      } finally {
+        idleHoldsTerminal = false;
+      }
+    },
+    refresh: async () => {
+      await baseIdle.refresh?.();
+    },
+    dispose: async () => {
+      handSurfaceOver();
+      await baseIdle.dispose?.();
+    },
+  };
 
   const ports: LoopPorts = {
     beads,
@@ -152,7 +300,17 @@ export function buildApp(config: AppConfig): App {
 
   return {
     ports,
-    run: () => runLoop(ports, config),
+    presenter,
+    run: async (): Promise<LoopResult> => {
+      try {
+        return await runLoop(ports, config);
+      } finally {
+        // Nothing outlives the run: no live screen, no footer claiming to be
+        // current, no half-painted frame left in scrollback.
+        handSurfaceOver();
+        presenter.dispose();
+      }
+    },
   };
 }
 
