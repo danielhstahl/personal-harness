@@ -303,8 +303,16 @@ export function classifyPathSafety(root: string, reported: string): { path: stri
       return { refuse: `absolute path is outside the repository (${raw})` };
     }
   }
-  const normalised = slashNormalised.replace(/^\.\/+/, "").replace(/\/+$/, "");
-  if (normalised === "" || normalised === "." ) return { refuse: "path resolves to the repo root" };
+  let normalised = slashNormalised.replace(/^\.\/+/, "").replace(/\/+$/, "");
+  if (isAbsolute(normalised)) {
+    // An absolute path inside the repo is the same file, named in full. What
+    // `git add` matches against and what `git status` reports are both
+    // repo-root-relative, so translate it here. Without this the request stops
+    // matching its own file and the plan comes back `nothing to commit` — a
+    // wrong answer wearing an honest face.
+    normalised = relative(resolve(root), resolve(normalised));
+  }
+  if (normalised === "" || normalised === ".") return { refuse: "path resolves to the repo root" };
   const parts = normalised.split("/").filter((part) => part !== "");
   if (parts.some((part) => part === "..")) {
     return { refuse: `path walks outside the repository (${raw})` };

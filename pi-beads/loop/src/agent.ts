@@ -821,7 +821,11 @@ When the work is finished, call the \`report_done\` tool with:
 - \`summary\`: what you actually did, in one paragraph. This becomes the commit
   message and the handoff note, so it has to make sense to someone who never saw
   this conversation.
-- \`changed_files\`: every path you modified, created or deleted.
+- \`changed_files\`: every path you modified, created or deleted, written
+  **relative to the repository root** — \`src/parser.ts\`, not
+  \`/home/someone/repo/src/parser.ts\`. The loop stages exactly this list
+  and nothing else, so a path that matches no real change is dropped and
+  the commit ends up thinner than the work.
 - \`next_steps\`: anything you deliberately left for later.
 
 If you cannot finish, call \`report_done\` with \`done: false\` and a \`reason\` that
@@ -1071,6 +1075,11 @@ interface LiveSession {
   readonly kind: RunnerSessionKind;
   disposed: boolean;
   disposeCount: number;
+  /**
+   * The in-flight `prompt()` promise, or undefined once it has settled. Tracked so
+   * disposal can do the one thing `dispose()` alone cannot: stop a running turn.
+   */
+  running?: Promise<unknown>;
 }
 
 const DEFAULT_TIMEOUT_MS = 20 * 60_000;
@@ -1104,6 +1113,23 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
     disposed += 1;
     live.delete(entry.session.sessionId);
     try {
+      // Disposing a session that is still mid-turn has to abort it first.
+      // `session.dispose()` releases listeners and resources, but it does not
+      // settle the `prompt()` someone is awaiting — so Ctrl-C would leave the
+      // loop parked on a promise that never resolves. Abort, give the turn the
+      // grace period to unwind on its own, then dispose.
+      if (entry.running !== undefined) {
+        try {
+          await entry.session.abort();
+        } catch {
+          // An abort that throws is still an abort; whether the turn settled is
+          // what the race below decides.
+        }
+        await Promise.race([
+          Promise.resolve(entry.running).catch(() => undefined),
+          delay(graceMs),
+        ]);
+      }
       await entry.session.dispose();
       emit({ type: "session_disposed", sessionId: entry.session.sessionId, kind: entry.kind });
       return true;
@@ -1162,6 +1188,7 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
           kind: "prompt-error",
           message: error instanceof Error ? error.message : String(error),
         }));
+      entry.running = running;
 
       const first = await Promise.race([budget, running]);
       if (timer !== undefined) clearTimeout(timer);
@@ -1213,6 +1240,7 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
       };
     } finally {
       unsubscribe();
+      entry.running = undefined;
       await disposeSession(entry);
     }
   }

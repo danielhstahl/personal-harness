@@ -28,13 +28,20 @@ arrives in `workspace-5yn.4`–`.9`.
 ## Layout
 
 ```
-src/main.ts          entry point (currently a toolchain smoke run, see header comment)
+src/main.ts          entry point: reads the environment, calls runApp. Nothing else.
+src/app.ts           composition root: builds the real adapters, runs the loop
+src/loop.ts          the interpreter: executes the machine's effects, decides nothing
 src/orchestrator.ts  the loop's decision layer: pure, effects-as-data, no I/O at all
+src/agent.ts         one pi AgentSession per iteration; fresh in, disposed out, verdicts only
+src/split.ts         SPLIT — a request in, a recorded epic plus ordered children
+src/finalize.ts      FINALIZE — commit, then remember, then close; or nothing at all
+src/vcs.ts           the ONLY module that shells out to `git` (typed, side-effect-safe)
 src/beads.ts         the ONLY module that shells out to `bd` (typed, side-effect-safe)
+src/idle.ts          the idle surface: pi's own TUI input, clean exits, raw text back
 src/format.ts        one-line plain-log summaries — NOT the renderer (see ADR-001)
 docs/               ADR-001: transport + rendering decision
 spikes/             throwaway prototypes + captured evidence backing ADR-001
-test/               adapter tests (fake `bd` shim) + orchestrator transition tests
+test/               unit tests, plus the whole walk in test/loop.test.ts
 ```
 
 ## The loop machine
@@ -47,8 +54,10 @@ so the whole loop is testable with no board and no pi.
 States: `init → check_work`, then `idle` / `split` / `pick` / `work` /
 `finalize` / `restart` back to `check_work`; `done` and `aborted` are terminal.
 Every side effect leaves as data (`beads.*`, `agent.*`, `vcs.commit`, `ui.*`,
-`drop_context`), and the interpreter in workspace-5yn.9 is a dispatch loop over
-`OrchestratorPorts` — the only place those decisions touch the world.
+`drop_context`), and `src/loop.ts` is the interpreter — a dispatch loop over
+`OrchestratorPorts`, the only place those decisions touch the world. It owns no
+phase logic of its own: `step()` is called from exactly one function, and an
+effect kind with no handler is a typed stop, never a silent no-op.
 
 `restart` is a real state that emits `drop_context`. Per ADR-001 that boundary is
 what buys "no context carried between iterations" — a fresh agent session, not a

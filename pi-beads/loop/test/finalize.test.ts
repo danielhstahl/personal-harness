@@ -860,6 +860,41 @@ test("rule 4b: a reported path that is not there is skipped, never guessed at", 
   }
 });
 
+test(
+  "rule 4c: an absolute path inside the repo is the same file, committed under its relative name",
+  async () => {
+    const sandbox = makeSandbox();
+    const order: string[] = [];
+    try {
+      sandbox.write("src/absolute.ts", "export const here = 1;\n");
+      const finalizer = createFinalizer({
+        vcs: realWriter(sandbox),
+        beads: fakeBoard(order, { calls: emptyCalls() }),
+      });
+
+      // A model that reports "/tmp/.../src/absolute.ts" means the same file git
+      // calls "src/absolute.ts". Losing that match used to surface as
+      // `nothing-to-commit`, which reads like an honest answer and isn't one.
+      const outcome = await finalizer.finalize(
+        request({ changedFiles: [join(sandbox.dir, "src/absolute.ts")] }),
+      );
+
+      assert.equal(outcome.kind, "finalized", describeFinalizeFailure(outcome));
+      assert.deepEqual(sandbox.committedPaths(), ["src/absolute.ts"]);
+      const adds = outcome.planned.filter(
+        (command) => command.phase === "write" && command.argv[0] === "add",
+      );
+      assert.deepEqual(
+        adds.map((command) => command.argv[2]),
+        ["src/absolute.ts"],
+        "the pathspec git was handed is repo-relative",
+      );
+    } finally {
+      sandbox.dispose();
+    }
+  },
+);
+
 test("rule 5: nothing reported means no commit, no memory, no close", async () => {
   const sandbox = makeSandbox();
   const order: string[] = [];
