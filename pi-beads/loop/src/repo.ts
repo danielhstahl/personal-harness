@@ -1,10 +1,11 @@
 /**
- * Repo snapshot adapter — the second (and last) process-spawning module in `src/`.
+ * Repo snapshot adapter — git, read-only.
  *
- * The loop needs one thing from git: a short, factual description of the working
- * tree at the moment an iteration starts, so the agent's context says what branch
- * it is on, what is already dirty, and what landed recently. That is `git status`,
- * `git log` and `git rev-parse` — nothing else, and never a write.
+ * The loop needs one thing from git here: a short, factual description of the
+ * working tree at the moment an iteration starts, so the agent's context says
+ * what branch it is on, what is already dirty, and what landed recently. That
+ * is `git status`, `git log` and `git rev-parse` — nothing else, and never a
+ * write.
  *
  * The discipline is copied deliberately from `src/beads.ts`, because every place
  * that spawns a child process is a place that can go wrong in the same four ways:
@@ -18,8 +19,11 @@
  *    (fatal) from "git said something we could not parse" (a bug worth seeing).
  * 4. **Debug log before the spawn**, so a hung call is still visible in the log.
  *
- * This module never commits, never stages, never touches remotes. The commit that
- * finalizes an iteration is workspace-5yn.9's decision; this module only reads.
+ * This module never commits, never stages, never touches remotes. Writes to git
+ * live in `src/vcs.ts`, the other allowlisted spawner, which is where the
+ * finalize step stages explicit paths and commits them. The split is the point:
+ * reading the tree can never be confused with changing it, and there is exactly
+ * one file to audit for the scary half.
  */
 import { execFile } from "node:child_process";
 

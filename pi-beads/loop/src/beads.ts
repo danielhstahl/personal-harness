@@ -276,6 +276,28 @@ function renderArgv(argv: readonly string[]): string {
     .join(" ");
 }
 
+/**
+ * The exact argv for `bd close`, as a pure function.
+ *
+ * Exported so a dry run can print the command without writing a second
+ * implementation of the same command line. `closeIssue` calls this same
+ * builder, so the printed plan and the spawned process cannot drift apart —
+ * `test/finalize.test.ts` proves it by comparing the dry-run text with the
+ * argv a recording fake `bd` actually received.
+ */
+export function closeArgv(id: string, reason?: string): string[] {
+  const argv = ["close", requireId(id, "issue id", ["close"]), "--json"];
+  if (reason !== undefined) argv.push("--reason", reason);
+  return argv;
+}
+
+/** {@link closeArgv}'s sibling for `bd remember`. Same one-builder guarantee. */
+export function rememberArgv(text: string, key?: string): string[] {
+  const argv = ["remember", requireId(text, "memory text", ["remember"]), "--json"];
+  if (key !== undefined) argv.push("--key", requireId(key, "memory key", argv));
+  return argv;
+}
+
 function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…(+${text.length - max} chars)`;
 }
@@ -587,8 +609,7 @@ export function createBdClient(options: BdClientOptions = {}): BdClient {
     },
 
     async closeIssue(id: string, reason?: string): Promise<Issue> {
-      const argv = ["close", requireId(id, "issue id", ["close"]), "--json"];
-      if (reason !== undefined) argv.push("--reason", reason);
+      const argv = closeArgv(id, reason);
       const parsed = await call(argv);
       const [issue] = asIssues(parsed ?? []);
       if (!issue) {
@@ -602,8 +623,7 @@ export function createBdClient(options: BdClientOptions = {}): BdClient {
     },
 
     async remember(text: string, key?: string): Promise<void> {
-      const argv = ["remember", requireId(text, "memory text", ["remember"]), "--json"];
-      if (key !== undefined) argv.push("--key", requireId(key, "memory key", argv));
+      const argv = rememberArgv(text, key);
       await call(argv);
     },
 

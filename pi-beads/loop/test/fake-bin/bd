@@ -110,6 +110,37 @@ switch (scenario) {
     process.exit(0);
     break;
 
+  // The finalize chain: `bd remember …` then `bd close <id> …`, in one scenario,
+  // so a live run of the finalizer can be recorded end to end.
+  case "finalize": {
+    const sub = argv[0];
+    if (sub === "remember") {
+      out(
+        JSON.stringify({
+          action: "remembered",
+          key: argv.includes("--key") ? argv[argv.indexOf("--key") + 1] : "auto-slug",
+          value: argv[1],
+          schema_version: 1,
+        }),
+      );
+      process.exit(0);
+    }
+    if (sub === "close") {
+      out(
+        JSON.stringify([
+          {
+            ...issue(argv[1] ?? "fake-1", "finalized me", "closed"),
+            closed_reason: argv.includes("--reason") ? argv[argv.indexOf("--reason") + 1] : "",
+          },
+        ]),
+      );
+      process.exit(0);
+    }
+    out("[]");
+    process.exit(0);
+    break;
+  }
+
   case "remembered":
     out(
       JSON.stringify({

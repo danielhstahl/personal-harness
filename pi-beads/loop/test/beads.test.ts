@@ -419,14 +419,16 @@ test("assertClaimFreeArgs refuses claim and assignee flags", () => {
 });
 
 /**
- * Only these two modules may spawn anything, and only for one named read-only
- * purpose each. The invariant is not "beads.ts is special" — it is "process
- * creation is confined to named adapters, so there is a short list to audit
- * and everything else has to go through them".
+ * Only these modules may spawn anything, each for one named purpose. The
+ * invariant is not "beads.ts is special" — it is "process creation is confined
+ * to named adapters, so there is a short list to audit and everything else has
+ * to go through them". Adding an entry is a deliberate act; the test below also
+ * fails if an entry stops spawning, so the list cannot go stale.
  */
 const SPAWN_ALLOWLIST: Readonly<Record<string, string>> = {
   "beads.ts": "bd, the issue tracker",
   "repo.ts": "git, read-only snapshotting",
+  "vcs.ts": "git, staging and committing for finalize",
 };
 
 test("only the named adapter modules may spawn processes anywhere in src/", () => {
