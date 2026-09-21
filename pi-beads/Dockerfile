@@ -39,7 +39,7 @@ RUN mkdir -p $BEADS_DIR
 
 ## Flutter
 ENV PATH="$PATH:/home/appuser/flutter/bin"
-ENV FLUTTER_VERSION=3.47.4
+ENV FLUTTER_VERSION=stable
 RUN git clone https://github.com/flutter/flutter.git -b ${FLUTTER_VERSION} --depth 1 /home/appuser/flutter
 
 ## Rust
