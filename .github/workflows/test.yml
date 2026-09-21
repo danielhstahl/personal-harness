@@ -20,3 +20,5 @@ jobs:
           npm ci
       - name: run tests
         run: npm run test -- --coverage .
+      - name: run typecheck
+        run: npm run typecheck
