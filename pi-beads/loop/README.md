@@ -94,6 +94,35 @@ In one line each:
 Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`,
 `LOOP_WIDTH`.
 
+### Cadence: `coalesceMs` and `heartbeatMs`
+
+pi-tui has no frame rate — it draws when something asks it to. The presenter
+asks through a coalescing window, so the refresh rate is two numbers on
+`AppConfig`, doing two different jobs:
+
+```ts
+buildApp({ cwd: repo, coalesceMs: 33, heartbeatMs: 500 });
+```
+
+- **`coalesceMs` (default 33 ≈ 30fps) is the streaming rate.** Every delta
+  inside one window costs exactly one frame, however fast the tokens arrive.
+  `16` gives ~60fps; below that the terminal is written more often than it
+  paints and nothing looks smoother. This is also rule 3: 300 deltas must not
+  become 300 writes.
+- **`heartbeatMs` (default 500) is the clock, not the animation.** A surface
+  we hold repaints while no event is arriving, so the elapsed field stays
+  honest. It repaints only when a time-derived footer field actually moved —
+  and that field has one-second resolution.
+
+They are not interchangeable, and that is the diagnostic: a surface running at
+about 1fps *while its clock ticks* has a missing paint request in whatever
+updated the content, not a cadence to tune. That is what this was for a while —
+a streamed reply painted once, when its block was created, and then only on the
+beat. A stream drives its own frames now (`heartbeatMs: 0` still paints every
+window), and `rule 3` / `rule 14` in `test/render.test.ts` pin both halves of
+that. `presenter.stats()` reports `paints`, `coalescedTicks` and the two
+cadence numbers, so the rate is measurable rather than eyeballed.
+
 ## Scratch beads DB (for live / integration checks)
 
 Never run a live check against a real board. `bd` resolves its database from

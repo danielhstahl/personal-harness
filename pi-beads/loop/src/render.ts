@@ -562,7 +562,12 @@ export interface WorkPresenterOptions {
   readonly now?: () => number;
   /** Timer injection for the coalescing window; returns a cancel function. */
   readonly schedule?: (run: () => void, ms: number) => () => void;
-  /** Frame coalescing window in ms. Default 33 — a *burst* costs one frame. */
+  /**
+   * Frame coalescing window in ms — this is the refresh-rate knob. Default 33:
+   * a *burst* of deltas costs one frame, so a stream paints at ~30fps however
+   * fast the tokens arrive. 16 gives ~60fps; below that the terminal is being
+   * written more often than it paints, and nothing looks smoother.
+   */
   readonly coalesceMs?: number;
   /**
    * Repaint cadence while the live surface is held, in ms. Default 500. Without
@@ -592,6 +597,9 @@ export interface PresenterStats {
   readonly plainWrites: number;
   readonly blocks: number;
   readonly coalescedTicks: number;
+  /** The cadence this presenter was built with, so the knob is checkable. */
+  readonly coalesceMs: number;
+  readonly heartbeatMs: number;
   /** A frame has been asked for and has not been drawn yet. */
   readonly paintPending: boolean;
   readonly live: boolean;
@@ -1095,6 +1103,13 @@ class Presenter implements WorkPresenter {
         }
         const block = this.ensureAssistant();
         block.update(message, type !== "message_end");
+        // The block changed; the terminal has not been told. Asked here, every
+        // delta asks — `markDirty` is coalesced, so rule 3 still holds (a burst
+        // costs one frame, not one write per token). Without this ask a
+        // streamed reply paints exactly once, when its block is created, and
+        // then only when the heartbeat notices the footer's `elapsed` string
+        // moved: one frame per second, on a reply that is still streaming.
+        this.markDirty();
         if (type === "message_end") {
           this.activeAssistant = null;
           // A reply that stopped because it was cut off, aborted or errored is
@@ -1449,6 +1464,8 @@ class Presenter implements WorkPresenter {
       plainWrites: this.plainWrites,
       blocks: this.blocks.length,
       coalescedTicks: this.ticks,
+      coalesceMs: this.coalesceMs,
+      heartbeatMs: this.heartbeatMs,
       paintPending: this.dirty,
       live: this.live,
       expanded: this.expandedAll,
@@ -1510,6 +1527,8 @@ export function createNullPresenter(): WorkPresenter {
       plainWrites: 0,
       blocks: 0,
       coalescedTicks: 0,
+      coalesceMs: 0,
+      heartbeatMs: 0,
       paintPending: false,
       live: false,
       expanded: false,

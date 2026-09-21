@@ -1148,6 +1148,49 @@ test("a work cycle hands the run back to a live idle surface, twice over", async
   }
 });
 
+// ── the surface's cadence is configured, not baked in ────────────────────────
+
+test("the presenter's refresh cadence comes from AppConfig, defaults included", () => {
+  const repo = makeRepo();
+  const board = createScriptBoard();
+  try {
+    const configured = buildApp({
+      cwd: repo.dir,
+      coalesceMs: 16,
+      heartbeatMs: 250,
+      overrides: { beads: board, git: repo.writer },
+    });
+    assert.equal(
+      configured.presenter.stats().coalesceMs,
+      16,
+      "the refresh rate is the operator's call, not a hard-coded habit",
+    );
+    assert.equal(configured.presenter.stats().heartbeatMs, 250);
+
+    const defaults = buildApp({
+      cwd: repo.dir,
+      overrides: { beads: board, git: repo.writer },
+    });
+    assert.equal(defaults.presenter.stats().coalesceMs, 33, "default ~30fps");
+    assert.equal(defaults.presenter.stats().heartbeatMs, 500);
+
+    // A supplied presenter is supplied whole: the root wires it, it does not
+    // re-tune something the caller already decided about.
+    const handed = buildApp({
+      cwd: repo.dir,
+      coalesceMs: 16,
+      overrides: { beads: board, git: repo.writer, presenter: createNullPresenter() },
+    });
+    assert.equal(
+      handed.presenter.stats().coalesceMs,
+      0,
+      "an injected surface keeps its own numbers",
+    );
+  } finally {
+    repo.dispose();
+  }
+});
+
 // ── rules 0, 15, 16: source guards ────────────────────────────────────────
 
 test("main.ts reads the environment in exactly one place and builds nothing itself", () => {

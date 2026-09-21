@@ -9,7 +9,8 @@
  *            terminal, app wiring verified at the composition root
  *   rule 1   one machine still: no phases decided here, no board handle
  *   rule 2   streaming without corruption: no half escapes, no fence bleed
- *   rule 3   bounded frame cost: one paint per coalescing window
+ *   rule 3   bounded frame cost: one paint per coalescing window, and a live
+ *            stream gets one in every window rather than one per reply
  *   rule 4   highlighting that matches pi, asserted against pi's own
  *            `highlightCode` and the committed spike baseline
  *   rules 5-7  tool calls collapse to one line, results expand under a
@@ -158,6 +159,7 @@ function fakeTime(start = 1_000): {
   pending: () => number;
   fire: () => void;
   fireAll: () => void;
+  tick: (ms: number) => void;
   schedule: (run: () => void, ms: number) => () => void;
 } {
   let current = start;
@@ -190,6 +192,21 @@ function fakeTime(start = 1_000): {
       return () => {
         timers.delete(id);
       };
+    },
+    /**
+     * Move the clock on and fire only what came due — the way a real one does.
+     * `fireAll` cannot express cadence: it fires timers that are not due yet,
+     * which is exactly the thing a streaming test needs to measure honestly.
+     */
+    tick(ms: number) {
+      current += ms;
+      const due = [...timers.entries()]
+        .filter(([, timer]) => timer.at <= current)
+        .sort((a, b) => a[1].at - b[1].at);
+      for (const [id, timer] of due) {
+        timers.delete(id);
+        timer.run();
+      }
     },
   };
 }
@@ -722,6 +739,36 @@ describe("rule 2: deltas render incrementally and corrupt nothing", () => {
   });
 });
 
+/**
+ * Stream `REPLY` across `windows` coalescing windows and report how many
+ * frames came back. Each chunk is followed by the slice of time it would have
+ * taken to arrive, so this measures cadence rather than luck.
+ */
+function framesWhileStreaming(
+  options: { coalesceMs?: number; heartbeatMs?: number },
+  windows = 30,
+): number {
+  const h = presenterHarness(options);
+  h.presenter.setContext({ issueId: "ws.5", phase: "work" });
+  h.presenter.feed(assistantEvent("message_start", ""));
+  const before = h.presenter.stats().paints;
+
+  const windowMs = options.coalesceMs ?? 33;
+  const chunks = cumulativeChunks(REPLY, windows * 10);
+  const perWindow = Math.ceil(chunks.length / windows);
+  let fed = 0;
+  for (let w = 0; w < windows; w += 1) {
+    for (const chunk of chunks.slice(fed, fed + perWindow)) {
+      h.presenter.feed(assistantEvent("message_update", chunk));
+    }
+    fed += perWindow;
+    h.time.tick(windowMs);
+  }
+  const painted = h.presenter.stats().paints - before;
+  h.presenter.dispose();
+  return painted;
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // rule 3 — bounded frame cost
 // ══════════════════════════════════════════════════════════════════════════════
@@ -772,6 +819,23 @@ describe("rule 3: frame cost is bounded by the coalescing window, not by tokens"
     h.presenter.flushSync();
     assert.equal(h.presenter.stats().paints - paintsBefore, 1);
     assert.equal(h.presenter.stats().paintPending, false);
+  });
+
+  it("a live stream gets a frame in every window, not one for the whole reply", () => {
+    // The regression: an assistant delta updated its block without asking for
+    // a frame, so a whole reply cost ONE paint — the frame in which its block
+    // appeared — and then nothing until the footer's `elapsed` string rolled
+    // over. A streaming reply sat at ~1fps while tool output beside it ran at
+    // 30, which reads as a frozen terminal, not a slow one.
+    const painted = framesWhileStreaming({ coalesceMs: 33, heartbeatMs: 0 }, 30);
+    assert.equal(painted, 30, "one frame per window, and one in every window");
+  });
+
+  it("coalesceMs is the refresh-rate knob: halve the window, double the frames", () => {
+    const thirty = framesWhileStreaming({ coalesceMs: 33, heartbeatMs: 0 }, 30);
+    const sixty = framesWhileStreaming({ coalesceMs: 16, heartbeatMs: 0 }, 60);
+    assert.equal(thirty, 30);
+    assert.equal(sixty, 60, "~60fps is reachable without breaking rule 3");
   });
 });
 
@@ -886,6 +950,19 @@ describe("rule 14: the clock repaints the frame without outrunning the budget", 
     const h = presenterHarness({ heartbeatMs: 0 });
     startWork(h);
     assert.equal(h.time.pending(), 0, "an explicit zero means no timer at all");
+  });
+
+  it("a stream does not lean on the beat: with the heartbeat off it still moves", () => {
+    // These two numbers were 1 and 0 before the fix. A reply's only frames came
+    // from the clock being checked, so prose and clock were one code path and
+    // the screen moved at the resolution of `formatElapsed` — one second.
+    const noBeat = framesWhileStreaming({ coalesceMs: 33, heartbeatMs: 0 }, 30);
+    const withBeat = framesWhileStreaming({ coalesceMs: 33, heartbeatMs: 500 }, 30);
+    assert.equal(noBeat, 30, "the stream itself drives the frames");
+    assert.ok(
+      withBeat >= noBeat && withBeat <= noBeat + 1,
+      `the beat added ${withBeat - noBeat} frames to a busy stream; it is a clock, not the animation`,
+    );
   });
 
   it("flushSync paints now but does not kill the heartbeat", () => {
