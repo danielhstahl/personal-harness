@@ -628,6 +628,10 @@ export const defaultSessionFactory: SessionFactory = async (spec) => {
     options.model = model;
   }
   if (spec.noBuiltinTools === true) {
+    // The default prompt would advertise tools this session does not have. Rather
+    // than trust the caller to remember that, refuse the combination.
+    const gap = toolInventoryGap(spec);
+    if (gap !== null) throw new AgentError("invalid-arguments", gap);
     options.noTools = "builtin";
   } else if (spec.builtinTools !== undefined) {
     options.tools = [...spec.builtinTools];
@@ -868,13 +872,114 @@ not start implementing any of it here.`;
 
 // ── report tools ────────────────────────────────────────────────────────────
 
+/**
+ * What a session with no built-in tools is told it can do.
+ *
+ * pi's default system prompt is written for a coding agent holding bash, read,
+ * edit and write. A split session holds none of those — it is a planner with one
+ * reporting tool. Left on the default prompt the model reaches for `bash`, gets
+ * `Tool "bash" not found` back, and reads *that* as a flaky harness. The failure
+ * was ours, not the model's, and it costs a turn every time it happens.
+ *
+ * The inventory is generated from the tools actually handed to the session, so a
+ * tool cannot be advertised without existing, and one that exists cannot be left
+ * out of what the model is told.
+ */
+export function bareToolsetSystemPrompt(
+  customTools: readonly string[],
+): string {
+  if (customTools.length === 0) {
+    throw new AgentError(
+      "invalid-arguments",
+      "a no-builtin-tools session needs at least one custom tool to be worth opening",
+    );
+  }
+  const inventory = customTools.map((name) => `\`${name}\``).join(", ");
+  const report = customTools[0] as string;
+  return `# You are the planner for a beads-driven agent loop
+
+You do one thing: turn one human sentence into a batch of board issues. You do
+not implement any of them, and you could not if you tried.
+
+## Your tool inventory is exactly: ${inventory}
+
+That is the whole list. This session has **no built-in tools**: no shell, no
+\`bash\`, no \`read\`, no \`edit\`, no \`write\`, no filesystem access, no web
+access, no sub-agents. Nothing in here can look at the repository, run a
+command, or confirm that a file exists. Plan from the words you were given.
+
+A call to anything outside the list above fails with
+\`Tool "<name>" not found\`. It tells you nothing and shortens the run. When you
+want to check something, resolve instead to what the request implies and report
+that.
+
+## Report once, then stop
+
+Call \`${report}\` one time, with the whole batch, and stop there. The loop
+creates the issues from that single call and stops listening to you as soon as it
+has it, so anything said afterwards is never read.`;
+}
+
+/**
+ * The invariant behind {@link bareToolsetSystemPrompt}, as a function so it can
+ * be tested instead of trusted: a session that was denied the built-in tools has
+ * to be told, in its own system prompt, about every tool it *does* have. The
+ * answer is `null` when there is no gap, or the sentence that explains one.
+ */
+export function toolInventoryGap(spec: {
+  readonly customTools: readonly { name: string }[];
+  readonly noBuiltinTools?: boolean;
+  readonly systemPromptOverride?: string;
+}): string | null {
+  if (spec.noBuiltinTools !== true) return null;
+  if (spec.customTools.length === 0) {
+    return "a session with no built-in tools and no custom tool has nothing to do; do not open one";
+  }
+  if (spec.systemPromptOverride === undefined) {
+    return (
+      "a session with no built-in tools must set systemPromptOverride: pi's " +
+      "default prompt promises bash/read/edit/write, and a model holding it will " +
+      "call tools that are not there"
+    );
+  }
+  const missing = spec.customTools
+    .map((tool) => tool.name)
+    .filter((name) => !spec.systemPromptOverride?.includes(name));
+  if (missing.length > 0) {
+    return (
+      `the system prompt does not name every tool the session has: ${missing.join(", ")}`
+    );
+  }
+  return null;
+}
+
 interface Capture<T> {
   accepted: T[];
   rejected: { raw: string; problems: string[] }[];
+  /**
+   * Proposals that arrived *after* a valid one. Recorded, never applied: a batch
+   * created twice is the one thing this path must not do, and silently picking
+   * between two answers is worse than keeping the one that landed first.
+   */
+  duplicates: T[];
+  /** Set once a tool accepted a payload and asked for the turn to end. */
+  stopRequested: boolean;
+  /**
+   * Installed by the runner before the prompt starts, called by a tool right
+   * after it accepts. The runner ends the turn because the answer is already in
+   * hand; every further model turn is a chance to reach for something that is
+   * not there.
+   */
+  onAccepted?: () => void;
 }
 
 function createCapture<T>(): Capture<T> {
-  return { accepted: [], rejected: [] };
+  return {
+    accepted: [],
+    rejected: [],
+    duplicates: [],
+    stopRequested: false,
+  };
 }
 
 /**
@@ -892,6 +997,8 @@ export interface RunEvidence<T> {
   /** Set when the prompt itself was rejected; `null` otherwise. */
   readonly promptError: string | null;
   readonly accepted: readonly T[];
+  /** Proposals made after the accepted one. Never applied, always reported. */
+  readonly duplicates: readonly T[];
   readonly verdictToolCalls: number;
 }
 
@@ -989,6 +1096,33 @@ export function createReportSplitTool(capture: Capture<NewIssueSpec[]>): ToolDef
     parameters: REPORT_SPLIT_PARAMS,
     execute: async (_toolCallId, params) => {
       const raw = JSON.stringify(params);
+      const first = capture.accepted[0] ?? [];
+      if (capture.accepted.length > 0) {
+        // A split already landed. This is not a second batch, and it must not
+        // become one. It is recorded so the run can say so out loud, and it
+        // does not throw: failing a run that already holds a good answer would
+        // be the worse outcome of the two.
+        const again = validateSplitPayload(params);
+        if (again.ok) capture.duplicates.push(again.specs);
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `A split was already recorded in this session (${first.length} ` +
+                `issue(s)); that is the batch that will be created. This second ` +
+                `proposal was NOT added` +
+                `${again.ok ? "." : " — and it did not validate anyway."} ` +
+                "Nothing more is needed: stop here.",
+            },
+          ],
+          details: {
+            duplicate: true,
+            problems: again.ok ? [] : again.problems,
+            specs: again.ok ? again.specs : undefined,
+          },
+        };
+      }
       const validated = validateSplitPayload(params);
       if (!validated.ok) {
         const problems = validated.problems.join("; ");
@@ -996,6 +1130,8 @@ export function createReportSplitTool(capture: Capture<NewIssueSpec[]>): ToolDef
         throw new Error(`report_split was rejected: ${problems}`);
       }
       capture.accepted.push(validated.specs);
+      capture.stopRequested = true;
+      capture.onAccepted?.();
       return {
         content: [
           {
@@ -1004,7 +1140,11 @@ export function createReportSplitTool(capture: Capture<NewIssueSpec[]>): ToolDef
               "Do not implement them here.",
           },
         ],
-        details: { specs: validated.specs },
+        details: {
+          duplicate: false,
+          problems: [],
+          specs: validated.specs,
+        },
       };
     },
   });
@@ -1158,6 +1298,12 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
       thinkingLevel,
       modelRef: options.modelRef,
       noBuiltinTools: kind === "split",
+      // A session with nothing but its report tool has to be told so; see
+      // {@link bareToolsetSystemPrompt}.
+      systemPromptOverride:
+        kind === "split"
+          ? bareToolsetSystemPrompt(tools.map((tool) => tool.name))
+          : undefined,
     });
     created += 1;
     const entry: LiveSession = { session, kind, disposed: false, disposeCount: 0 };
@@ -1174,6 +1320,16 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
     const unsubscribe = session.subscribe((event) => {
       emit({ type: "agent_event", sessionId: session.sessionId, kind, raw: event });
     });
+
+    // The turn ends when a tool says the answer is in. Deferred by a macrotask so
+    // the tool's own result is delivered first and the session history stays
+    // readable; the alternative — letting the model keep generating — is what
+    // produced duplicate proposals and phantom tool calls.
+    capture.onAccepted = () => {
+      setTimeout(() => {
+        void Promise.resolve(session.abort()).catch(() => undefined);
+      }, 0);
+    };
 
     try {
       let timer: NodeJS.Timeout | undefined;
@@ -1212,13 +1368,24 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
         ]);
         timeoutInfo = { settledAfterAbort: settled === "settled" };
       } else if (typeof first === "object" && first.kind === "prompt-error") {
-        promptError = first.message;
-        emit({
-          type: "agent_event",
-          sessionId: session.sessionId,
-          kind,
-          detail: `prompt rejected: ${promptError}`,
-        });
+        if (capture.stopRequested && capture.accepted.length > 0) {
+          // The turn ended because we ended it, with the answer already in hand.
+          // Reporting that as a failure would be a lie with an error colour on it.
+          emit({
+            type: "agent_event",
+            sessionId: session.sessionId,
+            kind,
+            detail: `turn stopped once the proposal was recorded (${first.message})`,
+          });
+        } else {
+          promptError = first.message;
+          emit({
+            type: "agent_event",
+            sessionId: session.sessionId,
+            kind,
+            detail: `prompt rejected: ${promptError}`,
+          });
+        }
       } else {
         assistantText = lastAssistantText(session.messages);
         classification = classifyRunEvidence({
@@ -1236,9 +1403,11 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
         timeout: timeoutInfo,
         promptError,
         accepted: capture.accepted,
+        duplicates: capture.duplicates,
         verdictToolCalls: capture.accepted.length,
       };
     } finally {
+      capture.onAccepted = undefined;
       unsubscribe();
       entry.running = undefined;
       await disposeSession(entry);
@@ -1441,7 +1610,23 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
     }
 
     const accepted = core.accepted.at(-1);
-    if (accepted !== undefined) return accepted;
+    if (accepted !== undefined) {
+      if (core.duplicates.length > 0) {
+        // Said out loud rather than swallowed: two proposals in one session means
+        // the model was unsure, and a human reading the split should know that
+        // only the first was taken.
+        emit({
+          type: "context_note",
+          detail:
+            `report_split was called ${core.duplicates.length + 1} times in one ` +
+            `split. Only the first proposal (${accepted.length} issue(s)) is ` +
+            `created; the ${core.duplicates.length} later proposal(s) were ` +
+            `ignored, because a second batch cannot be told apart from the first ` +
+            `and creating both would double the board.`,
+        });
+      }
+      return accepted;
+    }
 
     const classification = core.classification;
     if (classification !== null && classification.kind === "malformed-verdict") {

@@ -17,6 +17,7 @@ import {
   asAgentPort,
   asSessionPort,
   AgentError,
+  bareToolsetSystemPrompt,
   buildSplitPrompt,
   buildWorkContext,
   classifyRunEvidence,
@@ -28,6 +29,7 @@ import {
   lastAssistantText,
   resolveModelForRun,
   toWorkEvent,
+  toolInventoryGap,
   validateSplitPayload,
   validateVerdict,
   WORK_CONTEXT_SECTIONS,
@@ -35,6 +37,7 @@ import {
 } from "../src/agent.ts";
 import type {
   AgentSessionLike,
+  RunnerEvent,
   RunnerSessionKind,
   SessionFactory,
   SessionSpec,
@@ -68,6 +71,13 @@ interface FakeScript {
   reply?: string;
   /** Never finish until {@link FakeSession.release} is called. */
   neverSettle?: boolean;
+  /**
+   * Deliver the scripted tool calls in one assistant turn: no turn boundary
+   * between them, so nothing the runner schedules at one boundary can interrupt
+   * the sequence. Models the case where the model emits two tool calls in a
+   * single message.
+   */
+  sameTurn?: boolean;
   /** Reject the prompt outright. */
   rejectWith?: string;
   /** Make `dispose()` blow up. */
@@ -104,6 +114,10 @@ class FakeSession implements AgentSessionLike {
   disposeCalls = 0;
   subscribeCalls = 0;
   unsubscribeCalls = 0;
+  /** Set by `abort()`: the turn is over, however much script is left. */
+  aborted = false;
+  /** True when `abort()` cut a scripted tool sequence short. */
+  scriptTruncated = false;
 
   private readonly script: FakeScript;
   private gate: Promise<void> | null = null;
@@ -137,6 +151,11 @@ class FakeSession implements AgentSessionLike {
     }
 
     for (const [index, call] of (this.script.tools ?? []).entries()) {
+      if (this.aborted) {
+        // A real session does not run the rest of a turn it was told to stop.
+        this.scriptTruncated = true;
+        break;
+      }
       const tool = (this.spec.customTools as unknown as LooseTool[]).find(
         (candidate) => candidate.name === call.name,
       );
@@ -154,6 +173,13 @@ class FakeSession implements AgentSessionLike {
         const message = error instanceof Error ? error.message : String(error);
         this.toolErrors.push({ name: call.name, message });
         this.messages.push({ role: "toolResult", content: [{ type: "text", text: message }] } as unknown as ChatMessage);
+      }
+      // The turn boundary. A real session spends hundreds of milliseconds here on
+      // a model round trip; without an await of our own the whole scripted turn
+      // can run in microtasks and an abort scheduled by the runner would land
+      // after the last tool call — which is not what a real session does.
+      if (this.script.sameTurn !== true) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
       }
     }
 
@@ -179,6 +205,7 @@ class FakeSession implements AgentSessionLike {
 
   async abort(): Promise<void> {
     this.abortCalls += 1;
+    this.aborted = true;
     this.script.onAbort?.();
   }
 
@@ -313,6 +340,8 @@ interface RunnerHarness {
   readonly sessions: FakeSession[];
   readonly specs: SessionSpec[];
   readonly calls: string[];
+  /** Everything the runner emitted, in order. */
+  readonly events: RunnerEvent[];
 }
 
 function runnerHarness(
@@ -328,6 +357,7 @@ function runnerHarness(
 ): RunnerHarness {
   const sessions: FakeSession[] = [];
   const specs: SessionSpec[] = [];
+  const events: RunnerEvent[] = [];
   const issue = options.issue === undefined ? issueFixture() : options.issue;
   const stub = beadsStub(issue, options.memories ?? {});
 
@@ -357,9 +387,10 @@ function runnerHarness(
     timeoutMs: options.timeoutMs ?? 60_000,
     abortGraceMs: options.abortGraceMs ?? 50,
     now: clock.now,
+    onEvent: (event) => events.push(event),
   });
 
-  return { runner, sessions, specs, calls: stub.calls };
+  return { runner, sessions, specs, calls: stub.calls, events };
 }
 
 const DONE_PARAMS = {
@@ -991,6 +1022,152 @@ test("the split session runs with no built-in tools; work does not", async () =>
   await workRun.runner.run("loop-42");
   assert.equal(workRun.specs[0]?.kind, "work");
   assert.notEqual(workRun.specs[0]?.noBuiltinTools, true, "work needs its tools");
+  assert.equal(
+    workRun.specs[0]?.systemPromptOverride,
+    undefined,
+    "work keeps pi's own prompt; it really does have the built-ins it describes",
+  );
+});
+
+test("a session with no built-in tools is told its whole, and only, inventory", async () => {
+  const h = runnerHarness([
+    { tools: [{ name: "report_split", params: { issues: [{ title: "X" }] } }] },
+  ]);
+  await h.runner.split("plan please");
+
+  const spec = h.specs[0];
+  assert.ok(spec !== undefined);
+  const prompt = spec.systemPromptOverride ?? "<none: the model believes it has pi's tools>";
+  const inventoryLine =
+    prompt.split("\n").find((line) => line.startsWith("## Your tool inventory")) ??
+    "<no inventory line>";
+
+  assert.match(inventoryLine, /^## Your tool inventory is exactly: `report_split`$/u);
+  assert.doesNotMatch(inventoryLine, /bash|read|edit|write/u);
+  assert.match(prompt, /no shell, no\s*`bash`/u);
+  assert.match(
+    prompt,
+    /Tool "<name>" not found/u,
+    "the consequence of reaching for a tool that is not there must be stated",
+  );
+  // The gap check the production factory enforces is clean for the real wiring.
+  assert.equal(toolInventoryGap(spec), null, prompt);
+});
+
+test("toolInventoryGap refuses a bare session whose prompt does not name its own tools", () => {
+  const tool = { name: "report_split" };
+  assert.match(
+    toolInventoryGap({ customTools: [tool], noBuiltinTools: true }) ?? "",
+    /must set systemPromptOverride/u,
+  );
+  assert.match(
+    toolInventoryGap({
+      customTools: [tool],
+      noBuiltinTools: true,
+      systemPromptOverride: "You may use only the tools you can think of.",
+    }) ?? "",
+    /does not name every tool/u,
+  );
+  assert.match(
+    toolInventoryGap({
+      customTools: [],
+      noBuiltinTools: true,
+      systemPromptOverride: bareToolsetSystemPrompt(["report_split"]),
+    }) ?? "",
+    /nothing to do/u,
+  );
+  // A session that kept its built-ins needs no override at all.
+  assert.equal(toolInventoryGap({ customTools: [tool] }), null);
+  assert.throws(
+    () => bareToolsetSystemPrompt([]),
+    (error: unknown) =>
+      error instanceof AgentError && error.kind === "invalid-arguments",
+  );
+});
+
+test("a recorded split ends the turn instead of letting the model keep going", async () => {
+  const h = runnerHarness([
+    {
+      tools: [
+        { name: "report_split", params: { issues: [{ title: "The only thing" }] } },
+        // The phantom call this whole path exists to make impossible.
+        { name: "bash", params: { command: "ls" } },
+      ],
+    },
+  ]);
+
+  const specs = await h.runner.split("one thing");
+  assert.equal(specs.length, 1);
+  assert.equal(specs[0]?.title, "The only thing");
+
+  const session = h.sessions[0];
+  assert.ok(session !== undefined);
+  assert.ok(session.abortCalls >= 1, "the turn was never stopped");
+  assert.equal(
+    session.scriptTruncated,
+    true,
+    "the model got its turn back after the answer was already in hand",
+  );
+  assert.deepEqual(
+    session.toolErrors,
+    [],
+    "a call to a tool this session does not have reached the harness",
+  );
+  assert.deepEqual(
+    h.events
+      .filter((event) => event.type === "session_disposed")
+      .map((event) => event.detail ?? ""),
+    [""],
+    "a stop we asked for must not come back as a dispose warning",
+  );
+});
+
+test("a second report_split is refused and reported, never applied", async () => {
+  // Two calls inside one assistant turn: the runner's stop cannot land between
+  // them, so the tool itself is what has to refuse the second batch.
+  const h = runnerHarness([
+    {
+      sameTurn: true,
+      tools: [
+        { name: "report_split", params: { issues: [{ title: "First batch item" }] } },
+        {
+          name: "report_split",
+          params: { issues: [{ title: "Second batch item" }, { title: "And another" }] },
+        },
+      ],
+    },
+  ]);
+
+  const specs = await h.runner.split("plan twice if you feel like it");
+  assert.equal(specs.length, 1, "only the first proposal may be created");
+  assert.equal(specs[0]?.title, "First batch item");
+
+  const notes = h.events
+    .filter((event) => event.type === "context_note")
+    .map((event) => event.detail ?? "");
+  assert.equal(notes.length, 1, `expected one note, got: ${notes.join(" | ")}`);
+  assert.match(notes[0] ?? "", /report_split was called 2 times/u);
+  assert.match(notes[0] ?? "", /ignored/u);
+  // The second proposal never reached the accepted list, so it cannot be created.
+  assert.equal(h.sessions[0]?.toolErrors.length, 0);
+});
+
+test("a refused second proposal does not poison a run that already has an answer", async () => {
+  const h = runnerHarness([
+    {
+      sameTurn: true,
+      tools: [
+        { name: "report_split", params: { issues: [{ title: "Good" }] } },
+        { name: "report_split", params: { issues: [{ priority: 9 }] } },
+      ],
+    },
+  ]);
+
+  const specs = await h.runner.split("one good, one garbage");
+  assert.deepEqual(
+    specs.map((spec) => spec.title),
+    ["Good"],
+  );
 });
 
 test("split without a structured proposal is a typed error", async () => {
