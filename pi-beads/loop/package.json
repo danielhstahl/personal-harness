@@ -13,20 +13,17 @@
   "type": "module",
   "main": "./dist/main.js",
   "bin": {
-    "pi-beads-loop": "./dist/main.js"
+    "pi-beads-loop": "./src/main.ts"
   },
   "engines": {
     "node": ">=22.19.0"
   },
   "scripts": {
     "dev": "node src/main.ts",
-    "start": "node dist/main.js",
+    "start": "node src/main.ts",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test test/*.test.ts",
-    "spike:idle": "node spikes/4-idle-pty.ts",
-    "spike:split": "node spikes/5-split-live.ts",
-    "spike:render": "node spikes/7-render-live.ts",
     "clean": "rm -rf dist",
     "prepack": "npm run clean && npm run build"
   },

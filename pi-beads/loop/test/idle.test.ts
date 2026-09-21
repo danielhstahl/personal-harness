@@ -8,12 +8,9 @@
  */
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { dirname } from "node:path";
 import { describe, it } from "node:test";
 
 import {
@@ -730,64 +727,75 @@ describe("idle keybindings", () => {
   });
 });
 
-// ── live pty evidence ────────────────────────────────────────────────────────
+// ── end to end on a driven terminal ─────────────────────────────────────────
+//
+// This is the evidence a captured pty transcript used to provide, derived at
+// run time instead of committed as an artifact. The real `createIdleMode` is
+// booted on a fake `Terminal` that implements pi-tui's real contract and feeds
+// keystrokes through pi's own `StdinBuffer`, so "a frame was drawn", "Enter
+// submits" and "the terminal came back intact" are observed rather than
+// remembered. A committed capture can rot, be edited, or describe a different
+// version of the code; this cannot.
 
-describe("idle mode live pty evidence", () => {
-  const evidencePath = join(
-    dirname(fileURLToPath(import.meta.url)),
-    "..",
-    "spikes",
-    "out",
-    "4-idle-pty.txt",
-  );
+describe("idle mode end to end on a driven terminal", () => {
+  it("draws a real frame, takes a submit as input, and hands the terminal back", async () => {
+    // The surface must live entirely on the injected terminal. If it ever grabs
+    // the real process stdin, `isRaw` moves and this test says so.
+    const rawBefore = process.stdin.isRaw;
+    const h = harness({ columns: 100 });
 
-  function checkEvidence(text: string): void {
-    // The spike writes one RESULT line per case plus a terminal-state verdict.
-    assert.match(text, /RESULT submit .*"kind":"input"/u);
-    assert.match(text, /RESULT ctrlc .*"kind":"exit","reason":"command"/u);
-    assert.match(text, /raw mode left on: no/u);
-    assert.match(text, /cursor hidden after teardown: no/u);
-    assert.match(text, /spike passed/u);
-  }
-
-  it("the committed pty capture shows a real render, a submit and a clean exit", () => {
-    assert.ok(
-      existsSync(evidencePath),
-      `${evidencePath} is missing — run \`npm run spike:idle\` to produce it`,
+    await settle();
+    const frame = stripTerminalSequences(h.term.output);
+    assert.match(frame, /ready 3 · in progress 1/u, "no status line was drawn");
+    assert.match(frame, /model llamacpp/u, "model missing from the frame");
+    assert.match(frame, /enter send to split/u, "hint line missing from the frame");
+    assert.equal(
+      process.stdin.isRaw,
+      rawBefore,
+      "idle took over the real process stdin instead of the injected terminal",
     );
-    checkEvidence(readFileSync(evidencePath, "utf8"));
+
+    h.term.input("make a todo list app\r");
+    assert.deepEqual(await h.pending, {
+      kind: "input",
+      text: "make a todo list app",
+    });
+
+    // Teardown: cursor shown last, TUI stopped, and nothing written to the
+    // terminal after `stop()` — the goodbye goes to its own sink.
+    await h.handle.dispose();
+    assert.notEqual(h.term.indexOf("stop"), -1, "the TUI was never stopped");
+    assert.ok(
+      h.term.calls.lastIndexOf("showCursor") >
+        h.term.calls.lastIndexOf("hideCursor"),
+      `cursor left hidden at teardown: ${h.term.calls.join(", ")}`,
+    );
+    assert.equal(
+      h.term.writes.length,
+      h.term.writesAtStop,
+      "something was written to the terminal after stop()",
+    );
+    assert.equal(process.stdin.isRaw, rawBefore);
+    assert.equal(h.handle.finished, true);
   });
 
-  it("re-running the spike in a real pty reproduces it", () => {
-    // Opt-in: this spawns a real terminal session and is the one part of the
-    // suite that is environment-sensitive. The committed capture above is the
-    // always-on evidence; set LOOP_PTY_TESTS=1 to re-derive it.
-    if (process.env.LOOP_PTY_TESTS !== "1") return;
-    let haveScript = true;
-    try {
-      execFileSync("which", ["script"], { stdio: "ignore" });
-    } catch {
-      haveScript = false;
-    }
-    if (!haveScript) return; // the committed capture is the evidence then
+  it("ctrl+c twice exits with a command reason and a restored terminal", async () => {
+    const rawBefore = process.stdin.isRaw;
+    const h = harness();
 
-    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-    const dir = mkdtempSync(join(tmpdir(), "loop-idle-spike-"));
-    const out = join(dir, "evidence.txt");
-    const result = execFileSync(
-      process.execPath,
-      [
-        join(root, "node_modules", "tsx", "dist", "cli.mjs"),
-        join(root, "spikes", "4-idle-pty.ts"),
-      ],
-      {
-        encoding: "utf8",
-        env: { ...process.env, LOOP_SPIKE_OUT: out },
-        timeout: 120_000,
-      },
+    await settle();
+    h.term.input("\x03");
+    await settle();
+    h.term.input("\x03");
+
+    assert.deepEqual(await h.pending, { kind: "exit", reason: "command" });
+    assert.equal(h.handle.finished, true);
+    assert.equal(
+      process.stdin.isRaw,
+      rawBefore,
+      "exiting idle left the real stdin in raw mode",
     );
-    checkEvidence(result);
-    checkEvidence(readFileSync(out, "utf8"));
+    assert.equal(h.term.writes.length, h.term.writesAtStop);
   });
 });
 

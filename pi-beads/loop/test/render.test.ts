@@ -12,7 +12,7 @@
  *   rule 3   bounded frame cost: one paint per coalescing window, and a live
  *            stream gets one in every window rather than one per reply
  *   rule 4   highlighting that matches pi, asserted against pi's own
- *            `highlightCode` and the committed spike baseline
+ *            `highlightCode` and its live theme
  *   rules 5-7  tool calls collapse to one line, results expand under a
  *            registered keybinding, unknown events degrade to one honest line
  *   rule 8   the footer: fixed order, tolerant fields, removed on teardown
@@ -1062,24 +1062,55 @@ describe("rule 4: the highlighting is pi's, asserted against pi", () => {
     );
   });
 
-  it("matches the committed spike baseline captured from pi.dev", () => {
-    const baselinePath = join(
-      here,
-      "..",
-      "spikes",
-      "out",
-      "render-highlight.raw.txt",
-    );
-    assert.ok(existsSync(baselinePath), "spike 1 baseline must exist");
-    const baseline = readFileSync(baselinePath, "utf8");
-    const baselineCodes = new Set(baseline.match(SGR) ?? []);
-    const rendered = [...codeSet(pyLines), ...codeSet(tsLines)];
-    const unknown = [...new Set(rendered)].filter((c) => !baselineCodes.has(c));
+  it("uses no colour pi's own live theme does not emit", () => {
+    // This assertion used to diff against `spikes/out/render-highlight.raw.txt`
+    // — a capture of a pi.dev terminal. The live theme is the better baseline:
+    // it *is* pi, right now, so the check cannot go stale, needs no committed
+    // artifact, and follows a theme change instead of falsely failing under one.
+    // Everything painted must come out of pi's own palette: the markdown theme
+    // pi renders with, pi's own highlighter for this content, and the
+    // presenter's declared roles on the live theme.
+    const live = new Set<string>();
+
+    const markdown = getMarkdownTheme() as unknown as Record<string, unknown>;
+    for (const value of Object.values(markdown)) {
+      if (typeof value !== "function") continue;
+      try {
+        const painted = (value as (text: string) => string)("x");
+        if (typeof painted === "string") {
+          for (const code of codesIn(painted)) live.add(code);
+        }
+      } catch {
+        // Roles that need more than a bare string contribute nothing here; the
+        // highlighter pass below covers the token colours.
+      }
+    }
+
+    const fence = /^```\w+\n([^]*?)\n?```$/;
+    for (const [block, language] of [
+      [PY_BLOCK, "python"],
+      [TS_BLOCK, "typescript"],
+    ] as const) {
+      const body = block.replace(fence, "$1");
+      for (const line of highlightCode(body, language)) {
+        for (const code of codesIn(line)) live.add(code);
+      }
+    }
+
+    const theme = createPresenterTheme();
+    for (const role of PRESENTER_ROLES) {
+      for (const code of codesIn(theme.color(role, "x"))) live.add(code);
+    }
+    for (const code of codesIn(theme.bold("x"))) live.add(code);
+
+    const used = new Set([...codeSet(pyLines), ...codeSet(tsLines)]);
+    const invented = [...used].filter((code) => !live.has(code));
     assert.deepEqual(
-      unknown,
+      invented,
       [],
-      `the presenter used colours the pi.dev baseline never emitted: ${unknown.join(" ")}`,
+      `colours the live pi theme never emitted: ${invented.join(" ")}`,
     );
+    assert.ok(live.size >= 4, "the live palette should not be near-empty");
   });
 
   it("colours come from pi's live theme, narrowed to declared roles", () => {
