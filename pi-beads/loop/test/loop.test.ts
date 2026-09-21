@@ -26,7 +26,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { buildApp, perTurnIdle } from "../src/app.ts";
+import { buildApp, idleStatusFrom, perTurnIdle } from "../src/app.ts";
 import { createAgentRunner } from "../src/agent.ts";
 import { BdError } from "../src/beads.ts";
 import { createFinalizer } from "../src/finalize.ts";
@@ -743,6 +743,42 @@ test("an epic on the board is not picked as work", async () => {
     assert.ok(runDetails.some((detail) => detail.startsWith("tst.2:")), `the task was worked: ${runDetails}`);
     assert.ok(!runDetails.some((detail) => detail.startsWith("tst.1:")), "the epic was never worked");
     assert.equal(h.board.statusOf("tst.1"), "open", "the epic stays where it was");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("the idle line counts exactly what the loop can pick", async () => {
+  // The complaint this guards against: a status line saying there is work while
+  // the loop sits idle. Both sides are read off the same board here, so if the
+  // filter is ever applied to one and not the other this goes red.
+  const h = harness({ scripts: [], idleTexts: [] });
+  h.board.seed({
+    id: "tst.1",
+    title: "Umbrella",
+    status: "open",
+    priority: 0,
+    issue_type: "epic",
+  });
+  try {
+    const result = await h.run();
+    const worked = result.transcript.effects.filter((entry) => entry.kind === "agent.run");
+    assert.equal(worked.length, 0, `the epic was treated as work: ${JSON.stringify(worked)}`);
+
+    const status = idleStatusFrom(
+      await h.board.listReady({}),
+      await h.board.listInProgress({}),
+    );
+    assert.equal(status.ready, 0, "nothing pickable, and the line must not claim otherwise");
+    assert.equal(status.heldOut, 1, "the epic is reported rather than quietly dropped");
+
+    const ours = idleStatusFrom(
+      await h.board.listReady({}),
+      await h.board.listInProgress({}),
+      { workEpics: true },
+    );
+    assert.equal(ours.ready, 1, "told to work epics, the same board is work");
+    assert.equal(ours.heldOut, 0);
   } finally {
     h.dispose();
   }

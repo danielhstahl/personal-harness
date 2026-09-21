@@ -84,6 +84,12 @@ export type IdleOutcome =
 export interface IdleStatus {
   readonly ready: number;
   readonly inProgress: number;
+  /**
+   * Issues on the board that are open but not work the loop may take — epics, in
+   * practice. Said rather than left out of the count, so "ready 0" never looks
+   * like a bug when the board clearly has something on it.
+   */
+  readonly heldOut?: number;
   readonly model?: { readonly provider: string; readonly id: string };
   readonly thinkingLevel?: string;
 }
@@ -334,6 +340,10 @@ function countSegment(
   return `${theme.dim(label)} ${n}${last ? "" : theme.dim(" ·")}`;
 }
 
+function pluralContainers(count: number): string {
+  return count === 1 ? "epic" : "epics";
+}
+
 /**
  * The status line, as a pure function: same snapshot in, same line out, at any
  * width. Kept apart from the component so its formatting is directly testable.
@@ -346,11 +356,21 @@ export function renderIdleStatusLine(
   const safeWidth = Math.max(1, Math.trunc(width));
   const parts: string[] = [];
 
+  const heldOut = Math.max(0, Math.trunc(status.heldOut ?? 0));
   if (status.ready === 0 && status.inProgress === 0) {
-    parts.push(theme.accent("board empty"));
+    parts.push(
+      theme.accent(
+        heldOut > 0
+          ? `no work to pick · ${heldOut} ${pluralContainers(heldOut)} open, none pickable`
+          : "board empty",
+      ),
+    );
   } else {
     parts.push(countSegment(theme, "ready", status.ready, false));
-    parts.push(countSegment(theme, "in progress", status.inProgress, true));
+    parts.push(countSegment(theme, "in progress", status.inProgress, heldOut === 0));
+    if (heldOut > 0) {
+      parts.push(theme.dim(`(+${heldOut} ${pluralContainers(heldOut)} not work)`));
+    }
   }
 
   if (status.model !== undefined) {

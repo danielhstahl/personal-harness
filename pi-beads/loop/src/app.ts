@@ -12,8 +12,8 @@
  */
 import { createAgentRunner } from "./agent.ts";
 import type { AgentRunner, WorkOutcome } from "./agent.ts";
-import { createBdClient } from "./beads.ts";
-import type { BdClient } from "./beads.ts";
+import { createBdClient, selectWorkable } from "./beads.ts";
+import type { BdClient, Issue } from "./beads.ts";
 import { createFinalizer, describeFinalizeFailure, isFinalized } from "./finalize.ts";
 import type { FinalizeOutcome, FinalizeRequest } from "./finalize.ts";
 import { createIdleMode } from "./idle.ts";
@@ -204,6 +204,31 @@ export function perTurnIdle(makeIdle: () => IdleHandle): PerTurnIdlePort {
  * Build the loop without running it. Returns the ports too, so a caller (a
  * spike, a test) can inspect or drive the pieces after the run.
  */
+/**
+ * Board reads → the idle line's numbers, through the loop's own definition of
+ * pickable work ({@link selectWorkable}). Kept exported and pure so a test can
+ * set the status line and the pick list side by side and check they still agree
+ * — which is the whole reason they share the filter.
+ */
+export function idleStatusFrom(
+  ready: readonly Issue[],
+  inProgress: readonly Issue[],
+  options: {
+    workEpics?: boolean;
+    model?: { provider: string; id: string };
+  } = {},
+): IdleStatus {
+  const workEpics = options.workEpics === true;
+  const readyPick = selectWorkable(ready, { workEpics });
+  const progressPick = selectWorkable(inProgress, { workEpics });
+  return {
+    ready: readyPick.pickable.length,
+    inProgress: progressPick.pickable.length,
+    heldOut: readyPick.heldOut.length + progressPick.heldOut.length,
+    model: options.model,
+  };
+}
+
 export function buildApp(config: AppConfig): App {
   const overrides = config.overrides ?? {};
   const labels = config.labels === undefined ? undefined : { labels: config.labels };
@@ -352,11 +377,10 @@ export function buildApp(config: AppConfig): App {
         beads.listReady(labels ?? {}),
         beads.listInProgress(labels ?? {}),
       ]);
-      return {
-        ready: ready.length,
-        inProgress: inProgress.length,
+      return idleStatusFrom(ready, inProgress, {
+        workEpics: config.workEpics === true,
         model: config.modelRef,
-      };
+      });
     } catch {
       return { ready: 0, inProgress: 0, model: config.modelRef };
     }

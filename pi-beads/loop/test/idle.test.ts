@@ -463,6 +463,34 @@ describe("idle status line", () => {
     assert.match(line, /in progress 1/u);
   });
 
+  it("says what is held back instead of leaving the count looking wrong", () => {
+    const held = stripTerminalSequences(
+      renderIdleStatusLine({ ready: 2, inProgress: 0, heldOut: 1 }, theme, 200),
+    );
+    assert.match(held, /ready 2/u);
+    assert.match(held, /\(\+1 epic not work\)/u);
+
+    const many = stripTerminalSequences(
+      renderIdleStatusLine({ ready: 1, inProgress: 1, heldOut: 3 }, theme, 200),
+    );
+    assert.match(many, /\(\+3 epics not work\)/u);
+  });
+
+  it("a board of nothing but containers reads as no work, not as an empty board", () => {
+    const line = stripTerminalSequences(
+      renderIdleStatusLine({ ready: 0, inProgress: 0, heldOut: 2 }, theme, 200),
+    );
+    assert.match(line, /no work to pick · 2 epics open, none pickable/u);
+    assert.doesNotMatch(line, /board empty/u);
+  });
+
+  it("never counts the held-out issues as ready", () => {
+    const line = stripTerminalSequences(
+      renderIdleStatusLine({ ready: 0, inProgress: 0, heldOut: 1 }, theme, 200),
+    );
+    assert.doesNotMatch(line, /ready \d/u, `held-out work leaked into a count: ${line}`);
+  });
+
   it("shows model and thinking level when known", () => {
     const line = stripTerminalSequences(
       renderIdleStatusLine(

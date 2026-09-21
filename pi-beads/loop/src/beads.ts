@@ -658,6 +658,41 @@ function safeParse(stdout: string): Json | null {
   }
 }
 
+/** bd's issue type for a container. A container holds work; it is not work. */
+export const EPIC_ISSUE_TYPE = "epic";
+
+/** True when an issue's bd type is the container type, in whatever casing bd used. */
+export function isEpicIssue(issue: { issue_type?: string }): boolean {
+  return (
+    typeof issue.issue_type === "string" &&
+    issue.issue_type.toLowerCase() === EPIC_ISSUE_TYPE
+  );
+}
+
+/**
+ * The one definition of "issue the loop may pick up".
+ *
+ * The interpreter and the idle status line both read this, and that sharing is
+ * the point: a status line counting things the loop will not act on is worse than
+ * no status line at all — it reads "ready 2" across a table from a loop that is
+ * sitting idle. Picking and reporting cannot drift apart when they ask the same
+ * question, and the held-out half comes back too, so the difference is always
+ * sayable instead of merely true.
+ */
+export function selectWorkable<T extends { issue_type?: string }>(
+  issues: readonly T[],
+  options: { workEpics?: boolean } = {},
+): { pickable: T[]; heldOut: T[] } {
+  if (options.workEpics === true) return { pickable: [...issues], heldOut: [] };
+  const pickable: T[] = [];
+  const heldOut: T[] = [];
+  for (const issue of issues) {
+    if (isEpicIssue(issue)) heldOut.push(issue);
+    else pickable.push(issue);
+  }
+  return { pickable, heldOut };
+}
+
 /** Default client for callers that do not need custom options. */
 export const defaultBdClient: BdClient = createBdClient();
 

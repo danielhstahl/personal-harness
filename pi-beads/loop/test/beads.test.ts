@@ -17,7 +17,9 @@ import {
   assertClaimFreeArgs,
   createBdClient,
   dependsOn,
+  isEpicIssue,
   normaliseDependencies,
+  selectWorkable,
   type BdClient,
   type Issue,
 } from "../src/beads.ts";
@@ -559,4 +561,33 @@ test("an issue with no dependencies normalises to []", async () => {
 
   assert.deepEqual(normaliseDependencies(one), []);
   assert.equal(dependsOn(one, "anything"), false);
+});
+
+// ── the one definition of pickable work ───────────────────────────────────
+
+test("an epic is a container, not work", () => {
+  assert.equal(isEpicIssue({ issue_type: "epic" }), true);
+  assert.equal(isEpicIssue({ issue_type: "EPIC" }), true, "bd's casing is not our business");
+  assert.equal(isEpicIssue({ issue_type: "task" }), false);
+  assert.equal(isEpicIssue({}), false);
+  assert.equal(isEpicIssue({ issue_type: "epiclogue" }), false, "prefix matching is not matching");
+});
+
+test("selectWorkable returns both halves so the difference is sayable", () => {
+  const issues = [
+    { id: "p.1", issue_type: "task" },
+    { id: "p.2", issue_type: "epic" },
+    { id: "p.3", issue_type: "bug" },
+  ];
+
+  const held = selectWorkable(issues);
+  assert.deepEqual(held.pickable.map((i) => i.id), ["p.1", "p.3"]);
+  assert.deepEqual(held.heldOut.map((i) => i.id), ["p.2"]);
+
+  const everything = selectWorkable(issues, { workEpics: true });
+  assert.deepEqual(everything.pickable.map((i) => i.id), ["p.1", "p.2", "p.3"]);
+  assert.deepEqual(everything.heldOut, []);
+
+  assert.deepEqual(selectWorkable([]), { pickable: [], heldOut: [] });
+  assert.equal(issues.length, 3, "the input is never mutated");
 });

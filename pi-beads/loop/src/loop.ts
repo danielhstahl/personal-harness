@@ -57,7 +57,7 @@
  * own, drops every session at `drop_context`, and starts the next iteration
  * from a board read. See rule 6/7 in `test/loop.test.ts`.
  */
-import { BdError } from "./beads.ts";
+import { BdError, selectWorkable } from "./beads.ts";
 import type { BdClient, Issue } from "./beads.ts";
 import type { AgentRunner, WorkOutcome } from "./agent.ts";
 import { toWorkEvent } from "./agent.ts";
@@ -272,7 +272,6 @@ const EXIT_BY_KIND: Readonly<Record<LoopResultKind, number>> = {
 };
 
 const READ_EFFECTS: readonly string[] = ["beads.list_in_progress", "beads.list_ready"];
-const EPIC_TYPE = "epic";
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -507,13 +506,15 @@ export async function runLoop(
       return feed({ type: "observe_failed", reason });
     }
 
-    const hiddenEpics = workEpics
-      ? 0
-      : countEpics(inProgress) + countEpics(ready);
-    if (!workEpics) {
-      inProgress = inProgress.filter((issue) => !isEpic(issue));
-      ready = ready.filter((issue) => !isEpic(issue));
-    }
+    // One definition of "pickable", shared with the idle status line by way of
+    // `selectWorkable`, so a count on screen and a pick in the machine cannot
+    // drift apart. Epics are held out because picking one means "work the
+    // umbrella", which is never what the human meant.
+    const progressPick = selectWorkable(inProgress, { workEpics });
+    const readyPick = selectWorkable(ready, { workEpics });
+    const hiddenEpics = progressPick.heldOut.length + readyPick.heldOut.length;
+    inProgress = progressPick.pickable;
+    ready = readyPick.pickable;
     if (hiddenEpics > 0) {
       notes.push(`board: ${hiddenEpics} epic(s) held out of work selection`);
       log("debug", `held ${hiddenEpics} epic(s) out of the pick lists (workEpics=false)`);
@@ -524,14 +525,6 @@ export async function runLoop(
       detail: `in_progress=${inProgress.length} ready=${ready.length}`,
     });
     return feed({ type: "board_observed", inProgress, ready });
-  }
-
-  function isEpic(issue: Issue): boolean {
-    return typeof issue.issue_type === "string" && issue.issue_type.toLowerCase() === EPIC_TYPE;
-  }
-
-  function countEpics(issues: readonly Issue[]): number {
-    return issues.filter(isEpic).length;
   }
 
   // ── handlers, one per effect kind ────────────────────────────────────────
