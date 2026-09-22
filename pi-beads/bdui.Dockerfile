@@ -2,7 +2,7 @@ FROM node:24-slim
 RUN mkdir -p /app
 ENV NPM_CONFIG_PREFIX=/app/.npm-global
 ENV PATH=$PATH:/app/.npm-global/bin
-ENV BEADS_DIR=/workspace/.beads
+ENV BEADS_DIR=/home/appuser/.beads
 # needed to access outside container
 ENV HOST=0.0.0.0
 RUN addgroup --system appgroup && \

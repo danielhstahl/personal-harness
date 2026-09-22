@@ -25,11 +25,3 @@ docker run --rm -it \
   -v $PWD/pi-agent-home:/home/appuser/.pi/agent \
   pi-sandbox
 ```
-
-docker run --rm -it \
-  -e LLAMA_BASE_URL=llm.home:8000 \
-  -v "$PWD:/workspace" \
-  --add-host=host.docker.internal:host-gateway \
-  pi-sandbox
-
-docker build -t tmp -f Dockerfile . --no-cache

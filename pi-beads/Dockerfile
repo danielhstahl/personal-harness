@@ -3,7 +3,13 @@ FROM nikolaik/python-nodejs:python3.14-nodejs25-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates git ripgrep curl gcc unzip xz-utils zip libglu1-mesa libc6-dev \
     && rm -rf /var/lib/apt/lists/*
-RUN mkdir -p /app
+RUN mkdir -p /app/loop
+
+# copies directory into /app/loop/src
+ADD loop/src /app/loop/src
+ADD loop/package-lock.json /app/loop/package-lock.json
+ADD loop/package.json /app/loop/package.json
+RUN cd /app/loop && npm ci
 ENV NPM_CONFIG_PREFIX=/app/.npm-global
 ENV PATH=$PATH:/app/.npm-global/bin
 
@@ -33,7 +39,7 @@ RUN mkdir -p $BEADS_DIR
 
 ## Flutter
 ENV PATH="$PATH:/home/appuser/flutter/bin"
-ENV FLUTTER_VERSION=3.47.4
+ENV FLUTTER_VERSION=stable
 RUN git clone https://github.com/flutter/flutter.git -b ${FLUTTER_VERSION} --depth 1 /home/appuser/flutter
 
 ## Rust
@@ -41,6 +47,6 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/home/appuser/.cargo/bin:${PATH}"
 
 # uses beads to handle work
-RUN pi install npm:pi-workgraph
+# RUN pi install npm:pi-workgraph
 WORKDIR /workspace
 ENTRYPOINT ["/app/entrypoint.sh"]

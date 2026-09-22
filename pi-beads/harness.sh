@@ -13,7 +13,7 @@ docker volume create $VOLUME  >/dev/null
 
 # make sure .beads exists before anything else touches the volume
 docker run --rm \
-  -v $VOLUME:/workspace/.beads \
+  -v $VOLUME:/home/appuser/.beads \
   --entrypoint bd \
   ghcr.io/danielhstahl/pi-beads:$TAG \
   init --quiet --stealth || echo "already initialized"
@@ -28,7 +28,7 @@ docker run -d --rm \
   --name $UI_NAME \
   -p 127.0.0.1::3000 \
   --add-host=host.docker.internal:host-gateway \
-  -v $VOLUME:/workspace/.beads \
+  -v $VOLUME:/home/appuser/.beads \
   ghcr.io/danielhstahl/bd-ui:$TAG
 
 BD_UI_PORT=$(docker port "$UI_NAME" 3000/tcp | head -n1 | cut -d: -f2)
