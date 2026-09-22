@@ -328,6 +328,52 @@ interface ToolViewOptions {
   readonly collapsedPreviewLines: number;
   readonly maxExpandedChars: number;
   readonly legend: string;
+  /**
+   * Where the pending-call animation comes from. `null` (or no source at all)
+   * means there is no motion to show: the surface is not ours, the output is
+   * plain, the presenter has no clock, or the call has settled. The block never
+   * reads a clock itself — it is told what frame it is in.
+   */
+  readonly pulse?: () => ToolPulse | null;
+}
+
+/**
+ * One pulse of indeterminate motion: which frame, and how long the call has
+ * been outstanding. The frame says "still going"; the elapsed time says how
+ * long "still" has been, which is the difference between waiting and
+ * wondering.
+ */
+export interface ToolPulse {
+  readonly tick: number;
+  readonly elapsedMs: number;
+}
+
+/**
+ * The pending glyph with nothing moving under it. Used when animation is off:
+ * plain output, no clock, a surface we do not hold.
+ */
+const PENDING_GLYPH = "…";
+
+/**
+ * One second per turn of the spinner, at the default 120ms cadence. Exported
+ * because "what the pending glyph can be" is a fact about the surface that
+ * tests and any other reader should be able to ask for rather than guess.
+ */
+export const SPINNER_FRAMES: readonly string[] = [
+  "⠋",
+  "⠙",
+  "⠹",
+  "⠸",
+  "⠼",
+  "⠴",
+  "⠦",
+  "⠧",
+  "⠇",
+  "⠏",
+];
+
+function spinnerFrame(tick: number): string {
+  return SPINNER_FRAMES[Math.abs(tick) % SPINNER_FRAMES.length] ?? PENDING_GLYPH;
 }
 
 /**
@@ -422,13 +468,36 @@ class ToolBlock implements Component {
   }
 
   private glyph(): string {
-    if (this.status === "pending") return "…";
-    return this.status === "error" ? "✗" : "✓";
+    if (this.status === "error") return "✗";
+    if (this.status === "ok") return "✓";
+    const pulse = this.pulseNow();
+    return pulse === null ? PENDING_GLYPH : spinnerFrame(pulse.tick);
+  }
+
+  private pulseNow(): ToolPulse | null {
+    if (this.status !== "pending") return null;
+    return this.view.pulse?.() ?? null;
+  }
+
+  /**
+   * How long this call has been outstanding, undecorated. Suppressed under a
+   * second: an instant call showing `00:00` is noise, and a call that has been
+   * going two minutes is the thing worth saying.
+   */
+  pendingTimePlain(): string {
+    const pulse = this.pulseNow();
+    if (pulse === null || pulse.elapsedMs < 1_000) return "";
+    return ` · ${formatElapsed(pulse.elapsedMs)}`;
+  }
+
+  private pendingTime(): string {
+    const text = this.pendingTimePlain();
+    return text === "" ? "" : this.theme.color("muted", text);
   }
 
   /** Header line only — exposed so the one-line rule is directly testable. */
   headerPlain(): string {
-    return `${this.glyph()} ${this.name} ${this.summary()}`;
+    return `${this.glyph()} ${this.name} ${this.summary()}${this.pendingTimePlain()}`;
   }
 
   /** Nothing is cached between frames: every render is a fresh string build. */
@@ -446,6 +515,7 @@ class ToolBlock implements Component {
       this.theme.bold(this.theme.color("toolTitle", this.name)),
       " ",
       this.theme.color("muted", this.summary()),
+      this.pendingTime(),
     ].join("");
 
     const lines = [truncateToWidth(header, width, "…")];
@@ -577,6 +647,17 @@ export interface WorkPresenterOptions {
    * time-derived content has actually changed. 0 disables the heartbeat.
    */
   readonly heartbeatMs?: number;
+  /**
+   * Frame cadence while a call is outstanding, in ms. Default 120.
+   *
+   * The heartbeat keeps a clock, which is a one-second thing. A pending tool
+   * line needs a faster beat than that: at one frame a second a spinner is a
+   * flicker, and the screen is indistinguishable from one that hung. The two
+   * cadences share one timer — while something is outstanding the heartbeat runs
+   * at this rate instead of its own, and drops back the moment it is not.
+   * 0 turns the animation off and leaves the plain `…` pending glyph.
+   */
+  readonly spinnerMs?: number;
   readonly theme?: PresenterTheme;
   readonly themeName?: string;
   readonly keybindings?: KeybindingsManager;
@@ -600,6 +681,9 @@ export interface PresenterStats {
   /** The cadence this presenter was built with, so the knob is checkable. */
   readonly coalesceMs: number;
   readonly heartbeatMs: number;
+  readonly spinnerMs: number;
+  /** A pending tool call is outstanding, so the surface is animating. */
+  readonly animating: boolean;
   /** A frame has been asked for and has not been drawn yet. */
   readonly paintPending: boolean;
   readonly live: boolean;
@@ -628,6 +712,7 @@ export interface WorkPresenter {
 
 const DEFAULT_COALESCE_MS = 33;
 const DEFAULT_HEARTBEAT_MS = 500;
+const DEFAULT_SPINNER_MS = 120;
 const DEFAULT_COLLAPSED_LINES = 2;
 const DEFAULT_MAX_EXPANDED_CHARS = 4_000;
 const DEFAULT_PLAIN_WIDTH = 80;
@@ -808,6 +893,13 @@ class Presenter implements WorkPresenter {
   /** The re-arming heartbeat timer, live only while the surface is held. */
   private heartbeatCancel: (() => void) | null = null;
   private heartbeatMs: number;
+  private readonly spinnerMs: number;
+  /** Bumped on each animation beat; picks the spinner frame. */
+  private spinnerTick = 0;
+  /** Calls opened and not yet reported back. Drives the fast beat. */
+  private pendingCalls = 0;
+  /** When each outstanding call opened, for the per-call elapsed time. */
+  private readonly toolOpenedAt = new Map<string, number>();
   /** Elapsed text as of the last footer sync, so a tick can tell if time moved. */
   private lastElapsed = "";
   private paints = 0;
@@ -825,6 +917,7 @@ class Presenter implements WorkPresenter {
     this.schedule = options.schedule ?? defaultSchedule;
     this.coalesceMs = options.coalesceMs ?? DEFAULT_COALESCE_MS;
     this.heartbeatMs = Math.max(0, options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS);
+    this.spinnerMs = Math.max(0, options.spinnerMs ?? DEFAULT_SPINNER_MS);
     this.plainWidth = options.plainWidth ?? DEFAULT_PLAIN_WIDTH;
     this.terminalFactory =
       options.terminal !== undefined
@@ -1144,7 +1237,16 @@ class Presenter implements WorkPresenter {
             ? this.tools.get(record.toolCallId) ?? null
             : null;
         if (block === null) return;
+        const wasPending = block.toolStatus === "pending";
         block.finish(record?.result, record?.isError === true);
+        if (wasPending) {
+          // The call reported back: stop animating it, and stop paying for the
+          // fast beat. The bookkeeping is deleted rather than zeroed so a long
+          // run does not accumulate timestamps for calls that finished hours ago.
+          this.pendingCalls = Math.max(0, this.pendingCalls - 1);
+          this.toolOpenedAt.delete(block.callId);
+          this.refreshCadence();
+        }
         this.markDirty();
         return;
       }
@@ -1230,15 +1332,14 @@ class Presenter implements WorkPresenter {
       this.markDirty();
       return existing;
     }
-    const block = new ToolBlock(
-      callId,
-      name,
-      args,
-      this.theme,
-      this.viewOptions,
-      this.expandedAll,
-    );
+    const view: ToolViewOptions = {
+      ...this.viewOptions,
+      pulse: (): ToolPulse | null => this.pulseFor(callId),
+    };
+    const block = new ToolBlock(callId, name, args, this.theme, view, this.expandedAll);
     this.tools.set(callId, block);
+    this.toolOpenedAt.set(callId, this.now());
+    this.pendingCalls += 1;
     // The prose resumes after the tool, in a new block — never inside this one.
     this.activeAssistant = null;
     this.append(block);
@@ -1324,6 +1425,51 @@ class Presenter implements WorkPresenter {
     }
   }
 
+  /**
+   * The pulse a pending tool block is shown. Null whenever there is no motion to
+   * show: not live, no clock running, the call already settled. Computed at render
+   * time rather than pushed, so a frame always reflects the instant it was drawn.
+   */
+  private pulseFor(callId: string): ToolPulse | null {
+    if (!this.animatingNow()) return null;
+    const openedAt = this.toolOpenedAt.get(callId);
+    if (openedAt === undefined) return null;
+    return { tick: this.spinnerTick, elapsedMs: Math.max(0, this.now() - openedAt) };
+  }
+
+  /**
+   * True while a call the surface is showing has not reported back.
+   *
+   * This is the state the animation exists for. A line that reads `… bash $ cargo
+   * test` and does not move looks exactly like a screen that hung, which is the
+   * worst thing a status line can do: it trains the operator to ignore it.
+   */
+  private animatingNow(): boolean {
+    return (
+      this.pendingCalls > 0 &&
+      this.live &&
+      this.path === "live" &&
+      this.heartbeatMs > 0 &&
+      this.spinnerMs > 0
+    );
+  }
+
+  /** One timer, two cadences: fast while outstanding, slow otherwise. */
+  private beatMs(): number {
+    if (this.animatingNow()) return Math.min(this.spinnerMs, this.heartbeatMs);
+    return this.heartbeatMs;
+  }
+
+  /**
+   * Re-arm the beat at the current cadence. Called when a call opens so the
+   * spinner starts with it, instead of up to a heartbeat later.
+   */
+  private refreshCadence(): void {
+    if (this.closed || this.heartbeatCancel === null) return;
+    this.stopHeartbeat();
+    this.armHeartbeat();
+  }
+
   private paint(): void {
     if (this.tui === null || !this.live) return;
     this.syncFooter();
@@ -1350,7 +1496,7 @@ class Presenter implements WorkPresenter {
     this.heartbeatCancel = this.schedule(() => {
       this.heartbeatCancel = null;
       this.onHeartbeat();
-    }, this.heartbeatMs);
+    }, this.beatMs());
   }
 
   private stopHeartbeat(): void {
@@ -1368,7 +1514,14 @@ class Presenter implements WorkPresenter {
    */
   private onHeartbeat(): void {
     if (this.closed || !this.live) return;
-    if (formatElapsed(this.elapsedMs()) !== this.lastElapsed) this.markDirty();
+    if (this.animatingNow()) {
+      // The frame changed by definition, so the frame is asked for. No footer
+      // comparison: the spinner is the change.
+      this.spinnerTick += 1;
+      this.markDirty();
+    } else if (formatElapsed(this.elapsedMs()) !== this.lastElapsed) {
+      this.markDirty();
+    }
     this.armHeartbeat();
   }
 
@@ -1466,6 +1619,8 @@ class Presenter implements WorkPresenter {
       coalescedTicks: this.ticks,
       coalesceMs: this.coalesceMs,
       heartbeatMs: this.heartbeatMs,
+      spinnerMs: this.spinnerMs,
+      animating: this.animatingNow(),
       paintPending: this.dirty,
       live: this.live,
       expanded: this.expandedAll,
@@ -1529,6 +1684,8 @@ export function createNullPresenter(): WorkPresenter {
       coalescedTicks: 0,
       coalesceMs: 0,
       heartbeatMs: 0,
+      spinnerMs: 0,
+      animating: false,
       paintPending: false,
       live: false,
       expanded: false,

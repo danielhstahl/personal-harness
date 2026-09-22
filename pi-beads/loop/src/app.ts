@@ -43,10 +43,13 @@ export interface AppConfig extends LoopConfig {
    * window costs a single frame, so 33 means ~30fps and 16 means ~60fps,
    * whatever the token rate is. `heartbeatMs` is how often a held surface
    * re-checks its time-derived footer (the elapsed field) and repaints if it
-   * moved. Both are ignored when `overrides.presenter` supplies the surface.
+   * moved. `spinnerMs` is the faster beat a pending tool call gets, so an
+   * outstanding call visibly turns instead of looking hung. All are ignored
+   * when `overrides.presenter` supplies the surface.
    */
   readonly coalesceMs?: number;
   readonly heartbeatMs?: number;
+  readonly spinnerMs?: number;
   /** Commit identity. Defaults name the loop rather than a human. */
   readonly authorName?: string;
   readonly authorEmail?: string;
@@ -255,6 +258,7 @@ export function buildApp(config: AppConfig): App {
           themeName: config.themeName,
           coalesceMs: config.coalesceMs,
           heartbeatMs: config.heartbeatMs,
+          spinnerMs: config.spinnerMs,
         });
 
   /**

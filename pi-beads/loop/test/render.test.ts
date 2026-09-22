@@ -50,6 +50,7 @@ import { createIdleMode } from "../src/idle.ts";
 import {
   MISSING,
   PRESENTER_ROLES,
+  SPINNER_FRAMES,
   buildFooterSegments,
   createNullPresenter,
   createPresenterTheme,
@@ -228,6 +229,7 @@ function presenterHarness(
     tty?: boolean;
     coalesceMs?: number;
     heartbeatMs?: number;
+    spinnerMs?: number;
     collapsedPreviewLines?: number;
     maxExpandedChars?: number;
     expandKey?: string;
@@ -244,6 +246,7 @@ function presenterHarness(
     schedule: time.schedule,
     coalesceMs: options.coalesceMs ?? 33,
     heartbeatMs: options.heartbeatMs ?? 500,
+    spinnerMs: options.spinnerMs,
     collapsedPreviewLines: options.collapsedPreviewLines ?? 2,
     maxExpandedChars: options.maxExpandedChars ?? 4_000,
     expandKey: options.expandKey,
@@ -1130,6 +1133,229 @@ describe("rule 4: the highlighting is pi's, asserted against pi", () => {
   });
 });
 
+/**
+ * Any tool-call header line, settled or not. A pending call wears one of the
+ * spinner frames, so the glyph that marks these lines is a set, not a
+ * character — and the set belongs to the presenter.
+ */
+const TOOL_LINE = new RegExp(`^\\s*[✓✗…${SPINNER_FRAMES.join("")}]`, "u");
+
+// ══════════════════════════════════════════════════════════════════════════════
+// a pending call moves, so a waiting screen is not a hung one
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe("a pending tool call shows that it is waiting", () => {
+  const SPIN = 120;
+
+  /** The pending tool line in the current frame, or "" if none is showing. */
+  const pendingLine = (h: PresenterHarness): string => {
+    const line = h
+      .plain()
+      .find((l) => TOOL_LINE.test(l) && !/^\s*[✓✗]/u.test(l));
+    return line === undefined ? "" : line.trim();
+  };
+
+  const glyphOf = (line: string): string => line.trim().charAt(0);
+
+  /** One animation beat and the frame it asked for. */
+  const spinBeat = (h: PresenterHarness, ms = SPIN): void => {
+    h.time.fire(); // the beat
+    h.time.fire(); // the frame it scheduled inside the coalescing window
+    h.time.advance(ms);
+  };
+
+  const openCall = (h: PresenterHarness, id = "c1", command = "cargo test"): void => {
+    h.presenter.setContext({ issueId: "ws.7", phase: "work" });
+    h.presenter.feed(toolStart(id, "bash", { command }));
+    h.presenter.flushSync();
+  };
+
+  it("turns while the call is outstanding", () => {
+    const h = presenterHarness({ heartbeatMs: 500, spinnerMs: SPIN });
+    openCall(h);
+
+    const seen: string[] = [glyphOf(pendingLine(h))];
+    for (let beat = 0; beat < 5; beat += 1) {
+      spinBeat(h);
+      seen.push(glyphOf(pendingLine(h)));
+    }
+
+    assert.ok(pendingLine(h) !== "", "the pending call stayed on screen");
+    for (const glyph of seen) {
+      assert.ok(
+        SPINNER_FRAMES.includes(glyph),
+        `frame glyph is not a spinner frame: ${JSON.stringify(glyph)} in ${seen.join("")}`,
+      );
+    }
+    assert.ok(
+      new Set(seen).size >= 5,
+      `only ${new Set(seen).size} distinct frames across five beats: ${seen.join("")}`,
+    );
+  });
+
+  it("turns at spinnerMs, not at the footer's one-second clock", () => {
+    const h = presenterHarness({ heartbeatMs: 500, spinnerMs: SPIN });
+    openCall(h);
+    const before = h.presenter.stats().paints;
+
+    // One second of outstanding call. At the footer's cadence that is two
+    // frames, which is a thing that happens twice and then looks stopped.
+    for (let step = 0; step < Math.floor(1_000 / SPIN); step += 1) {
+      spinBeat(h);
+    }
+    const animated = h.presenter.stats().paints - before;
+    assert.ok(
+      animated >= 7,
+      `${animated} frames in a second of outstanding work; the spinner is not running at ${SPIN}ms`,
+    );
+  });
+
+  it("goes back to the slow beat once the call reports back", () => {
+    const h = presenterHarness({ heartbeatMs: 500, spinnerMs: SPIN });
+    openCall(h);
+    h.presenter.feed(toolEnd("c1", "bash", textResult("ok")));
+    h.presenter.flushSync();
+
+    assert.equal(h.presenter.stats().animating, false, "nothing outstanding");
+    const settled = h.plain().find((l) => TOOL_LINE.test(l)) ?? "";
+    assert.match(settled, /^\s*✓/u, "a settled call wears its result, not a spinner");
+
+    const before = h.presenter.stats().paints;
+    for (let step = 0; step < 4; step += 1) {
+      h.time.advance(1_000);
+      h.time.fire();
+      h.time.fire();
+    }
+    const painted = h.presenter.stats().paints - before;
+    assert.ok(
+      painted <= 5,
+      `${painted} frames in four settled seconds: the fast beat outlived the call`,
+    );
+    assert.doesNotMatch(h.plain().join("\n"), /[⠁-⣿]/u, "no spinner after the fact");
+  });
+
+  it("stats animating is true only while something is outstanding", () => {
+    const h = presenterHarness({ heartbeatMs: 500, spinnerMs: SPIN });
+    h.presenter.setContext({ issueId: "ws.7", phase: "work" });
+    assert.equal(h.presenter.stats().animating, false, "nothing asked yet");
+
+    h.presenter.feed(toolStart("c1", "bash", { command: "sleep 5" }));
+    assert.equal(h.presenter.stats().animating, true);
+
+    h.presenter.feed(toolEnd("c1", "bash", textResult("done")));
+    assert.equal(h.presenter.stats().animating, false);
+
+    h.presenter.feed(toolStart("c2", "read", { path: "src/app.ts" }));
+    h.presenter.release();
+    assert.equal(
+      h.presenter.stats().animating,
+      false,
+      "a surface we no longer hold must not animate anything",
+    );
+  });
+
+  it("only the outstanding call moves; a settled one keeps its verdict", () => {
+    const h = presenterHarness({ heartbeatMs: 500, spinnerMs: SPIN });
+    openCall(h, "c1");
+    h.presenter.feed(toolEnd("c1", "bash", textResult("green")));
+    h.presenter.feed(toolStart("c2", "bash", { command: "git push" }));
+    h.presenter.flushSync();
+
+    const settledBefore = (h.plain().find((l) => l.includes("cargo test")) ?? "").trim();
+    const movingBefore = (h.plain().find((l) => l.includes("git push")) ?? "").trim();
+    assert.match(settledBefore, /^✓/u, settledBefore);
+    assert.ok(SPINNER_FRAMES.includes(glyphOf(movingBefore)), movingBefore);
+
+    spinBeat(h);
+    spinBeat(h);
+
+    const settledAfter = (h.plain().find((l) => l.includes("cargo test")) ?? "").trim();
+    const movingAfter = (h.plain().find((l) => l.includes("git push")) ?? "").trim();
+    assert.equal(settledAfter, settledBefore, "a finished call never reanimates");
+    assert.notEqual(movingAfter.charAt(0), movingBefore.charAt(0), "the open call moved");
+  });
+
+  it("says how long a long call has been going, and stays one line", () => {
+    const h = presenterHarness({ heartbeatMs: 500, spinnerMs: SPIN });
+    openCall(h, "c1", "npm run build");
+    assert.doesNotMatch(
+      pendingLine(h),
+      /·/u,
+      "an instant call showing a timer is noise, not information",
+    );
+
+    h.time.advance(4_500);
+    h.time.fire();
+    h.time.fire();
+    const line = pendingLine(h);
+    assert.match(line, /npm run build/u);
+    assert.match(line, /· 00:04/u, line);
+    assert.ok(!line.includes("\n"), "the timer must not split the header");
+
+    h.time.advance(60_000);
+    h.time.fire();
+    h.time.fire();
+    assert.match(pendingLine(h), /· 01:04/u, pendingLine(h));
+  });
+
+  it("plain output shows no motion and no spinner glyph", () => {
+    const h = presenterHarness({ tty: false, heartbeatMs: 500, spinnerMs: SPIN });
+    h.presenter.setContext({ issueId: "ws.7", phase: "work" });
+    h.presenter.feed(toolStart("c1", "bash", { command: "npm test" }));
+
+    const first = h.plain().join("\n");
+    h.time.advance(2_000);
+    h.time.fire();
+    const second = h.plain().join("\n");
+
+    assert.equal(first, second, "an escape-free stream cannot animate; it must not try");
+    assert.doesNotMatch(second, /[⠁-⣿]/u, "no braille in log output");
+    assert.equal(h.presenter.stats().animating, false);
+  });
+
+  it("spinnerMs 0 keeps the honest static pending glyph", () => {
+    const h = presenterHarness({ heartbeatMs: 500, spinnerMs: 0 });
+    openCall(h);
+    assert.equal(glyphOf(pendingLine(h)), "…");
+    assert.equal(h.presenter.stats().animating, false, "the animation was turned off");
+
+    // The heartbeat is a separate thing and still runs.
+    h.time.advance(1_000);
+    h.time.fire();
+    h.time.fire();
+    assert.match(h.footerLine(), /elapsed 00:01/u);
+    assert.equal(glyphOf(pendingLine(h)), "…");
+  });
+
+  it("the animation does not outrun the coalescing window", () => {
+    // A beat asks; the window decides. With spinnerMs far above coalesceMs the
+    // two numbers should agree, and neither should turn into a write storm.
+    const h = presenterHarness({ coalesceMs: 33, heartbeatMs: 500, spinnerMs: SPIN });
+    openCall(h);
+    const before = h.presenter.stats();
+    const beats = Math.floor(1_200 / SPIN);
+    for (let step = 0; step < beats; step += 1) {
+      spinBeat(h);
+    }
+    const after = h.presenter.stats();
+    const painted = after.paints - before.paints;
+    const asked = after.coalescedTicks - before.coalescedTicks;
+    assert.ok(painted <= asked, "no frame without an ask");
+    assert.ok(painted <= beats, `${painted} frames for ${beats} beats: more than one per beat`);
+    assert.ok(painted >= beats - 2, `${painted} frames for ${beats} beats: frames dropped`);
+  });
+
+  it("the fast beat is shared, not a second timer", () => {
+    const h = presenterHarness({ heartbeatMs: 500, spinnerMs: SPIN });
+    openCall(h);
+    // Beat + coalesced paint pending: at most two timers, whatever the cadence.
+    assert.ok(
+      h.time.pending() <= 2,
+      `${h.time.pending()} timers held; the cadences are stacking instead of sharing`,
+    );
+  });
+});
+
 // ══════════════════════════════════════════════════════════════════════════════
 // rules 5, 6, 7 — tool calls
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1152,7 +1378,7 @@ describe("rule 5: every tool call is exactly one summary line", () => {
     );
     h.presenter.flushSync();
 
-    const headers = h.plain().filter((line) => /^\s*[✓✗…]/u.test(line));
+    const headers = h.plain().filter((line) => TOOL_LINE.test(line));
     assert.equal(headers.length, 4, "one line per tool call");
     assert.match(headers[0]!, /\$ ls -la \/etc/u);
     assert.match(headers[1]!, /src\/app\.ts:10-30/u);
@@ -1178,7 +1404,7 @@ describe("rule 5: every tool call is exactly one summary line", () => {
     const h = presenterHarness();
     h.presenter.feed(toolStart("c1", "bash", { command: "echo one\necho two" }));
     h.presenter.flushSync();
-    const headers = h.plain().filter((line) => /^\s*[✓✗…]/u.test(line));
+    const headers = h.plain().filter((line) => TOOL_LINE.test(line));
     assert.equal(headers.length, 1);
     assert.ok(!headers[0]!.includes("echo two"));
   });
@@ -1506,7 +1732,7 @@ describe("rule 9: non-TTY output is plain text with every field present", () => 
     for (const field of ["issue ws.5", "phase work", "elapsed", "tokens", "model llamacpp/qwen", "thinking low"]) {
       assert.ok(out.includes(field), `plain footer lost "${field}": ${out}`);
     }
-    const headers = out.split("\n").filter((line) => /^\s*[✓✗…]/u.test(line));
+    const headers = out.split("\n").filter((line) => TOOL_LINE.test(line));
     assert.equal(headers.length, 2, "one line per tool call in plain mode");
   });
 
@@ -1526,8 +1752,8 @@ describe("rule 9: non-TTY output is plain text with every field present", () => 
     const plainHeaders = plain
       .out()
       .split("\n")
-      .filter((l) => /^\s*[✓✗…]/u.test(l));
-    const liveHeaders = live.plain().filter((l) => /^\s*[✓✗…]/u.test(l));
+      .filter((l) => TOOL_LINE.test(l));
+    const liveHeaders = live.plain().filter((l) => TOOL_LINE.test(l));
     assert.deepEqual(plainHeaders, liveHeaders, "same summary lines, two transports");
   });
 });
