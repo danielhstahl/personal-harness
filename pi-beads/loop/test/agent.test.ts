@@ -23,6 +23,8 @@ import {
   classifyRunEvidence,
   collectAssistantText,
   createAgentRunner,
+  createCapture,
+  createReportSplitTool,
   describeFailure,
   extractLastFencedJson,
   isDone,
@@ -47,7 +49,7 @@ import type {
 import { BdError } from "../src/beads.ts";
 import { RepoError } from "../src/repo.ts";
 import type { RepoReaderLike } from "../src/agent.ts";
-import type { BdClient, Issue } from "../src/beads.ts";
+import type { BdClient, Issue, NewIssueSpec } from "../src/beads.ts";
 import { failureKeyFor, handoffKeyFor } from "../src/orchestrator.ts";
 import type { OrchestratorPorts } from "../src/orchestrator.ts";
 import type { RepoSnapshot } from "../src/repo.ts";
@@ -1167,6 +1169,80 @@ test("a refused second proposal does not poison a run that already has an answer
   assert.deepEqual(
     specs.map((spec) => spec.title),
     ["Good"],
+  );
+});
+
+/**
+ * The report tool's `execute` as a plain call. `defineTool`'s real signature
+ * carries pi's tool context, which a direct call has nothing to hand it — and
+ * needs none of, because this tool reads only its params and the capture.
+ */
+type ReportResult = {
+  details: { duplicate: boolean; problems: string[]; specs?: NewIssueSpec[] };
+};
+
+type LooseReportTool = {
+  execute(
+    toolCallId: string,
+    params: unknown,
+    signal: AbortSignal,
+    update: (partial?: unknown) => void,
+  ): Promise<ReportResult>;
+};
+
+const looseReportTool = (tool: unknown): LooseReportTool => tool as LooseReportTool;
+
+const callReport = (tool: LooseReportTool, params: unknown): Promise<ReportResult> =>
+  tool.execute("tc-direct", params, new AbortController().signal, () => {});
+
+test("a capture holds one accepted batch, whatever the model sends after it", async () => {
+  // The rule under test is arithmetic, not behavioural: `accepted` never grows
+  // past one, so there is never a choice between two batches to make downstream
+  // — and no "last one wins" to discover later at the call site.
+  const capture = createCapture<NewIssueSpec[]>();
+  const tool = looseReportTool(createReportSplitTool(capture));
+
+  const first = await callReport(tool, { issues: [{ title: "First" }, { title: "Second" }] });
+  assert.equal(first.details.duplicate, false);
+  assert.deepEqual(
+    capture.accepted.map((batch) => batch.map((spec) => spec.title)),
+    [["First", "Second"]],
+  );
+  assert.equal(capture.stopRequested, true, "the answer is in hand: end the turn");
+
+  await callReport(tool, { issues: [{ title: "Third" }] });
+  await callReport(tool, { issues: [{ title: "Fourth" }] });
+
+  assert.equal(capture.accepted.length, 1, "a second batch was accepted");
+  assert.deepEqual(
+    capture.accepted[0]?.map((spec) => spec.title),
+    ["First", "Second"],
+    "the first proposal is the one that was kept",
+  );
+  assert.deepEqual(
+    capture.duplicates.map((batch) => batch[0]?.title),
+    ["Third", "Fourth"],
+    "the later proposals are recorded, not dropped",
+  );
+
+  // Invalid after valid: neither a failure nor a proposal.
+  const invalid = await callReport(tool, { issues: [{ priority: 9 }] });
+  assert.equal(invalid.details.duplicate, true);
+  assert.equal(capture.accepted.length, 1);
+  assert.equal(capture.duplicates.length, 2, "a malformed duplicate is not a proposal");
+
+  // And the retry contract, on a capture with nothing accepted yet: a bad
+  // payload is refused loudly so the model is told, and the session lives.
+  const fresh = createCapture<NewIssueSpec[]>();
+  await assert.rejects(
+    () => callReport(looseReportTool(createReportSplitTool(fresh)), { issues: [{ priority: 9 }] }),
+    /report_split was rejected/u,
+  );
+  assert.equal(fresh.rejected.length, 1, "the rejection is kept for the verdict");
+  assert.equal(
+    fresh.stopRequested,
+    false,
+    "a malformed payload must not end a session that has not answered",
   );
 });
 

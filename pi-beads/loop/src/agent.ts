@@ -953,7 +953,14 @@ export function toolInventoryGap(spec: {
   return null;
 }
 
-interface Capture<T> {
+/**
+ * What one session's report tools write into, and what the runner reads back out.
+ *
+ * Exported because `createReportSplitTool` is exported: a caller that can hand
+ * over a tool has to be able to hand over the thing it fills, otherwise the
+ * only way to test the tool's contract is to run a whole session through it.
+ */
+export interface Capture<T> {
   accepted: T[];
   rejected: { raw: string; problems: string[] }[];
   /**
@@ -973,7 +980,8 @@ interface Capture<T> {
   onAccepted?: () => void;
 }
 
-function createCapture<T>(): Capture<T> {
+/** A capture in its starting state: nothing accepted, nothing rejected. */
+export function createCapture<T>(): Capture<T> {
   return {
     accepted: [],
     rejected: [],
@@ -1609,7 +1617,11 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
       throw new AgentError("session-failed", `split session failed: ${core.promptError}`);
     }
 
-    const accepted = core.accepted.at(-1);
+    // The FIRST accepted batch is the batch. `at(-1)` here would be the last-one
+    // wins behaviour this issue exists to remove: the tool refuses to append a
+    // second batch, so both read the same value today — but the day something
+    // does append, `at(-1)` silently changes which proposal becomes issues.
+    const accepted = core.accepted[0];
     if (accepted !== undefined) {
       if (core.duplicates.length > 0) {
         // Said out loud rather than swallowed: two proposals in one session means
