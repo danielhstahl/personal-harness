@@ -51,6 +51,17 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
    */
   const thinking = (name: string): ThinkingLevel | undefined =>
     parseThinkingLevel(source[name]);
+  /**
+   * Where the audited config goes. Anything truthy writes the patched config
+   * next to `models.json`; `inplace` means the live file, with a `.bak` first.
+   */
+  const auditWriteMode = (): "none" | "proposed" | "inplace" => {
+    const raw = source.LOOP_AUDIT_WRITE?.trim().toLowerCase();
+    if (raw === undefined || raw === "" || raw === "0" || raw === "false") return "none";
+    if (raw === "inplace" || raw === "in-place") return "inplace";
+    return "proposed";
+  };
+  const auditTimeout = number("LOOP_AUDIT_TIMEOUT_MS");
   return {
     cwd,
     bdBin: source.LOOP_BD_BIN,
@@ -63,6 +74,19 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
     retryUnfitWork: flag("LOOP_RETRY_UNFIT_WORK"),
     workThinkingLevel: thinking("LOOP_WORK_THINKING"),
     splitThinkingLevel: thinking("LOOP_SPLIT_THINKING"),
+    /**
+     * The startup provider comparison. Default on: the failures it catches cost
+     * a whole work pass each and are free to see before one starts. It is a
+     * warning, not a gate, unless `LOOP_AUDIT_STRICT` says otherwise.
+     */
+    providerAudit: {
+      enabled: flag("LOOP_AUDIT") ?? true,
+      strict: flag("LOOP_AUDIT_STRICT") ?? false,
+      verbose: flag("LOOP_AUDIT_VERBOSE") ?? false,
+      writeMode: auditWriteMode(),
+      ...(source.LOOP_HEALTH_URL === undefined ? {} : { healthUrl: source.LOOP_HEALTH_URL }),
+      ...(auditTimeout === undefined ? {} : { timeoutMs: auditTimeout }),
+    },
     maxIterations: number("LOOP_MAX_ITERATIONS"),
     themeName: source.PI_THEME,
     dryRun: flag("LOOP_DRY_RUN"),

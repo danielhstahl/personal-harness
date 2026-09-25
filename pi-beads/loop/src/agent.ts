@@ -1269,7 +1269,7 @@ export interface RunEvidence<T> {
   readonly verdictToolCalls: number;
 }
 
-const REPORT_DONE_PARAMS = Type.Object({
+export const REPORT_DONE_PARAMS = Type.Object({
   done: Type.Boolean({
     description: "True only if the issue is fully worked. false means not finished.",
   }),
@@ -1287,7 +1287,7 @@ const REPORT_DONE_PARAMS = Type.Object({
   ),
 });
 
-const REPORT_SPLIT_PARAMS = Type.Object({
+export const REPORT_SPLIT_PARAMS = Type.Object({
   issues: Type.Array(
     Type.Object({
       title: Type.String({ description: "Specific, actionable title." }),
@@ -1307,6 +1307,13 @@ const REPORT_SPLIT_PARAMS = Type.Object({
     { minItems: 1, description: "The proposed work items." },
   ),
 });
+
+export function harnessToolSchemas(): Record<string, unknown> {
+  return {
+    report_done: REPORT_DONE_PARAMS,
+    report_split: REPORT_SPLIT_PARAMS,
+  };
+}
 
 /**
  * `report_done` — the completion contract.

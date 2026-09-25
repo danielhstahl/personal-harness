@@ -24,6 +24,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test test/*.test.ts",
+    "audit": "node src/audit-cli.ts",
     "clean": "rm -rf dist",
     "prepack": "npm run clean && npm run build"
   },

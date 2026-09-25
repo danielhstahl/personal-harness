@@ -22,6 +22,7 @@ arrives in `workspace-5yn.4`–`.9`.
 | `npm run typecheck` | `tsc -p tsconfig.json --noEmit` (strict; must stay clean) |
 | `npm test` | `node --test test/*.test.ts` — adapter tests against a fake `bd` shim |
 | `npm run build` | `tsc -p tsconfig.build.json` → `dist/` |
+| `npm run audit` | compare `models.json` against the provider's `/health` and print the config changes it suggests (see "Startup: the provider comparison") |
 | `npm start` | `node dist/main.js` |
 | `npm run clean` | remove `dist/` |
 
@@ -29,6 +30,10 @@ arrives in `workspace-5yn.4`–`.9`.
 
 ```
 src/main.ts          entry point: reads the environment, calls runApp. Nothing else.
+src/health.ts        the provider probe: derive `<base>/health` from the API base URL, GET it once, never hang
+src/audit.ts         the startup comparison — pure, no I/O. Rules over the health report and the resolved model config; findings as data, suggestions that patch `models.json`
+src/startup.ts       the interpreter for both: read `models.json`, resolve the target, probe, compare, print, optionally write the suggested config
+src/audit-cli.ts     `npm run audit` — the same comparison without starting the loop
 src/app.ts           composition root: builds the real adapters, runs the loop, and
                      owns the one-idle-surface-per-turn rule (see perTurnIdle)
 src/loop.ts          the interpreter: executes the machine's effects, decides nothing
@@ -43,6 +48,7 @@ src/idle.ts          the idle surface: pi's own TUI input, clean exits, raw text
                      torn down, so the root builds a fresh one per idle turn
 src/format.ts        one-line plain-log summaries — NOT the renderer (see ADR-001)
 docs/               ADR-001: transport + rendering decision
+                    ADR-002: comparing the provider's /health report with models.json at startup
 spikes/             throwaway prototypes + captured evidence backing ADR-001
 test/               unit tests, plus the whole walk in test/loop.test.ts
 ```
@@ -91,13 +97,21 @@ In one line each:
   is how "start over with no context" is enforced structurally rather than by
   discipline.
 
+And [`docs/ADR-002-startup-provider-comparison.md`](docs/ADR-002-startup-provider-comparison.md):
+`models.json` is a list of claims about a machine that is not in this repo, so
+before the first ticket is claimed the loop asks that machine what it is and
+prints the disagreements. See "Startup: the provider comparison" below.
+
 Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`,
 `LOOP_WIDTH`, the per-pass thinking levels `LOOP_WORK_THINKING` /
 `LOOP_SPLIT_THINKING` — one of `off`, `minimal`, `low`, `medium`, `high`,
-`xhigh`, `max` — and the budget knobs `LOOP_WORK_TIMEOUT_MS`, `LOOP_WRAP_UP_MS`
-and `LOOP_RETRY_UNFIT_WORK` (see "Two clocks" below). Neither knob set is not the
-same as either set to `low`: unset falls through to the user's configured default
-and then pi's own, so a ticket is never run at a level nobody chose. A value pi
+`xhigh`, `max` — the budget knobs `LOOP_WORK_TIMEOUT_MS`, `LOOP_WRAP_UP_MS` and
+`LOOP_RETRY_UNFIT_WORK` (see "Two clocks" below), and the startup audit knobs
+`LOOP_AUDIT`, `LOOP_AUDIT_STRICT`, `LOOP_AUDIT_VERBOSE`, `LOOP_AUDIT_WRITE` and
+`LOOP_HEALTH_URL` (see "Startup: the provider comparison" below). Neither knob
+set is not the same as either set to `low`: unset falls through to the user's
+configured default and then pi's own, so a ticket is never run at a level nobody
+chose. A value pi
 does not recognise stops the loop with the list of what it accepts, rather than
 being quietly dropped.
 
@@ -286,6 +300,107 @@ beat. A stream drives its own frames now (`heartbeatMs: 0` still paints every
 window), and `rule 3` / `rule 14` in `test/render.test.ts` pin both halves of
 that. `presenter.stats()` reports `paints`, `coalescedTicks` and the two
 cadence numbers, so the rate is measurable rather than eyeballed.
+
+## Startup: the provider comparison
+
+Read [`docs/ADR-002-startup-provider-comparison.md`](docs/ADR-002-startup-provider-comparison.md).
+
+`models.json` is a list of assertions about a machine that is not in this repo,
+and the server is the only witness worth checking. Before the loop reads the
+board it does one `GET` on the provider's health report and diffs it against the
+config the run is about to use. The report lives at the **base** of the URL, not
+under the version prefix: pi sends requests to `http://host:8081/v1` and the
+report is at `http://host:8081/health` — `healthUrlFor()` in `src/health.ts` is
+the only place that transformation is encoded.
+
+What it checks, in one line each (25 rules, `src/audit.ts`):
+
+- **context window** — declared vs served, taking the tightest of `context`,
+  `slot_ctx` and `kv_pool_positions`. Undershooting is the expensive one: the
+  wall in `src/context.ts` is the *declared* number, so a ticket that would have
+  fitted in the window you pay for stops short and reports a false thing about
+  the work.
+- **output ceiling** — over the server's cap is a 400; under the thinking budget
+  plus answer room is a truncated `report_done`. `token_budget_covers_reasoning`
+  decides whether that check applies at all.
+- **the thinking channel** — does a requested level actually reach the server?
+  Under `thinkingFormat: "chat-template"` pi sends only what
+  `chatTemplateKwargs` lists, so a config that lists just `preserve_thinking`
+  leaves every level in the harness choosing something nobody receives and the
+  server running *its* default. Same for `enable_thinking`, which is what makes
+  `off` mean off.
+- **effort names** — pi bills `xhigh` and `max` at the same budget but sends the
+  name it was given; a name the server has no value for comes with a suggested
+  `thinkingLevelMap` translation.
+- **tools** — no tool support means no `report_done` means nothing can finish.
+  `constrained_decoding: false` means pi's `strict` schemas cannot be honoured.
+  `forced_call_disables_thinking` is why `report_done` is asked for, never
+  coerced.
+- **vision** — an image-capable `input` over a server with no vision tower turns
+  every `read` of a PNG into a refused request mid-ticket.
+- **sampling** — implemented vs accepted-but-ignored vs mirrored-from-the-server-
+  defaults (which is a freeze, not a no-op: a field you send always wins).
+- **stream usage** — the context guard eats `usage` every turn; without it the
+  guard is blind and the wall clock is the only clock left.
+- **the harness's own tool schemas** — against the server's enforced /
+  accepted-not-enforced / refused keyword lists.
+- **cache and capacity** — a warm cache that is not bit-identical (a re-run is
+  not a repro), and a server already queueing at startup, which the work budget
+  is charged for like any other time.
+- **what it could not check** — compat keys the report never spoke to are listed
+  as unverified rather than counted as passing.
+
+Findings are ranked `error` / `warn` / `info` / `ok`, each carrying its own
+patch: a scope, a dotted field, a value and a reason. `applySuggestions()`
+resolves a model with a raw `models` entry to `providers.<p>.models[i].<field>`
+and one without to `providers.<p>.modelOverrides.<id>.<field>`; two rules never
+claim the same key. The suggested `$var` and budget values are pinned by drift
+tests to pi's own schema and source, so the audit cannot suggest a key this
+version of pi would reject.
+
+It is a warning by default, never a crash, and it never rewrites the live config
+unasked:
+
+| Knob | Effect |
+| --- | --- |
+| `LOOP_AUDIT=0` | skip the request entirely (an endpoint with no health page) |
+| `LOOP_AUDIT_STRICT=1` | an `error`-severity finding stops the run (`provider-audit`, exit 2) |
+| `LOOP_AUDIT_VERBOSE=1` | also print the checks that passed |
+| `LOOP_AUDIT_WRITE=1` | write `models.json.proposed` beside the real file |
+| `LOOP_AUDIT_WRITE=inplace` | patch `models.json` and keep `models.json.bak` |
+| `LOOP_HEALTH_URL=…` | use this URL instead of the derived one |
+| `LOOP_AUDIT_TIMEOUT_MS` | the probe's deadline (default 2000) |
+
+```sh
+npm run audit                    # the same comparison, without starting the loop
+LOOP_AUDIT_WRITE=1 npm run audit # and leave a models.json.proposed to review
+```
+
+Against a real report and this repo's config (template values filled in), the
+warnings it prints are the real ones:
+
+```
+provider audit — llamacpp/halogen-qwen3.8-flash-next against http://inference.test:8081/health [ok]
+  WARN context-window-undersized: 6.1K of window is unreachable (256.0K declared, 262.1K served)
+         → set providers.llamacpp.models[0].contextWindow = 262144
+  WARN output-starves-the-answer: at `xhigh` the ceiling leaves 0 for the answer (16384 total, 16384 of thinking)
+         → set providers.llamacpp.models[0].maxTokens = 18432
+  WARN thinking-effort-never-sent: `thinkingFormat: "chat-template"` with no effort kwarg: the requested level is never sent
+         → set providers.llamacpp.compat.chatTemplateKwargs.reasoning_effort = {"$var":"thinking.effort"}
+  WARN thinking-enable-never-sent: nothing in the request can switch thinking off
+         → set providers.llamacpp.compat.chatTemplateKwargs.enable_thinking = {"$var":"thinking.enabled"}
+  WARN strict-mode-without-decoding: pi sends `strict` tool schemas and this server has no constrained decoding
+         → set providers.llamacpp.compat.supportsStrictMode = false
+0 error, 5 warn, 8 info, 12 ok (25 check(s), 6 suggested change(s))
+```
+
+Leave those six alone and every pass runs at the server's `xhigh` whatever the
+harness asks for, with no room left for the verdict it has to hand back.
+
+Printed output is secret-redacted (`«redacted»` for a literal key, `$ENVVAR`
+references left intact). The file the audit writes is *not* redacted: it lands
+beside the file that already holds the credential, and a redacted key there would
+just be a broken config.
 
 ## Scratch beads DB (for live / integration checks)
 

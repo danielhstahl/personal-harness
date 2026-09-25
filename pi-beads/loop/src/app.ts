@@ -10,8 +10,9 @@
  * The rule this file exists to satisfy: `src/main.ts` wires, it does not
  * decide. Anything that could be configured is configured here, once.
  */
-import { createAgentRunner } from "./agent.ts";
+import { createAgentRunner, harnessToolSchemas } from "./agent.ts";
 import type { AgentRunner, ThinkingLevel, WorkOutcome } from "./agent.ts";
+import { auditHeader, notableFindings, renderFinding, summariseAudit } from "./audit.ts";
 import { describeContextBudget } from "./context.ts";
 import { createBdClient, selectWorkable } from "./beads.ts";
 import type { BdClient, Issue } from "./beads.ts";
@@ -21,12 +22,39 @@ import { createIdleMode } from "./idle.ts";
 import type { IdleHandle, IdleOutcome, IdleStatus } from "./idle.ts";
 import { createNullPresenter, createWorkPresenter, describeOutcome } from "./render.ts";
 import type { WorkPresenter } from "./render.ts";
-import { runLoop } from "./loop.ts";
+import { runLoop, LoopError } from "./loop.ts";
 import type { LoopConfig, LoopIdlePort, LoopPorts, LoopResult, LoopUi } from "./loop.ts";
 import { createSplitter, portFromAgentRunner } from "./split.ts";
 import type { Splitter } from "./split.ts";
+import { runStartupAudit } from "./startup.ts";
+import type { StartupAuditResult } from "./startup.ts";
 import { createGitWriter } from "./vcs.ts";
 import type { GitWriter } from "./vcs.ts";
+
+/**
+ * The startup provider comparison: `GET <base>/health`, compared with the
+ * `models.json` this run is about to use.
+ *
+ * On by default because the failures it catches are the expensive kind — a
+ * window declared 6K short of what the server takes, a thinking level that
+ * never reaches the template, an output ceiling that starves the verdict — and
+ * all of them are visible before a ticket is claimed. `enabled: false` (or
+ * `LOOP_AUDIT=0`) skips the request entirely, which is the right call when the
+ * endpoint has no health page at all.
+ *
+ * `strict` turns an `error`-severity finding into a stop. Without it the loop
+ * starts anyway, because a warning that halts a nightly run in its tracks is a
+ * warning that gets switched off within a day; with it, an operator who has
+ * decided the config must be right can enforce that.
+ */
+export interface ProviderAuditSetting {
+  readonly enabled: boolean;
+  readonly strict?: boolean;
+  readonly verbose?: boolean;
+  readonly writeMode?: "none" | "proposed" | "inplace";
+  readonly healthUrl?: string;
+  readonly timeoutMs?: number;
+}
 
 export interface AppConfig extends LoopConfig {
   /** Repository and board live here. */
@@ -53,6 +81,8 @@ export interface AppConfig extends LoopConfig {
    */
   readonly workThinkingLevel?: ThinkingLevel;
   readonly splitThinkingLevel?: ThinkingLevel;
+  /** The startup provider comparison. See {@link ProviderAuditSetting}. */
+  readonly providerAudit?: ProviderAuditSetting;
   readonly themeName?: string;
   /**
    * The live surface's cadence, in ms.
@@ -93,6 +123,10 @@ export interface AppConfig extends LoopConfig {
      * log-only spike, where a live surface would paint over the transcript.
      */
     readonly presenter?: WorkPresenter | null;
+    /** Replace the audit's transport (tests inject a fake `/health`). */
+    readonly audit?: { readonly fetchImpl?: typeof fetch };
+    /** Skip the startup audit entirely, whatever `providerAudit` says. */
+    readonly skipAudit?: boolean;
   };
 }
 
@@ -104,8 +138,7 @@ export interface App {
   run(): Promise<LoopResult>;
 }
 
-/** What a finished work unit left on disk, in the few words the footer has room for. */
-function leftBehindFor(outcome: WorkOutcome): string | undefined {
+/** What a finished work unit left on disk, in the few words the footer has room for. */function leftBehindFor(outcome: WorkOutcome): string | undefined {
   switch (outcome.kind) {
     case "done":
     case "incomplete": {
@@ -483,6 +516,67 @@ export function buildApp(config: AppConfig): App {
     },
   };
 
+  /**
+   * The startup comparison, printed through the same surface everything else
+   * uses so it lands in the transcript rather than floating above it.
+   *
+   * The audit is never the reason a run crashes: a broken health endpoint is a
+   * warning line. It is only ever the reason a run *does not start* when the
+   * operator switched strictness on — which is a decision taken in the
+   * environment that this honours rather than second-guesses.
+   */
+  async function auditAtStartup(): Promise<void> {
+    if (overrides.skipAudit === true) return;
+    const setting = config.providerAudit ?? { enabled: true };
+    if (setting.enabled === false) return;
+
+    let result: StartupAuditResult | undefined;
+    try {
+      result = await runStartupAudit({
+        cwd: config.cwd,
+        ...(config.modelRef === undefined ? {} : { modelRef: config.modelRef }),
+        levels: {
+          ...(config.workThinkingLevel === undefined ? {} : { work: config.workThinkingLevel }),
+          ...(config.splitThinkingLevel === undefined ? {} : { split: config.splitThinkingLevel }),
+        },
+        toolSchemas: harnessToolSchemas(),
+        verbose: setting.verbose === true,
+        writeMode: setting.writeMode ?? "none",
+        ...(setting.healthUrl === undefined ? {} : { healthUrl: setting.healthUrl }),
+        ...(setting.timeoutMs === undefined ? {} : { timeoutMs: setting.timeoutMs }),
+        ...(overrides.audit?.fetchImpl === undefined ? {} : { fetchImpl: overrides.audit.fetchImpl }),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      presenter.warn(`provider audit could not run: ${message}`);
+      return;
+    }
+
+    const report = result?.report;
+    if (report === undefined) {
+      for (const line of result?.lines ?? []) presenter.notice("warn", line);
+      return;
+    }
+    presenter.notice(report.counts.error > 0 ? "warn" : "info", auditHeader(report));
+    for (const item of notableFindings(report, { showOk: setting.verbose === true })) {
+      presenter.notice(
+        item.severity === "error" ? "error" : item.severity === "warn" ? "warn" : "info",
+        renderFinding(item, report.target),
+      );
+    }
+    presenter.notice(report.counts.error > 0 ? "warn" : "info", summariseAudit(report));
+    if (result.writtenTo !== undefined) {
+      presenter.notice("info", `patched config written to ${result.writtenTo}`);
+    }
+    if (setting.strict === true && result.blocking) {
+      throw new LoopError(
+        "provider-audit",
+        `startup audit stopped the run: ${report.counts.error} error(s) in the provider config `
+          + `for ${report.provider}/${report.modelId} (LOOP_AUDIT_STRICT is on)`,
+      );
+    }
+  }
+
   const ports: LoopPorts = {
     beads,
     runner,
@@ -506,6 +600,7 @@ export function buildApp(config: AppConfig): App {
     presenter,
     run: async (): Promise<LoopResult> => {
       try {
+        await auditAtStartup();
         return await runLoop(ports, config);
       } finally {
         // Nothing outlives the run: no live screen, no footer claiming to be
