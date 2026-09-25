@@ -54,6 +54,7 @@ import {
   splitWireItem,
 } from "./loop-support.ts";
 import type { FakeScript, ScriptBoard } from "./loop-support.ts";
+import type { CapacityReading } from "../src/autoconfig.ts";
 import { FakeSignals, FakeTerminal, settle } from "./idle-fakes.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -110,6 +111,10 @@ interface HarnessOptions {
   abortGraceMs?: number;
   wrapUpMs?: number;
   retryUnfitWork?: boolean;
+  /** The box's admission answer, wired to `LoopPorts.capacity`. */
+  capacity?: () => Promise<CapacityReading | null>;
+  /** Startup refusals, wired to `LoopPorts.blockers`. */
+  blockers?: () => Promise<readonly string[]>;
   machine?: (state: OrchestratorState, event: OrchestratorEvent) => StepResult;
 }
 
@@ -162,6 +167,8 @@ function harness(options: HarnessOptions = {}): Harness {
     git: repo.writer,
     idle,
     ui,
+    capacity: options.capacity,
+    blockers: options.blockers,
     signals: signals.adapter,
     log: (entry) => {
       log.push(entry);
@@ -602,6 +609,159 @@ test("retryUnfitWork buys the second pass back, and the streak still ends it", a
     assert.equal(h.sessions.sessions.length, 2, "opted in, so the retry happens");
     assert.equal(result.kind, "blocked");
     assert.match(result.reason ?? "", /failed work 2 times in a row/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+// ── admission: the box gets a say before the clock starts ───────────────────
+
+function busyReading(): CapacityReading {
+  return {
+    busy: true,
+    slots: 4,
+    queued: 3,
+    inFlight: 4,
+    busyForS: 42,
+    open: false,
+    unknown: false,
+    why: "3 request(s) already queued ahead of us; 4 in flight against 4 slot(s)",
+  };
+}
+
+function openReading(): CapacityReading {
+  return {
+    busy: false,
+    slots: 4,
+    queued: 0,
+    inFlight: 0,
+    busyForS: 0,
+    open: true,
+    unknown: false,
+    why: "room to start (0/4 slots, 0 queued)",
+  };
+}
+
+test("a busy box is named before the pass, and the timeout note carries it", async () => {
+  const board = seedingTimeoutBoard();
+  let asked = 0;
+  const h = harness({
+    board,
+    scripts: [{ neverSettle: true, reply: "Still waiting my turn." }],
+    idleTexts: [],
+    timeoutMs: 25,
+    abortGraceMs: 10,
+    capacity: async () => {
+      asked += 1;
+      return busyReading();
+    },
+  });
+  try {
+    const result = await h.run();
+
+    assert.equal(asked, 1, "admission was asked once, once for the pass");
+    assert.equal(result.kind, "blocked");
+    assert.ok(
+      h.ui.warned.some((line) => /starting tst\.9 anyway with the server still busy/u.test(line)),
+      `the wait is said out loud before the work, not only after: ${h.ui.warned.join(" | ")}`,
+    );
+    const note = board.memories.get(failureKeyFor("tst.9")) ?? "";
+    assert.match(
+      note,
+      /The box was not idle when this pass started/u,
+      "the note the next reader sees names the queue, so a timeout is not read as a slow model",
+    );
+    assert.match(note, /3 request\(s\) already queued/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("an idle box produces no admission noise and no queue note", async () => {
+  const board = seedingTimeoutBoard();
+  const h = harness({
+    board,
+    scripts: [{ neverSettle: true, reply: "Working on an idle box." }],
+    idleTexts: [],
+    timeoutMs: 25,
+    abortGraceMs: 10,
+    capacity: async () => openReading(),
+  });
+  try {
+    await h.run();
+    assert.ok(
+      !h.ui.warned.some((line) => /still busy/u.test(line)),
+      h.ui.warned.join(" | "),
+    );
+    const note = board.memories.get(failureKeyFor("tst.9")) ?? "";
+    assert.ok(!/not idle when this pass started/u.test(note), note);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("an admission check that throws never stops the work", async () => {
+  const board = seedingTimeoutBoard();
+  const h = harness({
+    board,
+    scripts: [{ neverSettle: true, reply: "The probe is down; the work is not." }],
+    idleTexts: [],
+    timeoutMs: 25,
+    abortGraceMs: 10,
+    capacity: async () => {
+      throw new Error("socket hang up");
+    },
+  });
+  try {
+    const result = await h.run();
+    assert.equal(h.sessions.sessions.length, 1, "the pass ran despite the probe being down");
+    assert.ok(
+      h.ui.warned.some((line) => /capacity check failed/u.test(line)),
+      h.ui.warned.join(" | "),
+    );
+    assert.equal(result.kind, "blocked", "blocked for running out of time, as it always was");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("a blocker refuses the whole run before a single session is built", async () => {
+  const board = seedingTimeoutBoard();
+  const h = harness({
+    board,
+    scripts: [{ neverSettle: true }],
+    idleTexts: [],
+    blockers: async () => ["the API answers but the engine behind it does not"],
+  });
+  try {
+    const result = await h.run();
+    assert.equal(result.kind, "blocked");
+    assert.equal(h.sessions.sessions.length, 0, "nothing was started against a dead engine");
+    assert.match(result.reason ?? "", /engine behind it does not/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("a blockers check that throws is treated as unknown, not as a refusal", async () => {
+  const board = seedingTimeoutBoard();
+  const h = harness({
+    board,
+    scripts: [{ neverSettle: true, reply: "No blocker information; carry on." }],
+    idleTexts: [],
+    timeoutMs: 25,
+    abortGraceMs: 10,
+    blockers: async () => {
+      throw new Error("health endpoint unreachable");
+    },
+  });
+  try {
+    await h.run();
+    assert.equal(h.sessions.sessions.length, 1, "unknown blockers are not blockers");
+    assert.ok(
+      h.ui.warned.some((line) => /blocker check failed/u.test(line)),
+      h.ui.warned.join(" | "),
+    );
   } finally {
     h.dispose();
   }
@@ -1418,6 +1578,52 @@ test("the budget knobs are read, and reach the runner rather than the readme", (
   const source = readSource("app.ts");
   assert.match(source, /timeoutMs:\s*config\.workTimeoutMs/u);
   assert.match(source, /wrapUpMs:\s*config\.wrapUpMs/u);
+});
+
+test("the probe knobs are read and reach the composition root", () => {
+  const env = readEnv({
+    LOOP_HEALTH_URL: "http://box.test:8081/health",
+    LOOP_HEALTH_TIMEOUT_MS: "2500",
+    LOOP_CAPACITY_WAIT_MS: "0",
+  });
+  assert.equal(env.healthUrl, "http://box.test:8081/health");
+  assert.equal(env.healthTimeoutMs, 2_500);
+  assert.equal(env.capacityWaitMs, 0, "zero is a real setting — observe, do not wait");
+  assert.equal(readEnv({}).healthUrl, undefined, "unset means ask the provider where the box is");
+
+  const source = readSource("app.ts");
+  // The address comes from the provider unless it was configured, and the
+  // composition root must not grow its own guess about the endpoint.
+  assert.match(source, /configuredUrl:\s*config\.healthUrl/u);
+  assert.match(source, /providerBaseUrl/u);
+  assert.match(source, /resolveRunModel/u);
+  assert.match(source, /serverProfile:\s*overrides\.serverProfile/u);
+  assert.match(source, /capacity:/u);
+  assert.match(source, /blockers:/u);
+});
+
+test("the probe's derivation reads no environment and touches no socket", () => {
+  // Only `health.ts` may reach the network, and only through an injectable
+  // fetch; `autoconfig.ts` is data in, decision out. That split is what makes a
+  // captured payload a real test instead of a story about somebody's server, and
+  // why a changed contract fails here rather than at 02:00 inside a ticket.
+  const autoconfig = readSource("autoconfig.ts");
+  assert.ok(!/process\.env/.test(autoconfig), "the derivation must not read the environment");
+  assert.ok(!/fetch\s*\(/.test(autoconfig), "the derivation must not reach the network");
+  assert.ok(
+    !/Date\.now|new Date\(/.test(autoconfig),
+    "the derivation must not depend on the clock either",
+  );
+
+  const profile = readSource("profile.ts");
+  assert.ok(!/process\.env/.test(profile), "the profile is configured, never self-configured");
+  assert.ok(
+    !/fetch\s*\(/.test(profile),
+    "the profile goes through the probe instead of fetching on its own",
+  );
+
+  const health = readSource("health.ts");
+  assert.match(health, /method:\s*"GET"/u, "the probe reads; it never writes");
 });
 
 test("the wiring builds no ANSI by hand and spawns no processes of its own", () => {

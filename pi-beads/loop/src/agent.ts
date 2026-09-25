@@ -60,6 +60,8 @@ import { createRepoReader, formatRepoSnapshot, RepoError } from "./repo.ts";
 import type { RepoSnapshot } from "./repo.ts";
 import type { ContextBudget } from "./context.ts";
 import { describeContextBudget, measureContextBudget } from "./context.ts";
+import type { ServerProfile } from "./profile.ts";
+import { answerRoomFloor } from "./autoconfig.ts";
 
 /** Avoid the phantom-dependency import: borrow the SDK's own level type. */
 type ThinkingLevel = NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
@@ -723,6 +725,16 @@ export interface SessionSpec {
   readonly systemPromptOverride?: string;
   readonly thinkingLevel?: ThinkingLevel;
   readonly modelRef?: { provider: string; id: string };
+  /**
+   * The probed server profile. When present, the factory patches the resolved
+   * model with the box's own limits before pi sees it.
+   *
+   * Absent means no probe ran — which is not the same as "probed and found
+   * nothing", and the distinction is in the log either way. Nothing here
+   * invents a model: a profile without a resolved model is a report about a box
+   * nobody is going to call.
+   */
+  readonly serverProfile?: ServerProfile;
 }
 
 export type SessionFactory = (spec: SessionSpec) => Promise<AgentSessionLike>;
@@ -796,6 +808,25 @@ export function resolveModelForRun(
   return undefined;
 }
 
+/**
+ * Resolve the model this run will use, without opening a session.
+ *
+ * The composition root needs one fact from the provider — which box is this? —
+ * and the only honest source for that is the same resolution a session would do.
+ * Duplicating it in `app.ts` would give the probe a *second* opinion about the
+ * endpoint, and the two would drift the first time a settings override changes
+ * the answer. So the question is asked here, where the answer lives, by the same
+ * code path `defaultSessionFactory` takes.
+ */
+export async function resolveRunModel(
+  cwd: string,
+  ref?: { provider: string; id: string },
+): Promise<SessionModel | undefined> {
+  const runtime = await getModelRuntime();
+  const settings = SettingsManager.create(cwd, getAgentDir());
+  return resolveModelForRun(runtime, settings, ref);
+}
+
 function isThinkingLevel(value: string): value is ThinkingLevel {
   return Object.prototype.hasOwnProperty.call(THINKING_LEVEL_LOOKUP, value);
 }
@@ -847,6 +878,60 @@ export function resolveThinkingLevelForRun(
 }
 
 /**
+ * The resolved model with the probe's limits applied, if a probe ran.
+ *
+ * Pulled out of the factory so the branch is testable without a live SDK: the
+ * case that matters is "a profile exists but no model resolved", where the right
+ * answer is still no model. Patching a profile onto nothing would mean inventing
+ * a model to hang the profile on — the one thing a resolver must never do.
+ */
+export function modelWithServerProfile(
+  model: SessionModel | undefined,
+  profile: ServerProfile | undefined,
+): SessionModel | undefined {
+  if (model === undefined || profile === undefined) return model;
+  return profile.patchModel(model) as SessionModel;
+}
+
+/**
+ * A per-level cap on reasoning tokens. Mirrors `ThinkingBudgetsSettings` in
+ * pi's settings-manager, restated because that type is not re-exported from the
+ * package root; the drift test in `test/agent.test.ts` reads pi's own
+ * declaration and fails if the two drift apart.
+ */
+export interface ThinkingBudgets {
+  readonly minimal?: number;
+  readonly low?: number;
+  readonly medium?: number;
+  readonly high?: number;
+}
+
+/**
+ * The in-memory settings every session runs on.
+ *
+ * Compaction off is the amnesia story. What this helper exists to prevent is the
+ * other half of that sentence being read too broadly: "in-memory settings" must
+ * not mean "no settings". pi reads `thinkingBudgets` off the *session's*
+ * settings manager, so a manager built with only `compaction` in it silently
+ * drops the reasoning caps the operator configured — and then sends an
+ * uncapped thinking phase on every request while the log implies the level was
+ * respected. Anything the user set that this loop does not deliberately override
+ * is carried across.
+ *
+ * This is the piece that makes a derived `thinkingTokenBudgetField` more than a
+ * field name: without a budget on the wire the server caps nothing, and the
+ * answer-room rule is the only guard there is.
+ */
+export function sessionSettingsInit(source: {
+  getThinkingBudgets?(): ThinkingBudgets | undefined;
+}): { compaction: { enabled: boolean }; thinkingBudgets?: ThinkingBudgets } {
+  const budgets = source.getThinkingBudgets?.();
+  return budgets === undefined
+    ? { compaction: { enabled: false } }
+    : { compaction: { enabled: false }, thinkingBudgets: budgets };
+}
+
+/**
  * The production session factory.
  *
  * `SessionManager.inMemory()` + `SettingsManager.inMemory({compaction:{enabled:false}})`
@@ -858,12 +943,17 @@ export const defaultSessionFactory: SessionFactory = async (spec) => {
   const runtime = await getModelRuntime();
   const diskSettings = SettingsManager.create(spec.cwd, getAgentDir());
   const model = resolveModelForRun(runtime, diskSettings, spec.modelRef);
+  // The probe's numbers over the declared ones, because facts about the box beat
+  // claims about it. `patchModel` merges rather than replaces — a declared
+  // `preserve_thinking` survives — and never conjures a model where none
+  // resolved: a profile about a box with nothing configured is still no model.
+  const profiled = modelWithServerProfile(model, spec.serverProfile);
   // Resolved, never assigned: the caller's level if it named one, else the user's
   // configured default, else pi's own. A hard-coded level here made every ticket
   // run at whatever this file said, with nothing in the config able to overrule
   // it — and neither work nor split could be pitched differently from the other.
   const thinkingLevel = resolveThinkingLevelForRun(diskSettings, spec.thinkingLevel);
-  const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false } });
+  const settingsManager = SettingsManager.inMemory(sessionSettingsInit(diskSettings));
 
   const options: CreateAgentSessionOptions = {
     cwd: spec.cwd,
@@ -873,8 +963,8 @@ export const defaultSessionFactory: SessionFactory = async (spec) => {
     settingsManager,
     customTools: [...spec.customTools],
   };
-  if (model !== undefined) {
-    options.model = model;
+  if (profiled !== undefined) {
+    options.model = profiled;
   }
   if (spec.noBuiltinTools === true) {
     // The default prompt would advertise tools this session does not have. Rather
@@ -1470,6 +1560,12 @@ export interface AgentRunnerOptions {
   readonly cwd?: string;
   /** Explicit model; otherwise pi's configured default is used. Never env. */
   readonly modelRef?: { provider: string; id: string };
+  /**
+   * The probed server profile, built in the composition root. Threads the
+   * box's own limits into every session this runner opens, and the server's
+   * answer-room rule into the context guard.
+   */
+  readonly serverProfile?: ServerProfile;
   readonly workThinkingLevel?: ThinkingLevel;
   readonly splitThinkingLevel?: ThinkingLevel;
   /** Injectable clock, so elapsed time is testable. */
@@ -1532,6 +1628,7 @@ interface ContextStopped {
 function contextBudgetFor(
   session: AgentSessionLike,
   usage: { input?: number; cacheRead?: number } | undefined,
+  unworkableOutputTokens?: number,
 ): ContextBudget | null {
   const model = session.model;
   if (model === undefined || usage === undefined) return null;
@@ -1541,6 +1638,9 @@ function contextBudgetFor(
     windowTokens: model.contextWindow,
     maxOutputTokens: model.maxTokens,
     usedTokens,
+    // The server's own answer-room rule when the probe read one; undefined lets
+    // `context.ts` fall back to this loop's constant.
+    unworkableOutputTokens,
   });
 }
 
@@ -1565,6 +1665,12 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
   let created = 0;
   let disposed = 0;
   const wrapUpMs = options.wrapUpMs;
+  // The server's answer-room rule, read once. Applied per measurement against the
+  // budget actually granted, because the rule is a percentage of it — which
+  // makes the honest floor track the model rather than a constant in this file.
+  const answerRoom = options.serverProfile?.answerRoom();
+  const serverFloor = (grantedMaxTokens: number): number | undefined =>
+    answerRoom === undefined ? undefined : answerRoomFloor(answerRoom, grantedMaxTokens);
 
   async function disposeSession(entry: LiveSession): Promise<boolean> {
     if (entry.disposed) return false;
@@ -1617,6 +1723,7 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
       customTools: tools,
       thinkingLevel,
       modelRef: options.modelRef,
+      serverProfile: options.serverProfile,
       noBuiltinTools: kind === "split",
       // A session with nothing but its report tool has to be told so; see
       // {@link bareToolsetSystemPrompt}.
@@ -1662,7 +1769,11 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
       const message = event.message;
       if (message === undefined || message.role !== "assistant") return;
       assistantTurns += 1;
-      const budget = contextBudgetFor(session, message.usage);
+      const budget = contextBudgetFor(
+        session,
+        message.usage,
+        serverFloor(session.model?.maxTokens ?? 0),
+      );
       if (budget === null || !budget.exhausted) return;
       contextStopped = true;
       stopForContext?.({ kind: "context", budget, turns: assistantTurns });

@@ -29,7 +29,9 @@ import {
   extractLastFencedJson,
   isDone,
   lastAssistantText,
+  modelWithServerProfile,
   parseThinkingLevel,
+  sessionSettingsInit,
   resolveModelForRun,
   resolveThinkingLevelForRun,
   toWorkEvent,
@@ -56,6 +58,7 @@ import type {
 } from "../src/agent.ts";
 import { BdError } from "../src/beads.ts";
 import { RepoError } from "../src/repo.ts";
+import type { ServerProfile } from "../src/profile.ts";
 import type { RepoReaderLike } from "../src/agent.ts";
 import { measureContextBudget } from "../src/context.ts";
 import type { BdClient, Issue, NewIssueSpec } from "../src/beads.ts";
@@ -455,6 +458,7 @@ function runnerHarness(
     repoError?: boolean;
     workThinkingLevel?: ThinkingLevel;
     splitThinkingLevel?: ThinkingLevel;
+    serverProfile?: ServerProfile;
   } = {},
 ): RunnerHarness {
   const sessions: FakeSession[] = [];
@@ -491,6 +495,7 @@ function runnerHarness(
     wrapUpMs: options.wrapUpMs,
     workThinkingLevel: options.workThinkingLevel,
     splitThinkingLevel: options.splitThinkingLevel,
+    serverProfile: options.serverProfile,
     now: clock.now,
     onEvent: (event) => events.push(event),
   });
@@ -2033,6 +2038,126 @@ test("nothing in agent.ts assigns a thinking level literal", () => {
     "a hard-coded level makes every ticket run at whatever this file says, with " +
       "nothing in the config able to overrule it",
   );
+});
+
+// ── the probed server profile ────────────────────────────────────────────
+
+/** shaped like `createServerProfile`'s output, with only what a test needs overridden. */
+function fakeProfile(overrides: Partial<ServerProfile> = {}): ServerProfile {
+  const bare: ServerProfile = {
+    derived: () => null,
+    health: () => null,
+    resolveFor: () => null,
+    patchModel: (model) => model,
+    answerRoom: () => undefined,
+    awaitCapacity: async () => null,
+    describe: () => [],
+    notes: () => [],
+    blockers: () => [],
+    live: () => false,
+  };
+  return { ...bare, ...overrides };
+}
+
+test("in-memory settings carry the user's reasoning budgets instead of dropping them", () => {
+  // pi reads `thinkingBudgets` off the session's own settings manager. A
+  // manager holding only `compaction` therefore drops the caps the operator
+  // configured and sends an uncapped thinking phase while the log implies a
+  // level was honoured. This helper is the seam where that is not allowed to happen.
+  assert.deepEqual(sessionSettingsInit({}), { compaction: { enabled: false } });
+  assert.deepEqual(sessionSettingsInit({ getThinkingBudgets: () => undefined }), {
+    compaction: { enabled: false },
+  });
+  assert.deepEqual(
+    sessionSettingsInit({ getThinkingBudgets: () => ({ high: 4_000, low: 256 }) }),
+    { compaction: { enabled: false }, thinkingBudgets: { high: 4_000, low: 256 } },
+  );
+});
+
+test("the mirrored budget shape still matches pi's (drift guard)", () => {
+  const packageRoot = import.meta.resolve("@earendil-works/pi-coding-agent");
+  const source = readFileSync(new URL("./core/settings-manager.d.ts", packageRoot), "utf8");
+  const declared = /export interface ThinkingBudgetsSettings \{([\s\S]*?)\}/u.exec(source);
+  if (declared === null) throw new Error("pi's ThinkingBudgetsSettings is not where this module says it lives");
+  const body = declared[1] ?? "";
+  const fields = [...body.matchAll(/(\w+)\?:\s*number/gu)]
+    .map((match) => match[1])
+    .filter((name): name is string => typeof name === "string")
+    .sort();
+  assert.deepEqual(fields, ["high", "low", "medium", "minimal"], "pi changed the budget knobs");
+});
+
+test("pi still reads the budgets from the session's settings manager (drift guard)", () => {
+  // If this stops matching, `sessionSettingsInit` carries a value into a place
+  // pi no longer reads, and a reasoning cap has quietly become decoration.
+  const packageRoot = import.meta.resolve("@earendil-works/pi-coding-agent");
+  const source = readFileSync(new URL("./core/sdk.js", packageRoot), "utf8");
+  assert.match(
+    source,
+    /thinkingBudgets:\s*settingsManager\.getThinkingBudgets\(\)/u,
+    "pi no longer sources thinkingBudgets from the session's settings manager",
+  );
+});
+
+test("the profile travels to the session spec so the factory can patch the model", async () => {
+  const profile = fakeProfile();
+  const h = runnerHarness([{ tools: [{ name: "report_done", params: DONE_PARAMS }] }], {
+    serverProfile: profile,
+  });
+  await h.runner.run("loop-42");
+  assert.equal(h.specs.length, 1);
+  assert.equal(h.specs[0]?.serverProfile, profile, "the factory is the thing that applies it");
+});
+
+test("a profile never invents a model that was not configured", () => {
+  const model = { id: "a", maxTokens: 100, contextWindow: 1_000 } as never;
+  const patched = { id: "a", maxTokens: 100, contextWindow: 2_000 } as never;
+  assert.equal(
+    modelWithServerProfile(model, fakeProfile({ patchModel: () => patched })),
+    patched,
+    "with both, the patch applies",
+  );
+  assert.equal(modelWithServerProfile(undefined, fakeProfile()), undefined, "no model, no model");
+  assert.equal(modelWithServerProfile(undefined, fakeProfile({ patchModel: () => patched })), undefined,
+    "a profile about a box with nothing configured is still no model");
+  assert.equal(modelWithServerProfile(model, undefined), model, "no probe, declared stands");
+});
+
+test("the box's answer-room rule stops the run where the loop's own guess would not", async () => {
+  // Same session, same usage, same window. The only difference is the floor the
+  // probe read. Without it the run is still above this loop's own 2048-token
+  // guess and carries on until the clock stops it; with the box's rule —
+  // max(1024, 15% of the granted 32768) = 4916 — the next answer could not be
+  // that small, so the run stops as out of room instead of spending minutes on
+  // a turn that cannot finish.
+  const script = {
+    model: { contextWindow: 128_000, maxTokens: 32_768 },
+    turnUsage: [{ input: 119_904 }],
+    tools: [{ name: "report_done", params: REFUSED }],
+    neverSettle: true,
+  };
+
+  const plain = runnerHarness([script], { timeoutMs: 40, abortGraceMs: 10 });
+  const plainOutcome = await plain.runner.run("loop-42");
+  plain.sessions[0]?.release();
+  assert.equal(plainOutcome.kind, "timeout", "no probe: the clock ends it, not the wall");
+
+  const probed = runnerHarness([script], {
+    timeoutMs: 40,
+    abortGraceMs: 10,
+    serverProfile: fakeProfile({ answerRoom: () => ({ floorTokens: 1_024, percentOfMaxTokens: 15 }) }),
+  });
+  const probedOutcome = await probed.runner.run("loop-42");
+  probed.sessions[0]?.release();
+
+  assert.equal(probedOutcome.kind, "context-exhausted", JSON.stringify(probedOutcome, null, 2));
+  if (probedOutcome.kind !== "context-exhausted") return;
+  assert.equal(probedOutcome.budget.grantedOutputTokens, 4_000);
+  assert.ok(
+    probedOutcome.budget.grantedOutputTokens <= 4_916,
+    "the granted answer is below the box's own answer room",
+  );
+  assert.match(describeFailure(probedOutcome), /context exhausted/u);
 });
 
 // ── test utilities ──────────────────────────────────────────────────────────

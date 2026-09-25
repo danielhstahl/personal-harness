@@ -27,6 +27,10 @@ import { createSplitter, portFromAgentRunner } from "./split.ts";
 import type { Splitter } from "./split.ts";
 import { createGitWriter } from "./vcs.ts";
 import type { GitWriter } from "./vcs.ts";
+import { createServerProfile } from "./profile.ts";
+import type { ServerProfile } from "./profile.ts";
+import { resolveProbeTarget, type ProbeTarget } from "./health.ts";
+import { resolveRunModel } from "./agent.ts";
 
 export interface AppConfig extends LoopConfig {
   /** Repository and board live here. */
@@ -53,6 +57,28 @@ export interface AppConfig extends LoopConfig {
    */
   readonly workThinkingLevel?: ThinkingLevel;
   readonly splitThinkingLevel?: ThinkingLevel;
+  /**
+   * Overrides the `/health` endpoint the provider's own `baseUrl` implies.
+   *
+   * Leave it unset and the loop asks pi which box it is going to talk to — the
+   * resolved model's `baseUrl` — and derives `…/health` from that, so moving
+   * `models.json` moves the probe with it. Set it only where the derivation is
+   * wrong: a separate management port, or a proxy that fronts the API but not
+   * the box.
+   *
+   * Either way the probe is what lets the loop read the box's own limits — the
+   * window, the output cap, whether the thinking knob reaches the wire at all,
+   * whether anything is queued — instead of trusting `models.json`.
+   */
+  readonly healthUrl?: string;
+  /** Per-probe timeout. Default 5s. */
+  readonly healthTimeoutMs?: number;
+  /**
+   * How long a pass may wait for a free server slot before starting anyway.
+   * The wait happens before the pass clock is armed, so queued time is not
+   * charged to the ticket. Default 90s; `0` observes without waiting.
+   */
+  readonly capacityWaitMs?: number;
   readonly themeName?: string;
   /**
    * The live surface's cadence, in ms.
@@ -93,6 +119,12 @@ export interface AppConfig extends LoopConfig {
      * log-only spike, where a live surface would paint over the transcript.
      */
     readonly presenter?: WorkPresenter | null;
+    /**
+     * A resolved server profile. {@link runApp} builds one from `healthUrl`;
+     * tests hand one in over a fake fetch. Absent means no probe, and every
+     * consumer falls back to the declared config.
+     */
+    readonly serverProfile?: ServerProfile;
   };
 }
 
@@ -300,6 +332,22 @@ export function buildApp(config: AppConfig): App {
     return unitsIssued;
   };
 
+  // What the probe learned, printed before anything runs. These lines are the
+  // difference between a configured value and a value that arrived off the
+  // network: without them the two look identical in the terminal, and the only
+  // way to tell them apart is to read the code that chose them.
+  for (const line of overrides.serverProfile?.describe() ?? []) {
+    presenter.notice("info", line);
+  }
+  // The full adoption trail under `verbose`. The compact line says what the loop
+  // decided; this says why, one field at a time, which is the difference between
+  // grepping a log and reading a module.
+  if (config.verbose === true) {
+    for (const note of overrides.serverProfile?.notes() ?? []) {
+      presenter.notice("info", `  · ${note}`);
+    }
+  }
+
   /**
    * Only one surface may hold the terminal at a time. While the idle prompt is
    * up it owns the keyboard, so the presenter must not take the live path —
@@ -326,6 +374,7 @@ export function buildApp(config: AppConfig): App {
       wrapUpMs: config.wrapUpMs,
       workThinkingLevel: config.workThinkingLevel,
       splitThinkingLevel: config.splitThinkingLevel,
+      serverProfile: overrides.serverProfile,
       // The streaming half of the seam: every runner event lands on the
       // presenter, which is the only thing that draws them.
       onEvent: (event) => presenter.feed(event),
@@ -491,6 +540,17 @@ export function buildApp(config: AppConfig): App {
     git,
     idle,
     ui,
+    // Admission, asked before each pass so queue time is not charged to the
+    // ticket. Undefined without a probe: the loop then behaves exactly as it did
+    // before, blind to the box and no worse off for it.
+    capacity:
+      overrides.serverProfile === undefined
+        ? undefined
+        : () => overrides.serverProfile!.awaitCapacity(),
+    blockers:
+      overrides.serverProfile === undefined
+        ? undefined
+        : async () => overrides.serverProfile!.blockers(),
     signals: overrides.signals ?? {
       on(signal: string, handler: () => void) {
         process.on(signal, handler);
@@ -517,7 +577,64 @@ export function buildApp(config: AppConfig): App {
   };
 }
 
-/** Build and run. The single entry the CLI and the spike share. */
+/**
+ * Where to probe, and why.
+ *
+ * The provider's own `baseUrl` is the default because it is the address the run
+ * will actually use. A second URL in the environment describes the same box
+ * twice, and the second one goes stale the first time `models.json` moves —
+ * after which the probe reports the limits of a machine nobody is talking to,
+ * which is worse than reporting nothing. `LOOP_HEALTH_URL` stays as the
+ * override for what the guess cannot express: a separate management port, or a
+ * proxy that fronts the API but not the box.
+ *
+ * A model that will not resolve is reported as the reason there is no probe
+ * rather than raised here — the run raises it itself, better, at the point where
+ * it needs a model.
+ */
+async function probeTargetForRun(config: AppConfig): Promise<ProbeTarget> {
+  let providerBaseUrl: string | undefined;
+  let providerNote: string | undefined;
+  try {
+    const model = await resolveRunModel(config.cwd, config.modelRef);
+    providerBaseUrl = model?.baseUrl;
+    if (model === undefined) {
+      providerNote =
+        "pi has no configured default model, so there is no box to ask; " +
+        "using the declared model config";
+    }
+  } catch (error) {
+    providerNote =
+      `the box is unknown because the model could not be resolved ` +
+      `(${error instanceof Error ? error.message : String(error)}); using the declared model config`;
+  }
+  return resolveProbeTarget({
+    configuredUrl: config.healthUrl,
+    providerBaseUrl,
+    providerNote,
+  });
+}
+
+/**
+ * Build and run. The single entry the CLI and the spike share.
+ *
+ * The probe happens here rather than inside `buildApp` because it is the one
+ * piece of setup that needs the network, and `buildApp` stays synchronous — a
+ * composition root that blocks on a GET is a composition root nobody can test.
+ * A failed probe is not an error here: the profile carries the reason, prints
+ * it, and the declared config stands.
+ */
 export async function runApp(config: AppConfig): Promise<LoopResult> {
-  return buildApp(config).run();
+  if (config.overrides?.serverProfile !== undefined) {
+    return buildApp(config).run();
+  }
+  const serverProfile = await createServerProfile({
+    target: await probeTargetForRun(config),
+    timeoutMs: config.healthTimeoutMs,
+    waitMs: config.capacityWaitMs,
+  });
+  return buildApp({
+    ...config,
+    overrides: { ...config.overrides, serverProfile },
+  }).run();
 }

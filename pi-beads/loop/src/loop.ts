@@ -61,6 +61,7 @@ import { BdError, selectWorkable } from "./beads.ts";
 import type { BdClient, Issue } from "./beads.ts";
 import type { AgentRunner, WorkOutcome } from "./agent.ts";
 import { describeFailure, toWorkEvent } from "./agent.ts";
+import type { CapacityReading } from "./autoconfig.ts";
 import type { FinalizeOutcome, FinalizeRequest } from "./finalize.ts";
 import { describeFinalizeFailure, toFinalizeEvents } from "./finalize.ts";
 import type { IdleOutcome } from "./idle.ts";
@@ -133,6 +134,26 @@ export interface LoopPorts {
   readonly signals?: LoopSignalAdapter;
   readonly log?: (entry: LoopLogEntry) => void;
   readonly now?: () => number;
+  /**
+   * The model box's admission control, when a health probe is configured.
+   *
+   * Called before each pass — deliberately *before* that pass's clock is armed.
+   * A request sitting in the server's queue is not work, and charging queue time
+   * to the ticket is what makes "timed out at 20:00 of a 20:00 budget" describe
+   * a wait rather than a slow model. That is the most misleading thing this loop
+   * can print, so the wait happens here and is reported separately.
+   *
+   * Never a blocker. A port that cannot answer returns null and the pass starts:
+   * the probe is an improvement on the old blind behaviour, not a dependency of
+   * it. Callers must not fail a run because a status endpoint had a bad day.
+   */
+  readonly capacity?: () => Promise<CapacityReading | null>;
+  /**
+   * Reasons not to start the run at all, checked once in preflight. Pairs with
+   * {@link LoopPorts.capacity}: capacity says "wait a moment", blockers say
+   * "there is nothing to run against". Failing open on error, same as capacity.
+   */
+  readonly blockers?: () => Promise<readonly string[]>;
 }
 
 /** Narrowed so a test can hand in a scripted finalizer. */
@@ -685,6 +706,14 @@ export async function runLoop(
   }
 
   async function handleRun(effect: AgentRunEffect): Promise<readonly Effect[]> {
+    // Ask the box for room before arming the clock, so the budget measures work.
+    const admission = await readAdmission();
+    if (admission !== null && !admission.open) {
+      warn(
+        `starting ${effect.issueId} anyway with the server still busy: ${admission.why}. ` +
+          "Anything this pass times out on includes that wait",
+      );
+    }
     const outcome = await ports.runner.run(effect.issueId);
     lastWork = outcome;
     if (outcome.kind === "done") {
@@ -710,7 +739,41 @@ export async function runLoop(
     }
     effects.push({ kind: effect.kind, detail: `${effect.issueId}:${outcome.kind}` });
     log("info", `work on ${effect.issueId} ended ${outcome.kind} (${outcome.elapsedMs}ms)`);
-    return feed(toWorkEvent(outcome));
+    const event = toWorkEvent(outcome);
+    // A timeout on a box that was already busy is a different diagnosis from a
+    // timeout on an idle one, and the note is read by both a human and the next
+    // attempt. Put the queue fact where the failure fact already is.
+    if (
+      admission !== null &&
+      !admission.open &&
+      event.type === "work_failed" &&
+      (outcome.kind === "timeout" || outcome.kind === "context-exhausted")
+    ) {
+      return feed({ ...event, reason: appendAdmissionNote(event.reason, admission) });
+    }
+    return feed(event);
+  }
+
+  /**
+   * Read the capacity gate, failing open. A throwing probe is a missing fact, not
+   * a stopped loop — see {@link LoopPorts.capacity}.
+   */
+  async function readAdmission(): Promise<CapacityReading | null> {
+    if (ports.capacity === undefined) return null;
+    try {
+      return await ports.capacity();
+    } catch (error) {
+      warn(`capacity check failed, starting without it: ${kindOf(error)}: ${messageOf(error)}`);
+      return null;
+    }
+  }
+
+  function appendAdmissionNote(reason: string, reading: CapacityReading): string {
+    return (
+      `${reason}\n\nThe box was not idle when this pass started: ${reading.why}. Some of the elapsed ` +
+      "time above may be that wait rather than thinking — if it is, the ticket may be fine and the " +
+      "server was simply full"
+    );
   }
 
   async function handleDropContext(effect: DropContextEffect): Promise<readonly Effect[]> {
@@ -1040,24 +1103,72 @@ export async function runLoop(
 
   // ── preflight ───────────────────────────────────────────────────────────
 
-  async function preflight(): Promise<string | null> {
+  /**
+   * Why the run will not start, and which of the two kinds of "will not start"
+   * it is. A discriminated result rather than a bare string so the driver cannot
+   * flatten a refused job into a broken installation: the two want different
+   * exit codes and different follow-up from whoever is watching.
+   */
+  type PreflightFailure =
+    | { readonly kind: "blocked"; readonly message: string }
+    | { readonly kind: "fatal"; readonly message: string };
+
+  async function preflight(): Promise<PreflightFailure | null> {
+    // Server blockers first, and reported as `blocked` rather than `fatal`: a
+    // box that refuses this run is a known reason to stop and tell a human,
+    // which is what `blocked` means here. `fatal` stays reserved for the loop
+    // itself not working — no board, no work tree — a broken install rather
+    // than a refused job.
+    const blockers = await readBlockers();
+    if (blockers.length > 0) {
+      return {
+        kind: "blocked",
+        message: `the model server refuses this run: ${blockers.join("; ")}`,
+      };
+    }
     try {
       await ports.beads.listReady({ limit: 1 });
     } catch (error) {
       const kind = kindOf(error);
       if (kind === "missing-binary") {
-        return "bd is not installed or not on PATH — this loop has no board without it";
+        return {
+          kind: "fatal",
+          message: "bd is not installed or not on PATH — this loop has no board without it",
+        };
       }
-      return `the board could not be read (${kind}): ${messageOf(error)}. ` +
-        "Is this directory's beads database initialised?";
+      return {
+        kind: "fatal",
+        message:
+          `the board could not be read (${kind}): ${messageOf(error)}. ` +
+          "Is this directory's beads database initialised?",
+      };
     }
     try {
       await ports.git.repoRoot();
     } catch (error) {
-      return `this is not a git work tree (${kindOf(error)}): ${messageOf(error)}. ` +
-        "A loop that cannot commit has nowhere to put its work";
+      return {
+        kind: "fatal",
+        message:
+          `this is not a git work tree (${kindOf(error)}): ${messageOf(error)}. ` +
+          "A loop that cannot commit has nowhere to put its work",
+      };
     }
     return null;
+  }
+
+  /**
+   * Reasons the probe has to refuse the whole run. Failing open: a port that
+   * throws has told us nothing, and "the status endpoint was unreachable" must
+   * not become "no work happened today".
+   */
+  async function readBlockers(): Promise<readonly string[]> {
+    if (ports.blockers === undefined) return [];
+    try {
+      return (await ports.blockers()).filter((line) => line.trim() !== "");
+    } catch (error) {
+      warn(`blocker check failed, continuing without it: ${kindOf(error)}: ${messageOf(error)}`);
+      return [];
+    }
   }
 
   // ── signals ─────────────────────────────────────────────────────────────
@@ -1091,7 +1202,7 @@ export async function runLoop(
   try {
     if (config.preflight !== false) {
       const problem = await preflight();
-      if (problem !== null) return finish("fatal", problem);
+      if (problem !== null) return finish(problem.kind, problem.message);
     }
 
     if (config.dryRun === true) {

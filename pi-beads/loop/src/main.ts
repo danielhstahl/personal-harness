@@ -63,6 +63,13 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
     retryUnfitWork: flag("LOOP_RETRY_UNFIT_WORK"),
     workThinkingLevel: thinking("LOOP_WORK_THINKING"),
     splitThinkingLevel: thinking("LOOP_SPLIT_THINKING"),
+    /**
+     * Overrides the health endpoint implied by the provider's `baseUrl`. See
+     * `AppConfig.healthUrl`.
+     */
+    healthUrl: source.LOOP_HEALTH_URL,
+    healthTimeoutMs: number("LOOP_HEALTH_TIMEOUT_MS"),
+    capacityWaitMs: number("LOOP_CAPACITY_WAIT_MS"),
     maxIterations: number("LOOP_MAX_ITERATIONS"),
     themeName: source.PI_THEME,
     dryRun: flag("LOOP_DRY_RUN"),

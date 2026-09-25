@@ -1,0 +1,118 @@
+{
+  "_capture": "Captured from the developer's llama.cpp-compatible server (the box at LOOP_HEALTH_URL). This file is the drift anchor: `src/autoconfig.ts` reads these field names and `test/autoconfig.test.ts` pins the values it derives from them. Regenerate with `curl -sS \"$LOOP_HEALTH_URL\" | python3 -m json.tool > test/fixtures/health-halogen.json` and expect the pinned tests to fail — that failure is the point. Read it, decide what the new contract means, update both. Do not regenerate blindly and do not delete a pin because the server moved.",
+  "status": "ok",
+  "model": "halogen-2.2-27b-it-q8_0",
+  "context": 262144,
+  "rope_scaling": "yarn",
+  "indexer_budget": 2048,
+  "vision": {
+    "enabled": false,
+    "disabled_because": ["no vision projector in this checkpoint"]
+  },
+  "version": {
+    "api": "1.4.0",
+    "engine": "1.4.0",
+    "match": true
+  },
+  "engine": {
+    "responds": true,
+    "probe_s": 0.004
+  },
+  "busy": false,
+  "slots": 4,
+  "slot_ctx": 262144,
+  "kv_pool_positions": 262144,
+  "in_flight": 0,
+  "busy_for_s": 0,
+  "queued": 0,
+  "prompt_cache": {
+    "enabled": true,
+    "idle_ttl_s": 300
+  },
+  "tool_calls": {
+    "wire_format": "openai",
+    "streaming": true,
+    "parallel_tool_calls": true,
+    "constrained_decoding": true,
+    "forced_call_disables_thinking": true
+  },
+  "supported": [
+    "chat_completions",
+    "streaming",
+    "reasoning_effort",
+    "tools",
+    "parallel_tool_calls",
+    "prompt_cache",
+    "max_thinking_tokens",
+    "logprobs"
+  ],
+  "not_implemented": [
+    "top_logprobs",
+    "n>1",
+    "logit_bias",
+    "stop sequences longer than one",
+    "audio",
+    "realtime"
+  ],
+  "accepted_but_ignored": [
+    "user",
+    "seed when sampling is greedy"
+  ],
+  "reasoning_effort_default": "xhigh",
+  "reasoning_effort_values": [
+    "high",
+    "low",
+    "medium",
+    "minimal",
+    "none",
+    "xhigh"
+  ],
+  "token_budget_covers_reasoning": true,
+  "max_thinking_tokens_default": null,
+  "thinking_answer_room": "max(1024, 15% of max_tokens)",
+  "thinking_control_aliases": [
+    "thinking_budget",
+    "thinking_token_budget",
+    "thinking_budget_tokens",
+    "max_thinking_tokens"
+  ],
+  "chat_template_kwargs": [
+    "reasoning_effort",
+    "enable_thinking",
+    "preserve_thinking"
+  ],
+  "structured_output": {
+    "enabled": true,
+    "sampling": "greedy only",
+    "refused": [
+      "pattern",
+      "format",
+      "allOf",
+      "anyOf",
+      "oneOf",
+      "not",
+      "if",
+      "then",
+      "else",
+      "uniqueItems",
+      "minLength",
+      "maxLength"
+    ],
+    "accepted_not_enforced": []
+  },
+  "sampling": {
+    "implemented": [
+      "temperature",
+      "top_p",
+      "top_k",
+      "min_p",
+      "presence_penalty",
+      "frequency_penalty",
+      "repetition_penalty",
+      "seed"
+    ],
+    "not_implemented": ["logit_bias"]
+  },
+  "max_tokens_cap": 65536,
+  "max_tokens_default": 8192
+}

@@ -38,6 +38,12 @@ src/split.ts         SPLIT — a request in, a recorded epic plus ordered childr
 src/finalize.ts      FINALIZE — commit, then remember, then close; or nothing at all
 src/vcs.ts           the ONLY module that shells out to `git` (typed, side-effect-safe)
 src/beads.ts         the ONLY module that shells out to `bd` (typed, side-effect-safe)
+src/health.ts        the ONLY module that touches the model box: one GET of /health,
+                   typed payload, discriminated failure, no retry
+src/autoconfig.ts    pure: the report → the model patch, the answer-room rule, the
+                   capacity reading, the notes and the refusals
+src/profile.ts       the holder: probe once, carry that decision to the session
+                   factory, the context guard, and the interpreter's admission check
 src/idle.ts          the idle surface: pi's own TUI input, clean exits, raw text back.
                      Single-shot by contract — one surface answers once, then it is
                      torn down, so the root builds a fresh one per idle turn
@@ -257,6 +263,112 @@ cannot check, and why the note a timed-out attempt leaves says whose limit it wa
 before it says anything else (see "What the next attempt reads"). The replay is
 paid for on purpose; what it should be carrying is work, not anxiety about the
 harness.
+
+### Ask the box: `/health` as the source of the limits
+
+Everything the loop needs about the model server — the window, the output cap,
+whether the thinking knob reaches the wire at all, whether anything is queued —
+used to live in a hand-maintained `models.json`. That file is a *claim*. A claim
+larger than the engine is a 400 at the wall; a claim smaller wastes a fifth of
+the room; and a thinking level the endpoint silently drops is indistinguishable,
+from the terminal, from one it honoured. The server publishes its own truth at
+`/health`, so the loop reads it.
+
+```bash
+# nothing required: the address comes from the provider's own baseUrl
+#   models.json: baseUrl = http://llm.home:8081/v1  →  probe http://llm.home:8081/health
+
+LOOP_HEALTH_URL=http://mgmt:9000/health      # override: separate management port / proxy
+LOOP_HEALTH_TIMEOUT_MS=5000                  # per probe
+LOOP_CAPACITY_WAIT_MS=90000                  # how long a pass may wait for a free slot
+```
+
+The probe address is **not** configured beside the model URL, because two
+settings describing one box is one that goes stale: move `models.json` and a
+hand-set health URL keeps reporting the limits of a machine nobody is talking to,
+which is worse than reporting nothing. So `resolveRunModel` asks pi which model
+this run will use — the same resolution a session performs, not a second guess —
+and `…/health` is derived from its `baseUrl`, preserving any mount prefix
+(`/gpu1/v1` → `/gpu1/health`). `LOOP_HEALTH_URL` remains for the topology the
+derivation cannot express, and wins when set.
+
+Whatever it probes, the startup line says which address and where it came from:
+
+```
+server probe: http://llm.home:8081/health (from the provider's baseUrl http://llm.home:8081/v1) 13ms
+```
+
+Three modules, split by what touches the world:
+
+- `src/health.ts` — one `GET`, one timeout, no retry, typed payload, a
+discriminated result. A field it cannot read stays `undefined`; deriving
+`contextWindow: 0` from a missing field would make every later guard pass while
+the request fails, which is the worst possible failure because it looks like the
+guard working.
+- `src/autoconfig.ts` — pure. `deriveFromHealth(health, declared)` returns the
+model patch, the answer-room rule, a capacity reading, and the notes/warnings/
+blockers. Same payload, same decision, no clock, no network, no env.
+- `src/profile.ts` — the holder. Probe once at startup, carry the decision to
+the three places that need it (the session factory, the context guard, the
+interpreter's admission check).
+
+**Precedence.** Facts about the server — window, cap, whether `reasoning_effort`
+exists, whether the box is busy — the report wins. Choices the operator made —
+`preserve_thinking`, which level a pass runs at, the budget — `models.json`
+always wins; the derive *adds* what is missing and reports what it could not
+honour. Every adoption prints with the field it came from, so a value that
+arrived off the network is never mistaken for one that was typed:
+
+```
+server probe: 13ms
+server profile: model halogen-2.2-27b-it-q8_0 · window 262144 · out cap 65536 · input text · levels off/minimal/low/medium/high/xhigh/max · thinking as chat-template · budget via thinking_token_budget
+answer room: max(1024, 15% of granted)
+server capacity: room to start (0/4 slots, 0 queued)
+```
+
+`--verbose` adds the full trail, one line per adopted value. Three things that
+trail has already caught on this box:
+
+- `thinking_token_budget` is the field to cap reasoning with. `max_thinking_tokens`
+  is advertised too, but pi's request builder cannot name it, so the note says
+  which one is used and which one is scenery.
+- The thinking level is a **no-op** unless the endpoint advertises
+  `reasoning_effort`. If it does not, the loop says so instead of printing a
+  level that was never sent — which is what `LOOP_WORK_THINKING` was here before
+  this existed: `thinkingFormat: "chat-template"` sends only
+  `chatTemplateKwargs`, so the level was validated, logged, and dropped.
+- The cap only rides on the wire when a budget is configured. pi reads
+  `thinkingBudgets` from the *session's* settings manager, and the loop builds
+  that manager in memory, so `sessionSettingsInit` carries the user's budgets
+  across instead of dropping them. Without them the thinking phase is uncapped
+  and the answer-room rule below is the only guard on it.
+
+**The probe never stops work.** It is an improvement on the declared config, not
+a dependency of it. Unreachable, malformed, slow, or gone between passes: the
+capacity check falls back to the last known reading or to "open", and every
+failure is a printed line. A status endpoint having a bad afternoon must not
+become "no work happened today". The exception is a *blocker* — the API
+answering while the engine behind it does not — which refuses the run in
+preflight as `blocked`, not `fatal`: a refused job and a broken installation are
+different answers and want different exit codes.
+
+**Admission before the clock.** `LoopPorts.capacity` is asked *before* each pass
+starts, because a request sitting in the server's queue is not work. Charging
+queue time to the ticket is what makes "timed out at 20:00 of a 20:00 budget"
+describe a wait rather than a slow model, which is the most misleading thing
+this loop can print. If the box never frees, the pass starts anyway after the
+wait budget and says so, and a resulting timeout note carries the queue facts so
+the next reader can tell a full box from a slow model.
+
+**The fixture is the contract.** `test/fixtures/health-halogen.json` is a
+captured report; `test/autoconfig.test.ts` pins the entire derived shape against
+it. When the box is upgraded, that pin fails. That failure is not noise to regenerate away — it is
+the sound this module makes when the ground moves, which is the sound that was
+missing before: a reworded `thinking_answer_room` simply moving the loop's stop
+point, weeks later, inside a ticket. Regenerate with the URL the startup line
+printed — `curl -sS "<that url>" | python3 -m json.tool >
+test/fixtures/health-halogen.json` — read the diff, update the pin
+deliberately.
 
 ### Cadence: `coalesceMs` and `heartbeatMs`
 
