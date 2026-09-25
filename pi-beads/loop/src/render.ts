@@ -792,6 +792,10 @@ export interface OutcomeFacts {
   readonly budgetMs?: number;
   /** Did the session settle after `abort()`? */
   readonly settledAfterAbort?: boolean;
+  /** Assistant turns taken, for the kinds that stop early. */
+  readonly turns?: number;
+  /** Where the context stood when the run was stopped, pre-formatted. */
+  readonly contextText?: string;
   /** Extra context on what the run left behind (files, commits, verdicts). */
   readonly leftBehind?: string;
 }
@@ -830,6 +834,15 @@ export function describeOutcome(facts: OutcomeFacts): {
       return {
         level: "error",
         text: `malformed verdict on ${issue}${tail}`,
+      };
+    case "context-exhausted":
+      return {
+        level: "error",
+        text:
+          `context exhausted ${issue}` +
+          (facts.turns === undefined ? "" : ` after ${facts.turns} turn(s)`) +
+          (facts.contextText === undefined ? "" : `: ${oneLine(facts.contextText)}`) +
+          tail,
       };
     case "timeout":
       return {

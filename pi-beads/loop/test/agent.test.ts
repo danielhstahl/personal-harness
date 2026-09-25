@@ -29,11 +29,14 @@ import {
   extractLastFencedJson,
   isDone,
   lastAssistantText,
+  parseThinkingLevel,
   resolveModelForRun,
+  resolveThinkingLevelForRun,
   toWorkEvent,
   toolInventoryGap,
   validateSplitPayload,
   validateVerdict,
+  THINKING_LEVELS,
   WORK_CONTEXT_SECTIONS,
   WORK_OUTCOME_KINDS,
 } from "../src/agent.ts";
@@ -43,12 +46,14 @@ import type {
   RunnerSessionKind,
   SessionFactory,
   SessionSpec,
+  ThinkingLevel,
   WorkContextSectionName,
   WorkOutcome,
 } from "../src/agent.ts";
 import { BdError } from "../src/beads.ts";
 import { RepoError } from "../src/repo.ts";
 import type { RepoReaderLike } from "../src/agent.ts";
+import { measureContextBudget } from "../src/context.ts";
 import type { BdClient, Issue, NewIssueSpec } from "../src/beads.ts";
 import { failureKeyFor, handoffKeyFor } from "../src/orchestrator.ts";
 import type { OrchestratorPorts } from "../src/orchestrator.ts";
@@ -86,6 +91,17 @@ interface FakeScript {
   disposeThrows?: boolean;
   /** Milliseconds of fake elapsed time to burn during the prompt. */
   advanceOnPrompt?: number;
+  /**
+   * The model this fake reports, so the context check has a window to measure
+   * against. Omitted means "no model reported", which the check treats as "no
+   * opinion" rather than "fine".
+   */
+  model?: { readonly contextWindow: number; readonly maxTokens: number };
+  /**
+   * What the provider reported for each assistant turn, in order. Delivered with
+   * the turn's `message_end`, the way a real session delivers it.
+   */
+  turnUsage?: readonly { readonly input?: number; readonly cacheRead?: number }[];
   /** Called from `abort()`. */
   onAbort?: () => void;
 }
@@ -120,6 +136,11 @@ class FakeSession implements AgentSessionLike {
   aborted = false;
   /** True when `abort()` cut a scripted tool sequence short. */
   scriptTruncated = false;
+  /** Only what the context check reads; see {@link FakeScript.model}. */
+  readonly model?: { readonly contextWindow: number; readonly maxTokens: number };
+
+  private readonly listeners: ((event: unknown) => void)[] = [];
+  private assistantTurnsNotified = 0;
 
   private readonly script: FakeScript;
   private gate: Promise<void> | null = null;
@@ -133,13 +154,36 @@ class FakeSession implements AgentSessionLike {
     // In-memory sessions have no file. A run that wrote one would be persisting
     // context across iterations, which is exactly the breach under test.
     this.sessionFile = undefined;
+    if (script.model !== undefined) this.model = script.model;
+  }
+
+  /**
+   * Tell subscribers an assistant turn just landed, with the token counts the
+   * script says the provider reported for it. Real sessions push these; the
+   * context check listens for nothing else.
+   */
+  private endAssistantTurn(): void {
+    const usage = this.script.turnUsage?.[this.assistantTurnsNotified];
+    this.assistantTurnsNotified += 1;
+    const message: Record<string, unknown> = {
+      role: "assistant",
+      stopReason: "stop",
+    };
+    if (usage !== undefined) {
+      message.usage = { input: usage.input ?? 0, cacheRead: usage.cacheRead ?? 0 };
+    }
+    const event = { type: "message_end", message };
+    for (const listener of [...this.listeners]) listener(event);
   }
 
   subscribe(listener: unknown): () => void {
     this.subscribeCalls += 1;
+    const fn = listener as (event: unknown) => void;
+    this.listeners.push(fn);
     return () => {
       this.unsubscribeCalls += 1;
-      void listener;
+      const at = this.listeners.indexOf(fn);
+      if (at >= 0) this.listeners.splice(at, 1);
     };
   }
 
@@ -176,6 +220,7 @@ class FakeSession implements AgentSessionLike {
         this.toolErrors.push({ name: call.name, message });
         this.messages.push({ role: "toolResult", content: [{ type: "text", text: message }] } as unknown as ChatMessage);
       }
+      this.endAssistantTurn();
       // The turn boundary. A real session spends hundreds of milliseconds here on
       // a model round trip; without an await of our own the whole scripted turn
       // can run in microtasks and an abort scheduled by the runner would land
@@ -193,6 +238,7 @@ class FakeSession implements AgentSessionLike {
     } else {
       this.messages.push({ role: "assistant", content: [{ type: "text", text: "" }] } as unknown as ChatMessage);
     }
+    this.endAssistantTurn();
 
     if (this.script.rejectWith !== undefined) {
       throw new Error(this.script.rejectWith);
@@ -355,6 +401,8 @@ function runnerHarness(
     abortGraceMs?: number;
     noRepo?: boolean;
     repoError?: boolean;
+    workThinkingLevel?: ThinkingLevel;
+    splitThinkingLevel?: ThinkingLevel;
   } = {},
 ): RunnerHarness {
   const sessions: FakeSession[] = [];
@@ -388,6 +436,8 @@ function runnerHarness(
     repo,
     timeoutMs: options.timeoutMs ?? 60_000,
     abortGraceMs: options.abortGraceMs ?? 50,
+    workThinkingLevel: options.workThinkingLevel,
+    splitThinkingLevel: options.splitThinkingLevel,
     now: clock.now,
     onEvent: (event) => events.push(event),
   });
@@ -741,6 +791,132 @@ test("a session that settles after abort says so", async () => {
   assert.equal(outcome.kind, "timeout");
   assert.equal(outcome.settledAfterAbort, true);
   assert.equal(h.sessions[0]?.disposeCalls, 1);
+});
+
+// ── context exhaustion ──────────────────────────────────────────────────────
+
+const WALL_WINDOW = { contextWindow: 128_000, maxTokens: 16_384 };
+
+const REFUSED = { done: true };
+
+test("a turn that leaves the next one no room to answer stops the run", async () => {
+  const h = runnerHarness(
+    [
+      {
+        model: WALL_WINDOW,
+        turnUsage: [{ input: 40_000 }, { input: 90_000 }, { input: 126_000 }],
+        tools: [
+          { name: "report_done", params: REFUSED },
+          { name: "report_done", params: REFUSED },
+          { name: "report_done", params: REFUSED },
+        ],
+        neverSettle: true,
+      },
+    ],
+    { timeoutMs: 60_000, abortGraceMs: 20 },
+  );
+
+  const outcome = await h.runner.run("loop-42");
+  h.sessions[0]?.release();
+
+  if (outcome.kind !== "context-exhausted") {
+    throw new Error(`expected context-exhausted, got ${outcome.kind}`);
+  }
+  assert.equal(outcome.turns, 3, "the third turn is the one that hit the wall");
+  assert.equal(outcome.budget.usedTokens, 126_000);
+  assert.equal(outcome.budget.grantedOutputTokens, 1, "one token of answer is all that was left");
+  assert.equal(outcome.settledAfterAbort, false);
+  assert.equal(h.sessions[0]?.abortCalls, 1, "exhaustion aborts; it does not wait for the budget");
+  assert.equal(h.sessions[0]?.disposeCalls, 1);
+
+  const failure = describeFailure(outcome);
+  assert.match(failure, /context exhausted after 3 assistant turn\(s\)/u);
+  assert.doesNotMatch(failure, /timed out/u, "out of room must not read as out of time");
+  assert.equal(toWorkEvent(outcome).type, "work_failed");
+
+  const details = h.events
+    .filter((event) => event.type === "agent_event")
+    .map((event) => String((event as { detail?: unknown }).detail ?? ""));
+  assert.ok(
+    details.some((detail) => detail.includes("context exhausted") && detail.includes("aborting")),
+    "the live surface is told why the run stopped",
+  );
+});
+
+test("a run with room left says nothing about context", async () => {
+  const h = runnerHarness([
+    {
+      model: WALL_WINDOW,
+      turnUsage: [{ input: 40_000 }, { input: 90_000 }, { input: 120_000 }],
+      tools: [{ name: "report_done", params: DONE_PARAMS }],
+    },
+  ]);
+
+  const outcome = await h.runner.run("loop-42");
+  assert.equal(outcome.kind, "done");
+});
+
+test("a session that reports no window is never declared exhausted", async () => {
+  const h = runnerHarness([
+    {
+      turnUsage: [{ input: 1_000_000 }],
+      tools: [{ name: "report_done", params: DONE_PARAMS }],
+    },
+  ]);
+
+  const outcome = await h.runner.run("loop-42");
+  assert.equal(
+    outcome.kind,
+    "done",
+    "no reported model means no opinion, not a verdict of 'full'",
+  );
+});
+
+test("exhaustion that settles after the abort says so", async () => {
+  const h = runnerHarness(
+    [
+      {
+        model: WALL_WINDOW,
+        turnUsage: [{ input: 127_000 }],
+        neverSettle: true,
+      },
+    ],
+    { timeoutMs: 60_000, abortGraceMs: 200 },
+  );
+
+  const running = h.runner.run("loop-42");
+  await waitFor(() => (h.sessions[0]?.abortCalls ?? 0) === 1);
+  h.sessions[0]?.release();
+  const outcome = await running;
+
+  assert.equal(outcome.kind, "context-exhausted");
+  assert.equal(outcome.settledAfterAbort, true);
+  assert.equal(h.sessions[0]?.disposeCalls, 1);
+});
+
+test("split running out of context is a typed error that says which", async () => {
+  const h = runnerHarness(
+    [{ model: WALL_WINDOW, turnUsage: [{ input: 128_000 }], neverSettle: true }],
+    { timeoutMs: 60_000, abortGraceMs: 15 },
+  );
+
+  await assert.rejects(
+    () => h.runner.split("plan this"),
+    (error: unknown) =>
+      AgentError.is(error) &&
+      error.kind === "timeout" &&
+      /ran out of context after 1 assistant turn/u.test(error.message),
+  );
+  h.sessions[0]?.release();
+});
+
+test("the clock is not what ended an exhausted run (source guard)", () => {
+  const source = stripComments(readFileSync(join(SRC_DIR, "agent.ts"), "utf8"));
+  assert.match(
+    source,
+    /Promise\.race\(\[budget, running, contextExhausted\]\)/u,
+    "the context stop must race the budget, so a walled run cannot wait it out",
+  );
 });
 
 // ── context builder ─────────────────────────────────────────────────────────
@@ -1417,6 +1593,7 @@ test("every outcome kind maps to exactly one work event", () => {
       incomplete: "work_failed",
       "unstructured-verdict": "work_failed",
       "malformed-verdict": "work_failed",
+      "context-exhausted": "work_failed",
       timeout: "work_failed",
       error: "work_failed",
     },
@@ -1491,6 +1668,18 @@ function outcomeFixtureFor(kind: (typeof WORK_OUTCOME_KINDS)[number]): WorkOutco
         verdictSource: "fenced_json",
         rawBlock: "{bad}",
         problems: ["bad json"],
+      };
+    case "context-exhausted":
+      return {
+        ...base,
+        kind: "context-exhausted",
+        turns: 7,
+        settledAfterAbort: true,
+        budget: measureContextBudget({
+          windowTokens: 128_000,
+          maxOutputTokens: 16_384,
+          usedTokens: 127_500,
+        }),
       };
     case "timeout":
       return { ...base, kind: "timeout", budgetMs: 1234, settledAfterAbort: false };
@@ -1571,6 +1760,85 @@ test("agent.ts reads no environment variables at all", () => {
     source.includes("process.env"),
     false,
     "model/tool config must be passed in, not absorbed from whatever the parent shell exported",
+  );
+});
+
+// ── thinking level: configured, never hard-coded ────────────────────────────
+
+test("parseThinkingLevel accepts every level it advertises, case and padding free", () => {
+  for (const level of THINKING_LEVELS) {
+    assert.equal(parseThinkingLevel(`  ${level.toUpperCase()}  `), level);
+  }
+});
+
+test("an unset level stays unset: it is not quietly low, or medium, or anything", () => {
+  assert.equal(parseThinkingLevel(undefined), undefined);
+  assert.equal(parseThinkingLevel(""), undefined);
+  assert.equal(parseThinkingLevel("   "), undefined);
+});
+
+test("an unknown level is refused, naming itself and what is accepted", () => {
+  assert.throws(
+    () => parseThinkingLevel("superhigh"),
+    (error: unknown) =>
+      AgentError.is(error) &&
+      error.kind === "invalid-arguments" &&
+      error.message.includes('"superhigh"') &&
+      error.message.includes(THINKING_LEVELS.join(", ")),
+  );
+  assert.throws(
+    () => parseThinkingLevel(7),
+    (error: unknown) =>
+      AgentError.is(error) && error.kind === "invalid-arguments",
+  );
+});
+
+test("the level a run gets: the caller's, else the user's default, else pi's", () => {
+  const settings = (level?: ThinkingLevel) => ({
+    getDefaultThinkingLevel: () => level,
+  });
+  assert.equal(resolveThinkingLevelForRun(settings("high"), "minimal"), "minimal");
+  assert.equal(resolveThinkingLevelForRun(settings("high")), "high");
+  assert.equal(resolveThinkingLevelForRun(settings(undefined), "max"), "max");
+  assert.equal(
+    resolveThinkingLevelForRun(settings(undefined)),
+    undefined,
+    "nothing configured reaches the factory as nothing, not as a guess",
+  );
+});
+
+test("work and split carry their own configured level into the session spec", async () => {
+  const configured = runnerHarness(
+    [
+      { tools: [{ name: "report_done", params: DONE_PARAMS }] },
+      { tools: [{ name: "report_split", params: { issues: [{ title: "X" }] } }] },
+    ],
+    { workThinkingLevel: "high", splitThinkingLevel: "minimal" },
+  );
+  await configured.runner.run("loop-42");
+  await configured.runner.split("plan please");
+  assert.equal(configured.specs[0]?.thinkingLevel, "high");
+  assert.equal(configured.specs[1]?.thinkingLevel, "minimal");
+
+  // And unset travels through as unset, which is where pi's own resolution takes
+  // over. The runner filling in a level of its own is the bug this pins out.
+  const bare = runnerHarness([
+    { tools: [{ name: "report_done", params: DONE_PARAMS }] },
+    { tools: [{ name: "report_split", params: { issues: [{ title: "X" }] } }] },
+  ]);
+  await bare.runner.run("loop-42");
+  await bare.runner.split("plan please");
+  assert.equal(bare.specs[0]?.thinkingLevel, undefined);
+  assert.equal(bare.specs[1]?.thinkingLevel, undefined);
+});
+
+test("nothing in agent.ts assigns a thinking level literal", () => {
+  const source = stripComments(readFileSync(join(SRC_DIR, "agent.ts"), "utf8"));
+  assert.doesNotMatch(
+    source,
+    /thinkingLevel\s*[:=][^\n]*\b(off|minimal|low|medium|high|xhigh|max)\b/u,
+    "a hard-coded level makes every ticket run at whatever this file says, with " +
+      "nothing in the config able to overrule it",
   );
 });
 

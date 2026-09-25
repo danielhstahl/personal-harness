@@ -1,19 +1,23 @@
 {
   "providers": {
     "llamacpp": {
-      "baseUrl": "http://<yoururl>:8081",
+      "baseUrl": "http://<yoururl>:8081/v1",
       "api": "openai-completions",
       "apiKey": "hello",
       "compat": {
         "supportsDeveloperRole": false,
-        "supportsReasoningEffort": false
+        "supportsReasoningEffort": false,
+        "thinkingFormat": "chat-template",
+        "chatTemplateKwargs": {
+          "preserve_thinking": false
+        }
       },
       "models": [
         {
           "id": "<yourmodelid>",
           "reasoning": true,
           "maxTokens": 16384,
-          "contextWindow": 128000,
+          "contextWindow": 256000,
           "samplingParams": {
             "temperature": 1.0,
             "top_p": 0.95,

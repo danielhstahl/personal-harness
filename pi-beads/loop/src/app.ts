@@ -11,7 +11,8 @@
  * decide. Anything that could be configured is configured here, once.
  */
 import { createAgentRunner } from "./agent.ts";
-import type { AgentRunner, WorkOutcome } from "./agent.ts";
+import type { AgentRunner, ThinkingLevel, WorkOutcome } from "./agent.ts";
+import { describeContextBudget } from "./context.ts";
 import { createBdClient, selectWorkable } from "./beads.ts";
 import type { BdClient, Issue } from "./beads.ts";
 import { createFinalizer, describeFinalizeFailure, isFinalized } from "./finalize.ts";
@@ -35,6 +36,17 @@ export interface AppConfig extends LoopConfig {
   /** Explicit model. Never read from the environment below this line. */
   readonly modelRef?: { provider: string; id: string };
   readonly workTimeoutMs?: number;
+  /**
+   * Thinking level per pass. Unset is not "low" — it is *not configured*, and the
+   * runner resolves it in `src/agent.ts` against the user's own default,
+   * falling back to pi's.
+   *
+   * Two knobs because the two passes want different things: a split plans from one
+   * paragraph it can hold in mind at once, a work run has to survive a repo. The
+   * loop should not have to pick one number for both.
+   */
+  readonly workThinkingLevel?: ThinkingLevel;
+  readonly splitThinkingLevel?: ThinkingLevel;
   readonly themeName?: string;
   /**
    * The live surface's cadence, in ms.
@@ -98,6 +110,12 @@ function leftBehindFor(outcome: WorkOutcome): string | undefined {
     }
     case "malformed-verdict":
       return `${outcome.problems.length} problem(s) with the verdict block`;
+    case "context-exhausted":
+      // Partial edits are exactly what this kind leaves behind — the run stopped
+      // mid-ticket, on purpose, with the window full.
+      return outcome.settledAfterAbort
+        ? "context exhausted; session settled after abort"
+        : "context exhausted; session still running when we stopped waiting";
     case "timeout":
       return outcome.settledAfterAbort
         ? "budget expired; session settled after abort"
@@ -284,6 +302,8 @@ export function buildApp(config: AppConfig): App {
       cwd: config.cwd,
       modelRef: config.modelRef,
       timeoutMs: config.workTimeoutMs,
+      workThinkingLevel: config.workThinkingLevel,
+      splitThinkingLevel: config.splitThinkingLevel,
       // The streaming half of the seam: every runner event lands on the
       // presenter, which is the only thing that draws them.
       onEvent: (event) => presenter.feed(event),
@@ -306,6 +326,11 @@ export function buildApp(config: AppConfig): App {
         budgetMs: outcome.kind === "timeout" ? outcome.budgetMs : undefined,
         settledAfterAbort:
           outcome.kind === "timeout" ? outcome.settledAfterAbort : undefined,
+        turns: outcome.kind === "context-exhausted" ? outcome.turns : undefined,
+        contextText:
+          outcome.kind === "context-exhausted"
+            ? describeContextBudget(outcome.budget)
+            : undefined,
         leftBehind: leftBehindFor(outcome),
       });
       presenter.notice(said.level, said.text);
