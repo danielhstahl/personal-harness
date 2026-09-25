@@ -106,6 +106,10 @@ interface HarnessOptions {
   dryRun?: boolean;
   maxIterations?: number;
   maxConsecutiveFailures?: number;
+  timeoutMs?: number;
+  abortGraceMs?: number;
+  wrapUpMs?: number;
+  retryUnfitWork?: boolean;
   machine?: (state: OrchestratorState, event: OrchestratorEvent) => StepResult;
 }
 
@@ -136,6 +140,9 @@ function harness(options: HarnessOptions = {}): Harness {
     sessionFactory: sessions.factory,
     cwd: repo.dir,
     includeRepoSnapshot: false,
+    timeoutMs: options.timeoutMs,
+    abortGraceMs: options.abortGraceMs,
+    wrapUpMs: options.wrapUpMs,
   });
   const splitter = createSplitter({ agent: splitPort, beads: board }, {});
   const finalizer = createFinalizer(
@@ -178,6 +185,7 @@ function harness(options: HarnessOptions = {}): Harness {
       runLoop(ports, {
         maxIterations: options.maxIterations,
         maxConsecutiveFailures: options.maxConsecutiveFailures,
+        retryUnfitWork: options.retryUnfitWork,
         dryRun: options.dryRun === true,
         machine: options.machine,
       }),
@@ -527,6 +535,130 @@ test("an unfinished verdict creates no commit and closes nothing", async () => {
     assert.match(result.reason ?? "", /tst\.7/);
   } finally {
     repo.dispose();
+  }
+});
+
+// ── unfit work: running out of the harness's room ─────────────────────────
+
+/**
+ * The case these tests exist for: one bead, a session that never comes back, and a
+ * budget small enough to watch the arithmetic in a test run rather than in a
+ * twenty-minute wait.
+ */
+function seedingTimeoutBoard(): ScriptBoard {
+  const board = createScriptBoard();
+  board.seed({ id: "tst.9", title: "Too big for one session", status: "open", priority: 1 });
+  return board;
+}
+
+test("a run that ran out of time stops the run instead of buying a second one", async () => {
+  const board = seedingTimeoutBoard();
+  const h = harness({
+    board,
+    scripts: [{ neverSettle: true, reply: "Still reading the repo." }],
+    idleTexts: [],
+    timeoutMs: 25,
+    abortGraceMs: 10,
+  });
+  try {
+    const result = await h.run();
+
+    assert.equal(h.sessions.sessions.length, 1, "one pass, not two twenty-minute ones");
+    assert.equal(result.kind, "blocked");
+    assert.match(result.reason ?? "", /tst\.9 timed out/u);
+    assert.match(result.reason ?? "", /[Nn]ot running it again in this run/u);
+    assert.equal(board.statusOf("tst.9"), "open", "nothing is stranded: the bead is open work");
+    assert.match(
+      board.memories.get(failureKeyFor("tst.9")) ?? "",
+      /harness's limit, not a verdict/u,
+      "and what the next attempt reads is about the work, not the clock",
+    );
+    assert.ok(
+      !h.ui.warned.some((line) => /another pass/u.test(line)),
+      `nothing may promise a pass that is not coming: ${h.ui.warned.join(" | ")}`,
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("retryUnfitWork buys the second pass back, and the streak still ends it", async () => {
+  const board = seedingTimeoutBoard();
+  const h = harness({
+    board,
+    scripts: [
+      { neverSettle: true, reply: "First pass, out of time." },
+      { neverSettle: true, reply: "Second pass, out of time." },
+    ],
+    idleTexts: [],
+    timeoutMs: 20,
+    abortGraceMs: 5,
+    retryUnfitWork: true,
+    maxConsecutiveFailures: 2,
+  });
+  try {
+    const result = await h.run();
+
+    assert.equal(h.sessions.sessions.length, 2, "opted in, so the retry happens");
+    assert.equal(result.kind, "blocked");
+    assert.match(result.reason ?? "", /failed work 2 times in a row/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("a run that lands on request is a verdict, so it may be tried again", async () => {
+  const board = seedingTimeoutBoard();
+  const h = harness({
+    board,
+    scripts: [
+      {
+        neverSettle: true,
+        reply: "Midway.",
+        onSteer: {
+          name: "report_done",
+          params: {
+            done: false,
+            summary: "Did the parser; the docs are untouched.",
+            changed_files: ["src/colour.ts"],
+            reason: "ran out of room before the docs",
+          },
+        },
+      },
+      {
+        neverSettle: true,
+        reply: "Midway again.",
+        onSteer: {
+          name: "report_done",
+          params: {
+            done: false,
+            summary: "Still the parser.",
+            changed_files: ["src/colour.ts"],
+            reason: "ran out of room again",
+          },
+        },
+      },
+    ],
+    idleTexts: [],
+    timeoutMs: 5_000,
+    abortGraceMs: 10,
+    wrapUpMs: 20,
+    maxConsecutiveFailures: 2,
+  });
+  try {
+    const result = await h.run();
+
+    // A reported "not finished" says something about the work, so the streak —
+    // not the unfit-work guard — is what stops this run. That is the difference
+    // between a verdict and a cut-off, and it is why the off-ramp exists.
+    assert.equal(h.sessions.sessions.length, 2);
+    assert.match(result.reason ?? "", /failed work 2 times in a row/u);
+    assert.ok(
+      !/[Nn]ot running it again/u.test(result.reason ?? ""),
+      `an off-ramped run is not unfit work: ${result.reason ?? ""}`,
+    );
+  } finally {
+    h.dispose();
   }
 });
 
@@ -1274,6 +1406,18 @@ test("the thinking knobs are wired from config to the runner, not dropped on the
   const source = readSource("app.ts");
   assert.match(source, /workThinkingLevel:\s*config\.workThinkingLevel/u);
   assert.match(source, /splitThinkingLevel:\s*config\.splitThinkingLevel/u);
+});
+
+test("the budget knobs are read, and reach the runner rather than the readme", () => {
+  const env = readEnv({ LOOP_WORK_TIMEOUT_MS: "1200000", LOOP_WRAP_UP_MS: "1020000" });
+  assert.equal(env.workTimeoutMs, 1_200_000);
+  assert.equal(env.wrapUpMs, 1_020_000);
+  assert.equal(readEnv({}).wrapUpMs, undefined, "unset means the derived rule, not zero");
+  assert.equal(readEnv({ LOOP_RETRY_UNFIT_WORK: "true" }).retryUnfitWork, true);
+
+  const source = readSource("app.ts");
+  assert.match(source, /timeoutMs:\s*config\.workTimeoutMs/u);
+  assert.match(source, /wrapUpMs:\s*config\.wrapUpMs/u);
 });
 
 test("the wiring builds no ANSI by hand and spawns no processes of its own", () => {

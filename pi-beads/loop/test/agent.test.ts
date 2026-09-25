@@ -34,9 +34,13 @@ import {
   resolveThinkingLevelForRun,
   toWorkEvent,
   toolInventoryGap,
+  formatTimeoutNote,
   validateSplitPayload,
   validateVerdict,
+  wrapUpAtMs,
+  wrapUpInstruction,
   THINKING_LEVELS,
+  WRAP_UP_LEAD_MS,
   WORK_CONTEXT_SECTIONS,
   WORK_OUTCOME_KINDS,
 } from "../src/agent.ts";
@@ -89,6 +93,15 @@ interface FakeScript {
   rejectWith?: string;
   /** Make `dispose()` blow up. */
   disposeThrows?: boolean;
+  /**
+   * The off-ramp taken: the tool call the scripted model makes when the runner
+   * steers it to land, after which the turn settles. A script without it ignores
+   * the steer, which is how a run that will not land still reaches the hard
+   * budget — and the suite can tell those two apart instead of assuming.
+   */
+  onSteer?: FakeToolCall;
+  /** Prose the fake produces after taking the steer. */
+  steerReply?: string;
   /** Milliseconds of fake elapsed time to burn during the prompt. */
   advanceOnPrompt?: number;
   /**
@@ -125,6 +138,8 @@ class FakeSession implements AgentSessionLike {
 
   readonly spec: SessionSpec;
   readonly promptTexts: string[] = [];
+  /** Every steering message the runner sent, in order. */
+  readonly steers: string[] = [];
   /** What `messages` held at the moment each prompt started — the amnesia probe. */
   readonly historyAtPrompt: ChatMessage[][] = [];
   readonly toolErrors: { name: string; message: string }[] = [];
@@ -255,6 +270,42 @@ class FakeSession implements AgentSessionLike {
     this.abortCalls += 1;
     this.aborted = true;
     this.script.onAbort?.();
+  }
+
+  /**
+   * Recorded immediately rather than at the next turn boundary: what is under
+   * test is that the runner asks, not how pi schedules the asking. `onSteer` is
+   * the scripted model that takes the hint and reports.
+   */
+  async steer(text: string): Promise<void> {
+    this.steers.push(text);
+    this.messages.push({ role: "user", content: text } as ChatMessage);
+    const landing = this.script.onSteer;
+    if (landing === undefined) return;
+    const tool = (this.spec.customTools as unknown as LooseTool[]).find(
+      (candidate) => candidate.name === landing.name,
+    );
+    if (tool !== undefined) {
+      try {
+        await tool.execute("tc-steer", landing.params, new AbortController().signal, () => {});
+        this.messages.push({
+          role: "toolResult",
+          content: [{ type: "text", text: `${landing.name} accepted` }],
+        } as unknown as ChatMessage);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.toolErrors.push({ name: landing.name, message });
+        this.messages.push({ role: "toolResult", content: [{ type: "text", text: message }] } as unknown as ChatMessage);
+      }
+    }
+    if (this.script.steerReply !== undefined) {
+      this.messages.push({
+        role: "assistant",
+        content: [{ type: "text", text: this.script.steerReply }],
+      } as unknown as ChatMessage);
+    }
+    this.endAssistantTurn();
+    this.releaseGate?.();
   }
 
   dispose(): void {
@@ -399,6 +450,7 @@ function runnerHarness(
     memories?: Record<string, string>;
     timeoutMs?: number;
     abortGraceMs?: number;
+    wrapUpMs?: number;
     noRepo?: boolean;
     repoError?: boolean;
     workThinkingLevel?: ThinkingLevel;
@@ -436,6 +488,7 @@ function runnerHarness(
     repo,
     timeoutMs: options.timeoutMs ?? 60_000,
     abortGraceMs: options.abortGraceMs ?? 50,
+    wrapUpMs: options.wrapUpMs,
     workThinkingLevel: options.workThinkingLevel,
     splitThinkingLevel: options.splitThinkingLevel,
     now: clock.now,
@@ -767,7 +820,8 @@ test("a timeout aborts the session and is its own outcome kind", async () => {
   assert.equal(outcome.budgetMs, 30, "the outcome names the budget that ran out");
   assert.equal(h.sessions[0]?.abortCalls, 1, "abort() must be called on timeout");
   assert.equal(outcome.settledAfterAbort, false);
-  assert.match(describeFailure(outcome), /timed out after 30ms/u);
+  assert.match(describeFailure(outcome), /timed out/u);
+  assert.match(describeFailure(outcome), /of a 30ms session budget/u);
   assert.equal(toWorkEvent(outcome).type, "work_failed");
 });
 
@@ -791,6 +845,136 @@ test("a session that settles after abort says so", async () => {
   assert.equal(outcome.kind, "timeout");
   assert.equal(outcome.settledAfterAbort, true);
   assert.equal(h.sessions[0]?.disposeCalls, 1);
+});
+// ── the off-ramp ────────────────────────────────────────────────────────
+
+test("a run close to its budget is asked to land, and a report on landing is a verdict", async () => {
+  const h = runnerHarness(
+    [
+      {
+        neverSettle: true,
+        reply: "Midway through the reducer.",
+        onSteer: {
+          name: "report_done",
+          params: {
+            done: false,
+            summary: "Changed the reducer; the caller is not updated.",
+            changed_files: ["src/reducer.ts"],
+            reason: "out of room: the caller still needs migrating",
+          },
+        },
+      },
+    ],
+    { timeoutMs: 5_000, abortGraceMs: 50, wrapUpMs: 25 },
+  );
+
+  const outcome = await h.runner.run("loop-42");
+
+  assert.equal(h.sessions[0]?.steers.length, 1, "the off-ramp was offered once");
+  assert.match(h.sessions[0]?.steers[0] ?? "", /Wrap up now/u);
+  assert.equal(
+    outcome.kind,
+    "incomplete",
+    "a run that lands on request reports a verdict instead of being cut off",
+  );
+  assert.equal(h.sessions[0]?.abortCalls, 0, "no abort was needed once it landed");
+  const nudges = h.events.filter((event) => event.type === "wrap_up");
+  assert.equal(nudges.length, 1);
+  assert.equal(nudges[0]?.budgetMs, 5_000, "the nudge says which budget it is racing");
+});
+
+test("a run that ignores the off-ramp still ends at the budget, and the nudge is on the record", async () => {
+  const h = runnerHarness([{ neverSettle: true, reply: "Still going." }], {
+    timeoutMs: 60,
+    abortGraceMs: 20,
+    wrapUpMs: 20,
+  });
+
+  const outcome = await h.runner.run("loop-42");
+  h.sessions[0]?.release();
+
+  assert.equal(h.sessions[0]?.steers.length, 1, "it was offered the ramp whether it took it or not");
+  assert.equal(outcome.kind, "timeout");
+  assert.equal(h.sessions[0]?.abortCalls, 1);
+});
+
+test("the off-ramp is skipped when the budget is too small to land anything in", async () => {
+  // Any budget at or under the lead derives to `never`. A 25ms budget is one, and
+  // is quicker to demonstrate than the 3-minute real thing.
+  const h = runnerHarness([{ neverSettle: true }], { timeoutMs: 25, abortGraceMs: 10 });
+
+  const outcome = await h.runner.run("loop-42");
+  h.sessions[0]?.release();
+
+  assert.equal(wrapUpAtMs(25), 0, "the derived ramp for this budget is `never`");
+  assert.equal(h.sessions[0]?.steers.length, 0, "no lead means no ramp, and no pretending otherwise");
+  assert.equal(outcome.kind, "timeout");
+});
+
+test("the off-ramp tells the model what to do and never how long it has", () => {
+  for (const kind of ["work", "split"] as const) {
+    const text = wrapUpInstruction(kind);
+    assert.match(text, /Wrap up now/u);
+    // A number the model cannot check is a number it spends turns on. The ramp is
+    // an instruction, not a countdown.
+    assert.doesNotMatch(
+      text,
+      /\d+\s*(?:ms|s\b|sec|second|minute|min|hour)/u,
+      `${kind}: the wrap-up message carries a clock`,
+    );
+  }
+});
+
+test("the off-ramp is derived from the budget, and only when there is room to land in", () => {
+  // A 20-minute budget gets the ramp three minutes out; nothing else changes.
+  assert.equal(wrapUpAtMs(1_200_000), 1_200_000 - WRAP_UP_LEAD_MS);
+  // A budget no larger than the landing itself gets no ramp: there would be
+  // nothing to land with, and a nudge that cannot be obeyed is noise.
+  assert.equal(wrapUpAtMs(WRAP_UP_LEAD_MS), 0);
+  assert.equal(wrapUpAtMs(10_000), 0);
+  // Configured wins outright, including "never", and cannot be scheduled past the
+  // cut it is meant to come before.
+  assert.equal(wrapUpAtMs(1_200_000, 60_000), 60_000);
+  assert.equal(wrapUpAtMs(1_200_000, 0), 0);
+  assert.equal(wrapUpAtMs(10_000, 600_000), 10_000, "a ramp cannot be scheduled after the cut");
+  assert.equal(wrapUpAtMs(60_000, -5), 0);
+});
+
+test("the note a timeout leaves is for the operator first and the model second", () => {
+  const note = formatTimeoutNote(1_234_000, 1_200_000, true, "I was in the middle of the splitter.");
+  const [headline, ...rest] = note.split("\n");
+  assert.match(headline ?? "", /timed out at 20:34 of a 20:00 session budget/u);
+  assert.match(headline ?? "", /closed when asked/u);
+  assert.ok(!(headline ?? "").includes("splitter"), "the work detail goes below the headline");
+  assert.match(rest.join("\n"), /not a verdict on this ticket/u);
+  assert.match(rest.join("\n"), /> I was in the middle of the splitter\./u);
+  // No partial prose, no invented quote.
+  assert.ok(!formatTimeoutNote(1, 2, false, "   ").includes(">"));
+});
+
+test("a timed-out run hands the next attempt what it actually had", async () => {
+  const h = runnerHarness(
+    [{ neverSettle: true, reply: "Opened the reducer; the claim path is the tricky part." }],
+    { timeoutMs: 25, abortGraceMs: 50 },
+  );
+
+  const outcome = await h.runner.run("loop-42");
+
+  assert.match(
+    outcome.assistantText,
+    /the claim path is the tricky part/u,
+    "the cut-off reply is read out before the session is thrown away",
+  );
+
+  const note = describeFailure(outcome);
+  assert.match(note, /timed out at/u, "the human line says what happened");
+  assert.match(note, /the harness's limit, not a verdict/u, "and says whose limit it was");
+  assert.match(note, /claim path is the tricky part/u, "the note carries the work, not only the clock");
+  assert.match(note, /done: false/u, "and the exit that is actually available inside the next session");
+  assert.ok(
+    note.split("\n")[0]?.includes("harness") === false,
+    "the framing paragraph stays out of the headline the surface shows",
+  );
 });
 
 // ── context exhaustion ──────────────────────────────────────────────────────
@@ -1604,7 +1788,10 @@ test("failure text names what actually went wrong for every failing kind", () =>
   assert.match(describeFailure(outcomeFixtureFor("incomplete")), /agent reported incomplete/u);
   assert.match(describeFailure(outcomeFixtureFor("unstructured-verdict")), /no structured verdict/u);
   assert.match(describeFailure(outcomeFixtureFor("malformed-verdict")), /malformed verdict/u);
-  assert.match(describeFailure(outcomeFixtureFor("timeout")), /timed out after 1234ms/u);
+  assert.match(
+    describeFailure(outcomeFixtureFor("timeout")),
+    /timed out at 20:34 of a 20:00 session budget/u,
+  );
   assert.match(describeFailure(outcomeFixtureFor("error")), /run error: kaboom/u);
 });
 
@@ -1682,7 +1869,13 @@ function outcomeFixtureFor(kind: (typeof WORK_OUTCOME_KINDS)[number]): WorkOutco
         }),
       };
     case "timeout":
-      return { ...base, kind: "timeout", budgetMs: 1234, settledAfterAbort: false };
+      return {
+        ...base,
+        kind: "timeout",
+        elapsedMs: 1_234_000,
+        budgetMs: 1_200_000,
+        settledAfterAbort: false,
+      };
     case "error":
       return { ...base, kind: "error", message: "kaboom", phase: "run" };
   }

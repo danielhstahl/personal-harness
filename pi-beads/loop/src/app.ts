@@ -37,6 +37,12 @@ export interface AppConfig extends LoopConfig {
   readonly modelRef?: { provider: string; id: string };
   readonly workTimeoutMs?: number;
   /**
+   * When the work session is asked to land what it has, in ms from the start of
+   * the run. Unset means the runner's own rule: the budget minus
+   * `WRAP_UP_LEAD_MS`. See {@link createAgentRunner}.
+   */
+  readonly wrapUpMs?: number;
+  /**
    * Thinking level per pass. Unset is not "low" — it is *not configured*, and the
    * runner resolves it in `src/agent.ts` against the user's own default,
    * falling back to pi's.
@@ -117,9 +123,12 @@ function leftBehindFor(outcome: WorkOutcome): string | undefined {
         ? "context exhausted; session settled after abort"
         : "context exhausted; session still running when we stopped waiting";
     case "timeout":
+      // The edits are still there and nothing was committed — which is the whole
+      // story a timeout leaves, and the reason the next attempt is told to carry
+      // on rather than start over.
       return outcome.settledAfterAbort
-        ? "budget expired; session settled after abort"
-        : "budget expired; session still running when we stopped waiting";
+        ? "budget expired; nothing committed, every edit still in the working tree"
+        : "budget expired; nothing committed and the session was still running when we stopped waiting";
     default:
       return undefined;
   }
@@ -280,6 +289,18 @@ export function buildApp(config: AppConfig): App {
         });
 
   /**
+   * Work-unit identity for the surface. Every work, split and finalize unit takes
+   * the next number, so the presenter can tell "a new unit has started" from
+   * "the same unit is still going" — which is the only way it can tell a
+   * re-queued ticket from one that has simply been running a long time.
+   */
+  let unitsIssued = 0;
+  const nextRunId = (): number => {
+    unitsIssued += 1;
+    return unitsIssued;
+  };
+
+  /**
    * Only one surface may hold the terminal at a time. While the idle prompt is
    * up it owns the keyboard, so the presenter must not take the live path —
    * its text still goes out, as plain lines, in order.
@@ -302,6 +323,7 @@ export function buildApp(config: AppConfig): App {
       cwd: config.cwd,
       modelRef: config.modelRef,
       timeoutMs: config.workTimeoutMs,
+      wrapUpMs: config.wrapUpMs,
       workThinkingLevel: config.workThinkingLevel,
       splitThinkingLevel: config.splitThinkingLevel,
       // The streaming half of the seam: every runner event lands on the
@@ -316,7 +338,7 @@ export function buildApp(config: AppConfig): App {
    */
   const runner: AgentRunner = {
     run: async (issueId: string): Promise<WorkOutcome> => {
-      presenter.setContext({ issueId, phase: "work" });
+      presenter.setContext({ issueId, phase: "work", runId: nextRunId() });
       takeWorkSurface();
       const outcome = await baseRunner.run(issueId);
       const said = describeOutcome({
@@ -324,6 +346,7 @@ export function buildApp(config: AppConfig): App {
         issueId: outcome.issueId,
         message: outcome.kind === "error" ? outcome.message : undefined,
         budgetMs: outcome.kind === "timeout" ? outcome.budgetMs : undefined,
+        elapsedMs: outcome.kind === "timeout" ? outcome.elapsedMs : undefined,
         settledAfterAbort:
           outcome.kind === "timeout" ? outcome.settledAfterAbort : undefined,
         turns: outcome.kind === "context-exhausted" ? outcome.turns : undefined,
@@ -337,7 +360,7 @@ export function buildApp(config: AppConfig): App {
       return outcome;
     },
     split: async (text: string) => {
-      presenter.setContext({ phase: "split" });
+      presenter.setContext({ phase: "split", runId: nextRunId() });
       takeWorkSurface();
       return baseRunner.split(text);
     },
@@ -367,7 +390,11 @@ export function buildApp(config: AppConfig): App {
    */
   const finalizer = {
     async finalize(request: FinalizeRequest): Promise<FinalizeOutcome> {
-      presenter.setContext({ issueId: request.issueId, phase: "finalize" });
+      presenter.setContext({
+        issueId: request.issueId,
+        phase: "finalize",
+        runId: nextRunId(),
+      });
       takeWorkSurface();
       const outcome = await baseFinalizer.finalize(request);
       presenter.notice(

@@ -310,6 +310,12 @@ export interface FakeScript {
   /** Never settle until `abort()` releases the gate (the interrupt test). */
   neverSettle?: boolean;
   rejectWith?: string;
+  /**
+   * What the scripted model reports when the runner steers it to land. With it,
+   * the run ends as a verdict; without it, the steer is recorded and the run
+   * still ends at the hard budget.
+   */
+  onSteer?: FakeToolCall;
 }
 
 type ChatMessage = AgentSessionLike["messages"][number];
@@ -332,6 +338,8 @@ export class FakeSession implements AgentSessionLike {
   readonly sessionFile: string | undefined = undefined;
   messages: ChatMessage[] = [];
   readonly promptTexts: string[] = [];
+  /** Every steer the runner sent. A timeout with none here never got the chance to land. */
+  readonly steers: string[] = [];
   readonly kinds: string[] = [];
   abortCalls = 0;
   disposeCalls = 0;
@@ -391,6 +399,38 @@ export class FakeSession implements AgentSessionLike {
   async abort(): Promise<void> {
     this.abortCalls += 1;
     // An abort that does not unblock the prompt would make the interrupt test hang.
+    this.releaseGate?.();
+  }
+
+  /**
+   * Recorded on arrival: the asking is what the tests read. `onSteer` is the
+   * scripted model that takes the off-ramp and reports, which is the difference
+   * between a timeout that leaves a verdict and one that leaves nothing.
+   */
+  async steer(text: string): Promise<void> {
+    this.steers.push(text);
+    this.messages.push({ role: "user", content: text } as ChatMessage);
+    const landing = this.script.onSteer;
+    if (landing === undefined) return;
+    const tool = (this.spec.customTools as unknown as LooseTool[]).find(
+      (candidate) => candidate.name === landing.name,
+    );
+    if (tool !== undefined) {
+      try {
+        await tool.execute("tc-steer", landing.params, new AbortController().signal, () => {});
+        this.messages.push({
+          role: "toolResult",
+          content: [{ type: "text", text: `${landing.name} accepted` }],
+        } as unknown as ChatMessage);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.messages.push({ role: "toolResult", content: [{ type: "text", text: message }] } as unknown as ChatMessage);
+      }
+    }
+    this.messages.push({
+      role: "assistant",
+      content: [{ type: "text", text: this.script.reply ?? "" }],
+    } as unknown as ChatMessage);
     this.releaseGate?.();
   }
 

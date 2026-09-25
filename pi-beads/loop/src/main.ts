@@ -57,6 +57,10 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
     gitBin: source.LOOP_GIT_BIN,
     modelRef: provider !== undefined && model !== undefined ? { provider, id: model } : undefined,
     workTimeoutMs: number("LOOP_WORK_TIMEOUT_MS"),
+    /** When to tell a run to land and report. Unset = budget minus the lead. */
+    wrapUpMs: number("LOOP_WRAP_UP_MS"),
+    /** Opt back up: retry a run that ran out of time or context in place. */
+    retryUnfitWork: flag("LOOP_RETRY_UNFIT_WORK"),
     workThinkingLevel: thinking("LOOP_WORK_THINKING"),
     splitThinkingLevel: thinking("LOOP_SPLIT_THINKING"),
     maxIterations: number("LOOP_MAX_ITERATIONS"),
