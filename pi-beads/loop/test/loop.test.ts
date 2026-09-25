@@ -27,6 +27,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import { buildApp, idleStatusFrom, perTurnIdle } from "../src/app.ts";
+import { readEnv, runFromEnv } from "../src/main.ts";
 import { createAgentRunner } from "../src/agent.ts";
 import { BdError } from "../src/beads.ts";
 import { createFinalizer } from "../src/finalize.ts";
@@ -1249,6 +1250,30 @@ test("main.ts reads the environment in exactly one place and builds nothing itse
     assert.ok(!source.includes(forbidden), `main.ts must not construct ${forbidden}`);
   }
   assert.match(source, /runApp|buildApp/, "main.ts only runs what the composition root built");
+});
+
+test("both thinking knobs reach the config, and a bad one stops before the run", async () => {
+  const config = readEnv({ LOOP_WORK_THINKING: "High", LOOP_SPLIT_THINKING: " off " });
+  assert.equal(config.workThinkingLevel, "high");
+  assert.equal(config.splitThinkingLevel, "off");
+  assert.equal(readEnv({}).workThinkingLevel, undefined, "absent is unset, never a default");
+
+  const lines: string[] = [];
+  const code = await runFromEnv(() => readEnv({ LOOP_WORK_THINKING: "brutal" }), (line) => {
+    lines.push(line);
+  });
+  assert.equal(code, 2);
+  assert.match(
+    lines.join("\n"),
+    /unknown thinking level "brutal"/u,
+    "a refused knob is one clear line, not a stack trace",
+  );
+});
+
+test("the thinking knobs are wired from config to the runner, not dropped on the floor", () => {
+  const source = readSource("app.ts");
+  assert.match(source, /workThinkingLevel:\s*config\.workThinkingLevel/u);
+  assert.match(source, /splitThinkingLevel:\s*config\.splitThinkingLevel/u);
 });
 
 test("the wiring builds no ANSI by hand and spawns no processes of its own", () => {

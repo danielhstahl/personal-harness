@@ -92,7 +92,74 @@ In one line each:
   discipline.
 
 Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`,
-`LOOP_WIDTH`.
+`LOOP_WIDTH`, and the per-pass thinking levels `LOOP_WORK_THINKING` /
+`LOOP_SPLIT_THINKING` — one of `off`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, `max`. Neither knob set is not the same as either set to `low`: unset
+falls through to the user's configured default and then pi's own, so a ticket is
+never run at a level nobody chose. A value pi does not recognise stops the loop
+with the list of what it accepts, rather than being quietly dropped.
+
+### Two clocks: the budget and the context wall
+
+`timeoutMs` (default 20 minutes) is a wall clock. It answers *did this take too
+long* and nothing else — which is why it was a bad witness for "the run stalled
+around 128K tokens". A provider that refuses a request for being over the window
+fails in milliseconds and lands as `prompt rejected: …`; a run that expires is a
+run that was still generating. `test/agent.test.ts` keeps those two paths from
+looking alike.
+
+What a too-small *declared* window really does is quieter, and worse: pi clamps
+each request's answer budget to what the window still has —
+`min(maxTokens, max(1, window − context − 4096))` — so the answer shrinks long
+before anything errors, and near the wall the model is asked for a single token.
+That is not slow work, it is finished work, and the twenty minutes spent
+discovering it is the worst outcome available.
+
+So the loop measures instead of guessing. Every assistant turn carries the
+provider's own count of the request that produced it (`usage.input +
+usage.cacheRead`), and `src/context.ts` works out what the *next* request would
+be granted. When that grant falls to `UNWORKABLE_OUTPUT_TOKENS` (2048) or below,
+the run stops immediately as `context-exhausted` — seconds since the last turn,
+not the rest of the budget:
+
+```
+context exhausted after 3 assistant turn(s): 126.0K/128.0K tokens used (98%),
+1 of answer budget left for the next request — stopped instead of spending the
+run budget (settled after abort)
+```
+
+- `CONTEXT_SAFETY_TOKENS` mirrors pi's own reserve; a drift test pins it to
+  `@earendil-works/pi-ai/api/simple-options`, because a silent change upstream
+  moves the wall this measures to.
+- A session that reports no model gets no opinion — never a false "full".
+- **What to do with one:** raising the budget does nothing, because the budget
+  was never what stopped it. Either the declared `contextWindow` is smaller than
+  what the server takes, or the ticket does not fit in the window it has. The
+  first is a config fix; the second is a split.
+
+### Chain of thought is billed to the context window
+
+pi replays an assistant turn's thinking on the next request — that is what the
+`reasoning_content` field on the replayed assistant message is. Measured against
+this project's server: the same history costs **94 tokens without** the replayed
+CoT and **270 with it**. Every turn, compounding, on a loop that deliberately
+never compacts.
+
+There is no client-side switch that suppresses a non-empty replay. The server can
+be told, though, through the chat template:
+
+```jsonc
+"compat": {
+  "thinkingFormat": "chat-template",
+  "chatTemplateKwargs": { "preserve_thinking": false }
+}
+```
+
+That is the whole of what `chat-template` sends here, and the same A/B drops from
+**270 to 90** — thinking still streams to the terminal, it just stops being
+carried back in. Do **not** reach for `thinkingFormat: "qwen-chat-template"`
+instead: pi hard-codes `preserve_thinking: true` there, which is precisely the
+other answer.
 
 ### Cadence: `coalesceMs` and `heartbeatMs`
 

@@ -11,6 +11,8 @@
  */
 import { pathToFileURL } from "node:url";
 
+import { AgentError, parseThinkingLevel } from "./agent.ts";
+import type { ThinkingLevel } from "./agent.ts";
 import { runApp } from "./app.ts";
 import type { AppConfig } from "./app.ts";
 import { LoopError } from "./loop.ts";
@@ -21,6 +23,10 @@ import type { LoopResult } from "./loop.ts";
  *
  * `.11` replaces this with the real config layer; everything below stays
  * untouched because nothing else reads the process environment here.
+ *
+ * `LOOP_WORK_THINKING` / `LOOP_SPLIT_THINKING` set the level of each pass and
+ * are validated on the way in: unset means *unset* (the user's configured
+ * default, then pi's own), never a silently-guessed level.
  */
 export function readEnv(source: Readonly<Record<string, string | undefined>> = process.env): AppConfig {
   const number = (name: string): number | undefined => {
@@ -37,12 +43,22 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
   const cwd = source.LOOP_CWD ?? process.cwd();
   const provider = source.PI_PROVIDER;
   const model = source.PI_MODEL;
+  /**
+   * A thinking level, read where the environment is read and validated on the
+   * way out. Unlike the timeout — which drops what it cannot parse — a level pi
+   * would not accept is *refused*: a run at a level nobody asked for looks
+   * exactly like one that was configured, from the outside.
+   */
+  const thinking = (name: string): ThinkingLevel | undefined =>
+    parseThinkingLevel(source[name]);
   return {
     cwd,
     bdBin: source.LOOP_BD_BIN,
     gitBin: source.LOOP_GIT_BIN,
     modelRef: provider !== undefined && model !== undefined ? { provider, id: model } : undefined,
     workTimeoutMs: number("LOOP_WORK_TIMEOUT_MS"),
+    workThinkingLevel: thinking("LOOP_WORK_THINKING"),
+    splitThinkingLevel: thinking("LOOP_SPLIT_THINKING"),
     maxIterations: number("LOOP_MAX_ITERATIONS"),
     themeName: source.PI_THEME,
     dryRun: flag("LOOP_DRY_RUN"),
@@ -79,6 +95,22 @@ export function exitCodeFor(result: LoopResult): number {
   return result.exitCode;
 }
 
+/**
+ * The one mapping from a thrown error to the line the operator is told.
+ *
+ * A `LoopError` carries its own code. An `AgentError` is a refused value — a
+ * configured model that is not in the catalog, a thinking level nothing
+ * recognises — which is the operator's business rather than a crash, and wants
+ * one plain line instead of a stack pointing at the place the string was
+ * checked. `undefined` means "not one of ours", and leaves the caller to decide
+ * whether that is a line to print or an error to rethrow.
+ */
+function fatalLine(error: unknown): string | undefined {
+  if (LoopError.is(error)) return `Fatal: ${error.code}: ${error.message}`;
+  if (AgentError.is(error)) return `Fatal: ${error.message}`;
+  return undefined;
+}
+
 export async function cli(
   config: AppConfig,
   write: (line: string) => void = (line) => void process.stdout.write(`${line}\n`),
@@ -90,13 +122,42 @@ export async function cli(
   } catch (error) {
     // `runLoop` turns its own failures into a result, so this is the seam for
     // everything beneath it: a bad config, an adapter that could not be built.
-    if (LoopError.is(error)) {
-      write(`Fatal: ${error.code}: ${error.message}`);
+    const fatal = fatalLine(error);
+    if (fatal !== undefined) {
+      write(fatal);
       return 2;
     }
     const message = error instanceof Error ? (error.stack ?? error.message) : String(error);
     write(`Fatal: unexpected failure: ${message}`);
     return 2;
+  }
+}
+
+/**
+ * Read the config, then run it — with the refusal case handled before `cli` is
+ * ever entered.
+ *
+ * `readEnv` *refuses* a thinking level pi has never heard of instead of rounding
+ * it down, and that happens on the way in, outside `cli`'s try. Same line and the
+ * same exit code as a fatal from the run, because to whoever is watching it is
+ * the same event: the loop did not start.
+ *
+ * `read` is a thunk rather than a config because the refusal happens *while
+ * reading*: a config already built cannot be the thing that failed.
+ */
+export async function runFromEnv(
+  read: () => AppConfig = () => readEnv(),
+  write: (line: string) => void = (line) => void process.stdout.write(`${line}\n`),
+): Promise<number> {
+  try {
+    return await cli(await read(), write);
+  } catch (error) {
+    const fatal = fatalLine(error);
+    if (fatal !== undefined) {
+      write(fatal);
+      return 2;
+    }
+    throw error;
   }
 }
 
@@ -109,5 +170,5 @@ const isEntry =
   import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (isEntry) {
-  process.exitCode = await cli(readEnv());
+  process.exitCode = await runFromEnv();
 }

@@ -58,9 +58,35 @@ import { failureKeyFor, handoffKeyFor } from "./orchestrator.ts";
 import type { OrchestratorEvent } from "./orchestrator.ts";
 import { createRepoReader, formatRepoSnapshot, RepoError } from "./repo.ts";
 import type { RepoSnapshot } from "./repo.ts";
+import type { ContextBudget } from "./context.ts";
+import { describeContextBudget, measureContextBudget } from "./context.ts";
 
 /** Avoid the phantom-dependency import: borrow the SDK's own level type. */
 type ThinkingLevel = NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
+
+/**
+ * Every thinking level pi accepts, declared as a table rather than a list so the
+ * compiler keeps it honest: `Record<ThinkingLevel, true>` needs one key per
+ * member of the union, so a level added upstream makes this object stop
+ * compiling, and one invented here fails the same check from the other side.
+ *
+ * Insertion order is pi's own — cheapest first — and {@link THINKING_LEVELS}
+ * reads it back for messages and for validating configuration.
+ */
+const THINKING_LEVEL_LOOKUP: Record<ThinkingLevel, true> = {
+  off: true,
+  minimal: true,
+  low: true,
+  medium: true,
+  high: true,
+  xhigh: true,
+  max: true,
+};
+
+/** {@link THINKING_LEVEL_LOOKUP} as a list, in pi's order. */
+export const THINKING_LEVELS: readonly ThinkingLevel[] = Object.keys(
+  THINKING_LEVEL_LOOKUP,
+) as ThinkingLevel[];
 
 // ── verdicts ─────────────────────────────────────────────────────────────────
 
@@ -395,6 +421,7 @@ export const WORK_OUTCOME_KINDS = [
   "incomplete",
   "unstructured-verdict",
   "malformed-verdict",
+  "context-exhausted",
   "timeout",
   "error",
 ] as const;
@@ -425,6 +452,14 @@ export type WorkOutcome =
       kind: "malformed-verdict";
       rawBlock: string;
       problems: readonly string[];
+    })
+  | (WorkOutcomeBase & {
+      kind: "context-exhausted";
+      /** The measurement that stopped the run, as the provider reported it. */
+      budget: ContextBudget;
+      /** Assistant turns it took to get there. */
+      turns: number;
+      settledAfterAbort: boolean;
     })
   | (WorkOutcomeBase & {
       kind: "timeout";
@@ -472,6 +507,13 @@ export function describeFailure(outcome: WorkOutcome): string {
     case "timeout":
       return `timed out after ${outcome.budgetMs}ms ` +
         `(${outcome.settledAfterAbort ? "settled after abort" : "still running when the grace period ended"})`;
+    case "context-exhausted":
+      return (
+        `context exhausted after ${outcome.turns} assistant turn(s): ` +
+        `${describeContextBudget(outcome.budget)} — stopped instead of spending ` +
+        `the run budget ` +
+        `(${outcome.settledAfterAbort ? "settled after abort" : "still running when the grace period ended"})`
+      );
     case "error":
       return `${outcome.phase} error: ${outcome.message}`;
   }
@@ -514,7 +556,14 @@ export class AgentError extends Error {
 export type AgentSessionLike = Pick<
   AgentSession,
   "sessionId" | "sessionFile" | "messages" | "prompt" | "abort" | "dispose" | "subscribe"
->;
+> & {
+  /**
+   * Only the two numbers the context check needs, not the SDK's whole model
+   * type. Optional on purpose: a session that reports no model is a session this
+   * check has no opinion about, and a fake that says nothing stays a valid port.
+   */
+  readonly model?: { readonly contextWindow: number; readonly maxTokens: number };
+};
 
 export type RunnerSessionKind = "work" | "split";
 
@@ -602,6 +651,56 @@ export function resolveModelForRun(
   return undefined;
 }
 
+function isThinkingLevel(value: string): value is ThinkingLevel {
+  return Object.prototype.hasOwnProperty.call(THINKING_LEVEL_LOOKUP, value);
+}
+
+/**
+ * Read a thinking level out of configuration.
+ *
+ * Absent or blank is `undefined`: not "low", not "medium" — *not configured*, a
+ * state the caller can tell apart from a choice. Anything unrecognised is refused
+ * rather than rounded down, because a level asked for in one place and ignored in
+ * another is invisible from outside: a run at the wrong level looks exactly like
+ * a run that was configured correctly.
+ */
+export function parseThinkingLevel(raw: unknown): ThinkingLevel | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "string") {
+    throw new AgentError(
+      "invalid-arguments",
+      `a thinking level must be a string, got ${typeof raw}`,
+    );
+  }
+  const text = raw.trim().toLowerCase();
+  if (text === "") return undefined;
+  if (!isThinkingLevel(text)) {
+    throw new AgentError(
+      "invalid-arguments",
+      `unknown thinking level "${raw.trim()}"; expected one of: ` +
+        `${THINKING_LEVELS.join(", ")}`,
+    );
+  }
+  return text;
+}
+
+/**
+ * The level one run gets: the caller's if it named one, else the user's
+ * configured default, else nothing — which leaves pi to apply its own default
+ * instead of this loop guessing on the user's behalf.
+ *
+ * Deliberately the same shape as {@link resolveModelForRun}. Model and level are
+ * the two knobs that decide what a run actually is; they should resolve the same
+ * way, from the same place, with the same precedence.
+ */
+export function resolveThinkingLevelForRun(
+  settings: { getDefaultThinkingLevel(): ThinkingLevel | undefined },
+  explicit?: ThinkingLevel,
+): ThinkingLevel | undefined {
+  if (explicit !== undefined) return explicit;
+  return settings.getDefaultThinkingLevel() ?? undefined;
+}
+
 /**
  * The production session factory.
  *
@@ -614,12 +713,17 @@ export const defaultSessionFactory: SessionFactory = async (spec) => {
   const runtime = await getModelRuntime();
   const diskSettings = SettingsManager.create(spec.cwd, getAgentDir());
   const model = resolveModelForRun(runtime, diskSettings, spec.modelRef);
+  // Resolved, never assigned: the caller's level if it named one, else the user's
+  // configured default, else pi's own. A hard-coded level here made every ticket
+  // run at whatever this file said, with nothing in the config able to overrule
+  // it — and neither work nor split could be pitched differently from the other.
+  const thinkingLevel = resolveThinkingLevelForRun(diskSettings, spec.thinkingLevel);
   const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false } });
 
   const options: CreateAgentSessionOptions = {
     cwd: spec.cwd,
     modelRuntime: runtime,
-    thinkingLevel: spec.thinkingLevel ?? "low",
+    thinkingLevel,
     sessionManager: SessionManager.inMemory(spec.cwd),
     settingsManager,
     customTools: [...spec.customTools],
@@ -1002,6 +1106,16 @@ export interface RunEvidence<T> {
   readonly classification: RunClassification | null;
   /** Set when the wall-clock budget ran out; `null` otherwise. */
   readonly timeout: { readonly settledAfterAbort: boolean } | null;
+  /**
+   * Set when the *context* ran out before the clock did; `null` otherwise. The
+   * two are kept apart because the fixes are opposite: raise the budget for one,
+   * split the ticket for the other.
+   */
+  readonly context: {
+    readonly budget: ContextBudget;
+    readonly turns: number;
+    readonly settledAfterAbort: boolean;
+  } | null;
   /** Set when the prompt itself was rejected; `null` otherwise. */
   readonly promptError: string | null;
   readonly accepted: readonly T[];
@@ -1233,6 +1347,38 @@ interface LiveSession {
 const DEFAULT_TIMEOUT_MS = 20 * 60_000;
 const DEFAULT_GRACE_MS = 5_000;
 
+/**
+ * What the context check hands the run loop when it stops one early, as a tag so
+ * it sits beside the prompt-error arm of the same race instead of being
+ * second-guessed from its shape.
+ */
+interface ContextStopped {
+  readonly kind: "context";
+  readonly budget: ContextBudget;
+  readonly turns: number;
+}
+
+/**
+ * Where the model's declared window leaves the run, given the token counts the
+ * provider reported for the turn that just landed. `null` when there is nothing
+ * to measure — no model on the session, or a turn with no counts. A `null` is
+ * never treated as "fine": the check simply has no opinion.
+ */
+function contextBudgetFor(
+  session: AgentSessionLike,
+  usage: { input?: number; cacheRead?: number } | undefined,
+): ContextBudget | null {
+  const model = session.model;
+  if (model === undefined || usage === undefined) return null;
+  const usedTokens = (usage.input ?? 0) + (usage.cacheRead ?? 0);
+  if (usedTokens <= 0) return null;
+  return measureContextBudget({
+    windowTokens: model.contextWindow,
+    maxOutputTokens: model.maxTokens,
+    usedTokens,
+  });
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, ms);
@@ -1324,9 +1470,35 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
     let classification: RunClassification | null = null;
     let timeoutInfo: { settledAfterAbort: boolean } | null = null;
     let promptError: string | null = null;
+    let contextInfo: {
+      budget: ContextBudget;
+      turns: number;
+      settledAfterAbort: boolean;
+    } | null = null;
+
+    // Every assistant turn is weighed against the model's declared window as it
+    // lands, on the provider's own count of the request that produced it. Two
+    // turns of a work session are ordinary; a turn that leaves the *next* one a
+    // couple of thousand tokens of answer is not a slow run but a dead one,
+    // since the clamp in pi leaves nothing to say with. Stopping there costs the
+    // seconds since the last turn instead of the rest of the budget.
+    let assistantTurns = 0;
+    let contextStopped = false;
+    let stopForContext: ((stopped: ContextStopped) => void) | undefined;
+    const contextExhausted = new Promise<ContextStopped>((resolve) => {
+      stopForContext = (stopped: ContextStopped) => resolve(stopped);
+    });
 
     const unsubscribe = session.subscribe((event) => {
       emit({ type: "agent_event", sessionId: session.sessionId, kind, raw: event });
+      if (contextStopped || event.type !== "message_end") return;
+      const message = event.message;
+      if (message === undefined || message.role !== "assistant") return;
+      assistantTurns += 1;
+      const budget = contextBudgetFor(session, message.usage);
+      if (budget === null || !budget.exhausted) return;
+      contextStopped = true;
+      stopForContext?.({ kind: "context", budget, turns: assistantTurns });
     });
 
     // The turn ends when a tool says the answer is in. Deferred by a macrotask so
@@ -1349,12 +1521,12 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
         .prompt(prompt)
         .then(() => "settled" as const)
         .catch((error: unknown) => ({
-          kind: "prompt-error",
+          kind: "prompt-error" as const,
           message: error instanceof Error ? error.message : String(error),
         }));
       entry.running = running;
 
-      const first = await Promise.race([budget, running]);
+      const first = await Promise.race([budget, running, contextExhausted]);
       if (timer !== undefined) clearTimeout(timer);
 
       if (first === "timeout") {
@@ -1375,6 +1547,31 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
           delay(graceMs).then(() => "grace-expired" as const),
         ]);
         timeoutInfo = { settledAfterAbort: settled === "settled" };
+      } else if (typeof first === "object" && first.kind === "context") {
+        // The window ended this run, not the clock. Which one it was is the whole
+        // message: one wants a bigger budget, the other a smaller ticket.
+        emit({
+          type: "agent_event",
+          sessionId: session.sessionId,
+          kind,
+          detail:
+            `context exhausted after ${first.turns} assistant turn(s): ` +
+            `${describeContextBudget(first.budget)}; aborting`,
+        });
+        try {
+          await session.abort();
+        } catch {
+          // As above: the abort throwing changes nothing about what we report.
+        }
+        const settled = await Promise.race([
+          running.then(() => "settled" as const),
+          delay(graceMs).then(() => "grace-expired" as const),
+        ]);
+        contextInfo = {
+          budget: first.budget,
+          turns: first.turns,
+          settledAfterAbort: settled === "settled",
+        };
       } else if (typeof first === "object" && first.kind === "prompt-error") {
         if (capture.stopRequested && capture.accepted.length > 0) {
           // The turn ended because we ended it, with the answer already in hand.
@@ -1409,6 +1606,7 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
         assistantText,
         classification,
         timeout: timeoutInfo,
+        context: contextInfo,
         promptError,
         accepted: capture.accepted,
         duplicates: capture.duplicates,
@@ -1536,6 +1734,15 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
 
     const base = baseFields(id, core, started, context.notes, core.verdictToolCalls);
 
+    if (core.context !== null) {
+      return {
+        ...base,
+        kind: "context-exhausted",
+        budget: core.context.budget,
+        turns: core.context.turns,
+        settledAfterAbort: core.context.settledAfterAbort,
+      };
+    }
     if (core.timeout !== null) {
       return { ...base, kind: "timeout", budgetMs, settledAfterAbort: core.timeout.settledAfterAbort };
     }
@@ -1607,6 +1814,13 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
       capture,
     );
 
+    if (core.context !== null) {
+      throw new AgentError(
+        "timeout",
+        `split ran out of context after ${core.context.turns} assistant turn(s): ` +
+          describeContextBudget(core.context.budget),
+      );
+    }
     if (core.timeout !== null) {
       throw new AgentError(
         "timeout",
@@ -1701,3 +1915,4 @@ type OrchestratorPortsAgent = import("./orchestrator.ts").OrchestratorPorts["age
 type OrchestratorPortsSession = import("./orchestrator.ts").OrchestratorPorts["session"];
 
 export type { BdClient, Issue, NewIssueSpec, RepoSnapshot };
+export type { ThinkingLevel };
