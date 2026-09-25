@@ -20,6 +20,9 @@ RUN addgroup --system appgroup && \
 ENV PLAYWRIGHT_BROWSERS_PATH=/home/appuser/playwright
 ENV BEADS_DIR=/home/appuser/.beads
 
+# two hours timeout
+ENV LOOP_WORK_TIMEOUT_MS=7200000
+
 # Set all of /app to root:root, read-only for appuser
 RUN chown -R root:root /app && chmod -R 755 /app
 RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent

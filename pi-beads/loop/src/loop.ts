@@ -60,7 +60,7 @@
 import { BdError, selectWorkable } from "./beads.ts";
 import type { BdClient, Issue } from "./beads.ts";
 import type { AgentRunner, WorkOutcome } from "./agent.ts";
-import { toWorkEvent } from "./agent.ts";
+import { describeFailure, toWorkEvent } from "./agent.ts";
 import type { FinalizeOutcome, FinalizeRequest } from "./finalize.ts";
 import { describeFinalizeFailure, toFinalizeEvents } from "./finalize.ts";
 import type { IdleOutcome } from "./idle.ts";
@@ -156,6 +156,23 @@ export interface LoopConfig {
    * under the failure key, so "what went wrong" is not lost by stopping.
    */
   readonly maxConsecutiveFailures?: number;
+  /**
+   * Retry a run that ran out of the harness's room — wall-clock time, or context.
+   *
+   * Default false, and the reason is arithmetic rather than caution: the next pass
+   * is a *fresh* session with the same budget and the same window, so it stops at
+   * the same place one whole budget later. With a 20-minute budget and the default
+   * streak of two, the old behaviour spent forty minutes to rediscover that one
+   * ticket does not fit one session — and reported it as "re-queued for another
+   * pass", which is the one thing it was not going to get.
+   *
+   * Set true to restore retrying: a run that timed out for a reason that could
+   * clear (a cold cache, a loaded server) may be worth a second full pass.
+   *
+   * Neither case loses the work. The bead is reopened either way, with the
+   * previous attempt's own words in its failure note.
+   */
+  readonly retryUnfitWork?: boolean;
   /**
    * Stop after this many claim attempts in a row that the board refused.
    *
@@ -277,6 +294,11 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** The headline of a multi-line message; the rest is for whoever reads the note. */
+function firstLine(text: string): string {
+  return (text.split("\n")[0] ?? text).trim();
+}
+
 function kindOf(error: unknown): string {
   if (BdError.is(error)) return error.kind;
   if (error instanceof Error) return error.name;
@@ -354,6 +376,15 @@ export async function runLoop(
   let blockedReason: string | null = null;
   let failedIssue: string | null = null;
   let consecutiveFailures = 0;
+  /**
+   * Set when the last worked bead ran out of the harness's room rather than out of
+   * things to do. Kept apart from the failure streak on purpose: the streak says
+   * "this bead keeps failing", which is a thing to retry once and stop on; this
+   * says "the next pass cannot end any differently", which is a thing to stop on
+   * now. See {@link LoopConfig.retryUnfitWork}.
+   */
+  let unfitWork: { issueId: string; kind: string; reason: string } | null = null;
+  const retryUnfitWork = config.retryUnfitWork === true;
   let refusedClaimIssue: string | null = null;
   let refusedClaimStreak = 0;
   /**
@@ -372,6 +403,18 @@ export async function runLoop(
       guardTripped = {
         kind: "iteration-limit",
         reason: `stopped after ${maxIterations} iterations; this looks like a runaway loop`,
+      };
+      return guardTripped;
+    }
+    if (unfitWork !== null && !retryUnfitWork) {
+      guardTripped = {
+        kind: "blocked",
+        reason:
+          `${unfitWork.issueId} ${unfitWork.reason}. Not running it again in this run: the next pass ` +
+          `is a fresh session with the same room to work in, so it stops in the same place one whole ` +
+          `budget later. The bead is back on the board open, with what this attempt got to in its note ` +
+          `(${failureKeyFor(unfitWork.issueId)}) — split it into pieces that fit one session, or raise ` +
+          `the budget if the ticket really is this size, and run again.`,
       };
       return guardTripped;
     }
@@ -647,9 +690,23 @@ export async function runLoop(
     if (outcome.kind === "done") {
       failedIssue = null;
       consecutiveFailures = 0;
+      unfitWork = null;
     } else {
       consecutiveFailures = failedIssue === effect.issueId ? consecutiveFailures + 1 : 1;
       failedIssue = effect.issueId;
+      // Time and context are the harness's units, so running out of either is a
+      // statement about the run, not about the work. `incomplete` is a verdict
+      // about the work, and a verdict is worth another pass.
+      unfitWork =
+        outcome.kind === "timeout" || outcome.kind === "context-exhausted"
+          ? {
+              issueId: effect.issueId,
+              kind: outcome.kind,
+              // The same formatter the board note uses, so the guard line and the
+              // note on the board cannot drift apart.
+              reason: firstLine(describeFailure(outcome)),
+            }
+          : null;
     }
     effects.push({ kind: effect.kind, detail: `${effect.issueId}:${outcome.kind}` });
     log("info", `work on ${effect.issueId} ended ${outcome.kind} (${outcome.elapsedMs}ms)`);

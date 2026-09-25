@@ -2066,6 +2066,53 @@ describe("rule 13: timeout, abort and failure render as themselves", () => {
     assert.match(stripTerminalSequences(styledLine(h, "cut off")), /token limit/u);
   });
 
+  it("a timeout reports the run's own elapsed, not the surface's clock", () => {
+    // The surface had been showing this issue for 20:01. The run that timed out
+    // had been going 20:00 of a 20:00 budget. Only the runner knows which is
+    // which, so the numbers travel on the event.
+    const h = presenterHarness();
+    h.presenter.setContext({ issueId: "ws.7eg", phase: "work", runId: 1 });
+    h.time.advance(20 * 60_000 + 1_000);
+    h.presenter.feed({
+      type: "timeout",
+      elapsedMs: 1_200_000,
+      budgetMs: 1_200_000,
+      detail: "budget 1200000ms exceeded; aborting",
+    });
+    h.presenter.flushSync();
+    const line = stripTerminalSequences(styledLine(h, "timed out"));
+    assert.match(line, /timed out after 20:00 of a 20:00 budget \(issue ws\.7eg\)/u);
+    assert.ok(!line.includes("20:01"), "the surface's own clock did not leak into the line");
+  });
+
+  it("a re-run of the same bead is a new unit, and the footer clock starts over", () => {
+    const h = presenterHarness();
+    h.presenter.setContext({ issueId: "ws.7eg", phase: "work", runId: 1 });
+    h.time.advance(20 * 60_000);
+    // The pass timed out and the loop handed the same bead straight back. Same
+    // issue, new unit: a clock that keeps running across the handoff reports the
+    // two passes added together, which reads as a budget that doubled.
+    h.presenter.setContext({ issueId: "ws.7eg", phase: "work", runId: 2 });
+    h.time.advance(61_000);
+    h.presenter.flushSync();
+    assert.match(h.footerLine(), /elapsed 01:01/u, "the footer describes this pass, not both");
+  });
+
+  it("a wrap-up nudge shows as itself", () => {
+    const h = presenterHarness();
+    h.presenter.setContext({ issueId: "ws.8", phase: "work", runId: 1 });
+    h.presenter.feed({
+      type: "wrap_up",
+      elapsedMs: 1_020_000,
+      budgetMs: 1_200_000,
+      detail: "asked this session to land what it has and report; 03:00 left to do it in",
+    });
+    h.presenter.flushSync();
+    const line = stripTerminalSequences(styledLine(h, "wrapping up"));
+    assert.match(line, /wrapping up ws\.8/u);
+    assert.match(line, /land what it has/u);
+  });
+
   it("describeOutcome gives every kind its own word and level", () => {
     const cases: Array<[string, string, string]> = [
       ["done", "info", "finished"],

@@ -92,12 +92,14 @@ In one line each:
   discipline.
 
 Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`,
-`LOOP_WIDTH`, and the per-pass thinking levels `LOOP_WORK_THINKING` /
+`LOOP_WIDTH`, the per-pass thinking levels `LOOP_WORK_THINKING` /
 `LOOP_SPLIT_THINKING` — one of `off`, `minimal`, `low`, `medium`, `high`,
-`xhigh`, `max`. Neither knob set is not the same as either set to `low`: unset
-falls through to the user's configured default and then pi's own, so a ticket is
-never run at a level nobody chose. A value pi does not recognise stops the loop
-with the list of what it accepts, rather than being quietly dropped.
+`xhigh`, `max` — and the budget knobs `LOOP_WORK_TIMEOUT_MS`, `LOOP_WRAP_UP_MS`
+and `LOOP_RETRY_UNFIT_WORK` (see "Two clocks" below). Neither knob set is not the
+same as either set to `low`: unset falls through to the user's configured default
+and then pi's own, so a ticket is never run at a level nobody chose. A value pi
+does not recognise stops the loop with the list of what it accepts, rather than
+being quietly dropped.
 
 ### Two clocks: the budget and the context wall
 
@@ -137,6 +139,90 @@ run budget (settled after abort)
   what the server takes, or the ticket does not fit in the window it has. The
   first is a config fix; the second is a split.
 
+### The off-ramp: ask before cutting
+
+A hard timeout is the least informative way a run can end. There is no verdict,
+no `changed_files`, nothing the finalizer could commit if it wanted to, and a
+working tree left dirty behind a session that was cut off mid-sentence. The loop
+then re-queues the ticket and the next attempt starts from nothing except a note
+that says *the last one ran out of time* — which is a description of the harness,
+read by a model that has to decide what to do with the work.
+
+So at `wrapUpMs` — by default the budget minus `WRAP_UP_LEAD_MS` (3 minutes) —
+the runner sends `session.steer(wrapUpInstruction(kind))`: finish the edit you
+are in, call `report_done` now, `done: false` with what is left is a good answer.
+The steering lands after the current turn's tool calls, so nothing is interrupted
+mid-write, and the same clock that was going to cut the run off instead ends it
+with a verdict: a reason, a file list, and a next attempt that reads something
+about the *work*.
+
+- The message carries **no number**. A model given "you have 3m14s left" cannot
+  check it and will spend turns trying; it is told what to do, which it can act
+  on.
+- A budget smaller than the lead gets no off-ramp at all (`wrapUpAtMs` returns
+  `0`), because there would be nothing to land with. That is stated rather than
+  faked: `test/agent.test.ts` asserts no steer happens.
+- A run that ignores the ramp still ends at the budget. The nudge is on the
+  record either way (`wrap_up` runner event, painted as `wrapping up <issue>`).
+
+### A run that ran out of the harness's room is not retried in place
+
+The next pass after a timeout is a *fresh session with the same budget and the
+same window*, so it stops in the same place one whole budget later. With the old
+defaults that meant forty minutes to rediscover that one ticket does not fit one
+session — and the line `Re-queued for another pass.` printed just before the loop
+stopped, which is the one sentence in that trace a reader acts on and the loop
+does not honour. So:
+
+- `timeout` and `context-exhausted` set **unfit work**, and the guard stops the
+  run at the boundary instead of starting the next pass. The bead is reopened and
+  the note is written first, so nothing is stranded: re-run after splitting the
+  ticket and it is picked up like any other open work.
+- `incomplete` is *not* unfit. "I got this far and stopped" is a verdict about
+  the work, and a verdict is worth another pass — which is the whole reason the
+  off-ramp is worth having.
+- `retryUnfitWork` (`LOOP_RETRY_UNFIT_WORK=true`) restores retrying, up to
+  `maxConsecutiveFailures`, for a timeout that could plausibly clear.
+- No transition claims another pass is coming. The orchestrator says the bead is
+  open on the board again, which is the only part of that sentence it knows.
+
+### One clock per work unit
+
+The presenter used to reset its elapsed field when the *issue* changed. Work the
+same ticket twice and the second pass reported both passes added together: a
+`1200000ms` budget shown as `timed out after 40:01`, which reads like a budget
+that doubled rather than a ticket that failed twice. Two fixes, both pinned:
+
+- `setContext` takes a `runId`; the composition root issues one per work,
+  split or finalize unit, and a new `runId` resets the clock, the token counters
+  and the expand state the way a new issue always did. (The finalize step was the
+  same lie in slow motion: it showed the work pass's elapsed.)
+- The `timeout` event carries `elapsedMs` and `budgetMs` from the runner, which
+  is the only party that knows them. The surface's own clock is a fallback, not
+  the answer.
+
+### What the next attempt reads
+
+`describeFailure` output is the board note (`loop:failure:<id>`) and the
+`prior_attempt` section of the next prompt, so its shape is model behaviour, not
+just log cosmetics. A timeout note now reads:
+
+```
+Work on workspace-7eg failed: timed out at 20:00 of a 20:00 session budget (the session closed when asked)
+
+That is the harness's limit, not a verdict on this ticket: nothing in it says
+the work was wrong, and there is no clock inside your session. ...
+
+What the last attempt had said by the time it was cut off:
+> Reading the repo. Plan: open the parser, add the mode, then the docs…
+```
+
+Headline for the human, framing and recovered prose for the model. The cut-off
+reply is read out of the session *before* it is disposed — before this, the
+timeout path left `assistantText` empty and threw away the only thing worth
+handing forward. The warn line shows the headline only (`headlineOf`), because
+parking a sentence on the end of a quote is what a plain log ends up showing.
+
 ### Chain of thought is billed to the context window
 
 pi replays an assistant turn's thinking on the next request — that is what the
@@ -162,6 +248,15 @@ instead: pi hard-codes `preserve_thinking: true` there, which is precisely the
 other answer.
 
 However, for agentic workflows it is still recommended to keep the CoT within context.  Using `"preserve_thinking": true` is prefered for these types of coding use-cases.  The server brings data back pre-parsed into thinking and non-thinking responses.  Technically having `thinkingFormat` and the `chatTemplateKwargs` are not even required, but is included to be explicit about what is sent to the server.
+
+One consequence worth naming, because it was observed before it was understood: with
+the CoT replayed, whatever the model *says to itself* about time is re-read on
+every later turn. Point it at a clock and it will spend budget on the clock —
+which is why nothing inside a running session carries a countdown the model
+cannot check, and why the note a timed-out attempt leaves says whose limit it was
+before it says anything else (see "What the next attempt reads"). The replay is
+paid for on purpose; what it should be carrying is work, not anxiety about the
+harness.
 
 ### Cadence: `coalesceMs` and `heartbeatMs`
 

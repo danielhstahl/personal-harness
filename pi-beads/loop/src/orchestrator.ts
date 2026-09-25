@@ -495,6 +495,19 @@ function isBlank(text: string): boolean {
   return text.trim() === "";
 }
 
+/**
+ * The first line of a multi-line message.
+ *
+ * A failure reason is written for two readers at once: the board note, which the
+ * next attempt reads whole, and the warn line, which a human glances at while
+ * something else is running. The headline is what belongs to the second one —
+ * appending a sentence to a multi-line note parks it on the end of a quote, and
+ * that is what a plain log ends up showing.
+ */
+function headlineOf(text: string): string {
+  return (text.split("\n")[0] ?? text).trim();
+}
+
 /** One reachable state's worth of "that cannot happen here". */
 function unhandled(state: OrchestratorState, event: OrchestratorEvent): StepResult {
   if (event.type === "stop") {
@@ -855,6 +868,12 @@ export function step(state: OrchestratorState, event: OrchestratorEvent): StepRe
           // Invariant 4: remember the reason *before* reopening, so the next
           // iteration can read why. If the reopen itself is refused the issue
           // stays in_progress and rule 1 resumes it — never simply lost.
+          //
+          // And no "re-queued for another pass": whether another pass happens is
+          // the interpreter's guard, not this transition's promise. The machine
+          // knows the bead is open again; it does not know whether this run is
+          // about to stop, and saying it would be the one sentence in this trace
+          // that a reader acts on and the loop does not honour.
           return applied(
             throughBoundary(
               state,
@@ -863,7 +882,10 @@ export function step(state: OrchestratorState, event: OrchestratorEvent): StepRe
               [
                 { kind: "beads.remember", text: note, key: failureKeyFor(issueId) },
                 { kind: "beads.set_status", id: issueId, status: "open", ifStatus: "in_progress" },
-                warn(`${note}. Re-queued for another pass.`),
+                warn(
+                  `Work on ${issueId} failed: ${headlineOf(event.reason)}. ` +
+                    "The bead is open on the board again.",
+                ),
               ],
               { lastFailure: { stage: "work", reason: event.reason } },
             ),

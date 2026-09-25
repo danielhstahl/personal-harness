@@ -134,6 +134,16 @@ export class RenderError extends Error {
 export interface FooterFields {
   readonly issueId?: string;
   readonly phase?: string;
+  /**
+   * Which run of the surface this is. A new `runId` is a new work unit even when
+   * the issue is the same one — the shape a re-queued ticket always takes.
+   *
+   * Without it the surface keeps one clock per *issue*, and the second pass of a
+   * ticket that timed out reports the two passes added together: a 20-minute
+   * budget shown as `40:01`, which reads like the budget doubled rather than the
+   * ticket failing twice.
+   */
+  readonly runId?: number;
   readonly elapsedMs?: number;
   readonly tokensIn?: number;
   readonly tokensOut?: number;
@@ -790,6 +800,8 @@ export interface OutcomeFacts {
   readonly message?: string;
   /** Timeout budget, in ms. */
   readonly budgetMs?: number;
+  /** How long the run had actually been going, in ms. Not the budget. */
+  readonly elapsedMs?: number;
   /** Did the session settle after `abort()`? */
   readonly settledAfterAbort?: boolean;
   /** Assistant turns taken, for the kinds that stop early. */
@@ -844,13 +856,22 @@ export function describeOutcome(facts: OutcomeFacts): {
           (facts.contextText === undefined ? "" : `: ${oneLine(facts.contextText)}`) +
           tail,
       };
-    case "timeout":
+    case "timeout": {
+      // `elapsed` and `budget` are two different numbers and the old line passed
+      // the budget as if it were the first. On a re-queued ticket that is the
+      // difference between "this pass ran out" and "something is 40 minutes
+      // late", and only one of those is true.
+      const clock =
+        facts.elapsedMs === undefined
+          ? `after ${formatElapsed(facts.budgetMs)}`
+          : `after ${formatElapsed(facts.elapsedMs)} of a ${formatElapsed(facts.budgetMs)} budget`;
       return {
         level: "error",
         text:
-          `timed out ${issue} after ${formatElapsed(facts.budgetMs)}` +
+          `timed out ${issue} ${clock}` +
           ` (${facts.settledAfterAbort === false ? "still running when the grace period ended" : "session settled after abort"})${tail}`,
       };
+    }
     case "error":
       return {
         level: "error",
@@ -1095,10 +1116,15 @@ class Presenter implements WorkPresenter {
   setContext(patch: Partial<FooterFields>): void {
     if (this.closed) return;
     const previousIssue = this.fields.issueId;
+    const previousRun = this.fields.runId;
     this.fields = { ...this.fields, ...patch };
-    if (patch.issueId !== undefined && patch.issueId !== previousIssue) {
-      // A new issue is a new work unit: counts, clock and expand state reset, so
-      // the footer describes the thing actually running.
+    // A new work unit: counts, clock and expand state reset, so the footer
+    // describes the thing actually running. A new issue is one; so is a new run
+    // of the issue that is already showing, which is what a re-queued ticket is.
+    const newUnit =
+      (patch.runId !== undefined && patch.runId !== previousRun) ||
+      (patch.issueId !== undefined && patch.issueId !== previousIssue);
+    if (newUnit) {
       this.tokensIn = undefined;
       this.tokensOut = undefined;
       this.workStartedAt = this.now();
@@ -1137,11 +1163,25 @@ class Presenter implements WorkPresenter {
       case "timeout": {
         const issue = this.fields.issueId;
         const detail = event.detail === undefined ? "" : ` — ${oneLine(event.detail)}`;
+        // The runner's own elapsed when it called the budget spent. Its own clock
+        // is the fallback only: this surface outlives a run, and its clock is the
+        // wrong answer for a pass that started after the one being reported.
+        const elapsed = event.elapsedMs ?? this.elapsedMs();
+        const budget =
+          event.budgetMs === undefined ? "" : ` of a ${formatElapsed(event.budgetMs)} budget`;
         this.notice(
           "error",
-          `timed out after ${formatElapsed(this.elapsedMs())}${
+          `timed out after ${formatElapsed(elapsed)}${budget}${
             issue === undefined ? "" : ` (issue ${issue})`
           }${detail}`,
+        );
+        return;
+      }
+      case "wrap_up": {
+        const detail = event.detail === undefined ? "" : ` — ${oneLine(event.detail)}`;
+        this.notice(
+          "warn",
+          `wrapping up${this.fields.issueId === undefined ? "" : ` ${this.fields.issueId}`}${detail}`,
         );
         return;
       }

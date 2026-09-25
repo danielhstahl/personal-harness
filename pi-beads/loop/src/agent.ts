@@ -505,8 +505,12 @@ export function describeFailure(outcome: WorkOutcome): string {
     case "malformed-verdict":
       return `malformed verdict (${outcome.verdictSource}): ${outcome.problems.join("; ")}`;
     case "timeout":
-      return `timed out after ${outcome.budgetMs}ms ` +
-        `(${outcome.settledAfterAbort ? "settled after abort" : "still running when the grace period ended"})`;
+      return formatTimeoutNote(
+        outcome.elapsedMs,
+        outcome.budgetMs,
+        outcome.settledAfterAbort,
+        outcome.assistantText,
+      );
     case "context-exhausted":
       return (
         `context exhausted after ${outcome.turns} assistant turn(s): ` +
@@ -517,6 +521,137 @@ export function describeFailure(outcome: WorkOutcome): string {
     case "error":
       return `${outcome.phase} error: ${outcome.message}`;
   }
+}
+
+// ── what a run that overruns says, and to whom ──────────────────────────────
+
+/** `721_000` → `"12:01"`; `3_721_000` → `"1:02:01"`; `30` → `"30ms"`. */
+function formatDuration(ms: number | undefined): string {
+  if (ms === undefined || !Number.isFinite(ms) || ms < 0) return "unknown time";
+  if (ms < 1_000) return `${Math.round(ms)}ms`;
+  const total = Math.floor(ms / 1000);
+  const seconds = total % 60;
+  const minutes = Math.floor(total / 60) % 60;
+  const hours = Math.floor(total / 3600);
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds)}` : `${pad(minutes)}:${pad(seconds)}`;
+}
+
+/** A previous attempt's prose, quoted and bounded, for the next attempt's note. */
+function quoteTruncated(text: string, max: number): string {
+  return truncate(text, max)
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n");
+}
+
+/** How much of the cut-off reply is worth carrying forward. */
+const TIMEOUT_NOTE_TEXT_CHARS = 1_500;
+
+/**
+ * The note a timed-out run leaves for the next attempt.
+ *
+ * One string, two readers, and they want different things from it:
+ *
+ * - the operator, who wants the number and whether the session stopped when it
+ *   was asked;
+ * - the model that reads this back in its `prior_attempt` section, for whom the
+ *   number is unusable and the framing is everything.
+ *
+ * The framing is not decoration. This note used to be the bare fact —
+ * `timed out after 1200000ms` — and the next attempt read that as a verdict on
+ * the work and answered by reasoning about clocks instead of about the ticket:
+ * budget spent being anxious about a limit it cannot observe, on a run that then
+ * timed out for the same reason it was told about. So the note now says whose
+ * limit it was, points at the work that is already on disk, and names the exit
+ * that is actually available. The timing goes in the first line, attributed to
+ * the harness, where the human reads it.
+ */
+export function formatTimeoutNote(
+  elapsedMs: number,
+  budgetMs: number,
+  settledAfterAbort: boolean,
+  partialText: string,
+): string {
+  const lines: string[] = [
+    `timed out at ${formatDuration(elapsedMs)} of a ${formatDuration(budgetMs)} session budget ` +
+      `(${settledAfterAbort ? "the session closed when asked" : "the session was still running when we stopped waiting"})`,
+    "",
+    "That is the harness's limit, not a verdict on this ticket: nothing in it says",
+    "the work was wrong, and there is no clock inside your session. Everything the",
+    "last attempt changed is still in the working tree (see the repository state",
+    "below), so carry on from there rather than starting over. If the ticket cannot",
+    "fit inside one session, report `done: false` with what is left undone: a",
+    "reported half is a result the loop can keep, an unreported one is lost.",
+  ];
+  const said = partialText.trim();
+  if (said !== "") {
+    lines.push(
+      "",
+      "What the last attempt had said by the time it was cut off:",
+      quoteTruncated(said, TIMEOUT_NOTE_TEXT_CHARS),
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
+ * The off-ramp, sent while the run still has room to take it.
+ *
+ * A hard timeout is the least informative way a run can end: no verdict, no
+ * changed-file list, nothing the finalizer could commit even if it wanted to, and
+ * a working tree left dirty behind a session that was cut off mid-sentence.
+ * Steering the session turns the same clock into a reported `done: false` —
+ * the ending the loop can actually use, because the loop can only ever describe
+ * what it was told.
+ *
+ * Deliberately absent: a number. A model given "you have 3m14s left" cannot
+ * check it, and will spend turns instead of budget checking it. It is told what
+ * to do, which is the part it can act on.
+ */
+export function wrapUpInstruction(kind: RunnerSessionKind): string {
+  if (kind === "split") {
+    return `## Wrap up now — this session is close to its limit
+
+Do not start planning another item. Call \`report_split\` now with the batch exactly
+as it stands — a smaller batch that exists is worth more than a better batch that
+gets cut off before it is reported — and then stop.`;
+  }
+  return `## Wrap up now — this session is close to its limit
+
+Do not start anything new. In this order:
+
+1. Finish the edit or command you are in the middle of, so nothing is left
+   half-written.
+2. Call \`report_done\` now. If the ticket is finished, report it finished. If it
+   is not, report \`done: false\` with a \`reason\` that names exactly what is left,
+   and a \`changed_files\` list of every path you actually touched.
+
+A reported "not finished, here is what changed, here is what is left" is a good
+outcome: the loop keeps it, and the next attempt starts from your note instead of
+from the beginning. Being cut off with nothing reported throws all of it away.
+
+No new subtasks, no new refactors, no verification sweep. Land it and report.`;
+}
+
+/**
+ * How much of the budget to keep back for the landing.
+ *
+ * Long enough for the steer to be delivered (it waits for the current turn's tool
+ * calls), for one more assistant turn, and for the report tool to come back — and
+ * short enough that a 20-minute ticket is not cut short by 15%. A budget smaller
+ * than this gets no off-ramp at all: there would be nothing to land with.
+ */
+export const WRAP_UP_LEAD_MS = 180_000;
+
+/** The run's own wrap-up moment, or 0 for "never". */
+export function wrapUpAtMs(budgetMs: number, configured?: number): number {
+  if (configured !== undefined) {
+    // Clamped at both ends. A ramp scheduled after the cut is not a ramp, and a
+    // negative one is not either; the budget is the most that asking can buy.
+    return Math.min(Math.max(0, configured), Math.max(0, budgetMs));
+  }
+  return budgetMs > WRAP_UP_LEAD_MS ? budgetMs - WRAP_UP_LEAD_MS : 0;
 }
 
 // ── errors ──────────────────────────────────────────────────────────────────
@@ -555,7 +690,17 @@ export class AgentError extends Error {
  */
 export type AgentSessionLike = Pick<
   AgentSession,
-  "sessionId" | "sessionFile" | "messages" | "prompt" | "abort" | "dispose" | "subscribe"
+  | "sessionId"
+  | "sessionFile"
+  | "messages"
+  | "prompt"
+  | "abort"
+  | "dispose"
+  | "subscribe"
+  // The off-ramp. It is part of the port rather than a nice-to-have because the
+  // difference between "asked to stop and reported" and "cut off mid-sentence"
+  // is the whole value of a run that overruns. See {@link wrapUpInstruction}.
+  | "steer"
 > & {
   /**
    * Only the two numbers the context check needs, not the SDK's whole model
@@ -1281,11 +1426,23 @@ export interface RunnerEvent {
     | "tool_call"
     | "agent_event"
     | "timeout"
+    | "wrap_up"
     | "context_note";
   readonly sessionId?: string;
   readonly kind?: RunnerSessionKind;
   readonly detail?: string;
   readonly raw?: unknown;
+  /**
+   * This run's own elapsed milliseconds at the instant the event fired.
+   *
+   * Carried on the event rather than left to the surface's clock: a surface that
+   * keeps one clock across a re-queued pass of the same ticket reports the sum of
+   * both passes, which reads exactly like a budget that doubled. The runner knows
+   * the number; it says it.
+   */
+  readonly elapsedMs?: number;
+  /** The budget {@link elapsedMs} is being read against. */
+  readonly budgetMs?: number;
 }
 
 export interface RepoReaderLike {
@@ -1302,6 +1459,14 @@ export interface AgentRunnerOptions {
   readonly timeoutMs?: number;
   /** How long to wait for the session to settle after abort(). Default 5s. */
   readonly abortGraceMs?: number;
+  /**
+   * When to ask the session to land, in ms from the start of the run.
+   *
+   * Default: the budget minus {@link WRAP_UP_LEAD_MS}. A value <= 0 turns the
+   * off-ramp off, which leaves the hard abort as the only ending — the one that
+   * reports nothing.
+   */
+  readonly wrapUpMs?: number;
   readonly cwd?: string;
   /** Explicit model; otherwise pi's configured default is used. Never env. */
   readonly modelRef?: { provider: string; id: string };
@@ -1399,6 +1564,7 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
   const live = new Map<string, LiveSession>();
   let created = 0;
   let disposed = 0;
+  const wrapUpMs = options.wrapUpMs;
 
   async function disposeSession(entry: LiveSession): Promise<boolean> {
     if (entry.disposed) return false;
@@ -1459,6 +1625,7 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
           ? bareToolsetSystemPrompt(tools.map((tool) => tool.name))
           : undefined,
     });
+    const runStartedAt = now();
     created += 1;
     const entry: LiveSession = { session, kind, disposed: false, disposeCount: 0 };
     live.set(session.sessionId, entry);
@@ -1517,6 +1684,30 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
         timer = setTimeout(() => resolve("timeout"), budgetMs);
         timer.unref?.();
       });
+      // The off-ramp is not a racer: it ends nothing. It only tells the session
+      // to stop opening new work and report what it has, so that the same clock
+      // that was going to cut the run off instead lands it as a verdict. See
+      // {@link wrapUpInstruction}.
+      let settled = false;
+      const wrapAt = wrapUpAtMs(budgetMs, wrapUpMs);
+      let wrapTimer: NodeJS.Timeout | undefined;
+      if (wrapAt > 0) {
+        wrapTimer = setTimeout(() => {
+          if (settled) return;
+          emit({
+            type: "wrap_up",
+            sessionId: session.sessionId,
+            kind,
+            elapsedMs: Math.max(0, now() - runStartedAt),
+            budgetMs,
+            detail:
+              `asked this session to land what it has and report; ` +
+              `${formatDuration(budgetMs - wrapAt)} left to do it in`,
+          });
+          void Promise.resolve(session.steer(wrapUpInstruction(kind))).catch(() => undefined);
+        }, wrapAt);
+        wrapTimer.unref?.();
+      }
       const running = session
         .prompt(prompt)
         .then(() => "settled" as const)
@@ -1527,14 +1718,19 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
       entry.running = running;
 
       const first = await Promise.race([budget, running, contextExhausted]);
+      settled = true;
       if (timer !== undefined) clearTimeout(timer);
+      if (wrapTimer !== undefined) clearTimeout(wrapTimer);
 
       if (first === "timeout") {
+        const elapsed = Math.max(0, now() - runStartedAt);
         emit({
           type: "timeout",
           sessionId: session.sessionId,
           kind,
-          detail: `budget ${budgetMs}ms exceeded; aborting`,
+          elapsedMs: elapsed,
+          budgetMs,
+          detail: `budget ${formatDuration(budgetMs)} exceeded; aborting`,
         });
         try {
           await session.abort();
@@ -1542,11 +1738,15 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
           // Whether abort throws does not decide the outcome: whether the prompt
           // settled after we asked it to stop does.
         }
-        const settled = await Promise.race([
+        const settledNow = await Promise.race([
           running.then(() => "settled" as const),
           delay(graceMs).then(() => "grace-expired" as const),
         ]);
-        timeoutInfo = { settledAfterAbort: settled === "settled" };
+        // Read out before disposal, because it is the only thing this kind of run
+        // can hand forward: what it had got to. A timeout that carries no prose
+        // leaves the next attempt with nothing to resume from but the ticket.
+        assistantText = lastAssistantText(session.messages);
+        timeoutInfo = { settledAfterAbort: settledNow === "settled" };
       } else if (typeof first === "object" && first.kind === "context") {
         // The window ended this run, not the clock. Which one it was is the whole
         // message: one wants a bigger budget, the other a smaller ticket.
@@ -1563,14 +1763,15 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
         } catch {
           // As above: the abort throwing changes nothing about what we report.
         }
-        const settled = await Promise.race([
+        const settledNow = await Promise.race([
           running.then(() => "settled" as const),
           delay(graceMs).then(() => "grace-expired" as const),
         ]);
+        assistantText = lastAssistantText(session.messages);
         contextInfo = {
           budget: first.budget,
           turns: first.turns,
-          settledAfterAbort: settled === "settled",
+          settledAfterAbort: settledNow === "settled",
         };
       } else if (typeof first === "object" && first.kind === "prompt-error") {
         if (capture.stopRequested && capture.accepted.length > 0) {
@@ -1824,7 +2025,9 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
     if (core.timeout !== null) {
       throw new AgentError(
         "timeout",
-        `split timed out after ${budgetMs}ms and was aborted`,
+        `split timed out after ${formatDuration(budgetMs)} and was aborted. ` +
+          "A split is a planning run: if it cannot report in that time, the " +
+          "request is too big to hold in one pass — break it up and ask again.",
       );
     }
     if (core.promptError !== null) {
