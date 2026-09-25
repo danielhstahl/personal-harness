@@ -46,9 +46,13 @@ src/beads.ts         the ONLY module that shells out to `bd` (typed, side-effect
 src/idle.ts          the idle surface: pi's own TUI input, clean exits, raw text back.
                      Single-shot by contract — one surface answers once, then it is
                      torn down, so the root builds a fresh one per idle turn
-src/format.ts        one-line plain-log summaries — NOT the renderer (see ADR-001)
+src/monitor.ts      the backend monitor: read-only polling of /health, /metrics, /cache,
+                    /v1/models, with a tolerant field reader and a panel. GET-only, and
+                    no bd/session handle exists in it, so it cannot touch the run
+src/format.ts       one-line plain-log summaries — NOT the renderer (see ADR-001)
 docs/               ADR-001: transport + rendering decision
                     ADR-002: comparing the provider's /health report with models.json at startup
+                    ADR-003: the backend monitor — where it is drawn, and why not at the top
 spikes/             throwaway prototypes + captured evidence backing ADR-001
 test/               unit tests, plus the whole walk in test/loop.test.ts
 ```
@@ -102,13 +106,20 @@ And [`docs/ADR-002-startup-provider-comparison.md`](docs/ADR-002-startup-provide
 before the first ticket is claimed the loop asks that machine what it is and
 prints the disagreements. See "Startup: the provider comparison" below.
 
+And [`docs/ADR-003-backend-monitor.md`](docs/ADR-003-backend-monitor.md):
+while a ticket is being worked the loop also watches what that machine is
+*doing* — KV pressure, queue depth, drafter, throughput — and draws it in the
+fixed chrome, because a component appended to the transcript scrolls off
+instead of staying at the top. See "The monitor" below.
+
 Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`,
 `LOOP_WIDTH`, the per-pass thinking levels `LOOP_WORK_THINKING` /
 `LOOP_SPLIT_THINKING` — one of `off`, `minimal`, `low`, `medium`, `high`,
 `xhigh`, `max` — the budget knobs `LOOP_WORK_TIMEOUT_MS`, `LOOP_WRAP_UP_MS` and
 `LOOP_RETRY_UNFIT_WORK` (see "Two clocks" below), and the startup audit knobs
 `LOOP_AUDIT`, `LOOP_AUDIT_STRICT`, `LOOP_AUDIT_VERBOSE`, `LOOP_AUDIT_WRITE` and
-`LOOP_HEALTH_URL` (see "Startup: the provider comparison" below). Neither knob
+`LOOP_HEALTH_URL` (see "Startup: the provider comparison" below), and the
+monitor knobs `LOOP_MONITOR*` (see "The monitor" below). Neither knob
 set is not the same as either set to `low`: unset falls through to the user's
 configured default and then pi's own, so a ticket is never run at a level nobody
 chose. A value pi
@@ -401,6 +412,72 @@ Printed output is secret-redacted (`«redacted»` for a literal key, `$ENVVAR`
 references left intact). The file the audit writes is *not* redacted: it lands
 beside the file that already holds the credential, and a redacted key there would
 just be a broken config.
+
+## The monitor: what the server is doing right now
+
+ADR-002 answers what the server *is configured as*, before the first ticket. The
+monitor answers what it is *doing*, while a ticket is being worked — the question
+that arrives every time a pass is slow and the answer is sitting in `/metrics`:
+
+```
+● 1s · t/s 132 · kv 64% 168k/262k · slots 1/4 · queued 0
+ctx 262k · out 66k · draft mtp · cache 89% hit · req 2.0/s (415 served)
+```
+
+Top line is the live one (throughput, KV pressure, who else is here). Second
+line is the settled one (window, output ceiling, drafter, prompt cache, request
+rate, loaded model). `● 1s` is the age of the freshest reading, so a stalled
+server keeps its last good numbers without pretending to be current; if nothing
+ever answered the line reads `✕ unreachable: …` instead of a reading.
+
+**Where it is drawn.** Not at the top of the transcript — a component appended
+there scrolls off within a screenful (ADR-003 has the measurement). While a
+session runs it lives in the fixed chrome, the band immediately above the
+footer, which is the only region that is redrawn in the same place every frame.
+When the loop is idle there is no transcript, so the monitor is the top line
+proper. When the session is released the band stops being drawn: those lines
+describe what the server is doing *now*, and after a handoff “now” is no longer
+describing the work you are looking at. A piped log never sees the panel at all.
+
+**It is read-only, by shape.** No `bd` handle, no issue id, no `POST`. Every
+failure path returns a value rather than throwing. A field it cannot find is
+`—`, never a guess: if nothing exposes the KV capacity, the panel says
+`kv —` rather than dividing by an assumed pool.
+
+Rates are slopes and refuse to be computed when they would lie: a counter that
+went down is a restart, not negative throughput; a renamed counter is not
+differenced at all. Cache hit rate is reported as an interval with its delta
+(`cache 89% hit +21/-2`), so the first read shows `—` rather than a
+fabricated lifetime average that stays flattering long after the cache stopped
+helping.
+
+| Knob | Effect |
+| --- | --- |
+| `LOOP_MONITOR=0` | no monitor at all (a null source that renders and requests nothing) |
+| `LOOP_MONITOR_MS` | poll interval (default 1000) |
+| `LOOP_MONITOR_TIMEOUT_MS` | per-request deadline (default 1500) |
+| `LOOP_MONITOR_MODELS_MS` | model-list interval (default 30000; the list rarely changes) |
+| `LOOP_MONITOR_URL=…` | the backend base, over the provider config and the audit's URL |
+| `LOOP_MONITOR_LINES=n` | panel lines, 1–3. 3 adds the per-KV-pool breakdown |
+| `LOOP_MONITOR_AT=band\|top` | above the footer (default) or first on the surface (which scrolls) |
+| `LOOP_MONITOR_VERBOSE=1` | at startup, print each endpoint's state and the keys it exposed that no field reads |
+
+`/health` advertises where its own other pages live, and on the first cycle it is
+read before `/metrics`, `/cache` and `/models` are asked — so a server keeping
+its counters at `/counters` is never once asked at `/metrics`, and a
+non-standard layout needs no configuration. An endpoint that answers 404 is
+dropped from the rotation with a note rather than retried forever.
+
+It costs what it says it costs: three or four small `GET`s per second, one frame
+per poll through the existing coalescing window, and never two polls at once — a
+slow server produces one long wait, not a queue of them.
+
+```sh
+node tools/monitor-stub.mjs   # the panel, against a stub backend — no GPU needed
+LOOP_MONITOR=0 npm start                    # work without it
+LOOP_MONITOR_LINES=3 LOOP_MONITOR_VERBOSE=1 npm start   # wide panel + what the server exposed
+node --test test/monitor.test.ts         # 75 tests over the reader, poller and surfaces
+```
 
 ## Scratch beads DB (for live / integration checks)
 

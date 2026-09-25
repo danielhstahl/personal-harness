@@ -20,13 +20,26 @@ import { createFinalizer, describeFinalizeFailure, isFinalized } from "./finaliz
 import type { FinalizeOutcome, FinalizeRequest } from "./finalize.ts";
 import { createIdleMode } from "./idle.ts";
 import type { IdleHandle, IdleOutcome, IdleStatus } from "./idle.ts";
-import { createNullPresenter, createWorkPresenter, describeOutcome } from "./render.ts";
+import {
+  PLAIN_MONITOR_THEME,
+  createBackendMonitor,
+  createNullMonitor,
+  resolveMonitorUrls,
+  type BackendMonitor,
+  type MonitorTheme,
+} from "./monitor.ts";
+import {
+  createNullPresenter,
+  createPresenterTheme,
+  createWorkPresenter,
+  describeOutcome,
+} from "./render.ts";
 import type { WorkPresenter } from "./render.ts";
 import { runLoop, LoopError } from "./loop.ts";
 import type { LoopConfig, LoopIdlePort, LoopPorts, LoopResult, LoopUi } from "./loop.ts";
 import { createSplitter, portFromAgentRunner } from "./split.ts";
 import type { Splitter } from "./split.ts";
-import { runStartupAudit } from "./startup.ts";
+import { resolveProviderBaseUrl, runStartupAudit } from "./startup.ts";
 import type { StartupAuditResult } from "./startup.ts";
 import { createGitWriter } from "./vcs.ts";
 import type { GitWriter } from "./vcs.ts";
@@ -56,6 +69,40 @@ export interface ProviderAuditSetting {
   readonly timeoutMs?: number;
 }
 
+/**
+ * The read-only backend monitor: the panel that shows what the inference server
+ * is doing while the loop is using it.
+ *
+ * On by default. It costs four unauthenticated `GET`s per `intervalMs` against
+ * a server that is already on the network path of every token drawn here, and it
+ * answers questions that are otherwise invisible until a ticket times out — KV
+ * pressure, a slot somebody else is holding, a prompt cache that went cold, a
+ * drafter that is not the one you thought you were using. Off is one env
+ * variable away for a server with no diagnostics endpoints at all, and turning
+ * it off costs nothing but the panel.
+ */
+export interface MonitorSetting {
+  readonly enabled: boolean;
+  /** Poll cadence. Default 2000ms. */
+  readonly intervalMs?: number;
+  /** Per-request deadline. Default 1500ms. */
+  readonly timeoutMs?: number;
+  /** How often to re-read `/v1/models`. Default 30000ms. */
+  readonly modelsEveryMs?: number;
+  /** Override the derived base entirely (`http://host:8081` or `.../v1`). */
+  readonly url?: string;
+  /** Rows the panel may take. Default 2. */
+  readonly lines?: number;
+  /**
+   * Where the panel sits. `"band"` (default) is directly above the footer —
+   * always on screen, never covering the transcript. `"top"` puts it at the top
+   * of the work surface, which scrolls with the transcript; the idle surface
+   * always draws it at the top of the screen, where nothing scrolls.
+   */
+  readonly placement?: "band" | "top";
+  readonly verbose?: boolean;
+}
+
 export interface AppConfig extends LoopConfig {
   /** Repository and board live here. */
   readonly cwd: string;
@@ -83,6 +130,8 @@ export interface AppConfig extends LoopConfig {
   readonly splitThinkingLevel?: ThinkingLevel;
   /** The startup provider comparison. See {@link ProviderAuditSetting}. */
   readonly providerAudit?: ProviderAuditSetting;
+  /** The read-only server panel. See {@link MonitorSetting}. */
+  readonly monitor?: MonitorSetting;
   readonly themeName?: string;
   /**
    * The live surface's cadence, in ms.
@@ -109,6 +158,12 @@ export interface AppConfig extends LoopConfig {
     readonly splitter?: Splitter;
     readonly finalizer?: { finalize(request: FinalizeRequest): Promise<FinalizeOutcome> };
     readonly idle?: LoopIdlePort;
+    /** Substitute the monitor wholesale (`createNullMonitor()` to silence). */
+    readonly monitor?: BackendMonitor;
+    /** Where the monitor finds its provider's base URL (tests: a fixture path). */
+    readonly monitorBaseUrl?: string;
+    /** Read `models.json` from somewhere else when resolving the base. */
+    readonly modelsPath?: string;
     /**
      * Substitute the *kind* of idle surface without substituting the port, so
      * a test can hand in handles that model a single-shot teardown and still
@@ -123,7 +178,13 @@ export interface AppConfig extends LoopConfig {
      * log-only spike, where a live surface would paint over the transcript.
      */
     readonly presenter?: WorkPresenter | null;
-    /** Replace the audit's transport (tests inject a fake `/health`). */
+    /**
+     * Replace the transport to the inference backend. The startup audit reads
+     * `/health` through it and the monitor reads all four diagnostic endpoints
+     * through it, which is deliberate: one injection point controls every byte
+     * a run puts on the wire, so a test can assert on the whole conversation
+     * rather than on one participant's view of it.
+     */
     readonly audit?: { readonly fetchImpl?: typeof fetch };
     /** Skip the startup audit entirely, whatever `providerAudit` says. */
     readonly skipAudit?: boolean;
@@ -135,6 +196,8 @@ export interface App {
   readonly ports: LoopPorts;
   /** The work-stream presenter: live while work runs, down when idle is up. */
   readonly presenter: WorkPresenter;
+  /** The backend monitor: polled while the run is, drawn by both surfaces. */
+  readonly monitor: BackendMonitor;
   run(): Promise<LoopResult>;
 }
 
@@ -292,6 +355,70 @@ export function idleStatusFrom(
   };
 }
 
+/**
+ * Build the monitor source the run draws.
+ *
+ * Everything about this is allowed to fail into "off". No base URL could be
+ * resolved, the theme is unreachable, the endpoints are all absent — in every
+ * one of those cases the answer is a monitor that renders nothing, because the
+ * panel is a window into the server and a window that will not open is not a
+ * reason for the house to stop.
+ *
+ * The base URL is resolved the same way the startup audit resolves it (pi's
+ * default-model precedence through `models.json`), so the monitor is looking at
+ * the server this run is actually talking to. An explicit `LOOP_MONITOR_URL`
+ * overrides that for the cases where the answer is "no, look over there".
+ */
+function buildMonitor(
+  config: AppConfig,
+  overrides: AppConfig["overrides"] = {},
+): BackendMonitor {
+  if (overrides.monitor !== undefined) return overrides.monitor;
+  const setting = config.monitor ?? { enabled: true };
+  if (setting.enabled === false) return createNullMonitor("switched off by LOOP_MONITOR=0");
+
+  const resolved = resolveProviderBaseUrl({
+    cwd: config.cwd,
+    ...(config.modelRef === undefined ? {} : { modelRef: config.modelRef }),
+    ...(overrides.modelsPath === undefined ? {} : { modelsPath: overrides.modelsPath }),
+  });
+  // The explicit monitor URL beats the audited health URL, which beats the
+  // provider's own base — most specific hint wins.
+  const baseUrl = overrides.monitorBaseUrl ?? resolved.baseUrl;
+  const urls = resolveMonitorUrls({
+    ...(setting.url === undefined ? {} : { monitorUrl: setting.url }),
+    ...(config.providerAudit?.healthUrl === undefined
+      ? {}
+      : { healthUrl: config.providerAudit.healthUrl }),
+    ...(baseUrl === undefined ? {} : { baseUrl }),
+  });
+  if (Object.values(urls).every((value) => value === undefined)) {
+    // Nothing named the server: no monitor URL, no audited health URL, no
+    // provider base to derive from. Saying so is the difference between a
+    // missing panel and a panel that was never asked to exist.
+    return createNullMonitor("no backend url to read — set LOOP_MONITOR_URL or a provider baseUrl");
+  }
+
+  let theme: MonitorTheme;
+  try {
+    theme = createPresenterTheme(config.themeName);
+  } catch {
+    // A panel with no colour still tells the truth; a panel that throws does not.
+    theme = PLAIN_MONITOR_THEME;
+  }
+
+  return createBackendMonitor({
+    urls,
+    theme,
+    ...(setting.intervalMs === undefined ? {} : { intervalMs: setting.intervalMs }),
+    ...(setting.timeoutMs === undefined ? {} : { timeoutMs: setting.timeoutMs }),
+    ...(setting.modelsEveryMs === undefined ? {} : { modelsEveryMs: setting.modelsEveryMs }),
+    maxLines: setting.lines ?? 2,
+    verbose: setting.verbose === true,
+    ...(overrides.audit?.fetchImpl === undefined ? {} : { fetchImpl: overrides.audit.fetchImpl }),
+  });
+}
+
 export function buildApp(config: AppConfig): App {
   const overrides = config.overrides ?? {};
   const labels = config.labels === undefined ? undefined : { labels: config.labels };
@@ -303,6 +430,14 @@ export function buildApp(config: AppConfig): App {
     authorName: config.authorName ?? "pi-loop",
     authorEmail: config.authorEmail ?? "pi-loop@localhost",
   });
+
+  // ── the backend monitor ──────────────────────────────────────────────────
+  //
+  // Built here, drawn by both surfaces: one poller, one snapshot, two places to
+  // look at it. The presenter gets it in the band above the footer, the idle
+  // prompt gets it as the top line of the screen, and neither of them can make
+  // a request — they read what this already has.
+  const monitor: BackendMonitor = buildMonitor(config, overrides);
 
   // ── the work-stream surface (`.10`) ───────────────────────────────────
   //
@@ -319,6 +454,9 @@ export function buildApp(config: AppConfig): App {
           coalesceMs: config.coalesceMs,
           heartbeatMs: config.heartbeatMs,
           spinnerMs: config.spinnerMs,
+          monitor,
+          monitorPlacement: config.monitor?.placement ?? "band",
+          monitorLines: config.monitor?.lines ?? 2,
         });
 
   /**
@@ -487,6 +625,8 @@ export function buildApp(config: AppConfig): App {
         status: statusProvider,
         cwd: config.cwd,
         themeName: config.themeName,
+        monitor,
+        monitorLines: config.monitor?.lines ?? 2,
       }));
 
   const baseIdle: LoopIdlePort = overrides.idle ?? perTurnIdle(makeIdle);
@@ -598,13 +738,29 @@ export function buildApp(config: AppConfig): App {
   return {
     ports,
     presenter,
+    monitor,
     run: async (): Promise<LoopResult> => {
       try {
+        // The monitor starts before the audit so the panel is already showing
+        // something by the time the first finding is printed under it, and so a
+        // first poll that fails is on screen as `✕ unreachable` rather than a
+        // blank row that might just be slow.
+        monitor.start();
+        if (config.monitor?.verbose === true) {
+          // Join the cycle that `start()` kicked off before describing it:
+          // `describe()` printed now says what answered and what it exposed,
+          // instead of a column of "not asked" about requests still in flight.
+          await monitor.poll().catch(() => undefined);
+          for (const line of monitor.describe()) presenter.notice("info", line);
+        }
         await auditAtStartup();
         return await runLoop(ports, config);
       } finally {
         // Nothing outlives the run: no live screen, no footer claiming to be
-        // current, no half-painted frame left in scrollback.
+        // current, no half-painted frame left in scrollback — and no poller
+        // still asking a server about itself after the thing that cared about
+        // the answer has gone away.
+        monitor.stop();
         handSurfaceOver();
         presenter.dispose();
       }

@@ -52,6 +52,7 @@ import {
 } from "@earendil-works/pi-tui";
 
 import { formatToolArgs, formatToolResult, indentContent } from "./format.ts";
+import { MonitorComponent, type MonitorSource } from "./monitor.ts";
 import type { RunnerEvent } from "./agent.ts";
 
 // ── theme ────────────────────────────────────────────────────────────────────
@@ -681,6 +682,31 @@ export interface WorkPresenterOptions {
   readonly plainWidth?: number;
   /** Put the key legend in the footer. Default true (dropped if no key is known). */
   readonly legend?: boolean;
+  /**
+   * The backend monitor source (see `src/monitor.ts`). `null` or omitted means
+   * no monitor: the surface is exactly what it was without this option.
+   */
+  readonly monitor?: MonitorSource | null;
+  /**
+   * Where the monitor sits, in the one piece of the layout that is always on
+   * screen. Default `"band"` — directly above the footer.
+   *
+   * Why not the literal top of the screen: `TuiMainScreen` renders the whole
+   * content column and keeps the *bottom* `rows` lines in view, so anything at
+   * the top of the content scrolls into scrollback the moment the transcript
+   * outgrows the terminal — which it does, every unit, early. A block pinned at
+   * the top would therefore be visible at the start of a ticket and gone for
+   * the rest of it, and the only ways to prevent that (capping the body, or
+   * drawing over the top rows out of band) both cost the transcript its
+   * scrollback. Above the footer the panel is always visible, covers no
+   * content, and never forces the full-screen redraw the diff renderer falls
+   * back to when something above the viewport changes.
+   *
+   * `"top"` is there for a surface whose content is known to stay short.
+   */
+  readonly monitorPlacement?: "band" | "top";
+  /** How many rows the monitor may take. Default 2. */
+  readonly monitorLines?: number;
 }
 
 export interface PresenterStats {
@@ -911,6 +937,17 @@ class Presenter implements WorkPresenter {
   private footer: FooterBlock;
   private readonly body = new Container();
   private readonly surface = new Container();
+  /**
+   * The monitor band. Null when no source was supplied, in which case this
+   * surface is byte-for-byte what it was before the option existed.
+   */
+  private readonly monitorComponent: MonitorComponent | null;
+  /** Kept alongside the component so the subscribe/unsubscribe pair has a handle. */
+  private readonly monitorSource: MonitorSource | null;
+  /** Where the monitor sits — see {@link WorkPresenterOptions.monitorPlacement}. */
+  private readonly monitorPlacement: "band" | "top";
+  /** Unsubscribes the surface from the monitor's "new data landed" signal. */
+  private monitorUnsub: (() => void) | null = null;
 
   private terminal: Terminal | null = null;
   private tui: TUI | null = null;
@@ -1014,8 +1051,34 @@ class Presenter implements WorkPresenter {
     };
 
     this.footer = new FooterBlock(this.theme, this.legend);
+    // The monitor goes in the fixed chrome, never inside `body`: `body` is the
+    // transcript, and the transcript's job is to flow into scrollback. The
+    // monitor's job is the opposite — stay put — so it is a sibling.
+    this.monitorPlacement = options.monitorPlacement ?? "band";
+    this.monitorSource = options.monitor ?? null;
+    this.monitorComponent =
+      this.monitorSource === null
+        ? null
+        : new MonitorComponent(this.monitorSource, Math.max(1, options.monitorLines ?? 2), " ");
+    if (this.monitorComponent !== null && this.monitorPlacement === "top") {
+      this.surface.addChild(this.monitorComponent);
+    }
     this.surface.addChild(this.body);
+    if (this.monitorComponent !== null && this.monitorPlacement !== "top") {
+      this.surface.addChild(this.monitorComponent);
+    }
     this.surface.addChild(this.footer);
+  }
+
+  /**
+   * The monitor's lines at the current width, or none when there is no monitor
+   * or the surface is not ours to draw on. Ties the panel to the same
+   * live/released rule the footer obeys, so a released surface leaves no stale
+   * dashboard in scrollback pretending to be current.
+   */
+  private monitorLines(width: number): string[] {
+    if (this.monitorComponent === null || !this.live) return [];
+    return this.monitorComponent.render(width);
   }
 
   get isLive(): boolean {
@@ -1038,6 +1101,12 @@ class Presenter implements WorkPresenter {
     this.tui = tui;
     this.live = true;
     this.footer.show();
+    // A poll landing is a content change from the surface's point of view: hook
+    // it into the same coalesced path everything else uses, so the monitor's
+    // two-second cadence costs one frame and not one per field that moved.
+    if (this.monitorComponent !== null) {
+      this.monitorUnsub = this.monitorSource?.subscribe(() => this.markDirty()) ?? null;
+    }
     this.syncFooter();
     this.paint();
     // The surface is ours and the clock is still running: keep it honest between
@@ -1049,6 +1118,10 @@ class Presenter implements WorkPresenter {
   release(): void {
     if (this.closed) return;
     this.stopHeartbeat();
+    if (this.monitorUnsub !== null) {
+      this.monitorUnsub();
+      this.monitorUnsub = null;
+    }
     if (this.path === "plain") {
       this.emitPlainTail(true);
       this.emitPlainFooter(true);
@@ -1591,9 +1664,12 @@ class Presenter implements WorkPresenter {
   /** What the live surface shows right now, colours included. */
   captureFrame(): string[] {
     const width = this.width();
+    const monitor = this.monitorLines(width);
     const lines = this.visibleBlocks().flatMap((block) => block.render(width));
     const footer = this.footer.render(width);
-    return footer.length > 0 ? [...lines, ...footer] : lines;
+    const body =
+      this.monitorPlacement === "top" ? [...monitor, ...lines] : [...lines, ...monitor];
+    return footer.length > 0 ? [...body, ...footer] : body;
   }
 
   /** The same surface with every escape sequence stripped — rule 9's view. */

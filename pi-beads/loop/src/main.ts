@@ -62,6 +62,17 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
     return "proposed";
   };
   const auditTimeout = number("LOOP_AUDIT_TIMEOUT_MS");
+  /**
+   * The read-only server panel. On unless switched off: the numbers it shows are
+   * the ones you wish you had looked at, and the cost of looking is four `GET`s
+   * against a server that is already on the path of everything on the screen.
+   *
+   * `LOOP_MONITOR_AT=top` puts the panel at the top of the work surface instead
+   * of above the footer. That scrolls with the transcript, so it is the option
+   * for a surface known to stay short — not the default for a long-running one.
+   */
+  const monitorPlacement = (): "band" | "top" =>
+    source.LOOP_MONITOR_AT?.trim().toLowerCase() === "top" ? "top" : "band";
   return {
     cwd,
     bdBin: source.LOOP_BD_BIN,
@@ -88,6 +99,21 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
       ...(auditTimeout === undefined ? {} : { timeoutMs: auditTimeout }),
     },
     maxIterations: number("LOOP_MAX_ITERATIONS"),
+    /** The read-only backend monitor. See `MonitorSetting` in `src/app.ts`. */
+    monitor: {
+      enabled: flag("LOOP_MONITOR") ?? true,
+      ...(number("LOOP_MONITOR_MS") === undefined ? {} : { intervalMs: number("LOOP_MONITOR_MS") }),
+      ...(number("LOOP_MONITOR_TIMEOUT_MS") === undefined
+        ? {}
+        : { timeoutMs: number("LOOP_MONITOR_TIMEOUT_MS") }),
+      ...(number("LOOP_MONITOR_MODELS_MS") === undefined
+        ? {}
+        : { modelsEveryMs: number("LOOP_MONITOR_MODELS_MS") }),
+      ...(source.LOOP_MONITOR_URL === undefined ? {} : { url: source.LOOP_MONITOR_URL }),
+      ...(number("LOOP_MONITOR_LINES") === undefined ? {} : { lines: number("LOOP_MONITOR_LINES") }),
+      placement: monitorPlacement(),
+      verbose: flag("LOOP_MONITOR_VERBOSE") ?? false,
+    },
     themeName: source.PI_THEME,
     dryRun: flag("LOOP_DRY_RUN"),
     verbose: flag("LOOP_VERBOSE"),
