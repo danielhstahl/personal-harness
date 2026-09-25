@@ -161,6 +161,8 @@ carried back in. Do **not** reach for `thinkingFormat: "qwen-chat-template"`
 instead: pi hard-codes `preserve_thinking: true` there, which is precisely the
 other answer.
 
+However, for agentic workflows it is still recommended to keep the CoT within context.  Using `"preserve_thinking": true` is prefered for these types of coding use-cases.  The server brings data back pre-parsed into thinking and non-thinking responses.  Technically having `thinkingFormat` and the `chatTemplateKwargs` are not even required, but is included to be explicit about what is sent to the server.
+
 ### Cadence: `coalesceMs` and `heartbeatMs`
 
 pi-tui has no frame rate — it draws when something asks it to. The presenter
