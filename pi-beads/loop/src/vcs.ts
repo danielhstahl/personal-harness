@@ -52,13 +52,36 @@
  * `--force`, `reset --hard`, or touch the worktree. There is a source test in
  * `test/finalize.test.ts` that fails if any of those strings appear here.
  */
-import { execFile } from "node:child_process";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
+
+import {
+  backoffMs,
+  indexLockPath,
+  isIndexLockFailure,
+  lockAgeMs,
+  removeLockBestEffort,
+  runGracefully,
+  sleep,
+} from "./gitlock.ts";
 
 const DEFAULT_BIN = "git";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_BUFFER_BYTES = 8 * 1024 * 1024;
+
+/**
+ * How long a write will wait out a locked index before giving up.Thirty seconds
+ * covers an IDE refreshing a big repo, which is the contention this is for.
+ */
+const DEFAULT_LOCK_WAIT_MS = 30_000;
+/** Grace after `SIGTERM` before `SIGKILL`. See {@link runGracefully}. */
+const DEFAULT_KILL_GRACE_MS = 5_000;
+/** A lock older than this *looks* stale. Looking is not the same as removing. */
+const DEFAULT_STALE_LOCK_AFTER_MS = 60_000;
+const DEFAULT_LOCK_RETRY_BASE_MS = 250;
+const DEFAULT_LOCK_RETRY_CAP_MS = 4_000;
+/** A ceiling on retries, so a permanently locked repo cannot spin here forever. */
+const MAX_LOCK_ATTEMPTS = 20;
 
 /**
  * Trailer written into every loop commit. It is the join between a commit and
@@ -82,6 +105,14 @@ export type VcsErrorKind =
   | "not-a-repo"
   /** Killed by our timeout (locked index, huge tree). */
   | "timeout"
+  /**
+   * The index was locked by something else for as long as we were willing to
+   * wait. Nothing was staged and nothing was committed: this error is only ever
+   * raised when git failed *before* it got the lock, so retrying is safe and
+   * this run changed nothing. See [gitlock.ts](./gitlock.ts) and
+   * [ADR-006](../docs/ADR-006-index-lock.md).
+   */
+  | "index-locked"
   /** A reported path was refused: outside the repo, symlinked out, pathspec magic. */
   | "unsafe-path"
   /** Nothing to stage. Refusing to make an empty commit. */
@@ -213,64 +244,56 @@ function logArg(value: string): string {
   return value.length > 72 ? `${value.slice(0, 69)}...` : value;
 }
 
-function defaultRunner(
+/**
+ * The default spawn: `execFile` with `shell:false` and a two-stage kill.
+ *
+ * The signal order is not a detail. `SIGKILL` cannot be caught, so git never
+ * runs the cleanup that removes `.git/index.lock`, and the repo is left with a
+ * lock that fails every later write — including this loop's own. `SIGTERM` does
+ * get caught, git cleans up, and the timeout costs one command instead of the
+ * repository. Measured, not assumed:
+ * [ADR-006](../docs/ADR-006-index-lock.md).
+ */
+async function defaultRunner(
   bin: string,
   args: readonly string[],
   cwd: string,
   env: Readonly<Record<string, string>>,
   timeoutMs: number,
+  killGraceMs: number,
 ): Promise<RawGitResult> {
-  return new Promise<RawGitResult>((resolvePromise, rejectPromise) => {
-    execFile(
-      bin,
-      [...args],
-      {
-        cwd,
-        env: { ...process.env, ...env },
-        maxBuffer: MAX_BUFFER_BYTES,
-        shell: false,
-        timeout: timeoutMs,
-        killSignal: "SIGKILL",
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          const anyError = error as NodeJS.ErrnoException & {
-            killed?: boolean;
-            code?: string | number;
-            signal?: string | null;
-          };
-          if (anyError.code === "ENOENT") {
-            rejectPromise(new VcsError({
-              kind: "missing-binary",
-              message: `\`${bin}\` was not found on PATH`,
-              argv: [bin, ...args],
-              cause: error,
-            }));
-            return;
-          }
-          const timedOut = anyError.killed === true ||
-            anyError.signal === "SIGKILL" ||
-            anyError.code === "ETIMEDOUT";
-          if (timedOut) {
-            rejectPromise(new VcsError({
-              kind: "timeout",
-              message: `\`${bin} ${args.join(" ")}\` was killed after ${timeoutMs}ms`,
-              argv: [bin, ...args],
-              cause: error,
-            }));
-            return;
-          }
-          const code = typeof anyError.code === "number" ? anyError.code : null;
-          // Non-zero exit is a *result*, not a spawn failure: callers classify it
-          // by context (a rejected hook and an empty repo both exit non-zero and
-          // mean very different things).
-          resolvePromise({ stdout, stderr, exitCode: code ?? 1 });
-          return;
-        }
-        resolvePromise({ stdout, stderr, exitCode: 0 });
-      },
-    );
+  const outcome = await runGracefully(bin, args, cwd, { ...process.env, ...env }, {
+    timeoutMs,
+    killGraceMs,
+    maxBufferBytes: MAX_BUFFER_BYTES,
   });
+
+  if (outcome.killedBy !== null) {
+    throw new VcsError({
+      kind: "timeout",
+      message: `\`${bin} ${args.join(" ")}\` was killed after ${timeoutMs}ms ` +
+        `(stopped with ${outcome.killedBy})`,
+      argv: [bin, ...args],
+      ...(outcome.spawnError === undefined ? {} : { cause: outcome.spawnError }),
+    });
+  }
+  const spawnError = outcome.spawnError as NodeJS.ErrnoException | undefined;
+  if (spawnError !== undefined) {
+    if (spawnError.code === "ENOENT") {
+      throw new VcsError({
+        kind: "missing-binary",
+        message: `\`${bin}\` was not found on PATH`,
+        argv: [bin, ...args],
+        cause: spawnError,
+      });
+    }
+    // Non-zero exit is a *result*, not a spawn failure: callers classify it by
+    // context (a rejected hook and an empty repo both exit non-zero and mean very
+    // different things).
+    const code = typeof spawnError.code === "number" ? spawnError.code : null;
+    return { stdout: outcome.stdout, stderr: outcome.stderr, exitCode: code ?? 1 };
+  }
+  return { stdout: outcome.stdout, stderr: outcome.stderr, exitCode: outcome.exitCode ?? 0 };
 }
 
 // ── path safety ─────────────────────────────────────────────────────────────
@@ -375,6 +398,30 @@ export interface GitWriterOptions {
   readonly cwd?: string;
   readonly bin?: string;
   readonly timeoutMs?: number;
+  /**
+   * How long the child gets to stop after `SIGTERM` before it is killed.
+   * Default 5s. This is the window in which git writes the index and removes its
+   * own lock; shrinking it is what leaves a stale `.git/index.lock` behind.
+   */
+  readonly killGraceMs?: number;
+  /** How long a write will wait out somebody else's index lock. Default 30s. */
+  readonly lockWaitMs?: number;
+  readonly lockRetryBaseMs?: number;
+  readonly lockRetryCapMs?: number;
+  /** Ceiling on lock retries, so a permanently locked repo cannot spin here. */
+  readonly maxLockAttempts?: number;
+  /** A lock older than this *looks* stale. Default 60s. */
+  readonly staleLockAfterMs?: number;
+  /**
+   * What to do about a lock that looks stale.
+   *
+   * `"report"` (the default) — wait out the deadline, then fail with an error
+   * naming the lock's age and the one-line fix. `"remove"` — delete it once and
+   * retry, and say so in the log. Removal is opt-in because a lock held by a
+   * live process is load-bearing and pulling it mid-write corrupts the index,
+   * which is a far worse injury than the one being cured.
+   */
+  readonly staleLockPolicy?: "report" | "remove";
   readonly env?: Readonly<Record<string, string>>;
   /** Committer identity, passed as `-c` flags. Never written to config. */
   readonly authorName?: string;
@@ -439,6 +486,13 @@ export function createGitWriter(options: GitWriterOptions = {}): GitWriter {
   const bin = options.bin ?? DEFAULT_BIN;
   const cwd = options.cwd ?? process.cwd();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const killGraceMs = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
+  const lockWaitMs = options.lockWaitMs ?? DEFAULT_LOCK_WAIT_MS;
+  const lockRetryBaseMs = options.lockRetryBaseMs ?? DEFAULT_LOCK_RETRY_BASE_MS;
+  const lockRetryCapMs = options.lockRetryCapMs ?? DEFAULT_LOCK_RETRY_CAP_MS;
+  const maxLockAttempts = options.maxLockAttempts ?? MAX_LOCK_ATTEMPTS;
+  const staleLockAfterMs = options.staleLockAfterMs ?? DEFAULT_STALE_LOCK_AFTER_MS;
+  const staleLockPolicy = options.staleLockPolicy ?? "report";
   const env = options.env ?? {};
   const authorName = options.authorName ?? DEFAULT_AUTHOR_NAME;
   const authorEmail = options.authorEmail ?? DEFAULT_AUTHOR_EMAIL;
@@ -449,12 +503,97 @@ export function createGitWriter(options: GitWriterOptions = {}): GitWriter {
 
   const runner: GitRunner = injected
     ? injected
-    : (b, args, dir, e) => defaultRunner(b, args, dir, e, timeoutMs);
+    : (b, args, dir, e) => defaultRunner(b, args, dir, e, timeoutMs, killGraceMs);
 
   async function git(args: readonly string[]): Promise<RawGitResult> {
     // Logged BEFORE the spawn: a call that never returns is still visible.
     if (wantDebug) log(`[vcs] $ ${[bin, ...args].map(logArg).join(" ")}`);
     return runner(bin, [...args], cwd, { ...env });
+  }
+
+  /**
+   * A git **write** command, retried while somebody else holds the index lock.
+   *
+   * Lock contention is ordinary: `git status` takes the lock to refresh the stat
+   * cache, an IDE refreshes the repo, the agent session runs its own git, a
+   * second run of this loop is looking at the same tree. Failing the first time
+   * git says "File exists" treats a two-hundred-millisecond collision as a
+   * broken build.
+   *
+   * Only two things are retried, and both are safe by construction:
+   *
+   * - the index-lock error, which by definition means git did not get the lock
+   *   and therefore changed nothing — so retrying the same command cannot
+   *   double-apply anything; and
+   * - nothing else. A rejected hook, an unsafe path, a corrupt object comes
+   *   back exactly as it was, once, for the caller to classify.
+   *
+   * A lock older than `staleLockAfterMs` *looks* abandoned. By default that is
+   * reported, not acted on; `staleLockPolicy: "remove"` clears it once and
+   * retries, loudly in the log.
+   */
+  async function runWrite(argv: readonly string[]): Promise<RawGitResult> {
+    const startedAt = Date.now();
+    let lockAttempts = 0;
+    let removedStaleLock = false;
+
+    for (;;) {
+      const result = await git(argv);
+      if (result.exitCode === 0) return result;
+      if (!isIndexLockFailure(result.stderr)) return result;
+
+      lockAttempts += 1;
+      const lockPath = indexLockPath(result.stderr);
+      const ageMs = lockPath === null ? null : lockAgeMs(lockPath);
+      const age = ageMs === null ? "unknown age" : `${(ageMs / 1000).toFixed(1)}s old`;
+
+      if (
+        staleLockPolicy === "remove" &&
+        lockPath !== null &&
+        !removedStaleLock &&
+        ageMs !== null &&
+        ageMs >= staleLockAfterMs
+      ) {
+        removedStaleLock = true;
+        const removed = removeLockBestEffort(lockPath);
+        log(
+          `[vcs] ${lockPath} was ${age}, which looks like a crashed process rather than a ` +
+            `running one; removal ${removed ? "succeeded" : "failed"} and the write is retried once. ` +
+            `If a git process really was still running, this is the line to look at — ` +
+            `LOOP_GIT_STALE_LOCK=report is the default and would have waited instead.`,
+        );
+        continue;
+      }
+
+      const waitedMs = Date.now() - startedAt;
+      if (lockAttempts >= maxLockAttempts || waitedMs >= lockWaitMs) {
+        throw new VcsError({
+          kind: "index-locked",
+          message:
+            `the git index has been locked for ${(waitedMs / 1000).toFixed(1)}s ` +
+            `(${lockAttempts} retries; the lock is ${age}). Nothing was staged and nothing was ` +
+            `committed. ` +
+            (
+              ageMs !== null && ageMs >= staleLockAfterMs
+                ? `A lock that old usually means a git process was killed partway through: if no ` +
+                  `git is running, remove ${lockPath ?? ".git/index.lock"} and run again — or set ` +
+                  `LOOP_GIT_STALE_LOCK=remove to let the loop clear locks older than ` +
+                  `${(staleLockAfterMs / 1000).toFixed(0)}s by itself.`
+                : `Something is holding it right now. Wait for it, or raise ` +
+                  `LOOP_GIT_LOCK_WAIT_MS if that thing is legitimately slow.`
+            ),
+          argv: [bin, ...argv],
+          stderr: result.stderr,
+        });
+      }
+
+      const delayMs = backoffMs(lockAttempts, lockRetryBaseMs, lockRetryCapMs);
+      log(
+        `[vcs] the git index is locked (${age}); retrying in ${delayMs}ms ` +
+          `(${lockAttempts}/${maxLockAttempts}, up to ${(lockWaitMs / 1000).toFixed(0)}s total)`,
+      );
+      await sleep(delayMs);
+    }
   }
 
   function identityArgs(): string[] {
@@ -706,7 +845,7 @@ export function createGitWriter(options: GitWriterOptions = {}): GitWriter {
     let ranWrites = 0;
     try {
       for (const command of writes) {
-        const res = await git(command.argv);
+        const res = await runWrite(command.argv);
         ranWrites += 1;
         if (res.exitCode !== 0) {
           throw new VcsError({
@@ -792,7 +931,10 @@ export function createGitWriter(options: GitWriterOptions = {}): GitWriter {
     try {
       // `-q` because the output is noise here; `--` so a path can never be read
       // as an option. This is a soft unstage: the worktree is left alone.
-      await git(["reset", "-q", "--", ...paths]);
+      // Went through `runWrite` rather than `git` so an unstage that hits a
+      // contended index waits for it too: leaving our paths in the index because
+      // an IDE was refreshing is exactly the state the next commit would trip on.
+      await runWrite(["reset", "-q", "--", ...paths]);
     } catch {
       // Best effort. The original failure is the one worth reporting; the caller
       // is told we tried.
@@ -877,6 +1019,9 @@ export const LOOP_AUTHOR = { name: DEFAULT_AUTHOR_NAME, email: DEFAULT_AUTHOR_EM
  * delegates to the real runner is the only way to prove the plan a dry run
  * printed and the process a live run spawned are the same bytes.
  */
-export function createDefaultGitRunner(timeoutMs: number = DEFAULT_TIMEOUT_MS): GitRunner {
-  return (bin, args, cwd, env) => defaultRunner(bin, args, cwd, env, timeoutMs);
+export function createDefaultGitRunner(
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+  killGraceMs: number = DEFAULT_KILL_GRACE_MS,
+): GitRunner {
+  return (bin, args, cwd, env) => defaultRunner(bin, args, cwd, env, timeoutMs, killGraceMs);
 }

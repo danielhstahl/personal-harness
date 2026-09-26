@@ -463,11 +463,17 @@ test("assertClaimFreeArgs refuses claim and assignee flags", () => {
  */
 const SPAWN_ALLOWLIST: Readonly<Record<string, string>> = {
   "beads.ts": "bd, the issue tracker",
-  "repo.ts": "git, read-only snapshotting",
-  "vcs.ts": "git, staging and committing for finalize",
+  // git used to be spawned from two places, each with its own kill policy — and
+  // one of those policies (`SIGKILL` on timeout) stranded `.git/index.lock` in
+  // the repo. Both readers and writers now go through one module, so the audit
+  // is one file long and the signal order exists in exactly one place.
+  "gitlock.ts": "git, the only spawner: run, wait, and stop with SIGTERM first",
 };
 
 test("only the named adapter modules may spawn processes anywhere in src/", () => {
+  // Every git call in this app goes through `gitlock.ts`. `repo.ts` and
+  // `vcs.ts` are deliberately *not* allowlisted any more: they build argv and
+  // classify results, and never hold a child process themselves.
   for (const file of readdirSync(SRC_DIR).filter((f) => f.endsWith(".ts"))) {
     const text = readFileSync(join(SRC_DIR, file), "utf8");
     const allowed = SPAWN_ALLOWLIST[file] !== undefined;

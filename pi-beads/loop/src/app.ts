@@ -194,11 +194,32 @@ export interface NotifySetting {
   readonly maxConsecutiveFailures?: number;
 }
 
+/**
+ * What to do when something else is holding `.git/index.lock`.
+ *
+ * See [ADR-006](../docs/ADR-006-index-lock.md) for why the two numbers here are
+ * different knobs and why removal is opt-in: contention with a live process is
+ * normal and should be waited out, while a lock left by a killed git should be
+ * cleared — and the two look identical until you check the lock's age.
+ */
+export interface GitLockSetting {
+  /** How long a write waits out somebody else's lock. Default 30s. */
+  readonly waitMs?: number;
+  /** Grace after `SIGTERM` before `SIGKILL`. Default 5s. */
+  readonly killGraceMs?: number;
+  /** A lock older than this looks abandoned. Default 60s. */
+  readonly staleAfterMs?: number;
+  /** `report` (default) leaves it alone; `remove` clears a stale one once.` */
+  readonly stalePolicy?: "report" | "remove";
+}
+
 export interface AppConfig extends LoopConfig {
   /** Repository and board live here. */
   readonly cwd: string;
   readonly bdBin?: string;
   readonly gitBin?: string;
+  /** Index-lock policy for every git write this run makes. */
+  readonly gitLock?: GitLockSetting;
   /** Explicit model. Never read from the environment below this line. */
   readonly modelRef?: { provider: string; id: string };
   readonly workTimeoutMs?: number;
@@ -640,6 +661,16 @@ export function buildApp(config: AppConfig): App {
     bin: config.gitBin,
     authorName: config.authorName ?? "pi-loop",
     authorEmail: config.authorEmail ?? "pi-loop@localhost",
+    ...(config.gitLock?.waitMs === undefined ? {} : { lockWaitMs: config.gitLock.waitMs }),
+    ...(config.gitLock?.killGraceMs === undefined
+      ? {}
+      : { killGraceMs: config.gitLock.killGraceMs }),
+    ...(config.gitLock?.staleAfterMs === undefined
+      ? {}
+      : { staleLockAfterMs: config.gitLock.staleAfterMs }),
+    ...(config.gitLock?.stalePolicy === undefined
+      ? {}
+      : { staleLockPolicy: config.gitLock.stalePolicy }),
   });
 
   // ── the backend monitor ──────────────────────────────────────────────────

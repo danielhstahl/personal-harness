@@ -204,6 +204,26 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
     cwd,
     bdBin: source.LOOP_BD_BIN,
     gitBin: source.LOOP_GIT_BIN,
+    /**
+     * The index-lock policy. See
+     * [ADR-006](../docs/ADR-006-index-lock.md): the wait covers contention
+     * with something alive, the stale threshold decides when a lock looks like a
+     * crashed process instead, and removal stays off until it is asked for.
+     */
+    gitLock: {
+      ...(number("LOOP_GIT_LOCK_WAIT_MS") === undefined
+        ? {}
+        : { waitMs: number("LOOP_GIT_LOCK_WAIT_MS") }),
+      ...(number("LOOP_GIT_KILL_GRACE_MS") === undefined
+        ? {}
+        : { killGraceMs: number("LOOP_GIT_KILL_GRACE_MS") }),
+      ...(number("LOOP_GIT_STALE_LOCK_AFTER_MS") === undefined
+        ? {}
+        : { staleAfterMs: number("LOOP_GIT_STALE_LOCK_AFTER_MS") }),
+      ...((source.LOOP_GIT_STALE_LOCK ?? "").trim().toLowerCase() === "remove"
+        ? { stalePolicy: "remove" as const }
+        : {}),
+    },
     modelRef: provider !== undefined && model !== undefined ? { provider, id: model } : undefined,
     workTimeoutMs: number("LOOP_WORK_TIMEOUT_MS"),
     /** When to tell a run to land and report. Unset = budget minus the lead. */

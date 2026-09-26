@@ -25,10 +25,11 @@
  * reading the tree can never be confused with changing it, and there is exactly
  * one file to audit for the scary half.
  */
-import { execFile } from "node:child_process";
+import { runGracefully } from "./gitlock.ts";
 
 const DEFAULT_BIN = "git";
 const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_KILL_GRACE_MS = 5_000;
 const DEFAULT_RECENT_COMMITS = 8;
 const DEFAULT_MAX_DIRTY_FILES = 60;
 const MAX_BUFFER_BYTES = 8 * 1024 * 1024;
@@ -117,6 +118,14 @@ export interface RepoReaderOptions {
   /** git executable. Default `"git"`. */
   readonly bin?: string;
   readonly timeoutMs?: number;
+  /**
+   * Grace after `SIGTERM` before the child is killed outright. Default 5s.
+   *
+   * Not dead code for a read-only module: `git status` writes the refreshed index
+   * under `.git/index.lock`, so a reader killed without grace leaves the writer
+   * standing in a locked repo.
+   */
+  readonly killGraceMs?: number;
   /** How many commits to include. Default 8. */
   readonly recentCommits?: number;
   readonly maxDirtyFiles?: number;
@@ -147,7 +156,7 @@ function logArg(value: string): string {
   return value.length > 60 ? `${value.slice(0, 57)}...` : value;
 }
 
-function run(
+async function run(
   bin: string,
   args: readonly string[],
   options: RepoReaderOptions,
@@ -160,75 +169,64 @@ function run(
     log(`[repo] $ ${argv.map(logArg).join(" ")}`);
   }
 
-  return new Promise<RunResult>((resolve, reject) => {
-    execFile(
-      bin,
-      [...args],
-      {
-        cwd: options.cwd ?? process.cwd(),
-        env: { ...process.env, ...(options.env ?? {}) },
-        maxBuffer: MAX_BUFFER_BYTES,
-        shell: false,
-        timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-        killSignal: "SIGKILL",
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          const anyError = error as NodeJS.ErrnoException & {
-            killed?: boolean;
-            code?: string | number;
-            signal?: string | null;
-          };
-          if (anyError.code === "ENOENT") {
-            reject(new RepoError({
-              kind: "missing-binary",
-              message: `\`${bin}\` was not found on PATH`,
-              argv,
-              cause: error,
-            }));
-            return;
-          }
-          const timedOut = anyError.killed === true ||
-            anyError.signal === "SIGKILL" ||
-            anyError.code === "ETIMEDOUT";
-          if (timedOut) {
-            reject(new RepoError({
-              kind: "timeout",
-              message: `\`${bin} ${args.join(" ")}\` was killed after ` +
-                `${options.timeoutMs ?? DEFAULT_TIMEOUT_MS}ms`,
-              argv,
-              cause: error,
-            }));
-            return;
-          }
-          const code = typeof anyError.code === "number" ? anyError.code : null;
-          if (code === 128) {
-            // git's generic "wrong place / bad rev" code; classified by the caller
-            // because an empty repo also lands here and is not an error.
-            reject(new RepoError({
-              kind: "not-a-repo",
-              message: trimTrailingNewline(stderr) || `git exited 128: ${args.join(" ")}`,
-              argv,
-              exitCode: 128,
-              stderr,
-              cause: error,
-            }));
-            return;
-          }
-          reject(new RepoError({
-            kind: "exit",
-            message: trimTrailingNewline(stderr) ||
-              `\`${bin} ${args.join(" ")}\` failed with exit ${code ?? "?"}`,
-            argv,
-            exitCode: code,
-            stderr,
-            cause: error,
-          }));
-          return;
-        }
-        resolve({ stdout, stderr, exitCode: 0 });
-      },
-    );
+  // A *reader*, and still not exempt from how it is stopped: `git status` takes
+  // `.git/index.lock` whenever it has to refresh the stat cache, so a reader
+  // killed with `SIGKILL` leaves the writer's index locked behind it. The kill
+  // policy is shared with the writer for exactly that reason — see
+  // [gitlock.ts](./gitlock.ts).
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const outcome = await runGracefully(bin, args, options.cwd ?? process.cwd(), {
+    ...process.env,
+    ...(options.env ?? {}),
+  }, {
+    timeoutMs,
+    killGraceMs: options.killGraceMs ?? DEFAULT_KILL_GRACE_MS,
+    maxBufferBytes: MAX_BUFFER_BYTES,
+  });
+
+  const spawnError = outcome.spawnError as NodeJS.ErrnoException | undefined;
+  if (outcome.killedBy !== null) {
+    throw new RepoError({
+      kind: "timeout",
+      message: `\`${bin} ${args.join(" ")}\` was killed after ${timeoutMs}ms ` +
+        `(stopped with ${outcome.killedBy})`,
+      argv,
+      ...(spawnError === undefined ? {} : { cause: spawnError }),
+    });
+  }
+  if (spawnError === undefined) {
+    return { stdout: outcome.stdout, stderr: outcome.stderr, exitCode: outcome.exitCode ?? 0 };
+  }
+  if (spawnError.code === "ENOENT") {
+    throw new RepoError({
+      kind: "missing-binary",
+      message: `\`${bin}\` was not found on PATH`,
+      argv,
+      cause: spawnError,
+    });
+  }
+  const code = typeof spawnError.code === "number" ? spawnError.code : null;
+  const stderr = outcome.stderr;
+  if (code === 128) {
+    // git's generic "wrong place / bad rev" code; classified by the caller
+    // because an empty repo also lands here and is not an error.
+    throw new RepoError({
+      kind: "not-a-repo",
+      message: trimTrailingNewline(stderr) || `git exited 128: ${args.join(" ")}`,
+      argv,
+      exitCode: 128,
+      stderr,
+      cause: spawnError,
+    });
+  }
+  throw new RepoError({
+    kind: "exit",
+    message: trimTrailingNewline(stderr) ||
+      `\`${bin} ${args.join(" ")}\` failed with exit ${code ?? "?"}`,
+    argv,
+    exitCode: code,
+    stderr,
+    cause: spawnError,
   });
 }
 
