@@ -27,7 +27,7 @@ import { BdError } from "../src/beads.ts";
 import type { BdClient, Issue, IssueStatus, NewIssueSpec } from "../src/beads.ts";
 import type { IdleOutcome } from "../src/idle.ts";
 import type { LoopIdlePort, LoopUi } from "../src/loop.ts";
-import type { MailDelivery } from "../src/mail.ts";
+import type { NtfyDelivery } from "../src/ntfy.ts";
 import type { BeadCompletion, Notifier } from "../src/notify.ts";
 import { createGitWriter } from "../src/vcs.ts";
 import type { GitWriter } from "../src/vcs.ts";
@@ -623,7 +623,7 @@ export interface RecordingNotifier extends Notifier {
  *
  * `outcomes` is the script of delivery results; the last entry repeats, so a
  * two-bead walk with `["failed"]` reports a failure for both, which is what
- * "the relay is down" looks like from the loop's side.
+ * "the server is down" looks like from the loop's side.
  */
 export function recordingNotifier(
   outcomes: readonly ("delivered" | "failed" | "skipped")[] = ["delivered"],
@@ -634,13 +634,13 @@ export function recordingNotifier(
 
   const notifier: RecordingNotifier = {
     enabled: true,
-    destination: ["dev@example.test"],
+    destination: ["http://ntfy.recorder.test/loop-notices"],
     transport: "recorder",
     notices,
     failNext(error: Error): void {
       queued = error;
     },
-    async notifyCompletion(completion: BeadCompletion): Promise<MailDelivery> {
+    async notifyCompletion(completion: BeadCompletion): Promise<NtfyDelivery> {
       notices.push(completion);
       if (queued !== null) {
         const error = queued;
@@ -652,8 +652,8 @@ export function recordingNotifier(
       if (kind === "failed") {
         return {
           kind: "failed",
-          reason: "421 relay busy",
-          transport: "recorder",
+          reason: "ntfy replied 502: bad gateway",
+          destination: "http://ntfy.recorder.test/loop-notices",
           retryable: true,
         };
       }
@@ -662,9 +662,9 @@ export function recordingNotifier(
       }
       return {
         kind: "delivered",
-        messageId: `notice-${index}@recorder.test`,
+        messageId: `notice-${index}`,
+        destination: "http://ntfy.recorder.test/loop-notices",
         transport: "recorder",
-        recipients: ["dev@example.test"],
       };
     },
   };

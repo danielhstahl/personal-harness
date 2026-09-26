@@ -1,11 +1,19 @@
 # ADR-005: The completion notice — a report the run cannot be punished for
 
-- **Status:** Accepted
-- **Modules:** `src/mail.ts` (RFC 822 rendering, the SMTP client, the mailer),
+- **Status:** Accepted in part. **The transport half is superseded by
+  [ADR-007](./ADR-007-ntfy-notices.md)**: the mail adapter and every
+  `LOOP_MAIL_*` / `LOOP_NOTIFY_EMAIL` knob are gone, replaced by ntfy and a
+  topic URL. What still stands from this document is the notice itself — the
+  effect the machine asks for, the ordering after the close, the containment of
+  delivery failure, the give-up streak — and the reasoning below for those is
+  unchanged. Where this document talks about *mail*, read *the transport of the
+  day*; the shape of the argument is what was kept.
+- **Modules:** ~~`src/mail.ts`~~ (RFC 822 rendering, the SMTP client, the
+  mailer — **removed by ADR-007**; `src/ntfy.ts` is its successor),
   `src/notify.ts` (what a finished bead says, and when to stop trying to say it),
-  `src/orchestrator.ts` (the `notify.email` effect), `src/loop.ts` (the handler
-  and the enrichment), `src/app.ts` (composition, validation at build time),
-  `src/main.ts` (env knobs)
+  `src/orchestrator.ts` (the notice effect, now `notify.publish`), `src/loop.ts`
+  (the handler and the enrichment), `src/app.ts` (composition, validation at
+  build time), `src/main.ts` (env knobs)
 
 ## Context
 

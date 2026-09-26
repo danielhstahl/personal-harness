@@ -374,7 +374,7 @@ test("(d) success finalizes in the order commit → remember → close, then re-
     "vcs.commit",
     "beads.remember",
     "beads.close_issue",
-    "notify.email",
+    "notify.publish",
     "drop_context",
     "beads.list_in_progress",
     "beads.list_ready",
@@ -402,10 +402,10 @@ test("(d1) a closed bead asks for exactly one completion notice, and it carries 
     workingMachine(),
   );
 
-  const notices = steps.flatMap((s) => s.effects).filter((effect) => effect.kind === "notify.email");
+  const notices = steps.flatMap((s) => s.effects).filter((effect) => effect.kind === "notify.publish");
   assert.equal(notices.length, 1, "one notice for the one bead that closed");
   const notice = notices[0];
-  assert.ok(notice?.kind === "notify.email");
+  assert.ok(notice?.kind === "notify.publish");
   assert.equal(notice.issueId, "w-1", "the notice names the bead that closed, not whatever is active later");
   assert.equal(notice.title, "the one");
   assert.equal(notice.commit, "cafe1234", "the notice carries the commit that funds the claim");
@@ -416,7 +416,7 @@ test("(d1) a closed bead asks for exactly one completion notice, and it carries 
   // completion claim that has not been paid for yet.
   const order = steps.flatMap((s) => kinds(s.effects));
   assert.ok(
-    order.indexOf("beads.close_issue") < order.indexOf("notify.email"),
+    order.indexOf("beads.close_issue") < order.indexOf("notify.publish"),
     "the notice follows the close, never the other way round",
   );
 });
@@ -430,14 +430,14 @@ test("(d1b) no notice is ever asked for a bead that did not close", () => {
     workingMachine(),
   );
   assert.equal(
-    unfinished.steps.flatMap((s) => s.effects).filter((effect) => effect.kind === "notify.email").length,
+    unfinished.steps.flatMap((s) => s.effects).filter((effect) => effect.kind === "notify.publish").length,
     0,
     "a half-finalized iteration notifies nobody",
   );
 
   const failedWork = run([{ type: "work_failed", reason: "agent crashed" }], workingMachine());
   assert.equal(
-    failedWork.steps.flatMap((s) => s.effects).filter((effect) => effect.kind === "notify.email").length,
+    failedWork.steps.flatMap((s) => s.effects).filter((effect) => effect.kind === "notify.publish").length,
     0,
     "re-queued work is not a completion",
   );
@@ -835,7 +835,7 @@ test("every effect kind has exactly one dispatch target in the ports", () => {
     "agent.split": "agent.split",
     "agent.run": "agent.run",
     "vcs.commit": "vcs.commit",
-    "notify.email": "notify.notifyCompletion",
+    "notify.publish": "notify.notifyCompletion",
     "ui.say": "ui.say",
     "ui.warn": "ui.warn",
     drop_context: "session.dispose",

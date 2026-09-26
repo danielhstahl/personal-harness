@@ -29,9 +29,9 @@ import { test } from "node:test";
 import { buildApp, idleStatusFrom, perTurnIdle } from "../src/app.ts";
 import { readEnv, runFromEnv } from "../src/main.ts";
 import { createAgentRunner } from "../src/agent.ts";
-import { createMailer, createSmtpTransport, resolveSmtpConfig } from "../src/mail.ts";
+import { createHttpTransport, createNtfyPublisher, resolveNtfyTarget } from "../src/ntfy.ts";
 import { createNotifier } from "../src/notify.ts";
-import { startFakeSmtp } from "./mail-relay.ts";
+import { startFakeNtfy } from "./ntfy-server.ts";
 import { BdError } from "../src/beads.ts";
 import { createFinalizer } from "../src/finalize.ts";
 import { normaliseDependencies } from "../src/beads.ts";
@@ -338,12 +338,12 @@ test("the effect order on the wire is read → claim → run → commit → reme
  * The notices the interpreter reported, one per bead it finished.
  *
  * `dispatch` records the effect and the handler records its own outcome, so a
- * `notify.email` appears twice per bead in the raw list — once as "the loop was
+ * `notify.publish` appears twice per bead in the raw list — once as "the loop was
  * asked" and once as "here is what came back". These assertions want the second.
  */
 function notifiedBeads(result: { transcript: { effects: readonly { kind: string; detail: string }[] } }) {
   return result.transcript.effects.filter(
-    (entry) => entry.kind === "notify.email" && /:(delivered|failed|skipped)/u.test(entry.detail),
+    (entry) => entry.kind === "notify.publish" && /:(delivered|failed|skipped)/u.test(entry.detail),
   );
 }
 
@@ -391,7 +391,7 @@ test("a closed bead asks for one notice, built from what the loop actually watch
     const kinds = result.transcript.effects.map((entry) => entry.kind);
     const firstIteration = kinds.slice(kinds.indexOf("vcs.commit"));
     const closeAt = firstIteration.indexOf("beads.close_issue");
-    const noticeAt = firstIteration.indexOf("notify.email");
+    const noticeAt = firstIteration.indexOf("notify.publish");
     const dropAt = firstIteration.indexOf("drop_context");
     assert.ok(
       closeAt >= 0 && noticeAt > closeAt && dropAt > noticeAt,
@@ -404,7 +404,7 @@ test("a closed bead asks for one notice, built from what the loop actually watch
     );
     assert.match(
       h.ui.said.join("\n"),
-      /Completion notice for tst\.2 sent to dev@example\.test/u,
+      /Completion notice for tst\.2 published to http:\/\/ntfy\.recorder\.test\/loop-notices/u,
       "and the operator sees that it went out",
     );
   } finally {
@@ -412,83 +412,58 @@ test("a closed bead asks for one notice, built from what the loop actually watch
   }
 });
 
-test("the whole chain: a closed bead puts a real SMTP message on the wire, id in the subject", async () => {
-  // Nothing faked below the socket: the real notifier, the real mailer, the real
-  // SMTP client, talking to a relay on loopback that records what arrived. This
-  // is the test that says the feature works end to end rather than piece by piece.
-  const relay = await startFakeSmtp({ caps: ["STARTTLS", "AUTH PLAIN", "8BITMIME"] });
+test("the whole chain: a closed bead publishes to a real HTTP server, id in the title", async () => {
+  // Nothing faked below the socket: the real notifier, the real publisher, the
+  // real HTTP transport, talking to a server on loopback that records what
+  // arrived. This is the test that says the feature works end to end rather
+  // than piece by piece.
+  const server = await startFakeNtfy();
   const notifier = createNotifier({
-    mailer: createMailer({
-      from: "loop@example.test",
-      to: ["dev@example.test"],
-      cc: ["lead@example.test"],
-      transport: createSmtpTransport({
-        config: resolveSmtpConfig({
-          host: "127.0.0.1",
-          port: relay.port,
-          user: "ada",
-          password: "s3cr3t",
-          starttls: "off",
-          allowInsecureAuth: true,
-        }),
+    publisher: createNtfyPublisher({
+      target: resolveNtfyTarget({
+        url: server.base,
+        topic: "loop-notices",
       }),
-      now: () => Date.UTC(2025, 8, 26, 11, 3, 7),
-      uid: () => "e2e-notice",
+      transport: createHttpTransport(),
     }),
     context: { cwd: "/work/project", hostname: "buildhost", model: "fake/model" },
+    priority: "high",
+    tags: ["+1"],
   });
   const h = harness({ scripts: WORK_SCRIPTS, idleTexts: [SPLIT_REQUEST], notifier });
   prepareWalk(h);
   try {
     const result = await h.run();
     assert.equal(result.kind, "done");
-    assert.equal(relay.messages.length, 2, "two beads closed, two messages arrived");
+    assert.equal(server.requests.length, 2, "two beads closed, two publishes arrived");
 
-    const first = relay.messages[0] ?? "";
-    assert.match(first, /^Subject: \[pi-beads\] tst\.2 completed: Added the colour mode/mu);
-    assert.match(first, /^X-Loop-Issue: tst\.2$/mu, "and in the machine-readable header too");
-    assert.match(first, /^Auto-Submitted: auto-generated$/mu, "so nobody auto-replies to a build");
-    assert.match(first, /bd show tst\.2/u);
-    assert.match(first, /bd recall loop:handoff:tst\.2 --json/u);
-    assert.match(first, /Content-Transfer-Encoding: quoted-printable/u);
-    assert.match(first, /From: loop@example\.test/u);
-    assert.match(first, /To: dev@example\.test/u);
-    assert.match(
-      first,
-      /Cc: lead@example\.test/u,
-      "the copy arrives as a copy, with the header that says so intact on the wire",
-    );
-    assert.match(first, /buildhost/u);
+    const first = server.requests[0];
+    assert.equal(first?.method, "POST");
+    assert.equal(first?.path, "/loop-notices");
+    assert.equal(first?.headers.title, "[pi-beads] tst.2 completed: Added the colour mode to the parser.");
+    assert.equal(first?.headers.priority, "high");
+    assert.equal(first?.headers.tags, "+1");
+    assert.match(first?.body ?? "", /bd show tst\.2/u);
+    assert.match(first?.body ?? "", /bd recall loop:handoff:tst\.2/u);
+    assert.match(first?.body ?? "", /src\/colour\.ts/u);
 
-    const second = relay.messages[1] ?? "";
-    assert.match(second, /^Subject: \[pi-beads\] tst\.3 completed:/mu);
-    assert.match(second, /X-Loop-Issue: tst\.3/u);
+    const second = server.requests[1];
+    assert.match(String(second?.headers.title ?? ""), /^\[pi-beads\] tst\.3 completed:/u);
 
-    // The commit hashes in the messages are the ones git actually made.
+    // The commit hash in the notice is the one git actually made.
     const log = h.repo.git("log", "--pretty=%H %s");
     const commitForSecond = log.split("\n").find((line) => line.includes("tst.3"))?.split(" ")[0];
     assert.ok(commitForSecond);
     assert.ok(
-      second.includes(commitForSecond),
+      (second?.body ?? "").includes(commitForSecond.slice(0, 12)),
       "the notice carries the real hash for the bead it is about",
     );
-
-    // And it was sent the way a submission is sent: authenticated, one RCPT per
-    // recipient — the addressee and the copy, on every notice.
-    const verbs = relay.received.map((line) => (line.split(" ")[0] ?? "").toUpperCase());
-    assert.ok(verbs.includes("AUTH"), `the relay saw authentication: ${verbs.join(",")}`);
-    assert.equal(
-      relay.received.filter((line) => /^RCPT TO:/iu.test(line)).length,
-      4,
-      "two notices, two recipients each",
-    );
   } finally {
-    await relay.close();
+    await server.close();
     h.dispose();
   }
 });
-
-test("a notice that cannot be mailed warns, and costs the run nothing", async () => {
+test("a notice that cannot be published warns, and costs the run nothing", async () => {
   const notifier = recordingNotifier(["failed"]);
   const h = harness({ scripts: WORK_SCRIPTS, idleTexts: [SPLIT_REQUEST], notifier });
   prepareWalk(h);
@@ -497,12 +472,12 @@ test("a notice that cannot be mailed warns, and costs the run nothing", async ()
     assert.equal(
       result.kind,
       "done",
-      "the work is not punished for the mail's problems: the bead is closed either way",
+      "the work is not punished for the notice's problems: the bead is closed either way",
     );
     assert.equal(h.board.statusOf("tst.2"), "closed");
     assert.match(
       h.ui.warned.join("\n"),
-      /Could not mail the completion notice for tst\.2: 421 relay busy/u,
+      /Could not publish the completion notice for tst\.2: ntfy replied 502/u,
     );
     assert.match(h.ui.warned.join("\n"), /nothing about the work changed/u);
   } finally {
