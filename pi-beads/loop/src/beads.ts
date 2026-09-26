@@ -207,6 +207,13 @@ export interface BdClient {
   listReady(options?: ListOptions): Promise<Issue[]>;
   /** Issues currently `in_progress`. */
   listInProgress(options?: ListOptions): Promise<Issue[]>;
+  /**
+   * Recently closed issues. Read-only, and bounded: `limit` defaults to 50 so a
+   * board with ten thousand closed tickets cannot make this call unreadable.
+   * Ordering is whatever bd gives; callers that care about recency sort
+   * themselves (see `kanbanView` in `src/kanban.ts`).
+   */
+  listClosed(options?: ListOptions): Promise<Issue[]>;
   /** `null` when the issue does not exist (not an error). */
   getIssue(id: string): Promise<Issue | null>;
   createIssue(spec: NewIssueSpec): Promise<Issue>;
@@ -520,6 +527,13 @@ export function createBdClient(options: BdClientOptions = {}): BdClient {
       return parsed === null ? [] : asIssues(parsed);
     },
 
+    async listClosed(listOptions: ListOptions = {}): Promise<Issue[]> {
+      const bounded: ListOptions = { ...listOptions, limit: listOptions.limit ?? 50 };
+      const argv: string[] = ["list", "--status", "closed", "--json", ...listFlags(bounded)];
+      const parsed = await call(argv);
+      return parsed === null ? [] : asIssues(parsed);
+    },
+
     async getIssue(id: string): Promise<Issue | null> {
       const issueId = requireId(id, "issue id", ["show"]);
       const argv = ["show", issueId, "--json"];
@@ -698,6 +712,7 @@ export const defaultBdClient: BdClient = createBdClient();
 
 export const listReady = defaultBdClient.listReady;
 export const listInProgress = defaultBdClient.listInProgress;
+export const listClosed = defaultBdClient.listClosed;
 export const getIssue = defaultBdClient.getIssue;
 export const createIssue = defaultBdClient.createIssue;
 export const addDep = defaultBdClient.addDep;

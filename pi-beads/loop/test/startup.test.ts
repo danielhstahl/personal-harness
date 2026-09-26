@@ -376,6 +376,11 @@ test("strict mode stops the run before the loop starts", async () => {
     const app = buildApp({
       cwd: "/repo",
       providerAudit: { enabled: true, strict: true },
+      // The kanban reads the same board through the same client, and this test
+      // uses `listReady` as its tripwire for "the loop got as far as the
+      // board". With the board poller off, that claim stays exactly what it
+      // says — no one reached the board, because the run stopped before it.
+      kanban: { enabled: false },
       overrides: {
         presenter: createNullPresenter(),
         beads: {

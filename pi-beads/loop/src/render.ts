@@ -52,6 +52,11 @@ import {
 } from "@earendil-works/pi-tui";
 
 import { formatToolArgs, formatToolResult, indentContent } from "./format.ts";
+import {
+  KanbanComponent,
+  type KanbanMode,
+  type KanbanSource,
+} from "./kanban.ts";
 import { MonitorComponent, type MonitorSource } from "./monitor.ts";
 import type { RunnerEvent } from "./agent.ts";
 
@@ -707,6 +712,30 @@ export interface WorkPresenterOptions {
   readonly monitorPlacement?: "band" | "top";
   /** How many rows the monitor may take. Default 2. */
   readonly monitorLines?: number;
+  /**
+   * The mini kanban source (see `src/kanban.ts`): the board as ready / in
+   * progress / done. `null` or omitted means no board.
+   *
+   * It sits in the same fixed chrome as the monitor, below it and above the
+   * footer, for the same reason — the transcript flows into scrollback and
+   * this has to not. The default mode here is `"row"`, one line, because this
+   * surface already carries the transcript, the monitor and the footer, and a
+   * three-column grid on top of all three is a lot of chrome for a screen
+   * whose job is to show a session. Idle, which has the room, defaults to
+   * `"board"`.
+   */
+  readonly kanban?: KanbanSource | null;
+  /** `row` (one line) or `board` (bordered grid). Default `"row"` here. */
+  readonly kanbanMode?: KanbanMode;
+  /** Rows the board may take, borders included. Default 1 with `row`, 4 with `board`. */
+  readonly kanbanLines?: number;
+  /** Same meaning as {@link monitorPlacement}. Default `"band"`. */
+  readonly kanbanPlacement?: "band" | "top";
+}
+
+/** Whether a mode is the one-line one, so the default height matches it. */
+function modeIsRow(mode: KanbanMode | undefined): boolean {
+  return (mode ?? "row") === "row";
 }
 
 export interface PresenterStats {
@@ -948,6 +977,12 @@ class Presenter implements WorkPresenter {
   private readonly monitorPlacement: "band" | "top";
   /** Unsubscribes the surface from the monitor's "new data landed" signal. */
   private monitorUnsub: (() => void) | null = null;
+  /** The mini kanban, in the fixed chrome below the monitor. */
+  private readonly kanbanSource: KanbanSource | null;
+  private readonly kanbanComponent: KanbanComponent | null;
+  private readonly kanbanPlacement: "band" | "top";
+  /** Unsubscribes the surface from the board's "new read landed" signal. */
+  private kanbanUnsub: (() => void) | null = null;
 
   private terminal: Terminal | null = null;
   private tui: TUI | null = null;
@@ -1060,13 +1095,39 @@ class Presenter implements WorkPresenter {
       this.monitorSource === null
         ? null
         : new MonitorComponent(this.monitorSource, Math.max(1, options.monitorLines ?? 2), " ");
-    if (this.monitorComponent !== null && this.monitorPlacement === "top") {
-      this.surface.addChild(this.monitorComponent);
-    }
+    // The board goes under the monitor and above the footer. With both HUDs set
+    // to `"top"` the monitor ends up outermost, since the freshest number is
+    // the one worth reading first.
+    this.kanbanPlacement = options.kanbanPlacement ?? "band";
+    this.kanbanSource = options.kanban ?? null;
+    this.kanbanComponent =
+      this.kanbanSource === null
+        ? null
+        : new KanbanComponent(
+            this.kanbanSource,
+            Math.max(1, options.kanbanLines ?? (modeIsRow(options.kanbanMode) ? 1 : 4)),
+            " ",
+          );
+    this.kanbanComponent?.setMode(options.kanbanMode ?? "row");
+    // Two HUDs, each independently `"top"` or `"band"`, and the child order here
+    // is the same rule `captureFrame()` uses. It is stated once, in one order,
+    // on purpose: the day the two disagree is the day a HUD silently disappears
+    // from a captured frame while still being on screen (or the reverse), which
+    // is the kind of bug that eats an afternoon because the render path looks
+    // fine and the test path looks fine.
+    const head: Component[] = [];
+    const tail: Component[] = [];
+    const place = (component: Component | null, placement: "band" | "top"): void => {
+      if (component === null) return;
+      (placement === "top" ? head : tail).push(component);
+    };
+    // Monitor first in both bands, so whichever way they are pinned the panel
+    // stays outermost and the board sits between it and the transcript.
+    place(this.monitorComponent, this.monitorPlacement);
+    place(this.kanbanComponent, this.kanbanPlacement);
+    for (const component of head) this.surface.addChild(component);
     this.surface.addChild(this.body);
-    if (this.monitorComponent !== null && this.monitorPlacement !== "top") {
-      this.surface.addChild(this.monitorComponent);
-    }
+    for (const component of tail) this.surface.addChild(component);
     this.surface.addChild(this.footer);
   }
 
@@ -1079,6 +1140,16 @@ class Presenter implements WorkPresenter {
   private monitorLines(width: number): string[] {
     if (this.monitorComponent === null || !this.live) return [];
     return this.monitorComponent.render(width);
+  }
+
+  /**
+   * The board's lines, under the same live/released rule as the monitor: a
+   * released surface leaves no stale board in scrollback claiming that the
+   * queue is what it was two reads ago.
+   */
+  private kanbanLines(width: number): string[] {
+    if (this.kanbanComponent === null || !this.live) return [];
+    return this.kanbanComponent.render(width);
   }
 
   get isLive(): boolean {
@@ -1107,6 +1178,9 @@ class Presenter implements WorkPresenter {
     if (this.monitorComponent !== null) {
       this.monitorUnsub = this.monitorSource?.subscribe(() => this.markDirty()) ?? null;
     }
+    if (this.kanbanComponent !== null) {
+      this.kanbanUnsub = this.kanbanSource?.subscribe(() => this.markDirty()) ?? null;
+    }
     this.syncFooter();
     this.paint();
     // The surface is ours and the clock is still running: keep it honest between
@@ -1121,6 +1195,10 @@ class Presenter implements WorkPresenter {
     if (this.monitorUnsub !== null) {
       this.monitorUnsub();
       this.monitorUnsub = null;
+    }
+    if (this.kanbanUnsub !== null) {
+      this.kanbanUnsub();
+      this.kanbanUnsub = null;
     }
     if (this.path === "plain") {
       this.emitPlainTail(true);
@@ -1207,6 +1285,7 @@ class Presenter implements WorkPresenter {
     if (this.workStartedAt === null && this.fields.issueId !== undefined) {
       this.workStartedAt = this.now();
     }
+    this.kanbanComponent?.setCurrent(this.fields.issueId);
     this.syncFooter();
     if (this.path === "plain") this.emitPlainFooter(false);
     else this.markDirty();
@@ -1665,10 +1744,23 @@ class Presenter implements WorkPresenter {
   captureFrame(): string[] {
     const width = this.width();
     const monitor = this.monitorLines(width);
+    const kanban = this.kanbanLines(width);
     const lines = this.visibleBlocks().flatMap((block) => block.render(width));
     const footer = this.footer.render(width);
-    const body =
-      this.monitorPlacement === "top" ? [...monitor, ...lines] : [...lines, ...monitor];
+    // The same placement rule the surface's children were built with: a HUD
+    // pinned `"top"` goes above the transcript, one pinned `"band"` below it,
+    // monitor before board in whichever band each landed in. Every combination of
+    // the two knobs keeps both HUDs — a placement option that made a HUD vanish
+    // rather than move it would be a switch nobody could debug.
+    const head = [
+      ...(this.monitorPlacement === "top" ? monitor : []),
+      ...(this.kanbanPlacement === "top" ? kanban : []),
+    ];
+    const tail = [
+      ...(this.monitorPlacement === "top" ? [] : monitor),
+      ...(this.kanbanPlacement === "top" ? [] : kanban),
+    ];
+    const body = [...head, ...lines, ...tail];
     return footer.length > 0 ? [...body, ...footer] : body;
   }
 

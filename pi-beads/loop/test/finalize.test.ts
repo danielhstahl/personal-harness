@@ -107,6 +107,9 @@ function fakeBoard(order: string[], options: BoardOptions): BdClient {
     async listInProgress(): Promise<never> {
       throw new Error("finalize must not read the in-progress list");
     },
+    async listClosed(): Promise<never> {
+      throw new Error("finalize must not read the closed list");
+    },
     async getIssue(): Promise<never> {
       throw new Error("finalize must not read issues; it is handed the verdict");
     },
@@ -155,6 +158,7 @@ function recordBoard(order: string[], inner: BdClient): BdClient {
   return {
     listReady: (options) => inner.listReady(options),
     listInProgress: (options) => inner.listInProgress(options),
+    listClosed: (options) => inner.listClosed(options),
     getIssue: (id) => inner.getIssue(id),
     createIssue: (spec) => inner.createIssue(spec),
     addDep: (id, dependsOnId, type) => inner.addDep(id, dependsOnId, type),

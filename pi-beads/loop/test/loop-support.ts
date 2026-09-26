@@ -132,6 +132,14 @@ export function createScriptBoard(): ScriptBoard {
       return [...issues.values()].filter((issue) => issue.status === "in_progress").sort(boardOrder);
     },
 
+    async listClosed(options = {}) {
+      gate("listClosed", [`labels=${(options.labels ?? []).join("|")}`]);
+      const closed = [...issues.values()]
+        .filter((issue) => issue.status === "closed")
+        .sort(boardOrder);
+      return options.limit === undefined ? closed : closed.slice(0, options.limit);
+    },
+
     async getIssue(id) {
       gate("getIssue", [id]);
       return issues.get(id) ?? null;

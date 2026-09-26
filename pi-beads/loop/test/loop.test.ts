@@ -1421,10 +1421,64 @@ test("the budget knobs are read, and reach the runner rather than the readme", (
 });
 
 test("the wiring builds no ANSI by hand and spawns no processes of its own", () => {
-  for (const file of ["loop.ts", "app.ts", "main.ts"]) {
+  for (const file of ["loop.ts", "app.ts", "main.ts", "kanban.ts"]) {
     const source = readSource(file);
     assert.ok(!/\\x1b|\\u001b|\u001b/.test(source), `${file} must not contain a hand-rolled escape`);
     assert.ok(!/child_process|execSync|spawnSync|execFile/.test(source), `${file} must not spawn`);
     assert.ok(!/--assignee|--claim/.test(source), `${file} must not contain a claim flag`);
   }
+});
+
+test("the kanban knob answers off, shape and tuning without trapping anyone", () => {
+  assert.equal(readEnv({}).kanban?.enabled, true, "unset is on: the board is a default, not an opt-in");
+  assert.equal(readEnv({ LOOP_KANBAN: "0" }).kanban?.enabled, false);
+  assert.equal(readEnv({ LOOP_KANBAN: "off" }).kanban?.enabled, false);
+  assert.equal(readEnv({ LOOP_KANBAN: "no" }).kanban?.enabled, false);
+
+  // The shape words must not read as "not 1" and switch the board off. A knob
+  // that switched itself off because its value was `board` would cost the first
+  // person who tried it an hour of wondering.
+  assert.equal(readEnv({ LOOP_KANBAN: "board" }).kanban?.enabled, true);
+  assert.equal(readEnv({ LOOP_KANBAN: "board" }).kanban?.mode, "board");
+  assert.equal(readEnv({ LOOP_KANBAN: "ROW" }).kanban?.mode, "row");
+  assert.equal(readEnv({}).kanban?.mode, undefined, "unset shape means the surface picks its own");
+
+  const tuned = readEnv({
+    LOOP_KANBAN_MS: "2500",
+    LOOP_KANBAN_LINES: "7",
+    LOOP_KANBAN_DONE: "5",
+    LOOP_KANBAN_AT: "top",
+    LOOP_KANBAN_VERBOSE: "1",
+  });
+  assert.equal(tuned.kanban?.intervalMs, 2_500);
+  assert.equal(tuned.kanban?.lines, 7);
+  assert.equal(tuned.kanban?.doneLimit, 5);
+  assert.equal(tuned.kanban?.placement, "top");
+  assert.equal(tuned.kanban?.verbose, true);
+  assert.equal(readEnv({}).kanban?.placement, "band");
+  assert.equal(readEnv({}).kanban?.intervalMs, undefined, "unset means the source's own default");
+});
+
+test("the kanban is read-only by shape: no client, no write call, no spawn", () => {
+  const source = readSource("kanban.ts");
+  for (const forbidden of [
+    "createBdClient",
+    "defaultBdClient",
+    "createIssue",
+    "addDep",
+    "appendNote",
+    "setStatus",
+    "closeIssue",
+    "remember",
+  ]) {
+    // A call, not a mention: the module doc says out loud that it cannot do
+    // these things, and that sentence must not read as one.
+    const call = new RegExp(`${forbidden}\\s*\\(`, "u");
+    assert.ok(!call.test(source), `kanban.ts must not be able to ${forbidden}()`);
+  }
+  assert.match(
+    source,
+    /readonly read: \(\) => Promise<KanbanRead>/u,
+    "its only access to the board is a closure that reads",
+  );
 });

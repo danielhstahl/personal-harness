@@ -50,6 +50,7 @@ import {
   rawKeyHint,
 } from "@earendil-works/pi-coding-agent";
 
+import { KanbanComponent, type KanbanMode, type KanbanSource } from "./kanban.ts";
 import { MonitorComponent, type MonitorSource } from "./monitor.ts";
 import {
   CombinedAutocompleteProvider,
@@ -150,6 +151,24 @@ export interface IdleModeOptions {
   readonly monitor?: MonitorSource | null;
   /** Rows the monitor may take at the top. Default 2. */
   readonly monitorLines?: number;
+  /**
+   * The mini kanban (see `src/kanban.ts`), drawn directly under the monitor
+   * and above the board's own one-line status.
+   *
+   * Idle is where the grid belongs. There is no transcript competing for the
+   * screen, the person is looking at it, and the question on their mind before
+   * they type is exactly what these three columns answer: is there anything to
+   * pick, who else is working, and what has recently finished.
+   *
+   * Same read-only contract as everywhere else: the board's own poll timer
+   * drives the repaint, nothing keyed here reads or writes a ticket, and the
+   * idle surface still makes no model call.
+   */
+  readonly kanban?: KanbanSource | null;
+  /** `row` or `board`. Default `"board"` — idle has the room. */
+  readonly kanbanMode?: KanbanMode;
+  /** Rows the board may take, borders included. Default 5. */
+  readonly kanbanLines?: number;
 }
 
 export interface IdleHandle {
@@ -545,6 +564,8 @@ export function createIdleMode(options: IdleModeOptions = {}): IdleHandle {
   let signalUnsubs: readonly (() => void)[] = [];
   /** Detaches the surface from the monitor's poll signal. */
   let monitorUnsub: (() => void) | undefined;
+  /** Detaches the surface from the kanban's read signal. */
+  let kanbanUnsub: (() => void) | undefined;
 
   const theme = createIdleTextTheme();
 
@@ -654,6 +675,14 @@ export function createIdleMode(options: IdleModeOptions = {}): IdleHandle {
       }
       monitorUnsub = undefined;
     }
+    if (kanbanUnsub !== undefined) {
+      try {
+        kanbanUnsub();
+      } catch {
+        // Same again.
+      }
+      kanbanUnsub = undefined;
+    }
 
     try {
       tui?.stop();
@@ -701,6 +730,19 @@ export function createIdleMode(options: IdleModeOptions = {}): IdleHandle {
       // at render time, so a slow or dead server cannot delay a frame here any
       // more than it can delay the beads read behind the status line.
       monitorUnsub = options.monitor.subscribe(() => paint());
+    }
+    if (options.kanban !== null && options.kanban !== undefined) {
+      const kanbanComponent = new KanbanComponent(
+        options.kanban,
+        Math.max(2, options.kanbanLines ?? 5),
+        " ",
+      );
+      kanbanComponent.setMode(options.kanbanMode ?? "board");
+      root.addChild(kanbanComponent);
+      // A read landing is a repaint, and nothing more: the lines are produced
+      // at render time from data already in memory, so a `bd` that takes a
+      // second to answer cannot delay the prompt by a second.
+      kanbanUnsub = options.kanban.subscribe(() => paint());
     }
     root.addChild(statusLine);
     root.addChild(noticeComponent);

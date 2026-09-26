@@ -21,6 +21,14 @@ import type { FinalizeOutcome, FinalizeRequest } from "./finalize.ts";
 import { createIdleMode } from "./idle.ts";
 import type { IdleHandle, IdleOutcome, IdleStatus } from "./idle.ts";
 import {
+  createKanbanSource,
+  createNullKanban,
+  type KanbanColumnKey,
+  type KanbanMode,
+  type KanbanRead,
+  type KanbanSource,
+} from "./kanban.ts";
+import {
   PLAIN_MONITOR_THEME,
   createBackendMonitor,
   createNullMonitor,
@@ -103,6 +111,35 @@ export interface MonitorSetting {
   readonly verbose?: boolean;
 }
 
+/**
+ * The mini kanban: the board as three columns — what is ready, what is being
+ * worked, what is done — drawn alongside the monitor.
+ *
+ * On by default, with defaults set by a different cost model than the
+ * monitor's. Every read here is a `bd` child process rather than a socket
+ * read, so the cadence is slower (5s) and consecutive failures back off to a
+ * minute: a board that cannot be reached must cost one notice and a slow
+ * trickle of retries, not a process spawn per second.
+ *
+ * `mode` picks the shape: `"row"` is one dense line (the work surface's
+ * default, which already carries a transcript, a monitor and a footer);
+ * `"board"` is the bordered three-column grid, which the idle surface
+ * defaults to because nothing there is competing for the screen.
+ */
+export interface KanbanSetting {
+  readonly enabled: boolean;
+  /** Read cadence. Default 5000ms. */
+  readonly intervalMs?: number;
+  readonly mode?: KanbanMode;
+  /** Rows the grid may take, borders included. */
+  readonly lines?: number;
+  /** How many closed tickets the `done` column keeps. Default 12. */
+  readonly doneLimit?: number;
+  /** Where the board sits on the work surface. Default `"band"`. */
+  readonly placement?: "band" | "top";
+  readonly verbose?: boolean;
+}
+
 export interface AppConfig extends LoopConfig {
   /** Repository and board live here. */
   readonly cwd: string;
@@ -132,6 +169,7 @@ export interface AppConfig extends LoopConfig {
   readonly providerAudit?: ProviderAuditSetting;
   /** The read-only server panel. See {@link MonitorSetting}. */
   readonly monitor?: MonitorSetting;
+  readonly kanban?: KanbanSetting;
   readonly themeName?: string;
   /**
    * The live surface's cadence, in ms.
@@ -160,6 +198,8 @@ export interface AppConfig extends LoopConfig {
     readonly idle?: LoopIdlePort;
     /** Substitute the monitor wholesale (`createNullMonitor()` to silence). */
     readonly monitor?: BackendMonitor;
+    /** Substitute the mini kanban wholesale. */
+    readonly kanban?: KanbanSource;
     /** Where the monitor finds its provider's base URL (tests: a fixture path). */
     readonly monitorBaseUrl?: string;
     /** Read `models.json` from somewhere else when resolving the base. */
@@ -198,6 +238,8 @@ export interface App {
   readonly presenter: WorkPresenter;
   /** The backend monitor: polled while the run is, drawn by both surfaces. */
   readonly monitor: BackendMonitor;
+  /** The mini kanban: read-only board view, drawn by both surfaces. */
+  readonly kanban: KanbanSource;
   run(): Promise<LoopResult>;
 }
 
@@ -423,7 +465,7 @@ export function buildApp(config: AppConfig): App {
   const overrides = config.overrides ?? {};
   const labels = config.labels === undefined ? undefined : { labels: config.labels };
 
-  const beads = overrides.beads ?? createBdClient({ bin: config.bdBin, cwd: config.cwd });
+  const baseBeads = overrides.beads ?? createBdClient({ bin: config.bdBin, cwd: config.cwd });
   const git = overrides.git ?? createGitWriter({
     cwd: config.cwd,
     bin: config.gitBin,
@@ -438,6 +480,21 @@ export function buildApp(config: AppConfig): App {
   // prompt gets it as the top line of the screen, and neither of them can make
   // a request — they read what this already has.
   const monitor: BackendMonitor = buildMonitor(config, overrides);
+
+  // ── the mini kanban ─────────────────────────────────────────────────────
+  //
+  // Built here for the same reason as the monitor: one read of the board, one
+  // picture, drawn in two places. It is given a *reader*, not the client —
+  // `src/kanban.ts` has no `BdClient` in its signature, so there is nothing
+  // in the module that could move a ticket even by accident.
+  const kanban: KanbanSource = buildKanban(config, baseBeads, overrides, labels);
+
+  // The real client gets wrapped so this run's own writes refresh the picture
+  // immediately. An injected fake is not wrapped: it is exactly the object the
+  // test asked for, and a refresh bolted onto it would change what that test is
+  // counting.
+  const beads: BdClient =
+    overrides.beads === undefined ? refreshBoardOnWrite(baseBeads, kanban) : baseBeads;
 
   // ── the work-stream surface (`.10`) ───────────────────────────────────
   //
@@ -457,6 +514,10 @@ export function buildApp(config: AppConfig): App {
           monitor,
           monitorPlacement: config.monitor?.placement ?? "band",
           monitorLines: config.monitor?.lines ?? 2,
+          kanban,
+          kanbanMode: config.kanban?.mode ?? "row",
+          kanbanPlacement: config.kanban?.placement ?? "band",
+          ...(config.kanban?.lines === undefined ? {} : { kanbanLines: config.kanban.lines }),
         });
 
   /**
@@ -627,6 +688,9 @@ export function buildApp(config: AppConfig): App {
         themeName: config.themeName,
         monitor,
         monitorLines: config.monitor?.lines ?? 2,
+        kanban,
+        kanbanMode: config.kanban?.mode ?? "board",
+        kanbanLines: config.kanban?.lines ?? 5,
       }));
 
   const baseIdle: LoopIdlePort = overrides.idle ?? perTurnIdle(makeIdle);
@@ -739,6 +803,7 @@ export function buildApp(config: AppConfig): App {
     ports,
     presenter,
     monitor,
+    kanban,
     run: async (): Promise<LoopResult> => {
       try {
         // The monitor starts before the audit so the panel is already showing
@@ -746,6 +811,11 @@ export function buildApp(config: AppConfig): App {
         // first poll that fails is on screen as `✕ unreachable` rather than a
         // blank row that might just be slow.
         monitor.start();
+        kanban.start();
+        if (config.kanban?.verbose === true) {
+          await kanban.refresh().catch(() => undefined);
+          for (const line of kanban.describe()) presenter.notice("info", line);
+        }
         if (config.monitor?.verbose === true) {
           // Join the cycle that `start()` kicked off before describing it:
           // `describe()` printed now says what answered and what it exposed,
@@ -761,11 +831,141 @@ export function buildApp(config: AppConfig): App {
         // still asking a server about itself after the thing that cared about
         // the answer has gone away.
         monitor.stop();
+        kanban.stop();
         handSurfaceOver();
         presenter.dispose();
       }
     },
   };
+}
+
+/**
+ * Wrap a beads client so a write from this run refreshes the board.
+ *
+ * The board's own timer would catch the change within an interval anyway; this
+ * just removes the lag between the loop finishing a ticket and the picture
+ * agreeing with it. The refresh is fire-and-forget on purpose: the write has
+ * already succeeded, and a board read that fails after it is the board's
+ * problem — it shows `?` and backs off — never the write's.
+ *
+ * Exported because the claim it makes — *every* mutating call refreshes, and no
+ * read-only one does — is worth pinning directly, and cannot be reached through
+ * `buildApp` without a real `bd`: the wrapper is applied only to the real
+ * client, never to a fake a test handed in.
+ */
+export function refreshBoardOnWrite(client: BdClient, kanban: KanbanSource): BdClient {
+  const later = (): void => {
+    void kanban.refresh().catch(() => undefined);
+  };
+  return {
+    listReady: (options) => client.listReady(options),
+    listInProgress: (options) => client.listInProgress(options),
+    listClosed: (options) => client.listClosed(options),
+    getIssue: (id) => client.getIssue(id),
+    async createIssue(spec) {
+      const created = await client.createIssue(spec);
+      later();
+      return created;
+    },
+    async addDep(id, dependsOnId, type) {
+      await client.addDep(id, dependsOnId, type);
+      later();
+    },
+    async appendNote(id, text) {
+      const updated = await client.appendNote(id, text);
+      later();
+      return updated;
+    },
+    async setStatus(id, status, options) {
+      const updated = await client.setStatus(id, status, options);
+      later();
+      return updated;
+    },
+    async closeIssue(id, reason) {
+      const closed = await client.closeIssue(id, reason);
+      later();
+      return closed;
+    },
+    remember: (text, key) => client.remember(text, key),
+    recall: (key) => client.recall(key),
+  };
+}
+
+/**
+ * Build the mini kanban.
+ *
+ * The three reads are settled independently rather than awaited together, so
+ * one column failing does not black out the other two: `Promise.allSettled`
+ * maps directly onto the `failed` field of {@link KanbanRead}, which is what
+ * lets the renderer draw `?` for the column that failed and real counts for
+ * the columns that answered.
+ */
+function buildKanban(
+  config: AppConfig,
+  beads: BdClient,
+  overrides: AppConfig["overrides"] = {},
+  labels: { labels: readonly string[] } | undefined,
+): KanbanSource {
+  const setting = config.kanban ?? { enabled: true };
+  if (setting.enabled === false) {
+    return createNullKanban("switched off by LOOP_KANBAN=0");
+  }
+  if (overrides.kanban !== undefined) return overrides.kanban;
+
+  const doneLimit = Math.max(1, setting.doneLimit ?? 12);
+  let theme: MonitorTheme;
+  try {
+    theme = createPresenterTheme(config.themeName);
+  } catch {
+    theme = PLAIN_MONITOR_THEME;
+  }
+
+  const read = async (): Promise<KanbanRead> => {
+    // Read more closed tickets than the column shows: bd's own order is not
+    // guaranteed to be by close time, so the recency sort has to happen over a
+    // window wider than the display.
+    const windowSize = Math.max(doneLimit * 3, 30);
+    const [ready, inProgress, closed] = await Promise.allSettled([
+      beads.listReady(labels ?? {}),
+      beads.listInProgress(labels ?? {}),
+      beads.listClosed({ ...labels, limit: windowSize }),
+    ]);
+    const failed: KanbanColumnKey[] = [];
+    const firstError = [ready, inProgress, closed].find(
+      (result) => result.status === "rejected",
+    ) as PromiseRejectedResult | undefined;
+    if (ready.status === "rejected") failed.push("ready");
+    if (inProgress.status === "rejected") failed.push("progress");
+    if (closed.status === "rejected") failed.push("done");
+    const readResult: KanbanRead = {
+      ...(ready.status === "fulfilled" ? { ready: ready.value } : {}),
+      ...(inProgress.status === "fulfilled" ? { inProgress: inProgress.value } : {}),
+      ...(closed.status === "fulfilled" ? { closed: closed.value } : {}),
+      // Tell the view what the window was, so a full window reads as a floor
+      // (`done 36+`) rather than as a count that happens to be exact.
+      closedWindow: windowSize,
+      ...(failed.length === 0 ? {} : { failed }),
+      ...(firstError === undefined
+        ? {}
+        : {
+            error:
+              firstError.reason instanceof Error
+                ? firstError.reason.message
+                : String(firstError.reason),
+          }),
+    };
+    return readResult;
+  };
+
+  return createKanbanSource({
+    read,
+    theme,
+    mode: setting.mode ?? "board",
+    maxLines: setting.lines ?? 4,
+    doneLimit,
+    ...(setting.intervalMs === undefined ? {} : { intervalMs: setting.intervalMs }),
+    verbose: setting.verbose === true,
+  });
 }
 
 /** Build and run. The single entry the CLI and the spike share. */

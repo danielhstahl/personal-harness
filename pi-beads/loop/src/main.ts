@@ -14,7 +14,7 @@ import { pathToFileURL } from "node:url";
 import { AgentError, parseThinkingLevel } from "./agent.ts";
 import type { ThinkingLevel } from "./agent.ts";
 import { runApp } from "./app.ts";
-import type { AppConfig } from "./app.ts";
+import type { AppConfig, KanbanSetting } from "./app.ts";
 import { LoopError } from "./loop.ts";
 import type { LoopResult } from "./loop.ts";
 
@@ -73,6 +73,33 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
    */
   const monitorPlacement = (): "band" | "top" =>
     source.LOOP_MONITOR_AT?.trim().toLowerCase() === "top" ? "top" : "band";
+  /**
+   * The mini kanban, read as one knob with three answers: `0`/`off` hides it,
+   * `row` and `board` pick the shape, and anything else — including unset —
+   * leaves it on with the shape each surface prefers.
+   *
+   * The shape words are recognised here rather than left to fall through to the
+   * boolean: a variable that switched the board *off* because its value was
+   * `board` rather than `1` would be a trap that costs the first person who
+   * tries it an hour of wondering.
+   */
+  const kanbanSetting = (): KanbanSetting => {
+    const raw = source.LOOP_KANBAN?.trim().toLowerCase();
+    const off = raw === "0" || raw === "off" || raw === "no" || raw === "false";
+    const shape = raw === "row" || raw === "board" ? raw : undefined;
+    const intervalMs = number("LOOP_KANBAN_MS");
+    const lines = number("LOOP_KANBAN_LINES");
+    const doneLimit = number("LOOP_KANBAN_DONE");
+    return {
+      enabled: !off,
+      ...(shape === undefined ? {} : { mode: shape }),
+      ...(intervalMs === undefined ? {} : { intervalMs }),
+      ...(lines === undefined ? {} : { lines }),
+      ...(doneLimit === undefined ? {} : { doneLimit }),
+      placement: source.LOOP_KANBAN_AT?.trim().toLowerCase() === "top" ? "top" : "band",
+      verbose: flag("LOOP_KANBAN_VERBOSE") ?? false,
+    };
+  };
   return {
     cwd,
     bdBin: source.LOOP_BD_BIN,
@@ -114,6 +141,8 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
       placement: monitorPlacement(),
       verbose: flag("LOOP_MONITOR_VERBOSE") ?? false,
     },
+    /** The mini kanban. See `KanbanSetting` in `src/app.ts`. */
+    kanban: kanbanSetting(),
     themeName: source.PI_THEME,
     dryRun: flag("LOOP_DRY_RUN"),
     verbose: flag("LOOP_VERBOSE"),
