@@ -55,10 +55,10 @@ src/kanban.ts       the mini kanban: ready / in progress / done, read through an
                     states per column (see ADR-004)
 src/notify.ts       the completion notice: what a finished bead says, in what order,
                     and when to stop trying to say it. Wording only — no sockets
-src/mail.ts         the ONLY module that opens a socket to a mail server: RFC 822
-                    rendering, quoted-printable, folded headers, a hand-rolled SMTP
-                    client, and a mailer whose every failure path returns a delivery
-                    instead of throwing (see ADR-005)
+src/ntfy.ts       the ONLY module that talks to a notification server: topic
+                    resolution, the ntfy headers, the byte limits, and an HTTP
+                    publisher whose every failure path returns a delivery instead
+                    of throwing (see ADR-007)
 src/format.ts       one-line plain-log summaries — NOT the renderer (see ADR-001)
 src/gitlock.ts      the ONLY module that spawns git, and the only kill policy:
                     SIGTERM first, SIGKILL as escalation, because a killed git
@@ -69,8 +69,11 @@ docs/               ADR-001: transport + rendering decision
                     ADR-004: the mini kanban — read-only by shape, and what "unread" must not render as
                     ADR-005: the completion notice — an effect the machine asks for,
                              a report that can never break the run
+                             (transport superseded by ADR-007)
                     ADR-006: the index lock — wait it out, and never be the thing
                              that strands it
+                    ADR-007: the notice on ntfy — a URL instead of an address,
+                             and what that made simpler
 spikes/             throwaway prototypes + captured evidence backing ADR-001
 test/               unit tests, plus the whole walk in test/loop.test.ts
 ```
@@ -139,9 +142,17 @@ queue it could not read. See "The board" below.
 
 And [`docs/ADR-005-completion-notice.md`](docs/ADR-005-completion-notice.md):
 when a bead closes, the machine asks — as data — for a notice to be sent, and the
-interpreter decides who hears about it. Mail is a *report* about the run and
-never a dependency of it: a relay that is down costs a warning, a streak limit
+interpreter decides who hears about it. A notice is a *report* about the run and
+never a dependency of it: a server that is down costs a warning, a streak limit
 and a transcript line, and nothing else. See "The completion notice" below.
+
+And [`docs/ADR-007-ntfy-notices.md`](docs/ADR-007-ntfy-notices.md):
+that notice used to be email, and email brought twelve environment variables and
+thirteen hundred lines of mail adapter with it — half of them answering questions
+about relay security that this feature has no business answering. It is now an
+ntfy publish: the topic URL is the switch, a self-hosted server is the same
+variable with a different value, and there is no sender identity, no STARTTLS
+policy and no spam folder in the way.
 
 And [`docs/ADR-006-index-lock.md`](docs/ADR-006-index-lock.md):
 `.git/index.lock` was killing runs — and, worse, keeping them dead. Two measured
@@ -162,7 +173,7 @@ Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`
 `LOOP_HEALTH_URL` (see "Startup: the provider comparison" below), the monitor
 knobs `LOOP_MONITOR*` (see "The monitor" below), the board knobs
 `LOOP_KANBAN*` (see "The board" below), the completion-notice knobs
-`LOOP_NOTIFY_*` / `LOOP_MAIL_*` (see "The completion notice" below), and the
+`LOOP_NTFY_*` (see "The completion notice" below), and the
 git-lock knobs `LOOP_GIT_LOCK_WAIT_MS` / `LOOP_GIT_KILL_GRACE_MS` /
 `LOOP_GIT_STALE_LOCK_AFTER_MS` / `LOOP_GIT_STALE_LOCK` (see "The index lock"
 below). Neither knob
@@ -619,118 +630,108 @@ seconds before you type, when the answer has to be above the keyboard.
 
 ## The completion notice: telling somebody when a bead closes
 
-Set one variable and every bead the loop closes sends an email:
+Set one variable and every bead the loop closes publishes an ntfy notification:
 
 ```sh
-export LOOP_NOTIFY_EMAIL="dev@example.com"
+export LOOP_NTFY_TOPIC="loop-notices"        # or https://ntfy.sh/loop-notices
 node src/main.ts
 ```
 
-The subject carries the bead id — that is what the mail gets searched by — and the
-body is an index into the real record rather than a paraphrase of it:
+**Local hosting is the same variable with a different value** — that is the whole
+point of pointing at a URL instead of an address:
 
-```
-Subject: [pi-beads] tst.42 completed: Added colour handling to the tokenizer
-
-  tst.42 — Add the colour mode to the parser
-
-  Bead      tst.42
-  Title     Add the colour mode to the parser
-  Status    closed
-  When      2025-09-26 11:03:07 UTC
-  Work      done, 3m 11s, iteration 3
-
-  What it did
-      Added colour handling to the tokenizer and thread it through the parser.
-
-  Changes
-    Commit    deadbeefcafebabe0123456789abcdef01234567
-    Files     2 changed
-      - src/colour.ts
-      - src/parser.ts
-
-  Still to do
-      1. docs still need the colour section
-
-  Where to read more
-    Bead      bd show tst.42
-    Handoff   bd recall loop:handoff:tst.42 --json
-    Diff      git show deadbeefcafebabe0123456789abcdef01234567
-    Closed as Done: Added colour handling to the tokenizer…
-    Repo      /work/project
-
-  — sent by pi-beads-loop on buildhost from /work/project to dev@example.com (…)
-    A delivery failure never stops the loop: the work this notice describes is
-    committed and closed whatever the mail relay does next.
+```sh
+export LOOP_NTFY_URL="http://192.168.1.20:8080"   # your own ntfy
+export LOOP_NTFY_TOPIC="loop"
 ```
 
-**Mail is a report, never a dependency.** By the time a notice is due the bead is
-committed, handed off and closed, so nothing about the mail can change the work.
-A failed send costs one warning — *"The bead is closed either way — nothing about
-the work changed"* — and after three failures in a row the notice switches itself
-off for the rest of the run, because a dead relay is discovered once, not once
-per bead for the next six hours. A delivery that succeeds in the middle resets
-the streak, and the switch-off is printed on the failure that caused it — not
-quietly remembered until the next bead happens to close. The behaviour is not a
-knob; the count is (`LOOP_NOTIFY_MAX_FAILURES`).
+The title carries the bead id — that is what the notification gets searched by —
+and the body is an index into the real record rather than a paraphrase of it:
 
-**Bad config stops the run; bad delivery never does.** A malformed address, a mail
-URL that will not parse, or a password with no user stop the loop at startup with
-`notify-config` and exit 2 — the same way an unknown thinking level does — so a
-typo is found in the terminal it was typed in rather than as a day of missing
-mail. What *cannot* fail the run is a relay refusing a message.
+```
+[pi-beads] tst.42 completed: Added colour handling to the tokenizer and thread it through the parser.
 
-**Notice, not noise.** `LOOP_NOTIFY_EMAIL` unset means no notifier, no socket,
-no poller. A dry run sends nothing: a dry run never reaches the close that
-triggers the notice, which is the same reason it never closes a bead. A failed
-bead sends nothing either — it is not a completion, and its reason is already on
-the board under the failure key.
+tst.42 — Add the colour mode to the parser
+Added colour handling to the tokenizer and thread it through the parser.
+
+done · 3m 11s · iteration 3 · 2025-10-26 11:03 UTC
+deadbeefcafe · 2 files
+- src/colour.ts
+- src/parser.ts
+
+next: docs still need the colour section
+read: bd show tst.42 · bd recall loop:handoff:tst.42
+from /work/project on buildhost
+```
+
+It is shaped for a phone rather than a desk: the hash is short enough to read and
+long enough to paste, the file list folds past six, the next-step list says
+`(+2 more)` instead of running off the screen, and anything the run could not
+know says so rather than vanishing.
+
+**A notice is a report, never a dependency.** By the time one is due the bead is
+committed, handed off and closed, so nothing about the publish can change the
+work. A failed send costs one warning — *"The bead is closed either way — nothing
+about the work changed"* — and after three failures in a row the notice switches
+itself off for the rest of the run, because a dead server is discovered once,
+not once per bead for the next six hours. A publish that succeeds in the middle
+resets the streak, and the switch-off is printed on the failure that caused it —
+not quietly remembered until the next bead happens to close. The behaviour is
+not a knob; the count is (`LOOP_NTFY_MAX_FAILURES`).
+
+**Bad config stops the run; bad delivery never does.** A URL with no scheme, a
+URL with credentials stuffed into it, a topic that resolves to nothing, a
+priority that is neither 1–5 nor one of ntfy's names — these stop the loop at
+startup with `notify-config` and exit 2, the same way an unknown thinking level
+does, so a typo is found in the terminal it was typed in rather than as a day of
+missing notifications. What *cannot* fail the run is a server refusing a message.
+
+**Notice, not noise.** `LOOP_NTFY_TOPIC` unset means no publisher and no socket.
+A dry run sends nothing: a dry run never reaches the close that triggers the
+notice, which is the same reason it never closes a bead. A failed bead sends
+nothing either — it is not a completion, and its reason is already on the board
+under the failure key.
 
 | Variable | What it does | Default |
 | --- | --- | --- |
-| `LOOP_NOTIFY_EMAIL` | Recipients. Comma, semicolon or space separated. **This is the switch.** | unset — no mail |
-| `LOOP_NOTIFY_CC` | Extra recipients, copied on every notice | unset |
-| `LOOP_NOTIFY_FROM` | The `From:` header. Set this: most relays require it to match the authenticated sender | `pi-beads-loop@<host>`, or the commit identity if one is set |
-| `LOOP_NOTIFY_SUBJECT_PREFIX` | The `[pi-beads]` in the subject | `pi-beads` |
-| `LOOP_NOTIFY_MAX_FAILURES` | Give up after this many failures in a row | `3` |
-| `LOOP_MAIL_URL` | `smtp://user:pass@host:587` or `smtps://host:465`. Query params: `starttls`, `tls`, `timeout` | unset |
-| `LOOP_MAIL_HOST` / `LOOP_MAIL_PORT` | The relay, without a URL | `127.0.0.1` / the port the security mode means |
-| `LOOP_MAIL_USER` / `LOOP_MAIL_PASSWORD` | Submission credentials | unset — anonymous |
-| `LOOP_MAIL_STARTTLS` | `required`, `optional`, `off` | `optional` — upgrade if offered |
-| `LOOP_MAIL_TIMEOUT_MS` | Deadline per connect and per reply | `15000` |
-| `LOOP_MAIL_INSECURE_AUTH` | Allow a password over a channel that is not encrypted | off — refused outright |
+| `LOOP_NTFY_TOPIC` | The topic: a bare name, or a full `http(s)://host/topic` URL. **This is the switch.** | unset — no notices |
+| `LOOP_NTFY_URL` | The server a bare topic is joined onto. A path prefix (`https://host/ntfy`) is preserved | `https://ntfy.sh` |
+| `LOOP_NTFY_TOKEN` | Bearer token, for a server that requires one | unset — anonymous |
+| `LOOP_NTFY_PRIORITY` | `1`–5 or `min` / `low` / `default` / `high` / `urgent` | unset — ntfy's default |
+| `LOOP_NTFY_TAGS` | Emoji names on the notification, space or comma separated | unset |
+| `LOOP_NTFY_CLICK` | URL the notification opens | unset |
+| `LOOP_NTFY_TITLE_PREFIX` | The `[pi-beads]` in the title | `pi-beads` |
+| `LOOP_NTFY_TIMEOUT_MS` | Deadline for the publish request | `10000` |
+| `LOOP_NTFY_MAX_FAILURES` | Give up after this many failures in a row | `3` |
 
-A few defaults are worth knowing about, because they are the ones that bite:
+A few defaults are worth knowing about:
 
-- **TLS is opportunistic by default** and strict when you ask. With `required`
-  against a relay that does not advertise STARTTLS the send *fails* rather than
-  quietly downgrading. A password on an unencrypted channel is refused unless
-  `LOOP_MAIL_INSECURE_AUTH` says the operator means it, and `AUTH` lines are
-  redacted in the log whatever happens.
-- **Nothing unvalidated goes on the wire.** Addresses are parsed down to their
-  `addr-spec` before `RCPT TO`, and header values — including the subject, which
-  is an agent-written sentence — have line breaks flattened out of them, so a
-  summary cannot forge a header.
-- **Copies are copies, not blind copies.** `LOOP_NOTIFY_CC` lands in a real
-  `Cc:` header, and the `To:` header names only the addressees. Anyone written
-  into both fields gets one notice rather than two. An empty recipient list is a
-  skip, not a fallback to some other list — see
-  [ADR-005 §8](docs/ADR-005-completion-notice.md).
-- **What mail can actually deliver is the relay's problem.** This sends mail; it
-  does not sign it. SPF, DKIM, DMARC and whether a provider accepts the sender
-  at all belong to the host and the relay, which is why `LOOP_NOTIFY_FROM` is a
-  first-class knob instead of a guess at a hostname.
+- **Nothing unvalidated goes on the wire.** The target is resolved at startup —
+  scheme checked, credentials in the URL refused (ntfy uses a bearer header, and
+  a URL is a string that gets echoed into logs) — and header values, including
+  the title, which is an agent-written sentence, have line breaks flattened out
+  of them so a summary cannot forge a header.
+- **The token never appears in a log line.** There is a test that publishes with a
+  token and asserts the string shows up nowhere.
+- **ntfy's limits are honoured, not discovered.** The body is cut at 4096 bytes
+  on a character boundary and marked `… (truncated)`; the title is clipped so the
+  leading `[prefix] bead.id` survives. Cutting beats a `413`, and marking the cut
+  beats a notice that silently reads as shorter than the run.
+- **TLS with a self-signed certificate:** point Node's trust store at your CA with
+  `NODE_EXTRA_CA_CERTS` rather than disabling verification. This module has no
+  "skip TLS" setting, and adding one should be its own decision.
 - **In the container these are ordinary `-e` flags:**
-  `docker run -e LOOP_NOTIFY_EMAIL=dev@example.com -e LOOP_MAIL_URL=smtps://…`.
+  `docker run -e LOOP_NTFY_TOPIC=loop -e LOOP_NTFY_URL=http://192.168.1.20:8080`.
 
-Read [`docs/ADR-005-completion-notice.md`](docs/ADR-005-completion-notice.md)
-before changing any of it — in particular why the SMTP client is hand-rolled, why
-the machine emits the effect without knowing whether mail exists, and why the
-notice goes after the close and never before it.
+Read [`docs/ADR-007-ntfy-notices.md`](docs/ADR-007-ntfy-notices.md) before
+changing any of it — and
+[`docs/ADR-005-completion-notice.md`](docs/ADR-005-completion-notice.md) for the
+parts that survived the move: why the machine emits the effect without knowing a
+notice is wanted, and why it goes after the close and never before it.
 
 ```sh
-node --test test/mail.test.ts    # the SMTP client against a fake relay on loopback
-node --test test/notify.test.ts  # the wording, the headers, the failure streak
+node --test test/ntfy.test.ts    # the transport against a fake ntfy server on loopback
+node --test test/notify.test.ts  # the wording, the limits, the failure streak
 ```
 
 ## The index lock: waiting it out, and never stranding one

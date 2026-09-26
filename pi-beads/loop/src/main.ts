@@ -84,35 +84,24 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
    * tries it an hour of wondering.
    */
   /**
-   * Split an address list the way a person types one.
+   * Split a tag list the way a person types one.
    *
-   * Comma, semicolon or whitespace all separate, because the natural thing to
-   * write into an environment variable is
-   * `LOOP_NOTIFY_EMAIL="ada@example.com, grace@example.com"`, and the natural
-   * thing *not* to notice is that the second address silently never arrived.
-   * Validity itself is the mail adapter's business — it answers with one line
-   * and exit 2 at build time, not a warning per bead.
+   * Comma or whitespace both separate, because the natural thing to write into
+   * an environment variable is `LOOP_NTFY_TAGS="+1 tada"` and the natural thing
+   * *not* to notice is that one of them silently never arrived.
    */
-  const addresses = (raw: string | undefined): string[] =>
+  const tagList = (raw: string | undefined): string[] =>
     (raw ?? "")
       .split(/[,;\s]+/u)
       .map((entry) => entry.trim())
       .filter((entry) => entry !== "");
 
   /**
-   * The completion notice: one optional feature with the address as its switch.
-   *
-   * `undefined` when nothing mail-related is set at all, which keeps "this run
-   * was never asked to send mail" distinct in the transcript from "this run was
-   * asked and cannot". Those two read very differently to whoever is looking for
-   * a notice that did not arrive.
-   */
-  /**
-   * How many failed sends in a row before the notice gives up, refused rather
-   * than dropped.
+   * How many failed publishes in a row before the notice gives up, refused
+   * rather than dropped.
    *
    * `number()` returns `undefined` for what it cannot parse, which for this knob
-   * would be a trap: `LOOP_NOTIFY_MAX_FAILURES="three"` would fall back to the
+   * would be a trap: `LOOP_NTFY_MAX_FAILURES="three"` would fall back to the
    * default and look exactly like a setting that took. A value that is set has
    * to be a whole number of tries — and a *safely representable* one, since
    * `1e21` parses to an integer that is not the integer anybody meant — and
@@ -120,66 +109,67 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
    * told to try nine.
    */
   const maxFailuresSetting = (): number | undefined => {
-    const raw = source.LOOP_NOTIFY_MAX_FAILURES;
+    const raw = source.LOOP_NTFY_MAX_FAILURES;
     if (raw === undefined || raw.trim() === "") return undefined;
     const parsed = Number(raw);
     if (!Number.isSafeInteger(parsed) || parsed < 1) {
       throw new LoopError(
         "notify-config",
-        `LOOP_NOTIFY_MAX_FAILURES must be a whole number of tries, at least 1, not "${raw.trim()}"`,
+        `LOOP_NTFY_MAX_FAILURES must be a whole number of tries, at least 1, not "${raw.trim()}"`,
       );
     }
     return parsed;
   };
 
+  /**
+   * The completion notice: one optional feature with the topic as its switch.
+   *
+   * `undefined` when nothing ntfy-related is set at all, which keeps "this run
+   * was never asked to notify anybody" distinct in the transcript from "this run
+   * was asked and cannot". Those two read very differently to whoever is looking
+   * for a notice that did not arrive.
+   *
+   * `LOOP_NTFY_TOPIC` is the switch, and it takes either a bare topic name —
+   * joined onto `LOOP_NTFY_URL`, which defaults to the hosted server — or a
+   * complete URL, which is the form people copy out of the ntfy web UI. A
+   * self-hosted server is a different value in the same variable, not a
+   * different configuration: that is what makes local hosting a one-line change.
+   */
   const notifySetting = (): NotifySetting | undefined => {
     const knobs: readonly (string | undefined)[] = [
-      source.LOOP_NOTIFY_EMAIL,
-      source.LOOP_NOTIFY_CC,
-      source.LOOP_NOTIFY_FROM,
-      source.LOOP_NOTIFY_SUBJECT_PREFIX,
-      source.LOOP_MAIL_URL,
-      source.LOOP_MAIL_HOST,
-      source.LOOP_MAIL_PORT,
-      source.LOOP_MAIL_USER,
-      source.LOOP_MAIL_PASSWORD,
-      source.LOOP_MAIL_STARTTLS,
-      source.LOOP_MAIL_TIMEOUT_MS,
-      source.LOOP_MAIL_INSECURE_AUTH,
-      source.LOOP_NOTIFY_MAX_FAILURES,
+      source.LOOP_NTFY_TOPIC,
+      source.LOOP_NTFY_URL,
+      source.LOOP_NTFY_TOKEN,
+      source.LOOP_NTFY_PRIORITY,
+      source.LOOP_NTFY_TAGS,
+      source.LOOP_NTFY_CLICK,
+      source.LOOP_NTFY_TITLE_PREFIX,
+      source.LOOP_NTFY_TIMEOUT_MS,
+      source.LOOP_NTFY_MAX_FAILURES,
     ];
     if (knobs.every((value) => value === undefined || value.trim() === "")) return undefined;
-    const to = addresses(source.LOOP_NOTIFY_EMAIL);
-    const cc = addresses(source.LOOP_NOTIFY_CC);
+    const topic = (source.LOOP_NTFY_TOPIC ?? "").trim();
+    const tags = tagList(source.LOOP_NTFY_TAGS);
+    const maxFailures = maxFailuresSetting();
     return {
-      // The recipient is the switch. A relay configured with nobody to tell is a
-      // relay that will never be exercised, and saying so beats pretending.
-      enabled: to.length > 0,
-      to,
-      ...(cc.length === 0 ? {} : { cc }),
-      ...(source.LOOP_NOTIFY_FROM === undefined
+      // The topic is the switch. A server configured with nowhere to publish is
+      // a server that will never be exercised, and saying so beats pretending.
+      enabled: topic !== "",
+      ...(topic === "" ? {} : { topic }),
+      ...(source.LOOP_NTFY_URL === undefined ? {} : { url: source.LOOP_NTFY_URL.trim() }),
+      ...(source.LOOP_NTFY_TOKEN === undefined ? {} : { token: source.LOOP_NTFY_TOKEN.trim() }),
+      ...(source.LOOP_NTFY_PRIORITY === undefined
         ? {}
-        : { from: source.LOOP_NOTIFY_FROM.trim() }),
-      ...(source.LOOP_NOTIFY_SUBJECT_PREFIX === undefined
+        : { priority: source.LOOP_NTFY_PRIORITY.trim() }),
+      ...(tags.length === 0 ? {} : { tags }),
+      ...(source.LOOP_NTFY_CLICK === undefined ? {} : { click: source.LOOP_NTFY_CLICK.trim() }),
+      ...(source.LOOP_NTFY_TITLE_PREFIX === undefined
         ? {}
-        : { subjectPrefix: source.LOOP_NOTIFY_SUBJECT_PREFIX }),
-      ...(source.LOOP_MAIL_URL === undefined ? {} : { url: source.LOOP_MAIL_URL.trim() }),
-      ...(source.LOOP_MAIL_HOST === undefined ? {} : { host: source.LOOP_MAIL_HOST.trim() }),
-      ...(number("LOOP_MAIL_PORT") === undefined ? {} : { port: number("LOOP_MAIL_PORT") }),
-      ...(source.LOOP_MAIL_USER === undefined ? {} : { user: source.LOOP_MAIL_USER }),
-      ...(source.LOOP_MAIL_PASSWORD === undefined ? {} : { password: source.LOOP_MAIL_PASSWORD }),
-      ...(source.LOOP_MAIL_STARTTLS === undefined
+        : { titlePrefix: source.LOOP_NTFY_TITLE_PREFIX }),
+      ...(number("LOOP_NTFY_TIMEOUT_MS") === undefined
         ? {}
-        : { starttls: source.LOOP_MAIL_STARTTLS.trim() }),
-      ...(number("LOOP_MAIL_TIMEOUT_MS") === undefined
-        ? {}
-        : { timeoutMs: number("LOOP_MAIL_TIMEOUT_MS") }),
-      ...(flag("LOOP_MAIL_INSECURE_AUTH") === undefined
-        ? {}
-        : { allowInsecureAuth: flag("LOOP_MAIL_INSECURE_AUTH") }),
-      ...(maxFailuresSetting() === undefined
-        ? {}
-        : { maxConsecutiveFailures: maxFailuresSetting() }),
+        : { timeoutMs: number("LOOP_NTFY_TIMEOUT_MS") }),
+      ...(maxFailures === undefined ? {} : { maxConsecutiveFailures: maxFailures }),
     };
   };
 

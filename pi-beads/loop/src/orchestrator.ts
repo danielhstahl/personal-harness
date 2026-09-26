@@ -131,7 +131,7 @@ export type EffectKind =
   | "agent.split"
   | "agent.run"
   | "vcs.commit"
-  | "notify.email"
+  | "notify.publish"
   | "ui.say"
   | "ui.warn"
   | "drop_context";
@@ -173,7 +173,7 @@ export const EFFECT_KINDS = [
   "agent.split",
   "agent.run",
   "vcs.commit",
-  "notify.email",
+  "notify.publish",
   "ui.say",
   "ui.warn",
   "drop_context",
@@ -245,14 +245,14 @@ export interface VcsCommitEffect {
  * function of state and event. What leaves here is the set of facts the
  * interpreter cannot recover elsewhere — the id this step closed, the reason that
  * closed it, the hash that funded it — and the interpreter owns who hears about
- * it, and whether the answer is "nobody, `LOOP_NOTIFY_EMAIL` is unset".
+ * it, and whether the answer is "nobody, `LOOP_NTFY_TOPIC` is unset".
  *
  * It is emitted *after* the close rather than before it on purpose: a notice sent
  * before the close is a claim of completion that outruns the close itself, and
  * that is the one lie this loop is built not to tell.
  */
-export interface NotifyEmailEffect {
-  kind: "notify.email";
+export interface NotifyPublishEffect {
+  kind: "notify.publish";
   issueId: string;
   title: string;
   /** The `bd close --reason` text, so the notice matches what the board says. */
@@ -295,7 +295,7 @@ export type Effect =
   | AgentSplitEffect
   | AgentRunEffect
   | VcsCommitEffect
-  | NotifyEmailEffect
+  | NotifyPublishEffect
   | UiSayEffect
   | UiWarnEffect
   | DropContextEffect;
@@ -1012,7 +1012,7 @@ export function step(state: OrchestratorState, event: OrchestratorEvent): StepRe
               state,
               event,
               `${event.id} committed, remembered and closed`,
-              [notifyEmail(state, event.id)],
+              [notifyPublish(state, event.id)],
               {
                 commitHash: state.commitHash,
                 handoffKey: state.handoffKey,
@@ -1133,9 +1133,9 @@ function vcsCommit(message: string, paths: readonly string[]): VcsCommitEffect {
 }
 
 /** Build the completion notice from the only state that can still see all of it. */
-function notifyEmail(state: OrchestratorState, issueId: string): NotifyEmailEffect {
+function notifyPublish(state: OrchestratorState, issueId: string): NotifyPublishEffect {
   return {
-    kind: "notify.email",
+    kind: "notify.publish",
     issueId,
     title: state.activeIssueTitle ?? issueId,
     closeReason: state.pendingCloseReason ?? `Closed ${issueId}`,
@@ -1193,7 +1193,7 @@ export interface OrchestratorPorts {
     warn(text: string): void;
   };
   /**
-   * Where `notify.email` lands. Optional: a run with nobody to tell has no
+   * Where `notify.publish` lands. Optional: a run with nobody to tell has no
    * notifier, and the interpreter reports the effect as *skipped* rather than
    * pretending it went somewhere.
    *
@@ -1202,7 +1202,7 @@ export interface OrchestratorPorts {
    * here and `Notifier` in `src/notify.ts` satisfies it by shape.
    */
   readonly notify?: {
-    notifyCompletion(completion: NotifyEmailEffect): Promise<unknown>;
+    notifyCompletion(completion: NotifyPublishEffect): Promise<unknown>;
   };
   /**
    * Where `drop_context` lands. ADR-001: this must dispose the agent session, not

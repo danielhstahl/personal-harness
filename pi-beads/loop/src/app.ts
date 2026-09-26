@@ -28,15 +28,7 @@ import {
   type KanbanRead,
   type KanbanSource,
 } from "./kanban.ts";
-import {
-  createMailer,
-  createSmtpTransport,
-  defaultFromAddress,
-  localHostname,
-  parseAddress,
-  resolveSmtpConfig,
-  type MailTransport,
-} from "./mail.ts";
+import { createNtfyPublisher, createHttpTransport, localHostname, resolveNtfyTarget } from "./ntfy.ts";
 import { createNotifier, createNullNotifier, type Notifier } from "./notify.ts";
 import {
   PLAIN_MONITOR_THEME,
@@ -151,46 +143,49 @@ export interface KanbanSetting {
 }
 
 /**
- * The completion notice: one email per closed bead, to an address named in the
- * environment.
+ * The completion notice: one ntfy publish per closed bead, to a topic named in
+ * the environment.
  *
- * Off unless an address is given, which is the whole switch: `LOOP_NOTIFY_EMAIL`
- * unset means no notifier, no socket, no poller, and a transcript line that says
- * nobody was told rather than silence about it. For a feature whose entire
- * trigger is "something finished, repeatedly, unattended", off-by-default is the
- * only sane starting position.
+ * Off unless a topic is given, which is the whole switch: `LOOP_NTFY_TOPIC`
+ * unset means no publisher, no socket, and a transcript line that says nobody
+ * was told rather than silence about it. For a feature whose entire trigger is
+ * "something finished, repeatedly, unattended", off-by-default is the only sane
+ * starting position.
  *
- * The refusal cases — an unusable address, a mail URL that will not parse, a
- * password with no user — stop the run at startup instead of warning per bead. A
- * typo is found once, immediately, in the terminal it was typed in; found at the
- * first closed bead it means every notice for the rest of the run went nowhere
- * and nobody noticed until somebody's mail was missing a day later.
+ * The refusal cases — a URL with no scheme, credentials stuffed into the URL, a
+ * priority that is neither 1–5 nor a name — stop the run at startup instead of
+ * warning per bead. A typo is found once, immediately, in the terminal it was
+ * typed in; found at the first closed bead it means every notice for the rest of
+ * the run went nowhere and nobody noticed a day later.
  *
  * A *delivery* failure is a different animal and stops nothing: the work is
- * committed and closed whatever the relay does. See `src/notify.ts`.
+ * committed and closed whatever the ntfy server does. See
+ * [`src/notify.ts`](./notify.ts) and
+ * [ADR-007](../docs/ADR-007-ntfy-notices.md).
  */
 export interface NotifySetting {
   readonly enabled?: boolean;
-  /** Recipients. Nobody given means the capability is off. */
-  readonly to?: readonly string[];
-  readonly cc?: readonly string[];
-  /** The `From:` header. Defaults to the commit identity, then the host. */
-  readonly from?: string;
-  /** `smtp://user:pass@host:587` — where it speaks, it wins. */
+  /** The ntfy topic: a bare name, or a full `http(s)://host/topic` URL. */
+  readonly topic?: string;
+  /**
+   * The ntfy server, for a bare topic. Default `https://ntfy.sh`; point it at a
+   * self-hosted instance (`http://192.168.1.20:8080`) and nothing downstream
+   * knows the difference.
+   */
   readonly url?: string;
-  readonly host?: string;
-  readonly port?: number;
-  readonly user?: string;
-  readonly password?: string;
-  /** `required`, `optional` (default) or `off`. */
-  readonly starttls?: string;
-  /** Per-network-step deadline. Default 15s. */
+  /** Bearer token, for a server that requires one. */
+  readonly token?: string;
+  /** ntfy priority: 1–5 or `min`/`low`/`default`/`high`/`urgent`. */
+  readonly priority?: string;
+  /** Emoji names shown on the notification, e.g. `["+1"]`. */
+  readonly tags?: readonly string[];
+  /** URL the notification opens. */
+  readonly click?: string;
+  /** The `[pi-beads]` in the title. */
+  readonly titlePrefix?: string;
+  /** Request deadline. Default 10s. */
   readonly timeoutMs?: number;
-  /** Allow a password on a channel that is not encrypted. */
-  readonly allowInsecureAuth?: boolean;
-  /** The `[pi-beads]` in the subject. */
-  readonly subjectPrefix?: string;
-  /** Stop trying after this many failed sends in a row. Default 3. */
+  /** Stop trying after this many failed publishes in a row. Default 3. */
   readonly maxConsecutiveFailures?: number;
 }
 
@@ -245,7 +240,7 @@ export interface AppConfig extends LoopConfig {
   /** The read-only server panel. See {@link MonitorSetting}. */
   readonly monitor?: MonitorSetting;
   readonly kanban?: KanbanSetting;
-  /** The completion notice. Off unless `LOOP_NOTIFY_EMAIL` names an address. */
+  /** The completion notice. Off unless `LOOP_NTFY_TOPIC` names a topic. */
   readonly notify?: NotifySetting;
   readonly themeName?: string;
   /**
@@ -552,10 +547,23 @@ function buildMonitor(
  * differently in a transcript, and one of them is a question somebody asks.
  *
  * Everything unusable is refused here, at build time, with a `notify-config`
- * `LoopError` the CLI turns into one line and exit 2. Bad addresses and bad mail
- * URLs are operator errors, and the place to report an operator error is the
+ * `LoopError` the CLI turns into one line and exit 2. A bad endpoint and a bad
+ * priority are operator errors, and the place to report an operator error is the
  * terminal they typed it into — not a per-bead warning in a log nobody is
  * reading at 3am.
+ */
+/**
+ * Build the completion notifier — or the thing that says why nothing will be sent.
+ *
+ * The two off states are distinct on purpose, because they are distinct
+ * answers: "no topic was ever given" and "a topic was given and switched off"
+ * read differently in a transcript, and one of them is a question somebody asks.
+ *
+ * Everything unusable is refused here, at build time, with a `notify-config`
+ * `LoopError` the CLI turns into one line and exit 2. An endpoint with no scheme
+ * and a priority that is not a priority are operator errors, and the place to
+ * report an operator error is the terminal it was typed into — not a per-bead
+ * warning in a log nobody is reading at 3am.
  */
 function buildNotifier(
   config: AppConfig,
@@ -565,50 +573,50 @@ function buildNotifier(
   const setting = config.notify;
   if (setting === undefined || setting.enabled === false) {
     return createNullNotifier(
-      "LOOP_NOTIFY_EMAIL is unset, so no one is told when a bead closes",
+      "LOOP_NTFY_TOPIC is unset, so no one is told when a bead closes",
     );
   }
-  const recipients = (setting.to ?? []).filter((entry) => entry.trim() !== "");
-  if (recipients.length === 0) {
+  if ((setting.topic ?? "").trim() === "") {
     return createNullNotifier(
-      "LOOP_NOTIFY_EMAIL is set but empty, so there is nobody to tell when a bead closes",
+      "LOOP_NTFY_TOPIC is set but empty, so there is nowhere to tell when a bead closes",
     );
   }
   const hostname = localHostname();
-  const from = (setting.from ?? config.authorEmail ?? defaultFromAddress()).trim();
 
+  let target;
   try {
-    parseAddress(from, "the mail 'from' address");
-    recipients.forEach((entry, index) =>
-      parseAddress(entry, `LOOP_NOTIFY_EMAIL recipient ${index + 1}`),
-    );
-  } catch (error) {
-    throw new LoopError(
-      "notify-config",
-      `the completion notice cannot be sent: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-
-  let transport: MailTransport;
-  try {
-    transport = createSmtpTransport({
-      config: resolveSmtpConfig({
-        ...(setting.url === undefined ? {} : { url: setting.url }),
-        ...(setting.host === undefined ? {} : { host: setting.host }),
-        ...(setting.port === undefined ? {} : { port: setting.port }),
-        ...(setting.user === undefined ? {} : { user: setting.user }),
-        ...(setting.password === undefined ? {} : { password: setting.password }),
-        ...(setting.starttls === undefined ? {} : { starttls: setting.starttls }),
-        ...(setting.timeoutMs === undefined ? {} : { timeoutMs: setting.timeoutMs }),
-        ...(setting.allowInsecureAuth === undefined
-          ? {}
-          : { allowInsecureAuth: setting.allowInsecureAuth }),
-      }),
+    target = resolveNtfyTarget({
+      topic: setting.topic,
+      ...(setting.url === undefined ? {} : { url: setting.url }),
     });
   } catch (error) {
     throw new LoopError(
       "notify-config",
-      `the mail relay is unusable: ${error instanceof Error ? error.message : String(error)}`,
+      `the completion notice cannot be published: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  if (setting.priority !== undefined && !isNtfyPriority(setting.priority)) {
+    throw new LoopError(
+      "notify-config",
+      `LOOP_NTFY_PRIORITY must be 1-5 or one of ${NTFY_PRIORITY_NAMES.join(", ")}, ` +
+        `not "${setting.priority}"`,
+    );
+  }
+
+  /**
+   * The give-up threshold, checked before it can mean something unintended.
+   *
+   * `0` reads as "never give up" to one reader and "give up immediately" to
+   * another, and a non-integer is meaningless as a count of tries. Both are
+   * refused here rather than clamped: the notifier's default is a decision, and
+   * quietly falling back to it is how a typo ends up costing a day of notices.
+   */
+  const maxFailures = setting.maxConsecutiveFailures;
+  if (maxFailures !== undefined && (!Number.isSafeInteger(maxFailures) || maxFailures < 1)) {
+    throw new LoopError(
+      "notify-config",
+      `LOOP_NTFY_MAX_FAILURES must be a whole number of tries, at least 1, not ${maxFailures}`,
     );
   }
 
@@ -617,38 +625,33 @@ function buildNotifier(
       ? undefined
       : `${config.modelRef.provider}/${config.modelRef.id}`;
 
-  /**
-   * The give-up threshold, checked before it can mean something unintended.
-   *
-   * `0` reads as "never give up" to one reader and "give up immediately" to
-   * another, and a non-integer is meaningless as a count of tries. Both are
-   * refused here rather than clamped: the notifier's default is a decision, and
-   * quietly falling back to it is how a typo ends up costing a day of mail.
-   */
-  const maxFailures = setting.maxConsecutiveFailures;
-  if (maxFailures !== undefined && (!Number.isSafeInteger(maxFailures) || maxFailures < 1)) {
-    throw new LoopError(
-      "notify-config",
-      `LOOP_NOTIFY_MAX_FAILURES must be a whole number of tries, at least 1, not ${maxFailures}`,
-    );
-  }
-
   return createNotifier({
-    mailer: createMailer({
-      from,
-      to: recipients,
-      ...(setting.cc === undefined ? {} : { cc: setting.cc.filter((entry) => entry.trim() !== "") }),
-      transport,
-      hostname,
+    publisher: createNtfyPublisher({
+      target,
+      transport: createHttpTransport(),
+      ...(setting.token === undefined ? {} : { token: setting.token }),
+      ...(setting.timeoutMs === undefined ? {} : { timeoutMs: setting.timeoutMs }),
     }),
     context: {
       cwd: config.cwd,
       hostname,
       ...(model === undefined ? {} : { model }),
-      ...(setting.subjectPrefix === undefined ? {} : { subjectPrefix: setting.subjectPrefix }),
+      ...(setting.titlePrefix === undefined ? {} : { titlePrefix: setting.titlePrefix }),
     },
+    ...(setting.priority === undefined ? {} : { priority: setting.priority }),
+    ...(setting.tags === undefined ? {} : { tags: setting.tags }),
+    ...(setting.click === undefined ? {} : { click: setting.click }),
     ...(maxFailures === undefined ? {} : { maxConsecutiveFailures: maxFailures }),
   });
+}
+
+const NTFY_PRIORITY_NAMES = ["min", "low", "default", "high", "urgent"] as const;
+
+/** ntfy takes a priority as 1–5 or as one of five names. Nothing else. */
+function isNtfyPriority(value: string): boolean {
+  const raw = value.trim().toLowerCase();
+  if (NTFY_PRIORITY_NAMES.includes(raw as (typeof NTFY_PRIORITY_NAMES)[number])) return true;
+  return /^[1-5]$/.test(raw);
 }
 
 export function buildApp(config: AppConfig): App {
@@ -693,7 +696,7 @@ export function buildApp(config: AppConfig): App {
   //
   // Built once, per run, from the environment: the address, the relay, the
   // identity. The loop asks nothing of it beyond `notifyCompletion`, and is
-  // perfectly content when the answer is "nobody is listening, `LOOP_NOTIFY_EMAIL`
+  // perfectly content when the answer is "nobody is listening, `LOOP_NTFY_TOPIC`
   // is unset" — which is the state every run of this loop was in before the
   // feature existed, and still is for anyone who does not set it.
   const notifier: Notifier = buildNotifier(config, overrides);

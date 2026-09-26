@@ -1,31 +1,32 @@
 /**
  * Tests for `src/notify.ts` — the completion notice.
  *
- * Two layers here, and both get tested: the *wording* (a subject a person can
- * search by, a body that answers the questions a notice exists to answer) and the
- * *behaviour* (a notifier that keeps its silence after a few failures rather than
- * warning once per bead until somebody notices).
+ * Two layers here, and both get tested: the *wording* (a title a person can find
+ * a bead by, a body that answers the questions a notice exists to answer) and
+ * the *behaviour* (a notifier that keeps its silence after a few failures
+ * rather than warning once per bead until somebody notices).
  *
- * The mailer is a recording double: these tests are about what the notice says and
- * when it stops trying. The transport's own behaviour is `test/mail.test.ts`'s
- * problem, and the loop's reaction to a delivery report is `test/loop.test.ts`'s.
+ * The publisher is a recording double: these tests are about what the notice
+ * says and when it stops trying. The transport's own behaviour is
+ * `test/ntfy.test.ts`'s problem, and the loop's reaction to a delivery report
+ * is `test/loop.test.ts`'s.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { buildApp } from "../src/app.ts";
-import { createMailer, createRecordingTransport, type MailEnvelope } from "../src/mail.ts";
+import type { NtfyDelivery, NtfyMessage, NtfyPublisher } from "../src/ntfy.ts";
 import { LoopError } from "../src/loop.ts";
 import { readEnv } from "../src/main.ts";
 import {
-  MAX_SUBJECT_LENGTH,
+  MAX_TITLE_LENGTH,
   completionBody,
-  completionMessage,
-  completionSubject,
+  completionNotice,
+  completionTitle,
   createNotifier,
   createNullNotifier,
   formatDuration,
-  noticeFooter,
+  formatTimestamp,
   oneLine,
   type BeadCompletion,
 } from "../src/notify.ts";
@@ -57,201 +58,208 @@ function completion(overrides: Partial<BeadCompletion> = {}): BeadCompletion {
   };
 }
 
-/** A mailer that records instead of sending. */
-function recordingMailer(deliveries: Array<"delivered" | "failed"> = ["delivered"]) {
-  const sent: MailEnvelope[] = [];
+/** A publisher that records what it was asked to publish. */
+function recordingPublisher(deliveries: readonly ("delivered" | "failed" | "skipped")[] = ["delivered"]) {
+  const published: NtfyMessage[] = [];
   let index = 0;
-  const mailer = createMailer({
-    from: "loop@example.test",
-    to: ["dev@example.test"],
-    transport: {
-      name: "recorder",
-      async send(envelope: MailEnvelope) {
-        sent.push(envelope);
-        const kind = deliveries[Math.min(index, deliveries.length - 1)] ?? "delivered";
-        index += 1;
-        if (kind === "failed") {
-          return {
-            kind: "failed",
-            reason: "relay said no",
-            transport: "recorder",
-            retryable: true,
-          };
-        }
+  const publisher: NtfyPublisher = {
+    enabled: true,
+    destination: "http://ntfy.test/loop",
+    transport: "recorder",
+    async publish(message: NtfyMessage): Promise<NtfyDelivery> {
+      published.push(message);
+      const kind = deliveries[Math.min(index, deliveries.length - 1)] ?? "delivered";
+      index += 1;
+      if (kind === "failed") {
         return {
-          kind: "delivered",
-          messageId: envelope.messageId,
-          transport: "recorder",
-          recipients: envelope.recipients,
+          kind: "failed",
+          reason: "ntfy replied 502: bad gateway",
+          destination: "http://ntfy.test/loop",
+          retryable: true,
         };
-      },
+      }
+      if (kind === "skipped") {
+        return { kind: "skipped", reason: "nothing to publish" };
+      }
+      return {
+        kind: "delivered",
+        messageId: `msg-${index}`,
+        destination: "http://ntfy.test/loop",
+        transport: "recorder",
+      };
     },
-  });
-  return { mailer, sent };
+  };
+  return { publisher, published };
 }
 
-// ── the subject ─────────────────────────────────────────────────────────────
+// ── the title ───────────────────────────────────────────────────────────────
 
-test("the subject carries the bead id, which is what the mail gets searched by", () => {
-  const subject = completionSubject(completion());
-  assert.match(subject, /\btst\.42\b/u, "the bead id is in the subject");
-  assert.match(subject, /^\[pi-beads\] /u, "and the prefix says which loop it came from");
-  assert.match(subject, /Added colour handling/u, "and the summary says what finished");
+test("the title carries the bead id, which is what the notice is searched by", () => {
+  assert.equal(
+    completionTitle(completion()),
+    "[pi-beads] tst.42 completed: Added colour handling to the tokenizer and thread it through the parser.",
+  );
 });
 
-test("the subject is capped, because a phone shows about one line of it", () => {
-  const subject = completionSubject(
-    completion({ summary: "a summary that goes on ".repeat(30) }),
+test("the title prefix is configurable, and empty falls back rather than vanishing", () => {
+  assert.ok(
+    completionTitle(completion(), "nightly").startsWith("[nightly] tst.42"),
+    completionTitle(completion(), "nightly"),
   );
-  assert.ok(subject.length <= MAX_SUBJECT_LENGTH, `subject was ${subject.length} chars: ${subject}`);
-  assert.match(subject, /…$/u, "and it says it was cut, rather than ending mid-word");
+  assert.ok(
+    completionTitle(completion(), "").startsWith("[pi-beads] tst.42"),
+    "an empty prefix means 'not set', not 'no prefix' — a title with no bracket reads like a bug",
+  );
 });
 
-test("a notice with no summary falls back to the title rather than a blank subject", () => {
-  assert.match(completionSubject(completion({ summary: "   " })), /Add the colour mode/u);
-  assert.match(
-    completionSubject(completion({ summary: "", title: "" })),
-    /tst\.42 completed/u,
-    "the id alone still identifies it",
-  );
+test("with no summary the title uses the bead's own title", () => {
+  const title = completionTitle(completion({ summary: "" }));
+  assert.ok(title.includes("Add the colour mode to the parser"), title);
+  assert.ok(title.startsWith("[pi-beads] tst.42 completed"), title);
+});
+
+test("the title is capped for a lock screen without losing the id", () => {
+  const title = completionTitle(completion({ summary: "long ".repeat(80) }));
+  assert.ok(title.length <= MAX_TITLE_LENGTH, `title was ${title.length} chars`);
+  assert.ok(title.startsWith("[pi-beads] tst.42"), title);
 });
 
 // ── the body ────────────────────────────────────────────────────────────────
 
-test("the body answers what finished, what changed and what is left", () => {
+test("the body answers what finished, what it did, and what is left", () => {
   const body = completionBody(completion(), CONTEXT);
-  assert.match(body, /^tst\.42 — Add the colour mode to the parser/u);
-  assert.match(body, /Bead\s+tst\.42/u);
-  assert.match(body, /Status\s+closed/u);
-  assert.match(body, /2025-09-26 11:03:07 UTC/u);
-  assert.match(body, /done, 3m 11s, iteration 3/u);
-  assert.match(body, /What it did\n {4}Added colour handling/u);
-  assert.match(body, /Commit\s+deadbeefcafebabe/u);
-  assert.match(body, /- src\/colour\.ts/u);
-  assert.match(body, /- src\/parser\.ts/u);
-  assert.match(body, /Decisions taken\n {4}1\. case-insensitive/u);
-  assert.match(body, /Still to do\n {4}1\. docs still need/u);
-  assert.match(body, /bd show tst\.42/u, "the reader can go and look");
-  assert.match(body, /bd recall loop:handoff:tst\.42 --json/u);
-  assert.match(body, /git show deadbeefcafebabe/u);
-  assert.match(body, /Repo\s+\/work\/project/u);
-  assert.match(body, /Model\s+fake-provider\/fake-model/u);
+  assert.ok(body.startsWith("tst.42 — Add the colour mode to the parser"), body);
+  assert.ok(body.includes("Added colour handling to the tokenizer"), body);
+  assert.ok(body.includes("done"), body);
+  assert.ok(body.includes("3m 11s"), body);
+  assert.ok(body.includes("iteration 3"), body);
+  assert.ok(body.includes("deadbeefcafe"), "a short hash: long enough to paste, short enough to read");
+  assert.ok(body.includes("2 files"), body);
+  assert.ok(body.includes("- src/colour.ts"), body);
+  assert.ok(body.includes("next: docs still need the colour section"), body);
+  assert.ok(body.includes("bd show tst.42"), body);
+  assert.ok(body.includes("bd recall loop:handoff:tst.42"), body);
 });
 
-test("what the run could not know is said as unknown, never left out", () => {
+test("a long commit hash is shortened rather than wrapped across the notice", () => {
+  const body = completionBody(completion(), CONTEXT);
+  assert.ok(!body.includes("0123456789abcdef"), "the tail of the hash is not what anybody reads", body);
+});
+
+test("fields the run could not know say so instead of disappearing", () => {
   const body = completionBody(
     {
       issueId: "tst.7",
-      title: "A bead worked by a run that reported nothing",
+      title: "",
       summary: "",
+      commit: null,
+      changedFiles: [],
+      nextSteps: [],
+      handoffKey: null,
+      iteration: null,
+      workKind: null,
+      elapsedMs: null,
+      completedAt: null,
     },
-    { cwd: "/work/project" },
+    { cwd: "/srv/app" },
   );
-  assert.match(body, /\(the run reported no summary\)/u);
-  assert.match(body, /Commit\s+\(none recorded\)/u);
-  assert.match(body, /Files\s+\(none reported\)/u);
-  assert.match(body, /Still to do\n {4}\(nothing reported\)/u);
-  assert.match(body, /unknown verdict/u);
-  assert.match(body, /unknown iteration/u);
-  assert.match(body, /When\s+unknown/u);
-  assert.match(
-    body,
-    /no handoff key recorded/u,
-    "a missing handoff is a fact the reader needs, not an omission",
-  );
+  assert.ok(body.includes("(untitled bead)"), body);
+  assert.ok(body.includes("(the run reported no summary)"), body);
+  assert.ok(body.includes("no commit recorded"), body);
+  assert.ok(body.includes("no files reported"), body);
+  assert.ok(body.includes("unknown verdict"), body);
+  assert.ok(body.includes("unknown duration"), body);
+  assert.ok(body.includes("nothing left to do"), body);
+  assert.ok(body.includes("/srv/app"), "the repo is always there to say where the work is");
 });
 
-test("a commit reused from an earlier attempt says so, because a second notice for one bead is confusing", () => {
+test("a reused commit is labelled as one, because 'committed twice' is the fear", () => {
   const body = completionBody(completion({ committedAgain: true }), CONTEXT);
-  assert.match(body, /reused from an earlier attempt, not committed twice/u);
+  assert.ok(body.includes("reused"), body);
+  assert.ok(body.includes("not committed twice"), body);
 });
 
-test("the footer names the sender, the recipients and the host that wrote it", () => {
-  const footer = noticeFooter(CONTEXT, "loop@example.test", ["dev@example.test", "ada@example.test"]);
-  assert.match(footer, /pi-beads-loop on buildhost/u);
-  assert.match(footer, /dev@example\.test, ada@example\.test/u);
-  assert.match(footer, /delivery failure never stops the loop/u);
+test("many files are listed compactly, and a long next-step list says how many more", () => {
+  const manyFiles = completion({ changedFiles: Array.from({ length: 9 }, (_, i) => `f${i}.ts`) });
+  const fileBody = completionBody(manyFiles, CONTEXT);
+  assert.ok(fileBody.includes("9 files"), fileBody);
+  assert.ok(!fileBody.includes("f8.ts"), "the list is folded rather than scrolling the notice", fileBody);
+
+  const manySteps = completion({
+    nextSteps: ["one", "two", "three", "four", "five"],
+  });
+  const stepBody = completionBody(manySteps, CONTEXT);
+  assert.ok(stepBody.includes("next: one; two; three (+2 more)"), stepBody);
 });
 
-test("the message carries the machine-readable headers a generated notice should", () => {
-  const message = completionMessage(completion(), CONTEXT, {
-    from: "loop@example.test",
-    to: ["dev@example.test"],
-  });
-  assert.equal(message.headers["Auto-Submitted"], "auto-generated", "RFC 3834: do not auto-reply to this");
-  assert.equal(message.headers["X-Loop-Issue"], "tst.42");
-  assert.equal(message.headers["X-Loop-Commit"], "deadbeefcafebabe0123456789abcdef01234567");
-  assert.equal(message.headers["X-Loop-Handoff"], "loop:handoff:tst.42");
-  assert.equal(message.headers["X-Loop-Verdict"], "done");
+test("the notice pairs the title and the body for one publish", () => {
+  const notice = completionNotice(completion(), { ...CONTEXT, titlePrefix: "loop" });
+  assert.ok(notice.title.startsWith("[loop] tst.42"), notice.title);
+  assert.ok(notice.body.startsWith("tst.42 —"), notice.body);
 });
 
-test("a summary with a line break in it cannot forge a second header into the body footer", () => {
-  // The summary is an agent's own sentence. Whatever it contains, the notice must
-  // still be one message with the headers this module wrote.
-  const hostile = completion({
-    summary: "done\r\nX-Loop-Commit: forged\r\nand other things",
-  });
-  const message = completionMessage(hostile, CONTEXT, {
-    from: "loop@example.test",
-    to: ["dev@example.test"],
-  });
-  assert.equal(message.headers["X-Loop-Commit"], "deadbeefcafebabe0123456789abcdef01234567");
-  assert.match(message.subject, /^.{0,120}$/su, "the subject is one line");
-  const forgedLines = message.body
-    .split("\n")
-    .filter((line) => /^[A-Za-z-]+:\s*forged$/u.test(line));
-  assert.deepEqual(forgedLines, [], "no body line may read as a header we did not write");
+test("a summary with a line break in it is flattened, not rendered as a broken notice", () => {
+  const body = completionBody(completion({ summary: "first line\nsecond line" }), CONTEXT);
+  assert.ok(body.includes("first line second line"), body);
+  const title = completionTitle(completion({ summary: "first\nsecond" }));
+  assert.ok(!title.includes("\n"), `title kept a newline: ${JSON.stringify(title)}`);
 });
+
+// ── the formatters ──────────────────────────────────────────────────────────
 
 test("formatDuration reads like a human's estimate, not a millisecond count", () => {
   assert.equal(formatDuration(812), "812ms");
-  assert.equal(formatDuration(9_000), "9s");
-  assert.equal(formatDuration(191_000), "3m 11s");
+  assert.equal(formatDuration(3_110_000), "51m 50s");
   assert.equal(formatDuration(3_720_000), "1h 02m");
   assert.equal(formatDuration(null), null);
   assert.equal(formatDuration(-5), null);
-  assert.equal(formatDuration(Number.NaN), null);
 });
 
-test("oneLine flattens a paragraph into a subject-sized line", () => {
-  assert.equal(oneLine("  many\n\tnested \n lines  "), "many nested lines");
+test("formatTimestamp is short enough for a notice line and still unambiguous", () => {
+  assert.equal(formatTimestamp(Date.UTC(2025, 8, 26, 11, 3, 7)), "2025-09-26 11:03 UTC");
+  assert.equal(formatTimestamp(null), "unknown");
+});
+
+test("oneLine flattens a paragraph into a title-sized line", () => {
+  assert.equal(oneLine("  a   b \n c  "), "a b c");
 });
 
 // ── the notifier ────────────────────────────────────────────────────────────
 
-test("the notifier hands the notice to the mailer and reports what came back", async () => {
-  const { mailer, sent } = recordingMailer(["delivered"]);
-  const notifier = createNotifier({ mailer, context: CONTEXT });
-  assert.equal(notifier.enabled, true);
-  assert.deepEqual(notifier.destination, ["dev@example.test"]);
-
+test("the notifier hands the notice to the publisher and reports what came back", async () => {
+  const { publisher, published } = recordingPublisher(["delivered"]);
+  const notifier = createNotifier({
+    publisher,
+    context: CONTEXT,
+    priority: "high",
+    tags: ["+1"],
+    click: "http://board.test/tst.42",
+  });
   const delivery = await notifier.notifyCompletion(completion());
   assert.equal(delivery.kind, "delivered");
-  assert.equal(sent.length, 1);
-  assert.match(sent[0]?.raw ?? "", /Subject: \[pi-beads\] tst\.42 completed/u);
+  assert.equal(published.length, 1);
+  assert.equal(published[0]?.title, completionTitle(completion()));
+  assert.equal(published[0]?.priority, "high");
+  assert.deepEqual(published[0]?.tags, ["+1"]);
+  assert.equal(published[0]?.click, "http://board.test/tst.42");
+  assert.deepEqual(notifier.destination, ["http://ntfy.test/loop"]);
+  assert.equal(notifier.enabled, true);
 });
 
-test("a mailer with no recipients disables the notifier before anything is tried", async () => {
-  const seen: MailEnvelope[] = [];
-  const notifier = createNotifier({
-    mailer: createMailer({
-      from: "loop@example.test",
-      to: [],
-      transport: createRecordingTransport((envelope) => seen.push(envelope)),
-    }),
-    context: CONTEXT,
-  });
-  assert.equal(notifier.enabled, false);
+test("a relay with no topic disables the notifier before anything is tried", async () => {
+  const { publisher, published } = recordingPublisher();
+  const disabledPublisher: NtfyPublisher = { ...publisher, enabled: false };
+  const notifier = createNotifier({ publisher: disabledPublisher, context: CONTEXT });
   const delivery = await notifier.notifyCompletion(completion());
   assert.equal(delivery.kind, "skipped");
-  assert.equal(seen.length, 0);
+  assert.equal(published.length, 0);
 });
 
-test("a relay that keeps failing is given up on, not warned at once per bead", async () => {
-  const { mailer, sent } = recordingMailer(["failed"]);
+test("a server that keeps failing is given up on, not warned at once per bead", async () => {
+  const { publisher, published } = recordingPublisher(["failed"]);
   const logged: string[] = [];
   const notifier = createNotifier({
-    mailer,
+    publisher,
     context: CONTEXT,
     maxConsecutiveFailures: 3,
     logger: (line) => logged.push(line),
@@ -262,19 +270,19 @@ test("a relay that keeps failing is given up on, not warned at once per bead", a
   assert.equal((await notifier.notifyCompletion(completion())).kind, "failed");
   const after = await notifier.notifyCompletion(completion());
 
-  assert.equal(after.kind, "skipped", "the fourth bead is not used to discover the relay is down again");
+  assert.equal(after.kind, "skipped", "the fourth bead is not used to discover the server is down again");
   assert.match(
     after.kind === "skipped" ? after.reason : "",
-    /3 completion notices in a row failed to send/u,
+    /3 completion notices in a row failed to publish/u,
   );
-  assert.equal(sent.length, 3, "and nothing was attempted after the giving-up");
+  assert.equal(published.length, 3, "and nothing was attempted after the giving-up");
   assert.match(logged.join("\n"), /switched off for the rest of this run/u);
 });
 
 test("the switch-off is heard at the failure that caused it, not on the next bead's turn", async () => {
-  const { mailer } = recordingMailer(["failed"]);
-  const notifier = createNotifier({ mailer, context: CONTEXT, maxConsecutiveFailures: 3 });
-  assert.equal(notifier.enabled, true, "on its way down, mail is still on");
+  const { publisher } = recordingPublisher(["failed"]);
+  const notifier = createNotifier({ publisher, context: CONTEXT, maxConsecutiveFailures: 3 });
+  assert.equal(notifier.enabled, true, "on its way down, notices are still on");
 
   await notifier.notifyCompletion(completion());
   await notifier.notifyCompletion(completion());
@@ -290,38 +298,36 @@ test("the switch-off is heard at the failure that caused it, not on the next bea
   assert.equal(
     notifier.enabled,
     false,
-    "and 'is mail on?' answers no from here on — a snapshot taken at construction would keep answering yes",
+    "and 'are notices on?' answers no from here on — a snapshot taken at construction would keep answering yes",
   );
 });
 
 test("one success clears the failure streak", async () => {
-  const sent: MailEnvelope[] = [];
   const outcomes = ["failed", "failed", "delivered", "failed", "failed", "delivered"];
   let index = 0;
-  const notifier = createNotifier({
-    mailer: createMailer({
-      from: "loop@example.test",
-      to: ["dev@example.test"],
-      transport: {
-        name: "stubborn",
-        async send(envelope: MailEnvelope) {
-          sent.push(envelope);
-          const kind = outcomes[index] ?? "delivered";
-          index += 1;
-          return kind === "failed"
-            ? { kind: "failed", reason: "flaky", transport: "stubborn", retryable: true }
-            : {
-                kind: "delivered",
-                messageId: envelope.messageId,
-                transport: "stubborn",
-                recipients: envelope.recipients,
-              };
-        },
-      },
-    }),
-    context: CONTEXT,
-    maxConsecutiveFailures: 3,
-  });
+  const publisher: NtfyPublisher = {
+    enabled: true,
+    destination: "http://ntfy.test/loop",
+    transport: "stub",
+    async publish(): Promise<NtfyDelivery> {
+      const kind = outcomes[index] ?? "delivered";
+      index += 1;
+      return kind === "failed"
+        ? {
+            kind: "failed",
+            reason: "flaky",
+            destination: "http://ntfy.test/loop",
+            retryable: true,
+          }
+        : {
+            kind: "delivered",
+            messageId: "m",
+            destination: "http://ntfy.test/loop",
+            transport: "stub",
+          };
+    },
+  };
+  const notifier = createNotifier({ publisher, context: CONTEXT, maxConsecutiveFailures: 3 });
 
   for (let i = 0; i < 6; i += 1) {
     const delivery = await notifier.notifyCompletion(completion());
@@ -331,145 +337,71 @@ test("one success clears the failure streak", async () => {
       `attempt ${i + 1} should have reported ${outcomes[i]}, not been skipped`,
     );
   }
-  assert.equal(sent.length, 6, "a success in the middle means it was never a streak of three");
-});
-
-test("a copy is delivered as a copy: in Cc: on the wire, and named as a copy in the footer", async () => {
-  const seen: MailEnvelope[] = [];
-  const mailer = createMailer({
-    from: "loop@example.test",
-    to: ["dev@example.test"],
-    cc: ["lead@example.test"],
-    transport: createRecordingTransport((envelope) => seen.push(envelope)),
-  });
-  const notifier = createNotifier({ mailer, context: CONTEXT });
-
-  const delivery = await notifier.notifyCompletion(completion());
-
-  assert.equal(delivery.kind, "delivered");
-  assert.deepEqual(
-    notifier.destination,
-    ["dev@example.test", "lead@example.test"],
-    "the notice goes to both, and says so before it is sent",
-  );
-
-  const headers = (seen[0]?.raw ?? "").split("\r\n\r\n")[0] ?? "";
-  assert.match(headers, /^To: dev@example\.test$/mu);
-  assert.match(headers, /^Cc: lead@example\.test$/mu);
-  assert.ok(
-    !/To: dev@example\.test, lead@/u.test(headers),
-    "the copy is not dressed up as an addressee in the header the whole thread is replied to",
-  );
-  assert.deepEqual(seen[0]?.recipients, ["dev@example.test", "lead@example.test"]);
-});
-
-test("the footer tells a reader who was addressed and who was copied", () => {
-  const footer = noticeFooter(
-    CONTEXT,
-    "loop@example.test",
-    ["dev@example.test"],
-    ["lead@example.test", "ada@example.test"],
-  );
-  assert.ok(
-    footer.includes("to dev@example.test, cc lead@example.test, ada@example.test"),
-    footer,
-  );
-  assert.ok(
-    !noticeFooter(CONTEXT, "loop@example.test", ["dev@example.test"]).includes("cc"),
-    "no copies means no mention of copies",
-  );
 });
 
 test("a null notifier says why it is silent", async () => {
-  const notifier = createNullNotifier("LOOP_NOTIFY_EMAIL is unset");
+  const notifier = createNullNotifier("no topic is set");
   assert.equal(notifier.enabled, false);
   const delivery = await notifier.notifyCompletion(completion());
-  assert.equal(delivery.kind, "skipped");
-  assert.match(delivery.kind === "skipped" ? delivery.reason : "", /LOOP_NOTIFY_EMAIL is unset/u);
+  assert.deepEqual(delivery, { kind: "skipped", reason: "no topic is set" });
 });
 
 // ── the knobs ───────────────────────────────────────────────────────────────
 
-test("the mail knobs are read from the environment, and unset means unset", () => {
-  assert.equal(readEnv({}).notify, undefined, "nothing mail-related set means no setting at all");
+test("the ntfy knobs are read from the environment, and unset means unset", () => {
+  assert.equal(readEnv({}).notify, undefined, "nothing ntfy-related set means no setting at all");
 
   const configured = readEnv({
-    LOOP_NOTIFY_EMAIL: "dev@example.test, ada@example.com",
-    LOOP_NOTIFY_CC: "lead@example.test",
-    LOOP_NOTIFY_FROM: "ci@example.test",
-    LOOP_NOTIFY_SUBJECT_PREFIX: "nightly",
-    LOOP_MAIL_URL: "smtps://mail.example.test:465",
-    LOOP_MAIL_STARTTLS: "required",
-    LOOP_MAIL_TIMEOUT_MS: "4500",
-    LOOP_MAIL_INSECURE_AUTH: "1",
+    LOOP_NTFY_TOPIC: "loop-notices",
+    LOOP_NTFY_URL: "http://192.168.1.20:8080",
+    LOOP_NTFY_TOKEN: "ap_abc123",
+    LOOP_NTFY_PRIORITY: "high",
+    LOOP_NTFY_TAGS: "+1 beads",
+    LOOP_NTFY_CLICK: "http://board.test",
+    LOOP_NTFY_TITLE_PREFIX: "nightly",
+    LOOP_NTFY_TIMEOUT_MS: "4500",
+    LOOP_NTFY_MAX_FAILURES: "9",
   });
-  assert.deepEqual(configured.notify?.to, ["dev@example.test", "ada@example.com"]);
-  assert.deepEqual(configured.notify?.cc, ["lead@example.test"]);
-  assert.equal(configured.notify?.enabled, true);
-  assert.equal(configured.notify?.from, "ci@example.test");
-  assert.equal(configured.notify?.subjectPrefix, "nightly");
-  assert.equal(configured.notify?.url, "smtps://mail.example.test:465");
-  assert.equal(configured.notify?.starttls, "required");
+  assert.equal(configured.notify?.topic, "loop-notices");
+  assert.equal(configured.notify?.url, "http://192.168.1.20:8080");
+  assert.equal(configured.notify?.token, "ap_abc123");
+  assert.equal(configured.notify?.priority, "high");
+  assert.deepEqual(configured.notify?.tags, ["+1", "beads"]);
+  assert.equal(configured.notify?.click, "http://board.test");
+  assert.equal(configured.notify?.titlePrefix, "nightly");
   assert.equal(configured.notify?.timeoutMs, 4_500);
-  assert.equal(configured.notify?.allowInsecureAuth, true);
+  assert.equal(configured.notify?.maxConsecutiveFailures, 9);
+  assert.equal(configured.notify?.enabled, true);
 });
 
-test("an address list is split the way a person types one", () => {
-  const config = readEnv({ LOOP_NOTIFY_EMAIL: "a@x.test;b@x.test   c@x.test" });
-  assert.deepEqual(config.notify?.to, ["a@x.test", "b@x.test", "c@x.test"]);
-});
-
-test("an address is checked when the loop is built, not at the first closed bead", () => {
-  // Typo discovered now, in the terminal it was typed in, rather than as a
-  // per-bead warning in a log nobody is reading.
-  assert.throws(
-    () =>
-      buildApp({
-        cwd: "/tmp",
-        notify: { to: ["dev-at-example-dot-test"], enabled: true },
-      }),
-    (error: unknown) => LoopError.is(error) && error.code === "notify-config",
-  );
-  assert.throws(
-    () =>
-      buildApp({
-        cwd: "/tmp",
-        notify: { to: ["dev@example.test"], url: "smtp://mail.test:notaport" },
-      }),
-    (error: unknown) => LoopError.is(error) && error.code === "notify-config",
-  );
-});
-
-test("LOOP_NOTIFY_MAX_FAILURES sets the threshold, and a value that is not one is refused", () => {
+test("the topic is the switch", () => {
   assert.equal(
-    readEnv({ LOOP_NOTIFY_EMAIL: "a@x.test", LOOP_NOTIFY_MAX_FAILURES: "9" }).notify
-      ?.maxConsecutiveFailures,
-    9,
+    readEnv({ LOOP_NTFY_URL: "http://host:8080" }).notify?.enabled,
+    false,
+    "a server with nowhere to publish is off, and says so",
   );
   assert.equal(
-    readEnv({ LOOP_NOTIFY_EMAIL: "a@x.test" }).notify?.maxConsecutiveFailures,
+    readEnv({ LOOP_NTFY_TOPIC: "  " }).notify,
     undefined,
-    "unset is the notifier's own default, not a value invented here",
+    "a blank topic is the same as no topic at all — not a setting switched off",
   );
+  assert.equal(readEnv({ LOOP_NTFY_TOPIC: "loop" }).notify?.enabled, true);
+});
 
-  // `number()` would have dropped all of these into the default, which reads as a
-  // setting that took effect. A knob that is set must mean what it says.
-  for (const bad of ["0", "-2", "1.5", "three", " ", "999999999999999999999"]) {
-    if (bad.trim() === "") continue;
+test("LOOP_NTFY_MAX_FAILURES is refused when it is not a whole number of tries", () => {
+  for (const bad of ["0", "-2", "1.5", "three"]) {
     assert.throws(
-      () => readEnv({ LOOP_NOTIFY_EMAIL: "a@x.test", LOOP_NOTIFY_MAX_FAILURES: bad }),
+      () => readEnv({ LOOP_NTFY_TOPIC: "loop", LOOP_NTFY_MAX_FAILURES: bad }),
       (error: unknown) => LoopError.is(error) && error.code === "notify-config",
-      `LOOP_NOTIFY_MAX_FAILURES="${bad}" should have been refused`,
+      `LOOP_NTFY_MAX_FAILURES="${bad}" should have been refused`,
     );
   }
-
-  // A nonsense threshold reaches buildApp the same way — refused, not clamped.
   for (const bad of [0, -1, 1.5]) {
     assert.throws(
       () =>
         buildApp({
           cwd: "/tmp",
-          notify: { to: ["a@x.test"], enabled: true, maxConsecutiveFailures: bad },
+          notify: { topic: "loop", enabled: true, maxConsecutiveFailures: bad },
         }),
       (error: unknown) => LoopError.is(error) && error.code === "notify-config",
       `maxConsecutiveFailures=${bad} should have been refused`,
@@ -477,20 +409,52 @@ test("LOOP_NOTIFY_MAX_FAILURES sets the threshold, and a value that is not one i
   }
 });
 
-test("with no address the loop still builds, and knows it will tell nobody", () => {
+test("an unusable endpoint is refused when the loop is built, not at the first closed bead", () => {
+  const cases: Array<Partial<import("../src/app.ts").NotifySetting>> = [
+    { topic: "loop", url: "not-a-url" },
+    { topic: "loop", url: "ftp://host" },
+    { topic: "http://host.example" },
+    { topic: "loop", url: "http://user:pass@host" },
+  ];
+  for (const setting of cases) {
+    assert.throws(
+      () => buildApp({ cwd: "/tmp", notify: { enabled: true, ...setting } }),
+      (error: unknown) => LoopError.is(error) && error.code === "notify-config",
+      `${JSON.stringify(setting)} should have been refused`,
+    );
+  }
+});
+
+test("a nonsense priority is refused, and the five names and 1-5 are not", () => {
+  assert.throws(
+    () => buildApp({ cwd: "/tmp", notify: { topic: "loop", enabled: true, priority: "urgent!" } }),
+    (error: unknown) => LoopError.is(error) && error.code === "notify-config",
+  );
+  for (const ok of ["1", "3", "5", "min", "low", "default", "high", "urgent", "URGENT"]) {
+    const app = buildApp({ cwd: "/tmp", notify: { topic: "loop", enabled: true, priority: ok } });
+    assert.equal(app.ports.notify?.enabled, true, `priority "${ok}" should have been accepted`);
+  }
+});
+
+test("with no topic the loop still builds, and knows it will tell nobody", () => {
   const app = buildApp({ cwd: "/tmp" });
   const notifier = app.ports.notify;
   assert.ok(notifier, "the port exists so the loop's report is a real answer");
   assert.equal(notifier?.enabled, false);
-  assert.equal(notifier?.destination.length, 0);
+  assert.deepEqual(notifier?.destination, []);
 });
 
-test("a configured notifier reaches the loop's ports with the relay it was pointed at", () => {
+test("a configured notifier reaches the loop's ports with the endpoint it was pointed at", () => {
   const app = buildApp({
     cwd: "/tmp",
-    notify: { to: ["dev@example.test"], host: "relay.example.test", port: 2525 },
+    notify: { topic: "loop-notices", url: "http://127.0.0.1:8080", enabled: true },
   });
   assert.equal(app.ports.notify?.enabled, true);
-  assert.deepEqual(app.ports.notify?.destination, ["dev@example.test"]);
-  assert.match(app.ports.notify?.transport ?? "", /relay\.example\.test:2525/u);
+  assert.deepEqual(app.ports.notify?.destination, ["http://127.0.0.1:8080/loop-notices"]);
+  assert.equal(app.ports.notify?.transport, "ntfy");
+});
+
+test("a full topic URL works the same way through the app as through the resolver", () => {
+  const app = buildApp({ cwd: "/tmp", notify: { topic: "https://ntfy.sh/abc123", enabled: true } });
+  assert.deepEqual(app.ports.notify?.destination, ["https://ntfy.sh/abc123"]);
 });

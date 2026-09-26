@@ -64,7 +64,7 @@ import { describeFailure, toWorkEvent } from "./agent.ts";
 import type { FinalizeOutcome, FinalizeRequest } from "./finalize.ts";
 import { describeFinalizeFailure, toFinalizeEvents } from "./finalize.ts";
 import type { IdleOutcome } from "./idle.ts";
-import type { MailDelivery } from "./mail.ts";
+import type { NtfyDelivery } from "./ntfy.ts";
 import type { BeadCompletion, Notifier } from "./notify.ts";
 import { createInitialState, failureKeyFor, handoffKeyFor, step } from "./orchestrator.ts";
 import type {
@@ -73,7 +73,7 @@ import type {
   CreateIssueEffect,
   DropContextEffect,
   Effect,
-  NotifyEmailEffect,
+  NotifyPublishEffect,
   OrchestratorEvent,
   OrchestratorState,
   OrchestratorStateName,
@@ -338,7 +338,7 @@ function stripIssuePrefix(message: string, issueId: string): string {
  * The `Done: ` the machine puts on a close reason, taken back off.
  *
  * The board wants the prefix — `bd close --reason "Done: fixed the parser"` reads
- * as a claim in the issue's own record. A mail subject does not, and the two are
+ * as a claim in the issue's own record. A notice title does not, and the two are
  * the same string, so the stripping happens here rather than by writing the close
  * reason twice and hoping they agree.
  */
@@ -391,7 +391,7 @@ export async function runLoop(
   /**
    * The last finalize outcome, kept for the completion notice.
    *
-   * The machine's `notify.email` effect carries what a pure transition can know.
+   * The machine's `notify.publish` effect carries what a pure transition can know.
    * The committed path list, the reused-commit flag and the decisions the finalize
    * request carried live only here, in the interpreter that watched the unit run.
    */
@@ -722,7 +722,7 @@ export async function runLoop(
    * believed it touched. When they differ the reader wants the former, and the
    * latter is already in the handoff note.
    */
-  function completionFor(effect: NotifyEmailEffect): BeadCompletion {
+  function completionFor(effect: NotifyPublishEffect): BeadCompletion {
     const finalize =
       lastFinalize !== null && lastFinalize.issueId === effect.issueId ? lastFinalize : null;
     const committed = finalize !== null && finalize.kind === "finalized" ? finalize : null;
@@ -754,48 +754,47 @@ export async function runLoop(
   }
 
   /**
-   * `notify.email`: tell whoever asked that this bead is finished.
+   * `notify.publish`: tell whoever asked that this bead is finished.
    *
    * Nothing in here can stop the loop. The bead is committed and closed by the
-   * time this runs, so a relay that is down, misconfigured or unreachable costs a
-   * warning and a transcript line. The alternative — an iteration that fails
-   * because a *report* about it could not be filed — is a worse failure than the
-   * one being reported, and it would punish the work for the mail's problems.
+   * time this runs, so a server that is down, misconfigured or unreachable costs
+   * a warning and a transcript line. The alternative — an iteration that fails
+   * because a *report* about it could not be filed — is a worse failure than
+   * the one being reported, and it would punish the work for the notice's
+   * problems.
    */
-  async function handleNotifyEmail(effect: NotifyEmailEffect): Promise<readonly Effect[]> {
+  async function handleNotifyPublish(effect: NotifyPublishEffect): Promise<readonly Effect[]> {
     if (ports.notify === undefined) {
       effects.push({ kind: effect.kind, detail: `${effect.issueId}:skipped(no notifier wired)` });
       log(
         "debug",
         `no notifier wired: the completion notice for ${effect.issueId} went nowhere ` +
-          "(set LOOP_NOTIFY_EMAIL to get these)",
+          "(set LOOP_NTFY_TOPIC to get these)",
       );
       return [];
     }
     const notifier = ports.notify;
-    let delivery: MailDelivery;
+    let delivery: NtfyDelivery;
     try {
       delivery = await notifier.notifyCompletion(completionFor(effect));
     } catch (error) {
       // A notifier is allowed to be badly built; it is not allowed to be fatal.
       delivery = {
         kind: "failed",
-        reason: `${kindOf(error)}: ${messageOf(error)}`,
-        transport: notifier.transport,
+        reason: `${kindOf(error)}: ${messageOf(error)} (via ${notifier.transport})`,
+        destination: notifier.destination.join(", ") || "unknown",
         retryable: false,
       };
     }
     effects.push({ kind: effect.kind, detail: `${effect.issueId}:${delivery.kind}` });
     switch (delivery.kind) {
       case "delivered":
-        say(
-          `Completion notice for ${effect.issueId} sent to ${delivery.recipients.join(", ")}.`,
-        );
+        say(`Completion notice for ${effect.issueId} published to ${delivery.destination}.`);
         log("info", `completion notice for ${effect.issueId} delivered via ${delivery.transport}`);
         break;
       case "failed":
         warn(
-          `Could not mail the completion notice for ${effect.issueId}: ${delivery.reason}. ` +
+          `Could not publish the completion notice for ${effect.issueId}: ${delivery.reason}. ` +
             "The bead is closed either way — nothing about the work changed.",
         );
         break;
@@ -871,7 +870,7 @@ export async function runLoop(
     "agent.split": (effect) => runSplitUnit((effect as { text: string }).text),
     "agent.run": (effect) => handleRun(effect as AgentRunEffect),
     "vcs.commit": (effect) => runFinalizeUnit(effect as VcsCommitEffect),
-    "notify.email": (effect) => handleNotifyEmail(effect as NotifyEmailEffect),
+    "notify.publish": (effect) => handleNotifyPublish(effect as NotifyPublishEffect),
     "ui.say": (effect) => handleSay(effect as Effect & { text: string }),
     "ui.warn": (effect) => handleWarn(effect as Effect & { text: string }),
     drop_context: (effect) => handleDropContext(effect as DropContextEffect),
@@ -1373,7 +1372,7 @@ export const HANDLED_EFFECT_KINDS = [
   "agent.split",
   "agent.run",
   "vcs.commit",
-  "notify.email",
+  "notify.publish",
   "ui.say",
   "ui.warn",
   "drop_context",

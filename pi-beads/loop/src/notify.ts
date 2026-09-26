@@ -1,31 +1,39 @@
 /**
  * pi-beads loop — the completion notice.
  *
- * One job: turn the facts of a finished bead into an {@link EmailMessage}, and
- * hand it to a {@link Mailer}. It is a separate module from `src/mail.ts` for
- * the same reason `src/finalize.ts` is separate from `src/vcs.ts`: one knows the
- * shape of a bead, the other knows the shape of a wire. Neither needs to know
- * the other's details, and each can be tested without the other.
+ * One job: turn the facts of a finished bead into the title and body of a
+ * notice, and hand them to a publisher. It is a separate module from
+ * `src/ntfy.ts` for the same reason `src/finalize.ts` is separate from
+ * `src/vcs.ts`: one knows the shape of a bead, the other knows the shape of a
+ * wire. Neither needs to know the other's details, and each is testable without
+ * the other.
  *
  * WHAT THE NOTICE IS FOR
- * A completed bead is a fact about a run that finished an hour ago, sitting in a
- * database you are not looking at. The notice is the one place those facts are
- * assembled for a reader who was not watching: which bead, what it did, which
- * commit, what is left over, and where to go read more. Everything in the body
- * came from the run itself — the verdict the agent reported, the hash git read
- * back, the handoff key the loop wrote — so the mail is an index into the real
- * record rather than a paraphrase of it.
+ * A completed bead is a fact about a run that finished an hour ago, sitting in
+ * a database you are not looking at. The notice is the one place those facts
+ * get assembled for a reader who was not watching: which bead, what it did,
+ * which commit, what is left over. Every value came from the run itself — the
+ * verdict the agent reported, the hash git read back, the handoff key the loop
+ * wrote — so the notice is an index into the real record rather than a
+ * paraphrase of it.
+ *
+ * WHAT CHANGED WHEN THIS STOPPED BEING EMAIL
+ * The shape of the reader changed, so the shape of the message changed with it.
+ * An email can be a page long because it is read at a desk; a notification is
+ * read on a phone, in a glance, possibly while walking. The body is therefore
+ * the four things worth acting on rather than nine sections, and the title is
+ * still `[prefix] <bead id> completed: <summary>` because a notification is
+ * *found by* its title long after it arrives.
  *
  * WHAT IT IS NOT
  * A gate. `notifyCompletion` cannot fail a run: every path out of it is a
- * {@link MailDelivery}, and a `failed` delivery is information, not a stop. The
- * work is already committed and closed by the time this is called; mail is what
- * tells a human about it. That is also why the notifier gives up after a few
- * consecutive failures — a relay that is down should cost a handful of warnings
- * and then silence, not a warning per bead for the next six hours.
+ * {@link NtfyDelivery}, and a `failed` delivery is information, not a stop.
+ * The work is already committed and closed by the time this is called; the
+ * notice is what tells a human about it. That is also why the notifier gives up
+ * after a few consecutive failures — a server that is down should cost a
+ * handful of warnings and then silence, not a warning per bead for six hours.
  */
-import type { MailDelivery, Mailer } from "./mail.ts";
-import { MAILER_ID, defaultFromAddress } from "./mail.ts";
+import type { NtfyDelivery, NtfyPublisher } from "./ntfy.ts";
 
 /** The bead, as the run finished knowing it. Every field here is already fact. */
 export interface BeadCompletion {
@@ -54,18 +62,19 @@ export interface NoticeContext {
   readonly cwd: string;
   readonly hostname?: string;
   readonly model?: string;
-  /** Prefix for the subject line. Empty string means no prefix at all. */
-  readonly subjectPrefix?: string;
+  /** The `[pi-beads]` in the title. Empty string means no prefix at all. */
+  readonly titlePrefix?: string;
 }
 
-/** The subject-line cap. Long enough for an id and a sentence, short enough for a phone. */
-export const MAX_SUBJECT_LENGTH = 120;
+/** Long enough for an id and a sentence, short enough for a phone's lock screen. */
+export const MAX_TITLE_LENGTH = 120;
 
-const DEFAULT_SUBJECT_PREFIX = "pi-beads";
+export const NOTICE_ID = "pi-beads-loop";
+const DEFAULT_TITLE_PREFIX = "pi-beads";
 
 // ── small formatters ────────────────────────────────────────────────────────
 
-/** Collapse a paragraph into one line: what a subject line has room for. */
+/** Collapse a paragraph into one line: what a title has room for. */
 export function oneLine(text: string): string {
   return text.replace(/\s+/gu, " ").trim();
 }
@@ -87,178 +96,120 @@ export function formatDuration(ms: number | null | undefined): string | null {
   return `${seconds}s`;
 }
 
-function formatTimestamp(ms: number | null | undefined): string {
+/** `2025-09-26 11:03 UTC` — short enough for a notice line, still unambiguous. */
+export function formatTimestamp(ms: number | null | undefined): string {
   if (ms === null || ms === undefined || !Number.isFinite(ms)) return "unknown";
   const date = new Date(ms);
   const pad = (value: number): string => String(value).padStart(2, "0");
   return (
     `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ` +
-    `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())} UTC`
+    `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())} UTC`
   );
 }
 
-/** `Label      value`, aligned so a glance reads down the column. */
-function field(label: string, value: string): string {
-  return `  ${label.padEnd(10, " ")}${value}`;
-}
-
-function bulletList(items: readonly string[]): string[] {
-  return items.map((item, index) => `    ${index + 1}. ${item}`);
+/** Join the pieces of a status line with ` · `, dropping whatever is missing. */
+function dotJoin(parts: readonly (string | null | undefined)[]): string {
+  return parts
+    .map((part) => (typeof part === "string" ? part.trim() : ""))
+    .filter((part) => part !== "")
+    .join(" · ");
 }
 
 // ── the message ─────────────────────────────────────────────────────────────
 
 /**
- * The subject line: the bead id first after the prefix, because that is the one
- * thing a reader searches mail by, and the summary after it so the inbox list
- * alone answers "what finished?".
+ * The title: the bead id first after the prefix, because that is the one thing a
+ * reader searches by, and the summary after it so the notification list alone
+ * answers "what finished?".
  */
-export function completionSubject(
+export function completionTitle(
   completion: BeadCompletion,
-  subjectPrefix: string = DEFAULT_SUBJECT_PREFIX,
+  titlePrefix: string = DEFAULT_TITLE_PREFIX,
 ): string {
-  const prefix = oneLine(subjectPrefix);
+  const prefix = oneLine(titlePrefix) || DEFAULT_TITLE_PREFIX;
   const summary = oneLine(completion.summary) || oneLine(completion.title) || "no summary reported";
-  const head = `[${prefix || MAILER_ID}] ${completion.issueId.trim()} completed`;
-  return truncate(summary === "" ? head : `${head}: ${summary}`, MAX_SUBJECT_LENGTH);
+  const head = `[${prefix}] ${completion.issueId.trim()} completed`;
+  return truncate(summary === "" ? head : `${head}: ${summary}`, MAX_TITLE_LENGTH);
 }
 
 /**
- * The body, as plain text.
+ * The body: the four things a reader can act on, in that order, plus where to
+ * read more.
  *
- * Sections are ordered by how soon a reader acts on them: what happened, what
- * changed, what is left, where to read more. Fields that the run could not know
- * say so rather than being dropped — a missing commit hash is a fact worth
- * seeing, and a silently absent line reads as "nothing to report".
+ * Sections that the run could not know say so rather than vanishing — a missing
+ * commit hash is a fact worth seeing, and a silently absent line reads as
+ * "nothing to report".
  */
 export function completionBody(completion: BeadCompletion, context: NoticeContext): string {
-  const lines: string[] = [
-    `${completion.issueId.trim()} — ${oneLine(completion.title) || "(untitled bead)"}`,
-    "",
-    field("Bead", completion.issueId.trim()),
-    field("Title", oneLine(completion.title) || "(untitled)"),
-    field("Status", "closed"),
-    field("When", formatTimestamp(completion.completedAt)),
-    field(
-      "Work",
-      [
-        completion.workKind ?? "unknown verdict",
-        formatDuration(completion.elapsedMs) ?? "unknown duration",
-        completion.iteration === null || completion.iteration === undefined
-          ? "unknown iteration"
-          : `iteration ${completion.iteration}`,
-      ].join(", "),
-    ),
-    "",
-    "What it did",
-    ...(oneLine(completion.summary) === ""
-      ? ["    (the run reported no summary)"]
-      : [`    ${oneLine(completion.summary)}`]),
-  ];
+  const id = completion.issueId.trim();
+  const summary = oneLine(completion.summary) || "(the run reported no summary)";
 
-  const decisions = (completion.decisions ?? []).map(oneLine).filter((line) => line !== "");
-  if (decisions.length > 0) {
-    lines.push("", "Decisions taken", ...bulletList(decisions));
-  }
-
-  lines.push("", "Changes");
-  const commit = (completion.commit ?? "").trim();
-  lines.push(
-    field(
-      "Commit",
-      commit === ""
-        ? "(none recorded)"
-        : commit + (completion.committedAgain === true ? " — reused from an earlier attempt, not committed twice" : ""),
-      ),
-  );
   const files = (completion.changedFiles ?? []).map((path) => path.trim()).filter((p) => p !== "");
-  if (files.length === 0) {
-    lines.push(field("Files", "(none reported)"));
-  } else {
-    lines.push(field("Files", `${files.length} changed`));
-    lines.push(...files.map((path) => `    - ${path}`));
-  }
+  const commit = (completion.commit ?? "").trim();
+  const commitPart =
+    commit === ""
+      ? "no commit recorded"
+      : commit.slice(0, 12) + (completion.committedAgain === true ? " (reused, not committed twice)" : "");
+
+  const status = dotJoin([
+    completion.workKind ?? "unknown verdict",
+    formatDuration(completion.elapsedMs) ?? "unknown duration",
+    completion.iteration === null || completion.iteration === undefined
+      ? null
+      : `iteration ${completion.iteration}`,
+    formatTimestamp(completion.completedAt),
+  ]);
+  const scope = dotJoin([
+    commitPart,
+    files.length === 0 ? "no files reported" : `${files.length} file${files.length === 1 ? "" : "s"}`,
+  ]);
 
   const next = (completion.nextSteps ?? []).map(oneLine).filter((line) => line !== "");
-  lines.push("", "Still to do");
-  lines.push(...(next.length === 0 ? ["    (nothing reported)"] : bulletList(next)));
+  const lines: string[] = [
+    `${id} — ${oneLine(completion.title) || "(untitled bead)"}`,
+    summary,
+    "",
+    status,
+    scope,
+  ];
+
+  if (files.length > 0 && files.length <= 6) {
+    lines.push(files.map((path) => `- ${path}`).join("\n"));
+  } else if (files.length > 6) {
+    lines.push(`- ${files.slice(0, 5).join(", ")} …`);
+  }
 
   lines.push(
     "",
-    "Where to read more",
-    field("Bead", `bd show ${completion.issueId.trim()}`),
-    field(
-      "Handoff",
-      completion.handoffKey === null || completion.handoffKey === undefined
-        ? "(no handoff key recorded)"
-        : `bd recall ${completion.handoffKey} --json`,
-    ),
+    next.length === 0
+      ? "nothing left to do"
+      : `next: ${next.slice(0, 3).join("; ")}${next.length > 3 ? ` (+${next.length - 3} more)` : ""}`,
   );
-  if (commit !== "") lines.push(field("Diff", `git show ${commit}`));
-  if (completion.closeReason !== null && completion.closeReason !== undefined) {
-    lines.push(field("Closed as", oneLine(completion.closeReason)));
-  }
-  lines.push(field("Repo", context.cwd));
-  if (context.model !== undefined && context.model !== "") {
-    lines.push(field("Model", context.model));
-  }
+
+  const reading = dotJoin([
+    `bd show ${id}`,
+    completion.handoffKey === null || completion.handoffKey === undefined
+      ? null
+      : `bd recall ${completion.handoffKey}`,
+  ]);
+  if (reading !== "") lines.push(`read: ${reading}`);
+  // The machine the work happened on, always: one phone is often wired to more
+  // than one repository, and "which project?" is the first question a notice
+  // that names only a bead id leaves open.
+  lines.push(`from ${context.cwd}${context.hostname === undefined ? "" : ` on ${context.hostname}`}`);
+
   return lines.join("\n");
 }
 
-/**
- * The footer, with the delivery facts a reader checks when the mail itself looks
- * wrong: who it came from, who it went to, and which host wrote it.
- *
- * The copies are named separately because they are separate facts. "to dev,
- * lead" leaves a reader guessing whether the lead was asked to review or merely
- * told, and that is the exact distinction whoever set `LOOP_NOTIFY_CC` was
- * making when they set it.
- */
-export function noticeFooter(
-  context: NoticeContext,
-  from: string,
-  to: readonly string[],
-  cc: readonly string[] = [],
-): string {
-  const origin = context.hostname === undefined ? MAILER_ID : `${MAILER_ID} on ${context.hostname}`;
-  const copied = cc.length === 0 ? "" : `, cc ${cc.join(", ")}`;
-  return [
-    `— sent by ${origin} from ${context.cwd} to ${to.join(", ")}${copied} (from ${from}).`,
-    "  A delivery failure never stops the loop: the work this notice describes is",
-    "  committed and closed whatever the mail relay does next.",
-  ].join("\n");
-}
-
-/** The whole message: subject, body, and the headers a machine-sent notice wants. */
-export function completionMessage(
+/** The whole notice: a title you can find later, and a body you can read now. */
+export function completionNotice(
   completion: BeadCompletion,
   context: NoticeContext,
-  mailer: { from: string; to: readonly string[]; cc?: readonly string[] },
-): {
-  subject: string;
-  body: string;
-  cc: readonly string[];
-  headers: Record<string, string>;
-} {
-  const subject = completionSubject(completion, context.subjectPrefix ?? DEFAULT_SUBJECT_PREFIX);
-  const body = completionBody(completion, context);
-  const headers: Record<string, string> = {
-    // RFC 3834: this is generated traffic, and saying so is what keeps a
-    // vacation autoresponder from starting a conversation with a build server.
-    "Auto-Submitted": "auto-generated",
-    "X-Loop-Issue": completion.issueId.trim(),
+): { title: string; body: string } {
+  return {
+    title: completionTitle(completion, context.titlePrefix ?? DEFAULT_TITLE_PREFIX),
+    body: completionBody(completion, context),
   };
-  const commit = (completion.commit ?? "").trim();
-  if (commit !== "") headers["X-Loop-Commit"] = commit;
-  if (completion.handoffKey !== undefined && completion.handoffKey !== null) {
-    headers["X-Loop-Handoff"] = completion.handoffKey;
-  }
-  if (completion.workKind !== undefined && completion.workKind !== null) {
-    headers["X-Loop-Verdict"] = completion.workKind;
-  }
-  const cc = mailer.cc ?? [];
-  const footer = noticeFooter(context, mailer.from, mailer.to, cc);
-  return { subject, body: `${body}\n\n${footer}`, cc, headers };
 }
 
 // ── the notifier ────────────────────────────────────────────────────────────
@@ -271,18 +222,24 @@ export interface Notifier {
   readonly enabled: boolean;
   readonly destination: readonly string[];
   readonly transport: string;
-  notifyCompletion(completion: BeadCompletion): Promise<MailDelivery>;
+  notifyCompletion(completion: BeadCompletion): Promise<NtfyDelivery>;
 }
 
 export interface NotifierOptions {
-  readonly mailer: Mailer;
+  readonly publisher: NtfyPublisher;
   readonly context: NoticeContext;
+  /** ntfy priority for these notices: 1–5 or a name. */
+  readonly priority?: string;
+  /** Emoji names for the notification. */
+  readonly tags?: readonly string[];
+  /** URL the notification opens. */
+  readonly click?: string;
   /**
-   * Give up after this many failed sends in a row. Default 3.
+   * Give up after this many failed publishes in a row. Default 3.
    *
-   * A relay that is down is down; discovering that once per bead for six hours is
-   * a worse report than discovering it three times and then saying nothing. The
-   * giving-up itself is logged, so the silence has a start time.
+   * A server that is down is down; discovering that once per bead for six hours
+   * is a worse report than discovering it three times and then saying nothing.
+   * The giving-up itself is logged, so the silence has a start time.
    */
   readonly maxConsecutiveFailures?: number;
   readonly logger?: (line: string) => void;
@@ -294,14 +251,14 @@ export function createNullNotifier(reason: string): Notifier {
     enabled: false,
     destination: [],
     transport: "none",
-    async notifyCompletion(): Promise<MailDelivery> {
+    async notifyCompletion(): Promise<NtfyDelivery> {
       return { kind: "skipped", reason };
     },
   };
 }
 
 /**
- * Bind a mailer to the run's context, and add the runaway guard.
+ * Bind a publisher to the run's context, and add the runaway guard.
  *
  * The guard is a counter rather than a timer because the thing being guarded is
  * the loop's patience: `notifyCompletion` is called once per finished bead, so
@@ -311,56 +268,44 @@ export function createNullNotifier(reason: string): Notifier {
 export function createNotifier(options: NotifierOptions): Notifier {
   const maxFailures = options.maxConsecutiveFailures ?? 3;
   const log = options.logger ?? (() => undefined);
-  const mailer = options.mailer;
+  const publisher = options.publisher;
   let consecutiveFailures = 0;
-  let disabled: string | null = mailer.enabled ? null : "the mailer has no recipients";
+  let disabled: string | null = publisher.enabled ? null : "the publisher has no topic";
 
   return {
-    // A getter, not a snapshot: after the guard trips, "is mail on?" has one
-    // answer and it is "no". A `enabled: mailer.enabled && disabled === null`
-    // computed once at construction would keep reporting `true` for the rest of
-    // a run in which nothing will ever be sent again, which is the exact
-    // opposite of what the property is for.
+    // A getter, not a snapshot: after the guard trips, "is the notice on?" has
+    // one answer and it is "no". A value computed once at construction would
+    // keep reporting `true` for the rest of a run in which nothing will ever be
+    // sent again, which is the precise opposite of what the property is for.
     get enabled(): boolean {
-      return mailer.enabled && disabled === null;
+      return publisher.enabled && disabled === null;
     },
-    destination: mailer.recipients,
-    transport: mailer.transport,
-    async notifyCompletion(completion: BeadCompletion): Promise<MailDelivery> {
+    destination: [publisher.destination],
+    transport: publisher.transport,
+    async notifyCompletion(completion: BeadCompletion): Promise<NtfyDelivery> {
       if (disabled !== null) {
         return { kind: "skipped", reason: disabled };
       }
-      const from = mailer.from ?? defaultFromAddress();
-      const message = completionMessage(completion, options.context, {
-        from,
-        // The primaries and the copies are passed as what they are. Handing the
-        // combined list over as `to` was the bug this prevents: the copies were
-        // in the envelope, so they received the mail, but the `To:` header
-        // listed them as addressees and no `Cc:` header was ever written — a
-        // blind copy nobody configured, with a lying header on top of it.
-        to: mailer.to,
-        cc: mailer.cc,
-      });
-      const delivery = await mailer.send({
-        from,
-        to: mailer.to,
-        cc: mailer.cc,
-        subject: message.subject,
-        body: message.body,
-        headers: message.headers,
+      const notice = completionNotice(completion, options.context);
+      const delivery = await publisher.publish({
+        title: notice.title,
+        body: notice.body,
+        ...(options.priority === undefined ? {} : { priority: options.priority }),
+        ...(options.tags === undefined ? {} : { tags: options.tags }),
+        ...(options.click === undefined ? {} : { click: options.click }),
       });
       if (delivery.kind === "failed") {
         consecutiveFailures += 1;
         if (consecutiveFailures >= maxFailures) {
           disabled =
-            `${consecutiveFailures} completion notices in a row failed to send ` +
-            `(last: ${delivery.reason}); mail is switched off for the rest of this run`;
+            `${consecutiveFailures} completion notices in a row failed to publish ` +
+            `(last: ${delivery.reason}); notices are switched off for the rest of this run`;
           log(disabled);
           // The giving-up travels on the delivery the caller is already
           // reporting. Nobody wires the logger at composition time on purpose,
           // so a reason that only reached `log` would be heard on the *next*
-          // bead's turn — and a run that closes exactly `maxFailures` beads
-          // would never hear it at all.
+          // bead's turn — and a run that closes exactly `maxFailures` beads and
+          // then goes idle would never hear it at all.
           return { ...delivery, reason: `${delivery.reason}. ${disabled}` };
         }
       } else {
