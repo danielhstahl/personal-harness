@@ -14,7 +14,7 @@ import { pathToFileURL } from "node:url";
 import { AgentError, parseThinkingLevel } from "./agent.ts";
 import type { ThinkingLevel } from "./agent.ts";
 import { runApp } from "./app.ts";
-import type { AppConfig } from "./app.ts";
+import type { AppConfig, KanbanSetting } from "./app.ts";
 import { LoopError } from "./loop.ts";
 import type { LoopResult } from "./loop.ts";
 
@@ -62,6 +62,44 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
     return "proposed";
   };
   const auditTimeout = number("LOOP_AUDIT_TIMEOUT_MS");
+  /**
+   * The read-only server panel. On unless switched off: the numbers it shows are
+   * the ones you wish you had looked at, and the cost of looking is four `GET`s
+   * against a server that is already on the path of everything on the screen.
+   *
+   * `LOOP_MONITOR_AT=top` puts the panel at the top of the work surface instead
+   * of above the footer. That scrolls with the transcript, so it is the option
+   * for a surface known to stay short — not the default for a long-running one.
+   */
+  const monitorPlacement = (): "band" | "top" =>
+    source.LOOP_MONITOR_AT?.trim().toLowerCase() === "top" ? "top" : "band";
+  /**
+   * The mini kanban, read as one knob with three answers: `0`/`off` hides it,
+   * `row` and `board` pick the shape, and anything else — including unset —
+   * leaves it on with the shape each surface prefers.
+   *
+   * The shape words are recognised here rather than left to fall through to the
+   * boolean: a variable that switched the board *off* because its value was
+   * `board` rather than `1` would be a trap that costs the first person who
+   * tries it an hour of wondering.
+   */
+  const kanbanSetting = (): KanbanSetting => {
+    const raw = source.LOOP_KANBAN?.trim().toLowerCase();
+    const off = raw === "0" || raw === "off" || raw === "no" || raw === "false";
+    const shape = raw === "row" || raw === "board" ? raw : undefined;
+    const intervalMs = number("LOOP_KANBAN_MS");
+    const lines = number("LOOP_KANBAN_LINES");
+    const doneLimit = number("LOOP_KANBAN_DONE");
+    return {
+      enabled: !off,
+      ...(shape === undefined ? {} : { mode: shape }),
+      ...(intervalMs === undefined ? {} : { intervalMs }),
+      ...(lines === undefined ? {} : { lines }),
+      ...(doneLimit === undefined ? {} : { doneLimit }),
+      placement: source.LOOP_KANBAN_AT?.trim().toLowerCase() === "top" ? "top" : "band",
+      verbose: flag("LOOP_KANBAN_VERBOSE") ?? false,
+    };
+  };
   return {
     cwd,
     bdBin: source.LOOP_BD_BIN,
@@ -88,6 +126,23 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
       ...(auditTimeout === undefined ? {} : { timeoutMs: auditTimeout }),
     },
     maxIterations: number("LOOP_MAX_ITERATIONS"),
+    /** The read-only backend monitor. See `MonitorSetting` in `src/app.ts`. */
+    monitor: {
+      enabled: flag("LOOP_MONITOR") ?? true,
+      ...(number("LOOP_MONITOR_MS") === undefined ? {} : { intervalMs: number("LOOP_MONITOR_MS") }),
+      ...(number("LOOP_MONITOR_TIMEOUT_MS") === undefined
+        ? {}
+        : { timeoutMs: number("LOOP_MONITOR_TIMEOUT_MS") }),
+      ...(number("LOOP_MONITOR_MODELS_MS") === undefined
+        ? {}
+        : { modelsEveryMs: number("LOOP_MONITOR_MODELS_MS") }),
+      ...(source.LOOP_MONITOR_URL === undefined ? {} : { url: source.LOOP_MONITOR_URL }),
+      ...(number("LOOP_MONITOR_LINES") === undefined ? {} : { lines: number("LOOP_MONITOR_LINES") }),
+      placement: monitorPlacement(),
+      verbose: flag("LOOP_MONITOR_VERBOSE") ?? false,
+    },
+    /** The mini kanban. See `KanbanSetting` in `src/app.ts`. */
+    kanban: kanbanSetting(),
     themeName: source.PI_THEME,
     dryRun: flag("LOOP_DRY_RUN"),
     verbose: flag("LOOP_VERBOSE"),

@@ -122,6 +122,9 @@ function fakeBoard(prefix = "fake"): FakeBoard {
     async listInProgress(): Promise<Issue[]> {
       throw new Error("the splitter must not read the in-progress list");
     },
+    async listClosed(): Promise<Issue[]> {
+      throw new Error("the splitter must not read the closed list");
+    },
     async getIssue(id: string): Promise<Issue | null> {
       return issues.get(id) ?? null;
     },

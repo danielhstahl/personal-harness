@@ -129,6 +129,39 @@ test("listInProgress runs `bd list --status in_progress --json`", async () => {
   ]);
 });
 
+test("listClosed runs `bd list --status closed --json`, bounded by default", async () => {
+  const { client, calls } = harness("closed");
+
+  const issues = await client.listClosed();
+
+  assert.equal(issues[0]?.status, "closed");
+  assert.deepEqual(calls()[0]?.argv, [
+    "list",
+    "--status",
+    "closed",
+    "--json",
+    "--limit",
+    "50",
+  ]);
+});
+
+test("an explicit closed limit wins over the default, labels and all", async () => {
+  const { client, calls } = harness("closed");
+
+  await client.listClosed({ limit: 7, labels: ["loop"] });
+
+  assert.deepEqual(calls()[0]?.argv, [
+    "list",
+    "--status",
+    "closed",
+    "--json",
+    "--label",
+    "loop",
+    "--limit",
+    "7",
+  ]);
+});
+
 test("an empty board is [] and not an error", async () => {
   const { client } = harness("empty");
   assert.deepEqual(await client.listReady(), []);
@@ -358,6 +391,7 @@ test("every mutating method still forces BD_LAST_TOUCHED_FALLBACK=0", async () =
   const mutations: Array<{ name: string; run: (c: BdClient) => Promise<unknown> }> = [
     { name: "listReady", run: (c) => c.listReady() },
     { name: "listInProgress", run: (c) => c.listInProgress() },
+    { name: "listClosed", run: (c) => c.listClosed() },
     { name: "getIssue", run: (c) => c.getIssue("fake-1") },
     { name: "createIssue", run: (c) => c.createIssue({ title: "t" }) },
     { name: "addDep", run: (c) => c.addDep("fake-2", "fake-1") },

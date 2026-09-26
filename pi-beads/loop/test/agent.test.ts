@@ -392,6 +392,9 @@ function beadsStub(issue: Issue | null, memories: Record<string, string> = {}): 
     async listInProgress() {
       return notImplemented("listInProgress");
     },
+    async listClosed() {
+      return notImplemented("listClosed");
+    },
     async getIssue(id) {
       calls.push(`getIssue:${id}`);
       return issue;
@@ -534,6 +537,9 @@ test("the second iteration in the same process starts with an empty history", as
         throw new Error("unused");
       },
       async listInProgress() {
+        throw new Error("unused");
+      },
+      async listClosed() {
         throw new Error("unused");
       },
       async getIssue(id) {

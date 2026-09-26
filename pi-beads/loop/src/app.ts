@@ -20,13 +20,34 @@ import { createFinalizer, describeFinalizeFailure, isFinalized } from "./finaliz
 import type { FinalizeOutcome, FinalizeRequest } from "./finalize.ts";
 import { createIdleMode } from "./idle.ts";
 import type { IdleHandle, IdleOutcome, IdleStatus } from "./idle.ts";
-import { createNullPresenter, createWorkPresenter, describeOutcome } from "./render.ts";
+import {
+  createKanbanSource,
+  createNullKanban,
+  type KanbanColumnKey,
+  type KanbanMode,
+  type KanbanRead,
+  type KanbanSource,
+} from "./kanban.ts";
+import {
+  PLAIN_MONITOR_THEME,
+  createBackendMonitor,
+  createNullMonitor,
+  resolveMonitorUrls,
+  type BackendMonitor,
+  type MonitorTheme,
+} from "./monitor.ts";
+import {
+  createNullPresenter,
+  createPresenterTheme,
+  createWorkPresenter,
+  describeOutcome,
+} from "./render.ts";
 import type { WorkPresenter } from "./render.ts";
 import { runLoop, LoopError } from "./loop.ts";
 import type { LoopConfig, LoopIdlePort, LoopPorts, LoopResult, LoopUi } from "./loop.ts";
 import { createSplitter, portFromAgentRunner } from "./split.ts";
 import type { Splitter } from "./split.ts";
-import { runStartupAudit } from "./startup.ts";
+import { resolveProviderBaseUrl, runStartupAudit } from "./startup.ts";
 import type { StartupAuditResult } from "./startup.ts";
 import { createGitWriter } from "./vcs.ts";
 import type { GitWriter } from "./vcs.ts";
@@ -56,6 +77,69 @@ export interface ProviderAuditSetting {
   readonly timeoutMs?: number;
 }
 
+/**
+ * The read-only backend monitor: the panel that shows what the inference server
+ * is doing while the loop is using it.
+ *
+ * On by default. It costs four unauthenticated `GET`s per `intervalMs` against
+ * a server that is already on the network path of every token drawn here, and it
+ * answers questions that are otherwise invisible until a ticket times out — KV
+ * pressure, a slot somebody else is holding, a prompt cache that went cold, a
+ * drafter that is not the one you thought you were using. Off is one env
+ * variable away for a server with no diagnostics endpoints at all, and turning
+ * it off costs nothing but the panel.
+ */
+export interface MonitorSetting {
+  readonly enabled: boolean;
+  /** Poll cadence. Default 2000ms. */
+  readonly intervalMs?: number;
+  /** Per-request deadline. Default 1500ms. */
+  readonly timeoutMs?: number;
+  /** How often to re-read `/v1/models`. Default 30000ms. */
+  readonly modelsEveryMs?: number;
+  /** Override the derived base entirely (`http://host:8081` or `.../v1`). */
+  readonly url?: string;
+  /** Rows the panel may take. Default 2. */
+  readonly lines?: number;
+  /**
+   * Where the panel sits. `"band"` (default) is directly above the footer —
+   * always on screen, never covering the transcript. `"top"` puts it at the top
+   * of the work surface, which scrolls with the transcript; the idle surface
+   * always draws it at the top of the screen, where nothing scrolls.
+   */
+  readonly placement?: "band" | "top";
+  readonly verbose?: boolean;
+}
+
+/**
+ * The mini kanban: the board as three columns — what is ready, what is being
+ * worked, what is done — drawn alongside the monitor.
+ *
+ * On by default, with defaults set by a different cost model than the
+ * monitor's. Every read here is a `bd` child process rather than a socket
+ * read, so the cadence is slower (5s) and consecutive failures back off to a
+ * minute: a board that cannot be reached must cost one notice and a slow
+ * trickle of retries, not a process spawn per second.
+ *
+ * `mode` picks the shape: `"row"` is one dense line (the work surface's
+ * default, which already carries a transcript, a monitor and a footer);
+ * `"board"` is the bordered three-column grid, which the idle surface
+ * defaults to because nothing there is competing for the screen.
+ */
+export interface KanbanSetting {
+  readonly enabled: boolean;
+  /** Read cadence. Default 5000ms. */
+  readonly intervalMs?: number;
+  readonly mode?: KanbanMode;
+  /** Rows the grid may take, borders included. */
+  readonly lines?: number;
+  /** How many closed tickets the `done` column keeps. Default 12. */
+  readonly doneLimit?: number;
+  /** Where the board sits on the work surface. Default `"band"`. */
+  readonly placement?: "band" | "top";
+  readonly verbose?: boolean;
+}
+
 export interface AppConfig extends LoopConfig {
   /** Repository and board live here. */
   readonly cwd: string;
@@ -83,6 +167,9 @@ export interface AppConfig extends LoopConfig {
   readonly splitThinkingLevel?: ThinkingLevel;
   /** The startup provider comparison. See {@link ProviderAuditSetting}. */
   readonly providerAudit?: ProviderAuditSetting;
+  /** The read-only server panel. See {@link MonitorSetting}. */
+  readonly monitor?: MonitorSetting;
+  readonly kanban?: KanbanSetting;
   readonly themeName?: string;
   /**
    * The live surface's cadence, in ms.
@@ -109,6 +196,14 @@ export interface AppConfig extends LoopConfig {
     readonly splitter?: Splitter;
     readonly finalizer?: { finalize(request: FinalizeRequest): Promise<FinalizeOutcome> };
     readonly idle?: LoopIdlePort;
+    /** Substitute the monitor wholesale (`createNullMonitor()` to silence). */
+    readonly monitor?: BackendMonitor;
+    /** Substitute the mini kanban wholesale. */
+    readonly kanban?: KanbanSource;
+    /** Where the monitor finds its provider's base URL (tests: a fixture path). */
+    readonly monitorBaseUrl?: string;
+    /** Read `models.json` from somewhere else when resolving the base. */
+    readonly modelsPath?: string;
     /**
      * Substitute the *kind* of idle surface without substituting the port, so
      * a test can hand in handles that model a single-shot teardown and still
@@ -123,7 +218,13 @@ export interface AppConfig extends LoopConfig {
      * log-only spike, where a live surface would paint over the transcript.
      */
     readonly presenter?: WorkPresenter | null;
-    /** Replace the audit's transport (tests inject a fake `/health`). */
+    /**
+     * Replace the transport to the inference backend. The startup audit reads
+     * `/health` through it and the monitor reads all four diagnostic endpoints
+     * through it, which is deliberate: one injection point controls every byte
+     * a run puts on the wire, so a test can assert on the whole conversation
+     * rather than on one participant's view of it.
+     */
     readonly audit?: { readonly fetchImpl?: typeof fetch };
     /** Skip the startup audit entirely, whatever `providerAudit` says. */
     readonly skipAudit?: boolean;
@@ -135,6 +236,10 @@ export interface App {
   readonly ports: LoopPorts;
   /** The work-stream presenter: live while work runs, down when idle is up. */
   readonly presenter: WorkPresenter;
+  /** The backend monitor: polled while the run is, drawn by both surfaces. */
+  readonly monitor: BackendMonitor;
+  /** The mini kanban: read-only board view, drawn by both surfaces. */
+  readonly kanban: KanbanSource;
   run(): Promise<LoopResult>;
 }
 
@@ -292,17 +397,104 @@ export function idleStatusFrom(
   };
 }
 
+/**
+ * Build the monitor source the run draws.
+ *
+ * Everything about this is allowed to fail into "off". No base URL could be
+ * resolved, the theme is unreachable, the endpoints are all absent — in every
+ * one of those cases the answer is a monitor that renders nothing, because the
+ * panel is a window into the server and a window that will not open is not a
+ * reason for the house to stop.
+ *
+ * The base URL is resolved the same way the startup audit resolves it (pi's
+ * default-model precedence through `models.json`), so the monitor is looking at
+ * the server this run is actually talking to. An explicit `LOOP_MONITOR_URL`
+ * overrides that for the cases where the answer is "no, look over there".
+ */
+function buildMonitor(
+  config: AppConfig,
+  overrides: AppConfig["overrides"] = {},
+): BackendMonitor {
+  if (overrides.monitor !== undefined) return overrides.monitor;
+  const setting = config.monitor ?? { enabled: true };
+  if (setting.enabled === false) return createNullMonitor("switched off by LOOP_MONITOR=0");
+
+  const resolved = resolveProviderBaseUrl({
+    cwd: config.cwd,
+    ...(config.modelRef === undefined ? {} : { modelRef: config.modelRef }),
+    ...(overrides.modelsPath === undefined ? {} : { modelsPath: overrides.modelsPath }),
+  });
+  // The explicit monitor URL beats the audited health URL, which beats the
+  // provider's own base — most specific hint wins.
+  const baseUrl = overrides.monitorBaseUrl ?? resolved.baseUrl;
+  const urls = resolveMonitorUrls({
+    ...(setting.url === undefined ? {} : { monitorUrl: setting.url }),
+    ...(config.providerAudit?.healthUrl === undefined
+      ? {}
+      : { healthUrl: config.providerAudit.healthUrl }),
+    ...(baseUrl === undefined ? {} : { baseUrl }),
+  });
+  if (Object.values(urls).every((value) => value === undefined)) {
+    // Nothing named the server: no monitor URL, no audited health URL, no
+    // provider base to derive from. Saying so is the difference between a
+    // missing panel and a panel that was never asked to exist.
+    return createNullMonitor("no backend url to read — set LOOP_MONITOR_URL or a provider baseUrl");
+  }
+
+  let theme: MonitorTheme;
+  try {
+    theme = createPresenterTheme(config.themeName);
+  } catch {
+    // A panel with no colour still tells the truth; a panel that throws does not.
+    theme = PLAIN_MONITOR_THEME;
+  }
+
+  return createBackendMonitor({
+    urls,
+    theme,
+    ...(setting.intervalMs === undefined ? {} : { intervalMs: setting.intervalMs }),
+    ...(setting.timeoutMs === undefined ? {} : { timeoutMs: setting.timeoutMs }),
+    ...(setting.modelsEveryMs === undefined ? {} : { modelsEveryMs: setting.modelsEveryMs }),
+    maxLines: setting.lines ?? 2,
+    verbose: setting.verbose === true,
+    ...(overrides.audit?.fetchImpl === undefined ? {} : { fetchImpl: overrides.audit.fetchImpl }),
+  });
+}
+
 export function buildApp(config: AppConfig): App {
   const overrides = config.overrides ?? {};
   const labels = config.labels === undefined ? undefined : { labels: config.labels };
 
-  const beads = overrides.beads ?? createBdClient({ bin: config.bdBin, cwd: config.cwd });
+  const baseBeads = overrides.beads ?? createBdClient({ bin: config.bdBin, cwd: config.cwd });
   const git = overrides.git ?? createGitWriter({
     cwd: config.cwd,
     bin: config.gitBin,
     authorName: config.authorName ?? "pi-loop",
     authorEmail: config.authorEmail ?? "pi-loop@localhost",
   });
+
+  // ── the backend monitor ──────────────────────────────────────────────────
+  //
+  // Built here, drawn by both surfaces: one poller, one snapshot, two places to
+  // look at it. The presenter gets it in the band above the footer, the idle
+  // prompt gets it as the top line of the screen, and neither of them can make
+  // a request — they read what this already has.
+  const monitor: BackendMonitor = buildMonitor(config, overrides);
+
+  // ── the mini kanban ─────────────────────────────────────────────────────
+  //
+  // Built here for the same reason as the monitor: one read of the board, one
+  // picture, drawn in two places. It is given a *reader*, not the client —
+  // `src/kanban.ts` has no `BdClient` in its signature, so there is nothing
+  // in the module that could move a ticket even by accident.
+  const kanban: KanbanSource = buildKanban(config, baseBeads, overrides, labels);
+
+  // The real client gets wrapped so this run's own writes refresh the picture
+  // immediately. An injected fake is not wrapped: it is exactly the object the
+  // test asked for, and a refresh bolted onto it would change what that test is
+  // counting.
+  const beads: BdClient =
+    overrides.beads === undefined ? refreshBoardOnWrite(baseBeads, kanban) : baseBeads;
 
   // ── the work-stream surface (`.10`) ───────────────────────────────────
   //
@@ -319,6 +511,13 @@ export function buildApp(config: AppConfig): App {
           coalesceMs: config.coalesceMs,
           heartbeatMs: config.heartbeatMs,
           spinnerMs: config.spinnerMs,
+          monitor,
+          monitorPlacement: config.monitor?.placement ?? "band",
+          monitorLines: config.monitor?.lines ?? 2,
+          kanban,
+          kanbanMode: config.kanban?.mode ?? "row",
+          kanbanPlacement: config.kanban?.placement ?? "band",
+          ...(config.kanban?.lines === undefined ? {} : { kanbanLines: config.kanban.lines }),
         });
 
   /**
@@ -487,6 +686,11 @@ export function buildApp(config: AppConfig): App {
         status: statusProvider,
         cwd: config.cwd,
         themeName: config.themeName,
+        monitor,
+        monitorLines: config.monitor?.lines ?? 2,
+        kanban,
+        kanbanMode: config.kanban?.mode ?? "board",
+        kanbanLines: config.kanban?.lines ?? 5,
       }));
 
   const baseIdle: LoopIdlePort = overrides.idle ?? perTurnIdle(makeIdle);
@@ -598,18 +802,170 @@ export function buildApp(config: AppConfig): App {
   return {
     ports,
     presenter,
+    monitor,
+    kanban,
     run: async (): Promise<LoopResult> => {
       try {
+        // The monitor starts before the audit so the panel is already showing
+        // something by the time the first finding is printed under it, and so a
+        // first poll that fails is on screen as `✕ unreachable` rather than a
+        // blank row that might just be slow.
+        monitor.start();
+        kanban.start();
+        if (config.kanban?.verbose === true) {
+          await kanban.refresh().catch(() => undefined);
+          for (const line of kanban.describe()) presenter.notice("info", line);
+        }
+        if (config.monitor?.verbose === true) {
+          // Join the cycle that `start()` kicked off before describing it:
+          // `describe()` printed now says what answered and what it exposed,
+          // instead of a column of "not asked" about requests still in flight.
+          await monitor.poll().catch(() => undefined);
+          for (const line of monitor.describe()) presenter.notice("info", line);
+        }
         await auditAtStartup();
         return await runLoop(ports, config);
       } finally {
         // Nothing outlives the run: no live screen, no footer claiming to be
-        // current, no half-painted frame left in scrollback.
+        // current, no half-painted frame left in scrollback — and no poller
+        // still asking a server about itself after the thing that cared about
+        // the answer has gone away.
+        monitor.stop();
+        kanban.stop();
         handSurfaceOver();
         presenter.dispose();
       }
     },
   };
+}
+
+/**
+ * Wrap a beads client so a write from this run refreshes the board.
+ *
+ * The board's own timer would catch the change within an interval anyway; this
+ * just removes the lag between the loop finishing a ticket and the picture
+ * agreeing with it. The refresh is fire-and-forget on purpose: the write has
+ * already succeeded, and a board read that fails after it is the board's
+ * problem — it shows `?` and backs off — never the write's.
+ *
+ * Exported because the claim it makes — *every* mutating call refreshes, and no
+ * read-only one does — is worth pinning directly, and cannot be reached through
+ * `buildApp` without a real `bd`: the wrapper is applied only to the real
+ * client, never to a fake a test handed in.
+ */
+export function refreshBoardOnWrite(client: BdClient, kanban: KanbanSource): BdClient {
+  const later = (): void => {
+    void kanban.refresh().catch(() => undefined);
+  };
+  return {
+    listReady: (options) => client.listReady(options),
+    listInProgress: (options) => client.listInProgress(options),
+    listClosed: (options) => client.listClosed(options),
+    getIssue: (id) => client.getIssue(id),
+    async createIssue(spec) {
+      const created = await client.createIssue(spec);
+      later();
+      return created;
+    },
+    async addDep(id, dependsOnId, type) {
+      await client.addDep(id, dependsOnId, type);
+      later();
+    },
+    async appendNote(id, text) {
+      const updated = await client.appendNote(id, text);
+      later();
+      return updated;
+    },
+    async setStatus(id, status, options) {
+      const updated = await client.setStatus(id, status, options);
+      later();
+      return updated;
+    },
+    async closeIssue(id, reason) {
+      const closed = await client.closeIssue(id, reason);
+      later();
+      return closed;
+    },
+    remember: (text, key) => client.remember(text, key),
+    recall: (key) => client.recall(key),
+  };
+}
+
+/**
+ * Build the mini kanban.
+ *
+ * The three reads are settled independently rather than awaited together, so
+ * one column failing does not black out the other two: `Promise.allSettled`
+ * maps directly onto the `failed` field of {@link KanbanRead}, which is what
+ * lets the renderer draw `?` for the column that failed and real counts for
+ * the columns that answered.
+ */
+function buildKanban(
+  config: AppConfig,
+  beads: BdClient,
+  overrides: AppConfig["overrides"] = {},
+  labels: { labels: readonly string[] } | undefined,
+): KanbanSource {
+  const setting = config.kanban ?? { enabled: true };
+  if (setting.enabled === false) {
+    return createNullKanban("switched off by LOOP_KANBAN=0");
+  }
+  if (overrides.kanban !== undefined) return overrides.kanban;
+
+  const doneLimit = Math.max(1, setting.doneLimit ?? 12);
+  let theme: MonitorTheme;
+  try {
+    theme = createPresenterTheme(config.themeName);
+  } catch {
+    theme = PLAIN_MONITOR_THEME;
+  }
+
+  const read = async (): Promise<KanbanRead> => {
+    // Read more closed tickets than the column shows: bd's own order is not
+    // guaranteed to be by close time, so the recency sort has to happen over a
+    // window wider than the display.
+    const windowSize = Math.max(doneLimit * 3, 30);
+    const [ready, inProgress, closed] = await Promise.allSettled([
+      beads.listReady(labels ?? {}),
+      beads.listInProgress(labels ?? {}),
+      beads.listClosed({ ...labels, limit: windowSize }),
+    ]);
+    const failed: KanbanColumnKey[] = [];
+    const firstError = [ready, inProgress, closed].find(
+      (result) => result.status === "rejected",
+    ) as PromiseRejectedResult | undefined;
+    if (ready.status === "rejected") failed.push("ready");
+    if (inProgress.status === "rejected") failed.push("progress");
+    if (closed.status === "rejected") failed.push("done");
+    const readResult: KanbanRead = {
+      ...(ready.status === "fulfilled" ? { ready: ready.value } : {}),
+      ...(inProgress.status === "fulfilled" ? { inProgress: inProgress.value } : {}),
+      ...(closed.status === "fulfilled" ? { closed: closed.value } : {}),
+      // Tell the view what the window was, so a full window reads as a floor
+      // (`done 36+`) rather than as a count that happens to be exact.
+      closedWindow: windowSize,
+      ...(failed.length === 0 ? {} : { failed }),
+      ...(firstError === undefined
+        ? {}
+        : {
+            error:
+              firstError.reason instanceof Error
+                ? firstError.reason.message
+                : String(firstError.reason),
+          }),
+    };
+    return readResult;
+  };
+
+  return createKanbanSource({
+    read,
+    theme,
+    mode: setting.mode ?? "board",
+    maxLines: setting.lines ?? 4,
+    doneLimit,
+    ...(setting.intervalMs === undefined ? {} : { intervalMs: setting.intervalMs }),
+    verbose: setting.verbose === true,
+  });
 }
 
 /** Build and run. The single entry the CLI and the spike share. */

@@ -46,9 +46,18 @@ src/beads.ts         the ONLY module that shells out to `bd` (typed, side-effect
 src/idle.ts          the idle surface: pi's own TUI input, clean exits, raw text back.
                      Single-shot by contract — one surface answers once, then it is
                      torn down, so the root builds a fresh one per idle turn
-src/format.ts        one-line plain-log summaries — NOT the renderer (see ADR-001)
+src/monitor.ts      the backend monitor: read-only polling of /health, /metrics, /cache,
+                    /v1/models, with a tolerant field reader and a panel. GET-only, and
+                    no bd/session handle exists in it, so it cannot touch the run
+src/kanban.ts       the mini kanban: ready / in progress / done, read through an injected
+                    `read()` closure — no BdClient in its signature, so nothing in the
+                    module could move a ticket. Two layouts, backoff, and three honest
+                    states per column (see ADR-004)
+src/format.ts       one-line plain-log summaries — NOT the renderer (see ADR-001)
 docs/               ADR-001: transport + rendering decision
                     ADR-002: comparing the provider's /health report with models.json at startup
+                    ADR-003: the backend monitor — where it is drawn, and why not at the top
+                    ADR-004: the mini kanban — read-only by shape, and what "unread" must not render as
 spikes/             throwaway prototypes + captured evidence backing ADR-001
 test/               unit tests, plus the whole walk in test/loop.test.ts
 ```
@@ -102,13 +111,28 @@ And [`docs/ADR-002-startup-provider-comparison.md`](docs/ADR-002-startup-provide
 before the first ticket is claimed the loop asks that machine what it is and
 prints the disagreements. See "Startup: the provider comparison" below.
 
+And [`docs/ADR-003-backend-monitor.md`](docs/ADR-003-backend-monitor.md):
+while a ticket is being worked the loop also watches what that machine is
+*doing* — KV pressure, queue depth, drafter, throughput — and draws it in the
+fixed chrome, because a component appended to the transcript scrolls off
+instead of staying at the top. See "The monitor" below.
+
+And [`docs/ADR-004-mini-kanban.md`](docs/ADR-004-mini-kanban.md):
+the loop is a walk over a kanban — ready → in progress → done — and nothing on
+the screen showed it. The board is drawn beside the monitor, on the same terms:
+read-only *by shape* (it takes a `read()` closure, not a client), never
+load-bearing, and honest about the difference between a queue that is empty and a
+queue it could not read. See "The board" below.
+
 Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`,
 `LOOP_WIDTH`, the per-pass thinking levels `LOOP_WORK_THINKING` /
 `LOOP_SPLIT_THINKING` — one of `off`, `minimal`, `low`, `medium`, `high`,
 `xhigh`, `max` — the budget knobs `LOOP_WORK_TIMEOUT_MS`, `LOOP_WRAP_UP_MS` and
-`LOOP_RETRY_UNFIT_WORK` (see "Two clocks" below), and the startup audit knobs
+`LOOP_RETRY_UNFIT_WORK` (see "Two clocks" below), the startup audit knobs
 `LOOP_AUDIT`, `LOOP_AUDIT_STRICT`, `LOOP_AUDIT_VERBOSE`, `LOOP_AUDIT_WRITE` and
-`LOOP_HEALTH_URL` (see "Startup: the provider comparison" below). Neither knob
+`LOOP_HEALTH_URL` (see "Startup: the provider comparison" below), the monitor
+knobs `LOOP_MONITOR*` (see "The monitor" below), and the board knobs
+`LOOP_KANBAN*` (see "The board" below). Neither knob
 set is not the same as either set to `low`: unset falls through to the user's
 configured default and then pi's own, so a ticket is never run at a level nobody
 chose. A value pi
@@ -401,6 +425,164 @@ Printed output is secret-redacted (`«redacted»` for a literal key, `$ENVVAR`
 references left intact). The file the audit writes is *not* redacted: it lands
 beside the file that already holds the credential, and a redacted key there would
 just be a broken config.
+
+## The monitor: what the server is doing right now
+
+ADR-002 answers what the server *is configured as*, before the first ticket. The
+monitor answers what it is *doing*, while a ticket is being worked — the question
+that arrives every time a pass is slow and the answer is sitting in `/metrics`:
+
+```
+● 1s · t/s 132 · kv 64% 168k/262k · slots 1/4 · queued 0
+ctx 262k · out 66k · draft mtp · cache 89% hit · req 2.0/s (415 served)
+```
+
+Top line is the live one (throughput, KV pressure, who else is here). Second
+line is the settled one (window, output ceiling, drafter, prompt cache, request
+rate, loaded model). `● 1s` is the age of the freshest reading, so a stalled
+server keeps its last good numbers without pretending to be current; if nothing
+ever answered the line reads `✕ unreachable: …` instead of a reading.
+
+**Where it is drawn.** Not at the top of the transcript — a component appended
+there scrolls off within a screenful (ADR-003 has the measurement). While a
+session runs it lives in the fixed chrome, the band immediately above the
+footer, which is the only region that is redrawn in the same place every frame.
+When the loop is idle there is no transcript, so the monitor is the top line
+proper. When the session is released the band stops being drawn: those lines
+describe what the server is doing *now*, and after a handoff “now” is no longer
+describing the work you are looking at. A piped log never sees the panel at all.
+
+**It is read-only, by shape.** No `bd` handle, no issue id, no `POST`. Every
+failure path returns a value rather than throwing. A field it cannot find is
+`—`, never a guess: if nothing exposes the KV capacity, the panel says
+`kv —` rather than dividing by an assumed pool.
+
+Rates are slopes and refuse to be computed when they would lie: a counter that
+went down is a restart, not negative throughput; a renamed counter is not
+differenced at all. Cache hit rate is reported as an interval with its delta
+(`cache 89% hit +21/-2`), so the first read shows `—` rather than a
+fabricated lifetime average that stays flattering long after the cache stopped
+helping.
+
+| Knob | Effect |
+| --- | --- |
+| `LOOP_MONITOR=0` | no monitor at all (a null source that renders and requests nothing) |
+| `LOOP_MONITOR_MS` | poll interval (default 1000) |
+| `LOOP_MONITOR_TIMEOUT_MS` | per-request deadline (default 1500) |
+| `LOOP_MONITOR_MODELS_MS` | model-list interval (default 30000; the list rarely changes) |
+| `LOOP_MONITOR_URL=…` | the backend base, over the provider config and the audit's URL |
+| `LOOP_MONITOR_LINES=n` | panel lines, 1–3. 3 adds the per-KV-pool breakdown |
+| `LOOP_MONITOR_AT=band\|top` | above the footer (default) or first on the surface (which scrolls) |
+| `LOOP_MONITOR_VERBOSE=1` | at startup, print each endpoint's state and the keys it exposed that no field reads |
+
+`/health` advertises where its own other pages live, and on the first cycle it is
+read before `/metrics`, `/cache` and `/models` are asked — so a server keeping
+its counters at `/counters` is never once asked at `/metrics`, and a
+non-standard layout needs no configuration. An endpoint that answers 404 is
+dropped from the rotation with a note rather than retried forever.
+
+It costs what it says it costs: three or four small `GET`s per second, one frame
+per poll through the existing coalescing window, and never two polls at once — a
+slow server produces one long wait, not a queue of them.
+
+```sh
+node tools/monitor-stub.mjs   # the panel, against a stub backend — no GPU needed
+LOOP_MONITOR=0 npm start                    # work without it
+LOOP_MONITOR_LINES=3 LOOP_MONITOR_VERBOSE=1 npm start   # wide panel + what the server exposed
+node --test test/monitor.test.ts         # 75 tests over the reader, poller and surfaces
+```
+
+## The board: what is left, what is being worked, what will be picked next
+
+ADR-003 answers what the server is doing. The board answers the other question an
+operator has while watching this loop, and the loop is the reason it is answerable:
+`check_work` reads the ready list every iteration, `pick` takes its head, `work`
+holds one `in_progress` ticket, `finalize` closes it. The machine is a walk over a
+kanban. Until now the screen showed none of it.
+
+```
+▦ ready 4 · in progress 1 · done 5+ · next loop-3k ship the kanban
+
+╭ ready 4 ───────────────────────┬ in progress 1 ─────────────────┬ done 5+ ───────────────────────╮
+│· loop-3k ship the kanban       │▸ loop-4k wire the board i… [1m]│✓ loop-1m add the backend … [1h]│
+│· loop-7m back off when bd is u…│—                               │✓ loop-2b audit the provid… [5h]│
+│· loop-2t blocked behind … ⚠1 +1│                                │✓ loop-0a bootstrap the… [3d] +2│
+╰────────────────────────────────┴────────────────────────────────┴────────────────────────────────╯
+```
+The one-line `row` is the work surface's default — that screen already carries a
+transcript, a monitor and a footer. The bordered `board` is the idle default:
+nothing there is competing for the room, and "what will it pick" is exactly what is
+on the operator's mind before they type. The `ready` column is ordered the way the
+picker orders (priority, then longest-waiting), so its head **is** the next pick —
+and the row says which one that is.
+
+**Read-only, by shape — harder than the monitor's version.** The loop claims and
+closes tickets; a component that could too would be a second driver with one
+protocol between them. `src/kanban.ts` takes no `BdClient` and has no write path:
+the composition root hands it a `read()` closure returning plain data. There is
+nothing in the module that could move a ticket even by accident, which is what
+lets it sit next to a live loop at all. (A drag-and-drop kanban was rejected here
+for the same reason the loop rejects a claim from anything but its own transition.)
+
+**Absent is not zero.** Every column is `live` / `absent` / `unknown`, and a
+column that did not answer renders `?`, never `0`:
+
+```
+╭ ready 0 ───────────────────────┬ in progress 1 ─────────────────┬ done ? ────────────────────────╮
+│—                               │● loop-4k wire the board i… [1m]│unread                          │
+```
+
+`ready 0` is a fact about an empty queue. `?` is a fact about a `bd` that did not
+answer. A board that painted an unread queue as empty would be a confident "there
+is nothing to do", issued at exactly the moment nobody can check — the worst
+possible thing for this screen to say. When the *first* read fails, the board draws
+`▦ ready ? · in progress ? · done ?` rather than nothing, because silence here is
+indistinguishable from `LOOP_KANBAN=0` and an operator who cannot tell the two
+will assume the queue was empty.
+
+**Counts are bounded, and say so.** The closed list is read with a limit, so a read
+that came back exactly as long as the window is rendered as a floor — `done 5+` —
+not as a count. Exact and truncated are different claims.
+
+**It costs what it says it costs.** Every poll here is a `bd` child process, not a
+socket read, so the cadence is 5s rather than the monitor's 1s, and consecutive
+failures back off exponentially to a 60s ceiling: a `bd` missing from `PATH` costs
+one notice and a slowing trickle, not a spawn per second. Cycles never overlap — a
+`bd` that takes three seconds is one long wait, not a queue of them — and one read
+is one frame, through the same 33ms coalescing window as everything else. A write
+by this run (create, status change, close) triggers a refresh immediately, so the
+picture agrees with the ticket you just finished without waiting an interval. A
+refresh that fails after a successful write is the board's problem, never the
+write's: it shows `?` and backs off.
+
+| Knob | Effect |
+| --- | --- |
+| `LOOP_KANBAN=0` \| `off` | no board at all (a null source that draws nothing and reads nothing) |
+| `LOOP_KANBAN=row\|board` | pick the shape; anything else, including unset, leaves each surface on its own default |
+| `LOOP_KANBAN_MS` | read interval (default 5000, floor 500 — each poll is a process spawn) |
+| `LOOP_KANBAN_LINES=n` | rows the grid may take, borders included |
+| `LOOP_KANBAN_DONE=n` | how many closed tickets the `done` column keeps (default 12) |
+| `LOOP_KANBAN_AT=band\|top` | above the footer (default) or above the transcript, independently of the monitor |
+| `LOOP_KANBAN_VERBOSE=1` | at startup, print each column's state, its totals, and the interval and backoff ceiling |
+
+The two HUDs are placed independently of each other, and the surface's child order
+is the *same rule* the frame assembly uses, stated once. That is not pedantry:
+with them stated twice, `LOOP_KANBAN_AT=top` combined with a banded monitor dropped
+the board out of every captured frame while it was still on screen — a bug that
+looks correct in the terminal and correct in the tests, and is only wrong in the
+capture.
+
+```sh
+node tools/kanban-demo.mjs          # every shape, no board needed
+node tools/kanban-demo.mjs --live   # the same renderer over a real bd, read-only
+LOOP_KANBAN=board npm start         # the grid on the work surface too
+LOOP_KANBAN=0 npm start             # no board
+node --test test/kanban.test.ts     # 84 tests over model, layout, poller and surfaces
+```
+
+There is a full web kanban in this repo's `harness.sh` (`bdui`). It stays, and it
+is the right tool for browsing the board. This is for the other moment: the two
+seconds before you type, when the answer has to be above the keyboard.
 
 ## Scratch beads DB (for live / integration checks)
 

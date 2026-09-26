@@ -376,6 +376,11 @@ test("strict mode stops the run before the loop starts", async () => {
     const app = buildApp({
       cwd: "/repo",
       providerAudit: { enabled: true, strict: true },
+      // The kanban reads the same board through the same client, and this test
+      // uses `listReady` as its tripwire for "the loop got as far as the
+      // board". With the board poller off, that claim stays exactly what it
+      // says — no one reached the board, because the run stopped before it.
+      kanban: { enabled: false },
       overrides: {
         presenter: createNullPresenter(),
         beads: {
@@ -400,6 +405,10 @@ test("disabling the audit means no request is made at all", async () => {
     const app = buildApp({
       cwd: "/repo",
       providerAudit: { enabled: false },
+      // The monitor reads the same backend through the same injected transport, so
+      // it is switched off here as well: what this test claims is that *nothing*
+      // is requested, and that claim has to hold over every consumer of the wire.
+      monitor: { enabled: false },
       overrides: {
         presenter: createNullPresenter(),
         beads: { listReady: async () => [], listInProgress: async () => [] } as never,
@@ -424,6 +433,8 @@ test("skipAudit turns it off even when the setting says otherwise", async () => 
     const app = buildApp({
       cwd: "/repo",
       providerAudit: { enabled: true },
+      // Same reason as the test above: `asked` counts every request the run makes.
+      monitor: { enabled: false },
       overrides: {
         presenter: createNullPresenter(),
         beads: { listReady: async () => [], listInProgress: async () => [] } as never,

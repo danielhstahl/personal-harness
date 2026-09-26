@@ -341,3 +341,64 @@ export async function runStartupAudit(options: StartupAuditOptions): Promise<Sta
     },
   );
 }
+
+/**
+ * The `baseUrl` of the provider this run is going to talk to, on its own.
+ *
+ * The monitor needs exactly this and nothing else: where the server is. It is
+ * resolved here rather than in `src/monitor.ts` because reading `models.json`
+ * and knowing pi's default-model precedence is this module's job, and the
+ * monitor should not have to import a config reader to answer a question about
+ * a URL.
+ *
+ * Same resolution rules as the audit, same failure shape: a note and the
+ * candidates rather than a guess, because pointing a monitor at the wrong
+ * server is worse than showing nothing — its numbers would read as facts about
+ * the machine the run is actually using.
+ */
+export interface BaseUrlResolution {
+  readonly baseUrl?: string;
+  readonly note?: string;
+  readonly candidates: readonly string[];
+}
+
+export function resolveProviderBaseUrl(
+  options: {
+    readonly cwd: string;
+    readonly modelRef?: { provider: string; id: string };
+    readonly agentDir?: string;
+    readonly modelsPath?: string;
+    readonly defaultRef?: () => { provider?: string; id: string } | undefined;
+    readonly readFile?: (path: string) => string;
+    readonly fileExists?: (path: string) => boolean;
+  },
+  trace: (note: string) => void = () => undefined,
+): BaseUrlResolution {
+  const read = options.readFile ?? ((path: string) => readFileSync(path, "utf8"));
+  const exists = options.fileExists ?? ((path: string) => existsSync(path));
+  const agentDir = options.agentDir ?? getAgentDir();
+  const modelsPath = options.modelsPath ?? join(agentDir, "models.json");
+  try {
+    if (!exists(modelsPath)) {
+      return { note: `no models.json at ${modelsPath}`, candidates: [] };
+    }
+    const raw: unknown = JSON.parse(read(modelsPath));
+    const fallback =
+      options.defaultRef !== undefined
+        ? options.defaultRef()
+        : readDefaultModelRef(options.cwd, agentDir);
+    const resolved = resolveTarget(raw, {
+      ...(options.modelRef === undefined ? {} : { explicit: options.modelRef }),
+      ...(fallback === undefined ? {} : { fallback }),
+    });
+    const baseUrl = resolved.view?.baseUrl;
+    if (baseUrl === undefined || baseUrl === "") {
+      return { note: resolved.note ?? "no baseUrl on the resolved provider", candidates: resolved.candidates };
+    }
+    trace(`${resolved.target?.provider ?? "?"} baseUrl ${baseUrl}`);
+    return { baseUrl, candidates: resolved.candidates };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { note: `could not read ${modelsPath}: ${message}`, candidates: [] };
+  }
+}
