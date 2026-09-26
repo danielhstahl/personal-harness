@@ -27,6 +27,8 @@ import { BdError } from "../src/beads.ts";
 import type { BdClient, Issue, IssueStatus, NewIssueSpec } from "../src/beads.ts";
 import type { IdleOutcome } from "../src/idle.ts";
 import type { LoopIdlePort, LoopUi } from "../src/loop.ts";
+import type { MailDelivery } from "../src/mail.ts";
+import type { BeadCompletion, Notifier } from "../src/notify.ts";
 import { createGitWriter } from "../src/vcs.ts";
 import type { GitWriter } from "../src/vcs.ts";
 
@@ -605,4 +607,66 @@ export function fakeSplitPort(answers: readonly unknown[]): FakeSplitPort {
       return answer;
     },
   };
+}
+
+// ── the completion notifier ─────────────────────────────────────────────────
+
+export interface RecordingNotifier extends Notifier {
+  /** Every notice the loop asked for, in order, with the facts it was built from. */
+  readonly notices: BeadCompletion[];
+  /** Make the next `notifyCompletion` throw, once. */
+  failNext(error: Error): void;
+}
+
+/**
+ * A notifier that records instead of sending.
+ *
+ * `outcomes` is the script of delivery results; the last entry repeats, so a
+ * two-bead walk with `["failed"]` reports a failure for both, which is what
+ * "the relay is down" looks like from the loop's side.
+ */
+export function recordingNotifier(
+  outcomes: readonly ("delivered" | "failed" | "skipped")[] = ["delivered"],
+): RecordingNotifier {
+  const notices: BeadCompletion[] = [];
+  let index = 0;
+  let queued: Error | null = null;
+
+  const notifier: RecordingNotifier = {
+    enabled: true,
+    destination: ["dev@example.test"],
+    transport: "recorder",
+    notices,
+    failNext(error: Error): void {
+      queued = error;
+    },
+    async notifyCompletion(completion: BeadCompletion): Promise<MailDelivery> {
+      notices.push(completion);
+      if (queued !== null) {
+        const error = queued;
+        queued = null;
+        throw error;
+      }
+      const kind = outcomes[Math.min(index, outcomes.length - 1)] ?? "delivered";
+      index += 1;
+      if (kind === "failed") {
+        return {
+          kind: "failed",
+          reason: "421 relay busy",
+          transport: "recorder",
+          retryable: true,
+        };
+      }
+      if (kind === "skipped") {
+        return { kind: "skipped", reason: "nothing to do" };
+      }
+      return {
+        kind: "delivered",
+        messageId: `notice-${index}@recorder.test`,
+        transport: "recorder",
+        recipients: ["dev@example.test"],
+      };
+    },
+  };
+  return notifier;
 }

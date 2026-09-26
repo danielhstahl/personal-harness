@@ -14,7 +14,7 @@ import { pathToFileURL } from "node:url";
 import { AgentError, parseThinkingLevel } from "./agent.ts";
 import type { ThinkingLevel } from "./agent.ts";
 import { runApp } from "./app.ts";
-import type { AppConfig, KanbanSetting } from "./app.ts";
+import type { AppConfig, KanbanSetting, NotifySetting } from "./app.ts";
 import { LoopError } from "./loop.ts";
 import type { LoopResult } from "./loop.ts";
 
@@ -83,6 +83,106 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
    * `board` rather than `1` would be a trap that costs the first person who
    * tries it an hour of wondering.
    */
+  /**
+   * Split an address list the way a person types one.
+   *
+   * Comma, semicolon or whitespace all separate, because the natural thing to
+   * write into an environment variable is
+   * `LOOP_NOTIFY_EMAIL="ada@example.com, grace@example.com"`, and the natural
+   * thing *not* to notice is that the second address silently never arrived.
+   * Validity itself is the mail adapter's business — it answers with one line
+   * and exit 2 at build time, not a warning per bead.
+   */
+  const addresses = (raw: string | undefined): string[] =>
+    (raw ?? "")
+      .split(/[,;\s]+/u)
+      .map((entry) => entry.trim())
+      .filter((entry) => entry !== "");
+
+  /**
+   * The completion notice: one optional feature with the address as its switch.
+   *
+   * `undefined` when nothing mail-related is set at all, which keeps "this run
+   * was never asked to send mail" distinct in the transcript from "this run was
+   * asked and cannot". Those two read very differently to whoever is looking for
+   * a notice that did not arrive.
+   */
+  /**
+   * How many failed sends in a row before the notice gives up, refused rather
+   * than dropped.
+   *
+   * `number()` returns `undefined` for what it cannot parse, which for this knob
+   * would be a trap: `LOOP_NOTIFY_MAX_FAILURES="three"` would fall back to the
+   * default and look exactly like a setting that took. A value that is set has
+   * to be a whole number of tries — and a *safely representable* one, since
+   * `1e21` parses to an integer that is not the integer anybody meant — and
+   * saying so is cheaper than a run that quietly gave up after three when it was
+   * told to try nine.
+   */
+  const maxFailuresSetting = (): number | undefined => {
+    const raw = source.LOOP_NOTIFY_MAX_FAILURES;
+    if (raw === undefined || raw.trim() === "") return undefined;
+    const parsed = Number(raw);
+    if (!Number.isSafeInteger(parsed) || parsed < 1) {
+      throw new LoopError(
+        "notify-config",
+        `LOOP_NOTIFY_MAX_FAILURES must be a whole number of tries, at least 1, not "${raw.trim()}"`,
+      );
+    }
+    return parsed;
+  };
+
+  const notifySetting = (): NotifySetting | undefined => {
+    const knobs: readonly (string | undefined)[] = [
+      source.LOOP_NOTIFY_EMAIL,
+      source.LOOP_NOTIFY_CC,
+      source.LOOP_NOTIFY_FROM,
+      source.LOOP_NOTIFY_SUBJECT_PREFIX,
+      source.LOOP_MAIL_URL,
+      source.LOOP_MAIL_HOST,
+      source.LOOP_MAIL_PORT,
+      source.LOOP_MAIL_USER,
+      source.LOOP_MAIL_PASSWORD,
+      source.LOOP_MAIL_STARTTLS,
+      source.LOOP_MAIL_TIMEOUT_MS,
+      source.LOOP_MAIL_INSECURE_AUTH,
+      source.LOOP_NOTIFY_MAX_FAILURES,
+    ];
+    if (knobs.every((value) => value === undefined || value.trim() === "")) return undefined;
+    const to = addresses(source.LOOP_NOTIFY_EMAIL);
+    const cc = addresses(source.LOOP_NOTIFY_CC);
+    return {
+      // The recipient is the switch. A relay configured with nobody to tell is a
+      // relay that will never be exercised, and saying so beats pretending.
+      enabled: to.length > 0,
+      to,
+      ...(cc.length === 0 ? {} : { cc }),
+      ...(source.LOOP_NOTIFY_FROM === undefined
+        ? {}
+        : { from: source.LOOP_NOTIFY_FROM.trim() }),
+      ...(source.LOOP_NOTIFY_SUBJECT_PREFIX === undefined
+        ? {}
+        : { subjectPrefix: source.LOOP_NOTIFY_SUBJECT_PREFIX }),
+      ...(source.LOOP_MAIL_URL === undefined ? {} : { url: source.LOOP_MAIL_URL.trim() }),
+      ...(source.LOOP_MAIL_HOST === undefined ? {} : { host: source.LOOP_MAIL_HOST.trim() }),
+      ...(number("LOOP_MAIL_PORT") === undefined ? {} : { port: number("LOOP_MAIL_PORT") }),
+      ...(source.LOOP_MAIL_USER === undefined ? {} : { user: source.LOOP_MAIL_USER }),
+      ...(source.LOOP_MAIL_PASSWORD === undefined ? {} : { password: source.LOOP_MAIL_PASSWORD }),
+      ...(source.LOOP_MAIL_STARTTLS === undefined
+        ? {}
+        : { starttls: source.LOOP_MAIL_STARTTLS.trim() }),
+      ...(number("LOOP_MAIL_TIMEOUT_MS") === undefined
+        ? {}
+        : { timeoutMs: number("LOOP_MAIL_TIMEOUT_MS") }),
+      ...(flag("LOOP_MAIL_INSECURE_AUTH") === undefined
+        ? {}
+        : { allowInsecureAuth: flag("LOOP_MAIL_INSECURE_AUTH") }),
+      ...(maxFailuresSetting() === undefined
+        ? {}
+        : { maxConsecutiveFailures: maxFailuresSetting() }),
+    };
+  };
+
   const kanbanSetting = (): KanbanSetting => {
     const raw = source.LOOP_KANBAN?.trim().toLowerCase();
     const off = raw === "0" || raw === "off" || raw === "no" || raw === "false";
@@ -143,6 +243,8 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
     },
     /** The mini kanban. See `KanbanSetting` in `src/app.ts`. */
     kanban: kanbanSetting(),
+    /** The completion notice. See `NotifySetting` in `src/app.ts`. */
+    notify: notifySetting(),
     themeName: source.PI_THEME,
     dryRun: flag("LOOP_DRY_RUN"),
     verbose: flag("LOOP_VERBOSE"),

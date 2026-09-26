@@ -64,6 +64,8 @@ import { describeFailure, toWorkEvent } from "./agent.ts";
 import type { FinalizeOutcome, FinalizeRequest } from "./finalize.ts";
 import { describeFinalizeFailure, toFinalizeEvents } from "./finalize.ts";
 import type { IdleOutcome } from "./idle.ts";
+import type { MailDelivery } from "./mail.ts";
+import type { BeadCompletion, Notifier } from "./notify.ts";
 import { createInitialState, failureKeyFor, handoffKeyFor, step } from "./orchestrator.ts";
 import type {
   AgentRunEffect,
@@ -71,6 +73,7 @@ import type {
   CreateIssueEffect,
   DropContextEffect,
   Effect,
+  NotifyEmailEffect,
   OrchestratorEvent,
   OrchestratorState,
   OrchestratorStateName,
@@ -130,6 +133,12 @@ export interface LoopPorts {
   readonly git: GitWriter;
   readonly idle: LoopIdlePort;
   readonly ui: LoopUi;
+  /**
+   * Where a finished bead is announced to a human. Optional: the loop runs
+   * without one and says so in the transcript, which is a different thing from
+   * running without one and *silently* dropping the notice.
+   */
+  readonly notify?: Notifier;
   readonly signals?: LoopSignalAdapter;
   readonly log?: (entry: LoopLogEntry) => void;
   readonly now?: () => number;
@@ -325,6 +334,18 @@ function stripIssuePrefix(message: string, issueId: string): string {
   return message.startsWith(prefix) ? message.slice(prefix.length) : message;
 }
 
+/**
+ * The `Done: ` the machine puts on a close reason, taken back off.
+ *
+ * The board wants the prefix — `bd close --reason "Done: fixed the parser"` reads
+ * as a claim in the issue's own record. A mail subject does not, and the two are
+ * the same string, so the stripping happens here rather than by writing the close
+ * reason twice and hoping they agree.
+ */
+function stripClosePrefix(reason: string): string {
+  return reason.replace(/^done:\s*/iu, "").trim();
+}
+
 // ── the engine ──────────────────────────────────────────────────────────────
 
 /** A unit in flight: a group of machine effects executed as one transaction. */
@@ -367,6 +388,14 @@ export async function runLoop(
   let state: OrchestratorState = createInitialState();
   let unit: Unit | null = null;
   let lastWork: WorkOutcome | null = null;
+  /**
+   * The last finalize outcome, kept for the completion notice.
+   *
+   * The machine's `notify.email` effect carries what a pure transition can know.
+   * The committed path list, the reused-commit flag and the decisions the finalize
+   * request carried live only here, in the interpreter that watched the unit run.
+   */
+  let lastFinalize: FinalizeOutcome | null = null;
   // A holder object, not a bare `let`: the driver reads this after a nested
   // function has written it, and a property reference is not narrowed away the
   // way a captured local would be.
@@ -684,6 +713,99 @@ export async function runLoop(
     return [];
   }
 
+  /**
+   * Assemble the notice: the machine's facts, plus the ones only the interpreter
+   * has from watching the unit run.
+   *
+   * The committed paths win over the verdict's claim list, because "what landed" is
+   * what the finalizer actually staged and "what was reported" is what the agent
+   * believed it touched. When they differ the reader wants the former, and the
+   * latter is already in the handoff note.
+   */
+  function completionFor(effect: NotifyEmailEffect): BeadCompletion {
+    const finalize =
+      lastFinalize !== null && lastFinalize.issueId === effect.issueId ? lastFinalize : null;
+    const committed = finalize !== null && finalize.kind === "finalized" ? finalize : null;
+    const worked = lastWork !== null && lastWork.issueId === effect.issueId ? lastWork : null;
+    const verdict =
+      worked !== null && (worked.kind === "done" || worked.kind === "incomplete")
+        ? worked.verdict
+        : null;
+    const changedFiles =
+      committed !== null && committed.committedPaths.length > 0
+        ? committed.committedPaths
+        : verdict?.changedFiles ?? [];
+    return {
+      issueId: effect.issueId,
+      title: effect.title,
+      summary: verdict?.summary ?? stripClosePrefix(effect.closeReason),
+      commit: committed?.commitHash ?? effect.commit,
+      committedAgain: committed?.reusedCommit ?? false,
+      changedFiles,
+      nextSteps: verdict?.nextSteps ?? [],
+      decisions: finalize?.request.decisions ?? [],
+      closeReason: effect.closeReason,
+      handoffKey: effect.handoffKey,
+      iteration: effect.iteration,
+      workKind: worked?.kind ?? null,
+      elapsedMs: worked?.elapsedMs ?? null,
+      completedAt: now(),
+    };
+  }
+
+  /**
+   * `notify.email`: tell whoever asked that this bead is finished.
+   *
+   * Nothing in here can stop the loop. The bead is committed and closed by the
+   * time this runs, so a relay that is down, misconfigured or unreachable costs a
+   * warning and a transcript line. The alternative — an iteration that fails
+   * because a *report* about it could not be filed — is a worse failure than the
+   * one being reported, and it would punish the work for the mail's problems.
+   */
+  async function handleNotifyEmail(effect: NotifyEmailEffect): Promise<readonly Effect[]> {
+    if (ports.notify === undefined) {
+      effects.push({ kind: effect.kind, detail: `${effect.issueId}:skipped(no notifier wired)` });
+      log(
+        "debug",
+        `no notifier wired: the completion notice for ${effect.issueId} went nowhere ` +
+          "(set LOOP_NOTIFY_EMAIL to get these)",
+      );
+      return [];
+    }
+    const notifier = ports.notify;
+    let delivery: MailDelivery;
+    try {
+      delivery = await notifier.notifyCompletion(completionFor(effect));
+    } catch (error) {
+      // A notifier is allowed to be badly built; it is not allowed to be fatal.
+      delivery = {
+        kind: "failed",
+        reason: `${kindOf(error)}: ${messageOf(error)}`,
+        transport: notifier.transport,
+        retryable: false,
+      };
+    }
+    effects.push({ kind: effect.kind, detail: `${effect.issueId}:${delivery.kind}` });
+    switch (delivery.kind) {
+      case "delivered":
+        say(
+          `Completion notice for ${effect.issueId} sent to ${delivery.recipients.join(", ")}.`,
+        );
+        log("info", `completion notice for ${effect.issueId} delivered via ${delivery.transport}`);
+        break;
+      case "failed":
+        warn(
+          `Could not mail the completion notice for ${effect.issueId}: ${delivery.reason}. ` +
+            "The bead is closed either way — nothing about the work changed.",
+        );
+        break;
+      case "skipped":
+        log("info", `completion notice for ${effect.issueId} skipped: ${delivery.reason}`);
+        break;
+    }
+    return [];
+  }
+
   async function handleRun(effect: AgentRunEffect): Promise<readonly Effect[]> {
     const outcome = await ports.runner.run(effect.issueId);
     lastWork = outcome;
@@ -749,6 +871,7 @@ export async function runLoop(
     "agent.split": (effect) => runSplitUnit((effect as { text: string }).text),
     "agent.run": (effect) => handleRun(effect as AgentRunEffect),
     "vcs.commit": (effect) => runFinalizeUnit(effect as VcsCommitEffect),
+    "notify.email": (effect) => handleNotifyEmail(effect as NotifyEmailEffect),
     "ui.say": (effect) => handleSay(effect as Effect & { text: string }),
     "ui.warn": (effect) => handleWarn(effect as Effect & { text: string }),
     drop_context: (effect) => handleDropContext(effect as DropContextEffect),
@@ -915,6 +1038,7 @@ export async function runLoop(
     unit = { kind: "finalize", request };
     try {
       const outcome = await ports.finalizer.finalize(request);
+      lastFinalize = outcome;
       effects.push({ kind: "vcs.commit", detail: `unit:${outcome.kind}` });
       log("info", `finalize unit ended ${outcome.kind} for ${issueId}`);
 
@@ -1249,6 +1373,7 @@ export const HANDLED_EFFECT_KINDS = [
   "agent.split",
   "agent.run",
   "vcs.commit",
+  "notify.email",
   "ui.say",
   "ui.warn",
   "drop_context",

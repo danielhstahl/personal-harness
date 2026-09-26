@@ -131,6 +131,7 @@ export type EffectKind =
   | "agent.split"
   | "agent.run"
   | "vcs.commit"
+  | "notify.email"
   | "ui.say"
   | "ui.warn"
   | "drop_context";
@@ -172,6 +173,7 @@ export const EFFECT_KINDS = [
   "agent.split",
   "agent.run",
   "vcs.commit",
+  "notify.email",
   "ui.say",
   "ui.warn",
   "drop_context",
@@ -234,6 +236,34 @@ export interface VcsCommitEffect {
   paths: readonly string[];
 }
 
+/**
+ * A notice that a bead finished, for whoever asked to be told.
+ *
+ * The machine emits one on every bead it closes and knows nothing about whether
+ * anybody wants it: the address lives in the environment, the environment lives
+ * in the interpreter, and a transition that consulted either would stop being a
+ * function of state and event. What leaves here is the set of facts the
+ * interpreter cannot recover elsewhere — the id this step closed, the reason that
+ * closed it, the hash that funded it — and the interpreter owns who hears about
+ * it, and whether the answer is "nobody, `LOOP_NOTIFY_EMAIL` is unset".
+ *
+ * It is emitted *after* the close rather than before it on purpose: a notice sent
+ * before the close is a claim of completion that outruns the close itself, and
+ * that is the one lie this loop is built not to tell.
+ */
+export interface NotifyEmailEffect {
+  kind: "notify.email";
+  issueId: string;
+  title: string;
+  /** The `bd close --reason` text, so the notice matches what the board says. */
+  closeReason: string;
+  /** The commit that carries the work. `null` only if none was ever recorded. */
+  commit: string | null;
+  /** The iteration that did the work — the notice is per-run, not per-bead. */
+  iteration: number;
+  handoffKey: string;
+}
+
 export interface UiSayEffect {
   kind: "ui.say";
   text: string;
@@ -265,6 +295,7 @@ export type Effect =
   | AgentSplitEffect
   | AgentRunEffect
   | VcsCommitEffect
+  | NotifyEmailEffect
   | UiSayEffect
   | UiWarnEffect
   | DropContextEffect;
@@ -977,11 +1008,17 @@ export function step(state: OrchestratorState, event: OrchestratorEvent): StepRe
             );
           }
           return applied(
-            throughBoundary(state, event, `${event.id} committed, remembered and closed`, [], {
-              commitHash: state.commitHash,
-              handoffKey: state.handoffKey,
-              lastFailure: null,
-            }),
+            throughBoundary(
+              state,
+              event,
+              `${event.id} committed, remembered and closed`,
+              [notifyEmail(state, event.id)],
+              {
+                commitHash: state.commitHash,
+                handoffKey: state.handoffKey,
+                lastFailure: null,
+              },
+            ),
           );
         }
 
@@ -1095,6 +1132,19 @@ function vcsCommit(message: string, paths: readonly string[]): VcsCommitEffect {
   return { kind: "vcs.commit", message, paths: [...paths] };
 }
 
+/** Build the completion notice from the only state that can still see all of it. */
+function notifyEmail(state: OrchestratorState, issueId: string): NotifyEmailEffect {
+  return {
+    kind: "notify.email",
+    issueId,
+    title: state.activeIssueTitle ?? issueId,
+    closeReason: state.pendingCloseReason ?? `Closed ${issueId}`,
+    commit: state.commitHash,
+    iteration: state.iteration,
+    handoffKey: state.handoffKey ?? handoffKeyFor(issueId),
+  };
+}
+
 /** Rebuild the currently pending finalize effect, byte-for-byte. */
 function pendingFinalizeEffect(
   state: OrchestratorState,
@@ -1141,6 +1191,18 @@ export interface OrchestratorPorts {
   readonly ui: {
     say(text: string): void;
     warn(text: string): void;
+  };
+  /**
+   * Where `notify.email` lands. Optional: a run with nobody to tell has no
+   * notifier, and the interpreter reports the effect as *skipped* rather than
+   * pretending it went somewhere.
+   *
+   * Spelled structurally rather than imported: this module may name `beads` as a
+   * type and nothing else (there is a test about it), so the port is declared
+   * here and `Notifier` in `src/notify.ts` satisfies it by shape.
+   */
+  readonly notify?: {
+    notifyCompletion(completion: NotifyEmailEffect): Promise<unknown>;
   };
   /**
    * Where `drop_context` lands. ADR-001: this must dispose the agent session, not

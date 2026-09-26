@@ -53,11 +53,19 @@ src/kanban.ts       the mini kanban: ready / in progress / done, read through an
                     `read()` closure — no BdClient in its signature, so nothing in the
                     module could move a ticket. Two layouts, backoff, and three honest
                     states per column (see ADR-004)
+src/notify.ts       the completion notice: what a finished bead says, in what order,
+                    and when to stop trying to say it. Wording only — no sockets
+src/mail.ts         the ONLY module that opens a socket to a mail server: RFC 822
+                    rendering, quoted-printable, folded headers, a hand-rolled SMTP
+                    client, and a mailer whose every failure path returns a delivery
+                    instead of throwing (see ADR-005)
 src/format.ts       one-line plain-log summaries — NOT the renderer (see ADR-001)
 docs/               ADR-001: transport + rendering decision
                     ADR-002: comparing the provider's /health report with models.json at startup
                     ADR-003: the backend monitor — where it is drawn, and why not at the top
                     ADR-004: the mini kanban — read-only by shape, and what "unread" must not render as
+                    ADR-005: the completion notice — an effect the machine asks for,
+                             a report that can never break the run
 spikes/             throwaway prototypes + captured evidence backing ADR-001
 test/               unit tests, plus the whole walk in test/loop.test.ts
 ```
@@ -124,6 +132,12 @@ read-only *by shape* (it takes a `read()` closure, not a client), never
 load-bearing, and honest about the difference between a queue that is empty and a
 queue it could not read. See "The board" below.
 
+And [`docs/ADR-005-completion-notice.md`](docs/ADR-005-completion-notice.md):
+when a bead closes, the machine asks — as data — for a notice to be sent, and the
+interpreter decides who hears about it. Mail is a *report* about the run and
+never a dependency of it: a relay that is down costs a warning, a streak limit
+and a transcript line, and nothing else. See "The completion notice" below.
+
 Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`,
 `LOOP_WIDTH`, the per-pass thinking levels `LOOP_WORK_THINKING` /
 `LOOP_SPLIT_THINKING` — one of `off`, `minimal`, `low`, `medium`, `high`,
@@ -131,8 +145,9 @@ Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`
 `LOOP_RETRY_UNFIT_WORK` (see "Two clocks" below), the startup audit knobs
 `LOOP_AUDIT`, `LOOP_AUDIT_STRICT`, `LOOP_AUDIT_VERBOSE`, `LOOP_AUDIT_WRITE` and
 `LOOP_HEALTH_URL` (see "Startup: the provider comparison" below), the monitor
-knobs `LOOP_MONITOR*` (see "The monitor" below), and the board knobs
-`LOOP_KANBAN*` (see "The board" below). Neither knob
+knobs `LOOP_MONITOR*` (see "The monitor" below), the board knobs
+`LOOP_KANBAN*` (see "The board" below), and the completion-notice knobs
+`LOOP_NOTIFY_*` / `LOOP_MAIL_*` (see "The completion notice" below). Neither knob
 set is not the same as either set to `low`: unset falls through to the user's
 configured default and then pi's own, so a ticket is never run at a level nobody
 chose. A value pi
@@ -583,6 +598,122 @@ node --test test/kanban.test.ts     # 84 tests over model, layout, poller and su
 There is a full web kanban in this repo's `harness.sh` (`bdui`). It stays, and it
 is the right tool for browsing the board. This is for the other moment: the two
 seconds before you type, when the answer has to be above the keyboard.
+
+## The completion notice: telling somebody when a bead closes
+
+Set one variable and every bead the loop closes sends an email:
+
+```sh
+export LOOP_NOTIFY_EMAIL="dev@example.com"
+node src/main.ts
+```
+
+The subject carries the bead id — that is what the mail gets searched by — and the
+body is an index into the real record rather than a paraphrase of it:
+
+```
+Subject: [pi-beads] tst.42 completed: Added colour handling to the tokenizer
+
+  tst.42 — Add the colour mode to the parser
+
+  Bead      tst.42
+  Title     Add the colour mode to the parser
+  Status    closed
+  When      2025-09-26 11:03:07 UTC
+  Work      done, 3m 11s, iteration 3
+
+  What it did
+      Added colour handling to the tokenizer and thread it through the parser.
+
+  Changes
+    Commit    deadbeefcafebabe0123456789abcdef01234567
+    Files     2 changed
+      - src/colour.ts
+      - src/parser.ts
+
+  Still to do
+      1. docs still need the colour section
+
+  Where to read more
+    Bead      bd show tst.42
+    Handoff   bd recall loop:handoff:tst.42 --json
+    Diff      git show deadbeefcafebabe0123456789abcdef01234567
+    Closed as Done: Added colour handling to the tokenizer…
+    Repo      /work/project
+
+  — sent by pi-beads-loop on buildhost from /work/project to dev@example.com (…)
+    A delivery failure never stops the loop: the work this notice describes is
+    committed and closed whatever the mail relay does next.
+```
+
+**Mail is a report, never a dependency.** By the time a notice is due the bead is
+committed, handed off and closed, so nothing about the mail can change the work.
+A failed send costs one warning — *"The bead is closed either way — nothing about
+the work changed"* — and after three failures in a row the notice switches itself
+off for the rest of the run, because a dead relay is discovered once, not once
+per bead for the next six hours. A delivery that succeeds in the middle resets
+the streak, and the switch-off is printed on the failure that caused it — not
+quietly remembered until the next bead happens to close. The behaviour is not a
+knob; the count is (`LOOP_NOTIFY_MAX_FAILURES`).
+
+**Bad config stops the run; bad delivery never does.** A malformed address, a mail
+URL that will not parse, or a password with no user stop the loop at startup with
+`notify-config` and exit 2 — the same way an unknown thinking level does — so a
+typo is found in the terminal it was typed in rather than as a day of missing
+mail. What *cannot* fail the run is a relay refusing a message.
+
+**Notice, not noise.** `LOOP_NOTIFY_EMAIL` unset means no notifier, no socket,
+no poller. A dry run sends nothing: a dry run never reaches the close that
+triggers the notice, which is the same reason it never closes a bead. A failed
+bead sends nothing either — it is not a completion, and its reason is already on
+the board under the failure key.
+
+| Variable | What it does | Default |
+| --- | --- | --- |
+| `LOOP_NOTIFY_EMAIL` | Recipients. Comma, semicolon or space separated. **This is the switch.** | unset — no mail |
+| `LOOP_NOTIFY_CC` | Extra recipients, copied on every notice | unset |
+| `LOOP_NOTIFY_FROM` | The `From:` header. Set this: most relays require it to match the authenticated sender | `pi-beads-loop@<host>`, or the commit identity if one is set |
+| `LOOP_NOTIFY_SUBJECT_PREFIX` | The `[pi-beads]` in the subject | `pi-beads` |
+| `LOOP_NOTIFY_MAX_FAILURES` | Give up after this many failures in a row | `3` |
+| `LOOP_MAIL_URL` | `smtp://user:pass@host:587` or `smtps://host:465`. Query params: `starttls`, `tls`, `timeout` | unset |
+| `LOOP_MAIL_HOST` / `LOOP_MAIL_PORT` | The relay, without a URL | `127.0.0.1` / the port the security mode means |
+| `LOOP_MAIL_USER` / `LOOP_MAIL_PASSWORD` | Submission credentials | unset — anonymous |
+| `LOOP_MAIL_STARTTLS` | `required`, `optional`, `off` | `optional` — upgrade if offered |
+| `LOOP_MAIL_TIMEOUT_MS` | Deadline per connect and per reply | `15000` |
+| `LOOP_MAIL_INSECURE_AUTH` | Allow a password over a channel that is not encrypted | off — refused outright |
+
+A few defaults are worth knowing about, because they are the ones that bite:
+
+- **TLS is opportunistic by default** and strict when you ask. With `required`
+  against a relay that does not advertise STARTTLS the send *fails* rather than
+  quietly downgrading. A password on an unencrypted channel is refused unless
+  `LOOP_MAIL_INSECURE_AUTH` says the operator means it, and `AUTH` lines are
+  redacted in the log whatever happens.
+- **Nothing unvalidated goes on the wire.** Addresses are parsed down to their
+  `addr-spec` before `RCPT TO`, and header values — including the subject, which
+  is an agent-written sentence — have line breaks flattened out of them, so a
+  summary cannot forge a header.
+- **Copies are copies, not blind copies.** `LOOP_NOTIFY_CC` lands in a real
+  `Cc:` header, and the `To:` header names only the addressees. Anyone written
+  into both fields gets one notice rather than two. An empty recipient list is a
+  skip, not a fallback to some other list — see
+  [ADR-005 §8](docs/ADR-005-completion-notice.md).
+- **What mail can actually deliver is the relay's problem.** This sends mail; it
+  does not sign it. SPF, DKIM, DMARC and whether a provider accepts the sender
+  at all belong to the host and the relay, which is why `LOOP_NOTIFY_FROM` is a
+  first-class knob instead of a guess at a hostname.
+- **In the container these are ordinary `-e` flags:**
+  `docker run -e LOOP_NOTIFY_EMAIL=dev@example.com -e LOOP_MAIL_URL=smtps://…`.
+
+Read [`docs/ADR-005-completion-notice.md`](docs/ADR-005-completion-notice.md)
+before changing any of it — in particular why the SMTP client is hand-rolled, why
+the machine emits the effect without knowing whether mail exists, and why the
+notice goes after the close and never before it.
+
+```sh
+node --test test/mail.test.ts    # the SMTP client against a fake relay on loopback
+node --test test/notify.test.ts  # the wording, the headers, the failure streak
+```
 
 ## Scratch beads DB (for live / integration checks)
 

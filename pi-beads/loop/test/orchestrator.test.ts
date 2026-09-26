@@ -374,6 +374,7 @@ test("(d) success finalizes in the order commit → remember → close, then re-
     "vcs.commit",
     "beads.remember",
     "beads.close_issue",
+    "notify.email",
     "drop_context",
     "beads.list_in_progress",
     "beads.list_ready",
@@ -388,6 +389,58 @@ test("(d) success finalizes in the order commit → remember → close, then re-
   assert.match(remember.text, /Changed: src\/a\.ts, src\/b\.ts/u);
   assert.ok(close?.kind === "beads.close_issue");
   assert.equal(close.id, "w-1");
+});
+
+test("(d1) a closed bead asks for exactly one completion notice, and it carries the facts", () => {
+  const { steps } = run(
+    [
+      { type: "work_succeeded", summary: "did the thing", changedFiles: ["src/a.ts"] },
+      { type: "committed", hash: "cafe1234" },
+      { type: "remembered", key: handoffKeyFor("w-1") },
+      { type: "closed", id: "w-1" },
+    ],
+    workingMachine(),
+  );
+
+  const notices = steps.flatMap((s) => s.effects).filter((effect) => effect.kind === "notify.email");
+  assert.equal(notices.length, 1, "one notice for the one bead that closed");
+  const notice = notices[0];
+  assert.ok(notice?.kind === "notify.email");
+  assert.equal(notice.issueId, "w-1", "the notice names the bead that closed, not whatever is active later");
+  assert.equal(notice.title, "the one");
+  assert.equal(notice.commit, "cafe1234", "the notice carries the commit that funds the claim");
+  assert.equal(notice.handoffKey, handoffKeyFor("w-1"), "and the key the next reader digs up");
+  assert.match(notice.closeReason, /^Done: /u, "the close reason is the board's own words");
+
+  // The order is the whole point: a notice that precedes the close would be a
+  // completion claim that has not been paid for yet.
+  const order = steps.flatMap((s) => kinds(s.effects));
+  assert.ok(
+    order.indexOf("beads.close_issue") < order.indexOf("notify.email"),
+    "the notice follows the close, never the other way round",
+  );
+});
+
+test("(d1b) no notice is ever asked for a bead that did not close", () => {
+  const unfinished = run(
+    [
+      { type: "work_succeeded", summary: "s", changedFiles: [] },
+      { type: "finalize_failed", stage: "commit", reason: "git index locked" },
+    ],
+    workingMachine(),
+  );
+  assert.equal(
+    unfinished.steps.flatMap((s) => s.effects).filter((effect) => effect.kind === "notify.email").length,
+    0,
+    "a half-finalized iteration notifies nobody",
+  );
+
+  const failedWork = run([{ type: "work_failed", reason: "agent crashed" }], workingMachine());
+  assert.equal(
+    failedWork.steps.flatMap((s) => s.effects).filter((effect) => effect.kind === "notify.email").length,
+    0,
+    "re-queued work is not a completion",
+  );
 });
 
 test("(d2) finalize cannot be reordered — every out-of-order report is refused", () => {
@@ -782,6 +835,7 @@ test("every effect kind has exactly one dispatch target in the ports", () => {
     "agent.split": "agent.split",
     "agent.run": "agent.run",
     "vcs.commit": "vcs.commit",
+    "notify.email": "notify.notifyCompletion",
     "ui.say": "ui.say",
     "ui.warn": "ui.warn",
     drop_context: "session.dispose",
