@@ -29,6 +29,9 @@ import { test } from "node:test";
 import { buildApp, idleStatusFrom, perTurnIdle } from "../src/app.ts";
 import { readEnv, runFromEnv } from "../src/main.ts";
 import { createAgentRunner } from "../src/agent.ts";
+import { createMailer, createSmtpTransport, resolveSmtpConfig } from "../src/mail.ts";
+import { createNotifier } from "../src/notify.ts";
+import { startFakeSmtp } from "./mail-relay.ts";
 import { BdError } from "../src/beads.ts";
 import { createFinalizer } from "../src/finalize.ts";
 import { normaliseDependencies } from "../src/beads.ts";
@@ -48,6 +51,7 @@ import {
   fakeSessionFactory,
   fakeSplitPort,
   makeRepo,
+  recordingNotifier,
   recordingUi,
   scriptedIdle,
   scriptedSignals,
@@ -110,6 +114,8 @@ interface HarnessOptions {
   abortGraceMs?: number;
   wrapUpMs?: number;
   retryUnfitWork?: boolean;
+  /** The completion notifier to wire in. Absent means the loop has none. */
+  notifier?: import("../src/notify.ts").Notifier;
   machine?: (state: OrchestratorState, event: OrchestratorEvent) => StepResult;
 }
 
@@ -162,6 +168,7 @@ function harness(options: HarnessOptions = {}): Harness {
     git: repo.writer,
     idle,
     ui,
+    ...(options.notifier === undefined ? {} : { notify: options.notifier }),
     signals: signals.adapter,
     log: (entry) => {
       log.push(entry);
@@ -322,6 +329,255 @@ test("the effect order on the wire is read → claim → run → commit → reme
       1,
       "list_in_progress + list_ready must fold into a single board_observed",
     );
+  } finally {
+    h.dispose();
+  }
+});
+
+/**
+ * The notices the interpreter reported, one per bead it finished.
+ *
+ * `dispatch` records the effect and the handler records its own outcome, so a
+ * `notify.email` appears twice per bead in the raw list — once as "the loop was
+ * asked" and once as "here is what came back". These assertions want the second.
+ */
+function notifiedBeads(result: { transcript: { effects: readonly { kind: string; detail: string }[] } }) {
+  return result.transcript.effects.filter(
+    (entry) => entry.kind === "notify.email" && /:(delivered|failed|skipped)/u.test(entry.detail),
+  );
+}
+
+// ── the completion notice ───────────────────────────────────────────────────
+
+test("a closed bead asks for one notice, built from what the loop actually watched", async () => {
+  const notifier = recordingNotifier(["delivered"]);
+  const h = harness({ scripts: WORK_SCRIPTS, idleTexts: [SPLIT_REQUEST], notifier });
+  prepareWalk(h);
+  try {
+    const result = await h.run();
+    assert.equal(result.kind, "done");
+    assert.equal(notifier.notices.length, 2, "one notice per closed bead");
+    assert.deepEqual(
+      notifier.notices.map((notice) => notice.issueId),
+      ["tst.2", "tst.3"],
+      "in the order they closed",
+    );
+
+    const notice = notifier.notices[0];
+    assert.ok(notice, "the first notice exists");
+    assert.equal(notice.title, "Add colour mode to the parser");
+    assert.equal(notice.summary, "Added the colour mode to the parser.");
+    assert.deepEqual(notice.changedFiles, ["src/colour.ts"]);
+    assert.deepEqual(notice.nextSteps, ["docs are still missing"]);
+    assert.equal(notice.workKind, "done");
+    assert.equal(notice.handoffKey, handoffKeyFor("tst.2"));
+    assert.ok(
+      typeof notice.completedAt === "number" && notice.completedAt > 0,
+      "the notice is timestamped by the interpreter, not by a model's guess",
+    );
+
+    // The hash is the one git really made for that bead, read out of the repo.
+    const realCommit = h.repo
+      .git("log", "--pretty=%H %s")
+      .split("\n")
+      .find((line) => line.includes("tst.2"))
+      ?.split(" ")[0];
+    assert.ok(realCommit, "the first bead's commit is in history");
+    assert.equal(notice.commit, realCommit, "and the notice carries that hash, not a paraphrase of it");
+
+    // The notice is a recorded effect, between the close and the cold boundary.
+    // (Each dispatched effect leaves two records: the dispatch itself and the
+    // handler's own detail, so the assertions below read the handler's.)
+    const kinds = result.transcript.effects.map((entry) => entry.kind);
+    const firstIteration = kinds.slice(kinds.indexOf("vcs.commit"));
+    const closeAt = firstIteration.indexOf("beads.close_issue");
+    const noticeAt = firstIteration.indexOf("notify.email");
+    const dropAt = firstIteration.indexOf("drop_context");
+    assert.ok(
+      closeAt >= 0 && noticeAt > closeAt && dropAt > noticeAt,
+      `the notice must follow the close and precede the drop: ${firstIteration.join(",")}`,
+    );
+    assert.equal(
+      notifiedBeads(result).length,
+      2,
+      "once per closed bead, not once per run",
+    );
+    assert.match(
+      h.ui.said.join("\n"),
+      /Completion notice for tst\.2 sent to dev@example\.test/u,
+      "and the operator sees that it went out",
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("the whole chain: a closed bead puts a real SMTP message on the wire, id in the subject", async () => {
+  // Nothing faked below the socket: the real notifier, the real mailer, the real
+  // SMTP client, talking to a relay on loopback that records what arrived. This
+  // is the test that says the feature works end to end rather than piece by piece.
+  const relay = await startFakeSmtp({ caps: ["STARTTLS", "AUTH PLAIN", "8BITMIME"] });
+  const notifier = createNotifier({
+    mailer: createMailer({
+      from: "loop@example.test",
+      to: ["dev@example.test"],
+      cc: ["lead@example.test"],
+      transport: createSmtpTransport({
+        config: resolveSmtpConfig({
+          host: "127.0.0.1",
+          port: relay.port,
+          user: "ada",
+          password: "s3cr3t",
+          starttls: "off",
+          allowInsecureAuth: true,
+        }),
+      }),
+      now: () => Date.UTC(2025, 8, 26, 11, 3, 7),
+      uid: () => "e2e-notice",
+    }),
+    context: { cwd: "/work/project", hostname: "buildhost", model: "fake/model" },
+  });
+  const h = harness({ scripts: WORK_SCRIPTS, idleTexts: [SPLIT_REQUEST], notifier });
+  prepareWalk(h);
+  try {
+    const result = await h.run();
+    assert.equal(result.kind, "done");
+    assert.equal(relay.messages.length, 2, "two beads closed, two messages arrived");
+
+    const first = relay.messages[0] ?? "";
+    assert.match(first, /^Subject: \[pi-beads\] tst\.2 completed: Added the colour mode/mu);
+    assert.match(first, /^X-Loop-Issue: tst\.2$/mu, "and in the machine-readable header too");
+    assert.match(first, /^Auto-Submitted: auto-generated$/mu, "so nobody auto-replies to a build");
+    assert.match(first, /bd show tst\.2/u);
+    assert.match(first, /bd recall loop:handoff:tst\.2 --json/u);
+    assert.match(first, /Content-Transfer-Encoding: quoted-printable/u);
+    assert.match(first, /From: loop@example\.test/u);
+    assert.match(first, /To: dev@example\.test/u);
+    assert.match(
+      first,
+      /Cc: lead@example\.test/u,
+      "the copy arrives as a copy, with the header that says so intact on the wire",
+    );
+    assert.match(first, /buildhost/u);
+
+    const second = relay.messages[1] ?? "";
+    assert.match(second, /^Subject: \[pi-beads\] tst\.3 completed:/mu);
+    assert.match(second, /X-Loop-Issue: tst\.3/u);
+
+    // The commit hashes in the messages are the ones git actually made.
+    const log = h.repo.git("log", "--pretty=%H %s");
+    const commitForSecond = log.split("\n").find((line) => line.includes("tst.3"))?.split(" ")[0];
+    assert.ok(commitForSecond);
+    assert.ok(
+      second.includes(commitForSecond),
+      "the notice carries the real hash for the bead it is about",
+    );
+
+    // And it was sent the way a submission is sent: authenticated, one RCPT per
+    // recipient — the addressee and the copy, on every notice.
+    const verbs = relay.received.map((line) => (line.split(" ")[0] ?? "").toUpperCase());
+    assert.ok(verbs.includes("AUTH"), `the relay saw authentication: ${verbs.join(",")}`);
+    assert.equal(
+      relay.received.filter((line) => /^RCPT TO:/iu.test(line)).length,
+      4,
+      "two notices, two recipients each",
+    );
+  } finally {
+    await relay.close();
+    h.dispose();
+  }
+});
+
+test("a notice that cannot be mailed warns, and costs the run nothing", async () => {
+  const notifier = recordingNotifier(["failed"]);
+  const h = harness({ scripts: WORK_SCRIPTS, idleTexts: [SPLIT_REQUEST], notifier });
+  prepareWalk(h);
+  try {
+    const result = await h.run();
+    assert.equal(
+      result.kind,
+      "done",
+      "the work is not punished for the mail's problems: the bead is closed either way",
+    );
+    assert.equal(h.board.statusOf("tst.2"), "closed");
+    assert.match(
+      h.ui.warned.join("\n"),
+      /Could not mail the completion notice for tst\.2: 421 relay busy/u,
+    );
+    assert.match(h.ui.warned.join("\n"), /nothing about the work changed/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("a notifier that throws is contained by the loop", async () => {
+  const notifier = recordingNotifier(["delivered"]);
+  notifier.failNext(new Error("the notifier fell over on the wire"));
+  const h = harness({ scripts: WORK_SCRIPTS, idleTexts: [SPLIT_REQUEST], notifier });
+  prepareWalk(h);
+  try {
+    const result = await h.run();
+    assert.equal(result.kind, "done", "a badly built notifier is not a fatal");
+    assert.match(
+      h.ui.warned.join("\n"),
+      /the notifier fell over on the wire/u,
+      "but it is said out loud, not swallowed",
+    );
+    assert.equal(notifier.notices.length, 2, "and the next bead is still notified");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("no notifier wired is a reported state, never a silently dropped effect", async () => {
+  const h = harness({ scripts: WORK_SCRIPTS, idleTexts: [SPLIT_REQUEST] });
+  prepareWalk(h);
+  try {
+    const result = await h.run();
+    assert.equal(result.kind, "done");
+    const notices = notifiedBeads(result);
+    assert.equal(notices.length, 2, "the effect still shows in the transcript with nowhere to go");
+    for (const notice of notices) {
+      assert.match(
+        notice.detail,
+        /skipped\(no notifier wired\)/u,
+        `and says why nothing happened: ${notice.detail}`,
+      );
+    }
+  } finally {
+    h.dispose();
+  }
+});
+
+test("work that did not finish produces no notice at all", async () => {
+  const notifier = recordingNotifier(["delivered"]);
+  const board = createScriptBoard();
+  board.seed({ id: "tst.5", title: "A bead the agent could not finish", status: "open", priority: 1 });
+  const h = harness({
+    board,
+    notifier,
+    maxConsecutiveFailures: 1,
+    scripts: [
+      {
+        tools: [
+          {
+            name: "report_done",
+            params: doneParams({ done: false, summary: "Got stuck on the grammar." }),
+          },
+        ],
+      },
+    ],
+    idleTexts: [],
+  });
+  try {
+    const result = await h.run();
+    assert.equal(notifier.notices.length, 0, "an unfinished bead is not a completion");
+    assert.equal(
+      notifiedBeads(result).length,
+      0,
+      "not even an effect asking for one",
+    );
+    assert.equal(h.board.statusOf("tst.5"), "open", "and it is back on the board, honestly");
   } finally {
     h.dispose();
   }
