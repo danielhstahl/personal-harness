@@ -60,12 +60,17 @@ src/mail.ts         the ONLY module that opens a socket to a mail server: RFC 82
                     client, and a mailer whose every failure path returns a delivery
                     instead of throwing (see ADR-005)
 src/format.ts       one-line plain-log summaries — NOT the renderer (see ADR-001)
+src/gitlock.ts      the ONLY module that spawns git, and the only kill policy:
+                    SIGTERM first, SIGKILL as escalation, because a killed git
+                    strands .git/index.lock (see ADR-006)
 docs/               ADR-001: transport + rendering decision
                     ADR-002: comparing the provider's /health report with models.json at startup
                     ADR-003: the backend monitor — where it is drawn, and why not at the top
                     ADR-004: the mini kanban — read-only by shape, and what "unread" must not render as
                     ADR-005: the completion notice — an effect the machine asks for,
                              a report that can never break the run
+                    ADR-006: the index lock — wait it out, and never be the thing
+                             that strands it
 spikes/             throwaway prototypes + captured evidence backing ADR-001
 test/               unit tests, plus the whole walk in test/loop.test.ts
 ```
@@ -138,6 +143,16 @@ interpreter decides who hears about it. Mail is a *report* about the run and
 never a dependency of it: a relay that is down costs a warning, a streak limit
 and a transcript line, and nothing else. See "The completion notice" below.
 
+And [`docs/ADR-006-index-lock.md`](docs/ADR-006-index-lock.md):
+`.git/index.lock` was killing runs — and, worse, keeping them dead. Two measured
+facts drove the fix: a git stopped with `SIGKILL` **strands** the lock, so a
+single timed-out `git add` used to break every later write in the repo until a
+human intervened; and `git status` takes the same lock to refresh the stat cache,
+so contention with an IDE or a second run is normal, not exceptional. The loop
+now stops git with `SIGTERM` first, retries *only* lock contention, and ages a
+lock before calling it stale — removing one is opt-in, because pulling a live
+process's lock out is how you corrupt an index. See "The index lock" below.
+
 Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`,
 `LOOP_WIDTH`, the per-pass thinking levels `LOOP_WORK_THINKING` /
 `LOOP_SPLIT_THINKING` — one of `off`, `minimal`, `low`, `medium`, `high`,
@@ -146,8 +161,11 @@ Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`
 `LOOP_AUDIT`, `LOOP_AUDIT_STRICT`, `LOOP_AUDIT_VERBOSE`, `LOOP_AUDIT_WRITE` and
 `LOOP_HEALTH_URL` (see "Startup: the provider comparison" below), the monitor
 knobs `LOOP_MONITOR*` (see "The monitor" below), the board knobs
-`LOOP_KANBAN*` (see "The board" below), and the completion-notice knobs
-`LOOP_NOTIFY_*` / `LOOP_MAIL_*` (see "The completion notice" below). Neither knob
+`LOOP_KANBAN*` (see "The board" below), the completion-notice knobs
+`LOOP_NOTIFY_*` / `LOOP_MAIL_*` (see "The completion notice" below), and the
+git-lock knobs `LOOP_GIT_LOCK_WAIT_MS` / `LOOP_GIT_KILL_GRACE_MS` /
+`LOOP_GIT_STALE_LOCK_AFTER_MS` / `LOOP_GIT_STALE_LOCK` (see "The index lock"
+below). Neither knob
 set is not the same as either set to `low`: unset falls through to the user's
 configured default and then pi's own, so a ticket is never run at a level nobody
 chose. A value pi
@@ -713,6 +731,73 @@ notice goes after the close and never before it.
 ```sh
 node --test test/mail.test.ts    # the SMTP client against a fake relay on loopback
 node --test test/notify.test.ts  # the wording, the headers, the failure streak
+```
+
+## The index lock: waiting it out, and never stranding one
+
+`git` guards the index with `.git/index.lock`, and this loop touches that index
+from two directions: the writer staging a bead's commit, and the reader
+taking a `git status` snapshot — which also takes the lock, because refreshing
+the stat cache means writing the index. Anything else looking at the same repo
+(IDE git integration, a second run, the agent session's own `git`) joins the
+same queue. Contention is normal; the interesting part is what happens next.
+
+**A lock that clears is not a failure.** The writer retries — jittered backoff,
+250ms to 4s, up to 30s of total wait — and the commit lands. Only git's
+index-lock error gets that treatment; a rejected hook or an unsafe path is
+reported once, because retrying those just says "no" more slowly.
+
+**A lock that will not clear says so, with its age and the fix:**
+
+```
+the git index has been locked for 30.2s (20 retries; the lock is 91.8s old).
+Nothing was staged and nothing was committed. A lock that old usually means a
+git process was killed partway through: if no git is running, remove
+/path/.git/index.lock and run again — or set LOOP_GIT_STALE_LOCK=remove to
+let the loop clear locks older than 60s by itself.
+```
+
+**The loop will not delete a lock that looks alive, under any setting.** Removal
+is opt-in (`LOOP_GIT_STALE_LOCK=remove`) and gated on the lock's *age* — a lock
+held by a live process is load-bearing, and pulling it out mid-write is how a
+repository gets a corrupt index, which is a far worse injury than the one being
+cured and stays quiet for much longer. When the removal path runs it logs the
+act, so a wrong guess is at least visible.
+
+**Nothing this loop does can strand a lock.** That used to be false, and it is
+the reason `src/gitlock.ts` exists. git cleans up its own lock on every exit it
+gets to run, and `SIGKILL` gives it none: the previous behaviour — `execFile`
+with `killSignal: "SIGKILL"` on timeout — meant one slow `git add` (big file,
+slow disk, hung hook) left `.git/index.lock` behind **permanently**, so every
+commit after it failed with the same message until somebody deleted the file.
+Measured with git 2.47:
+
+```
+  git add -- huge.bin   (200 MB, ~1.2s, lock held throughout)
+  kill -TERM mid-add  ->  lock removed by git
+  kill -KILL mid-add  ->  LOCK STRANDED; every later write fails
+```
+
+The spawner now sends `SIGTERM` at the deadline and `SIGKILL` only if the child
+is still there 5 seconds later — the window git needs to write the index and
+clean up. Both the reader and the writer use it; `src/gitlock.ts` is the only
+module in `src/` that spawns git at all, which the spawn-allowlist test enforces.
+
+| Variable | What it does | Default |
+| --- | --- | --- |
+| `LOOP_GIT_LOCK_WAIT_MS` | How long a write waits out somebody else's lock | `30000` |
+| `LOOP_GIT_KILL_GRACE_MS` | Grace after `SIGTERM` before the child is killed | `5000` |
+| `LOOP_GIT_STALE_LOCK_AFTER_MS` | When a lock starts to look abandoned | `60000` |
+| `LOOP_GIT_STALE_LOCK` | `remove` lets the loop clear a stale lock once; anything else reports instead | off (`report`) |
+
+Read [`docs/ADR-006-index-lock.md`](docs/ADR-006-index-lock.md) before changing
+any of it — in particular why the retry covers *only* the lock error, why an
+unknown lock age is never treated as stale, and why the control test that
+asserts `SIGKILL` strands the lock is as important as the one that says it
+doesn't.
+
+```sh
+node --test test/gitlock.test.ts   # the policy, against real git and real signals
 ```
 
 ## Scratch beads DB (for live / integration checks)
