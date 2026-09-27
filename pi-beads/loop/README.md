@@ -78,6 +78,9 @@ docs/               ADR-001: transport + rendering decision
                              reason and carry on, instead of ending the run
                     ADR-009: the planner gets eyes — the split pass can read the
                              repository, cannot change it, and is checked
+                    ADR-010: every tool call gets a timeout — shadowed into pi's
+                             own tools by name, killed through the wrapper's own
+                             signal, and reported as details.timedOut
 spikes/             throwaway prototypes + captured evidence backing ADR-001
 test/               unit tests, plus the whole walk in test/loop.test.ts
 ```
