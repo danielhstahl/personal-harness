@@ -27,8 +27,7 @@ import { BdError } from "../src/beads.ts";
 import type { BdClient, Issue, IssueStatus, NewIssueSpec } from "../src/beads.ts";
 import type { IdleOutcome } from "../src/idle.ts";
 import type { LoopIdlePort, LoopUi } from "../src/loop.ts";
-import type { NtfyDelivery } from "../src/ntfy.ts";
-import type { BeadCompletion, Notifier } from "../src/notify.ts";
+import type { BeadCompletion, Delivery, Notifier } from "../src/notify.ts";
 import { createGitWriter } from "../src/vcs.ts";
 import type { GitWriter } from "../src/vcs.ts";
 
@@ -640,7 +639,7 @@ export function recordingNotifier(
     failNext(error: Error): void {
       queued = error;
     },
-    async notifyCompletion(completion: BeadCompletion): Promise<NtfyDelivery> {
+    async notifyCompletion(completion: BeadCompletion): Promise<Delivery> {
       notices.push(completion);
       if (queued !== null) {
         const error = queued;

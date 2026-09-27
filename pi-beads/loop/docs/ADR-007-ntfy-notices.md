@@ -399,3 +399,86 @@ nothing for the client to react to. That is what the knob is for: if you run an
 attachment store and do not want your completion notices in it, set
 `LOOP_NTFY_MAX_MESSAGE_BYTES` to the limit you configured, and the loop will
 never produce one that long.
+
+## Amendment: the notice stopped being an ntfy publish
+
+- **Status:** Accepted. Amends §3 above and the shape of everything between the
+  loop and this transport. The delivery kinds, the retry rule, the byte limits and
+  the give-up streak all stand as decided — what changed is *who is allowed to
+  name them*.
+- **Trigger:** no incident. A reading of `src/notify.ts` after two amendments
+  had piled onto it: a module described as "the wording" imported
+  `NtfyDelivery` and `NtfyPublisher`, returned an ntfy-typed value from
+  `notifyCompletion()`, and took `priority` / `tags` / `click` — ntfy's own
+  vocabulary — as its options. One level out, `src/main.ts` imported
+  `NTFY_MAX_MESSAGE_BYTES` and `NTFY_MIN_MESSAGE_BYTES` into the environment
+  parser. The seam was already drawn in the wrong place: half of ntfy lived in
+  the notice.
+
+### What the seam is now
+
+Three shapes, defined in `src/notify.ts`, implemented out there:
+
+| Shape | Who owns it | What it says |
+| --- | --- | --- |
+| `Notice` | the notice | `title`, `body`, and `hints` — transport-specific wishes, carried unread |
+| `Delivery` | the notice | `delivered` / `skipped` / `failed{reason, retryable, destination}` |
+| `NoticePublisher` | the notice | `enabled`, `destination`, `transport`, `publish(notice): Promise<Delivery>` |
+
+`NtfyPublisher extends NoticePublisher` is the clause that makes TypeScript
+check the claim instead of taking it on faith, and `NtfyDelivery` is now an
+*alias* of `Delivery` rather than a second definition of the same three kinds —
+they were never ntfy's kinds. `createNullNotifier` had been returning
+`{ kind: "skipped", reason }` with no transport in sight all along; the type
+finally caught up with it.
+
+Everything ntfy-only moved inside the transport, where the file header had
+already been arguing it belonged: `ntfyMessageFromNotice` turns the hints back
+into ntfy fields, `ntfyPublishPayload` builds the JSON envelope, and the
+clamping owns `limit-message-bytes: 4096`, the exclusive-boundary slack and
+the JSON 2×-headroom rule.
+
+### The judgement call: `hints`, not fields
+
+`priority`, `tags` and `click` could have stayed first-class on `Notice`. They
+did not, because a field asserts a capability. A `priority` field says *every*
+notification has a notion of urgency, and a transport without one is then
+broken rather than merely different — a webhook that ignores urgency has not
+failed at anything. As hints, the notice layer carries the bag without reading
+it, the transport decides which keys it understands, and there is finally a
+place to say *"this transport reads priority, tags, click and nothing else"*
+about a hint nobody claimed — which is the difference between a typo'd
+`pirority` showing up in a log and showing up as an unstyled notice.
+
+Values are strings and lists of strings because that is what an environment
+variable can hold. Anything richer would have to be parsed by both ends and
+agreed on by neither.
+
+### What §3's delivery table now has to say
+
+The table above is unchanged and is now *reachable from any transport*: the loop
+switches on `kind` alone and never learns which publisher produced the report,
+and `Notifier.transport` is a name printed in a log rather than a thing the
+notice layer branches on. If it ever became a branch, the seam would be a lie —
+so `test/notify.test.ts` drives the give-up-after-N path through an in-test
+webhook fake that has no topic, no envelope and no byte limit, and asserts the
+whole notice arrives intact on the other side.
+
+### What is still true about the byte cap
+
+`LOOP_NTFY_MAX_MESSAGE_BYTES` does exactly what the previous amendment said.
+Who checks it changed, because a parser that imports a transport's constants is
+a parser that cannot host another transport:
+
+- `src/main.ts` checks that the value was **written** as a byte count — a whole,
+  safely representable number of bytes, at least one.
+- `buildNotifier` in `src/app.ts` — the one place that knows which transport was
+  chosen — checks it against that transport's declared range
+  (`NTFY_MESSAGE_LIMITS`: `256`–`4096`), and refuses outside it at startup with
+  `notify-config`, as before.
+- The publisher still halves its cap on a "too much message" refusal and keeps
+  the lower cap for the rest of the run.
+
+`NTFY_MAX_MESSAGE_BYTES` and `NTFY_MIN_MESSAGE_BYTES` remain exported from
+`src/ntfy.ts` as this transport's declared limits. They are just no longer
+anybody else's constants.

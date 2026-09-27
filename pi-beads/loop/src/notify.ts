@@ -27,13 +27,29 @@
  *
  * WHAT IT IS NOT
  * A gate. `notifyCompletion` cannot fail a run: every path out of it is a
- * {@link NtfyDelivery}, and a `failed` delivery is information, not a stop.
+ * {@link Delivery}, and a `failed` delivery is information, not a stop.
  * The work is already committed and closed by the time this is called; the
  * notice is what tells a human about it. That is also why the notifier gives up
  * after a few consecutive failures — a server that is down should cost a
  * handful of warnings and then silence, not a warning per bead for six hours.
+ *
+ * THE SEAM (workspace-k1o.3)
+ * Three shapes live here, and this file does not care who implements them: a
+ * {@link Notice} (a title, a body, and a bag of transport-specific hints), a
+ * {@link Delivery} (what came back), and a {@link NoticePublisher} (the thing
+ * that takes the first and returns the second). `src/ntfy.ts` implements the
+ * publisher for one server; a test implements it with an object literal.
+ *
+ * It did not used to be this way, and the way it was leaked at every level:
+ * `NotifierOptions` took an `NtfyPublisher`, `notifyCompletion` returned an
+ * ntfy-typed value, and the options themselves were ntfy's vocabulary —
+ * `priority`, `tags`, `click`. "A notice" and "an ntfy publish" were the same
+ * concept in every signature between the two modules, which meant adding a
+ * second transport meant editing the wording layer. Now the wording layer
+ * imports nothing at all: no transport, no sockets, no byte limits, no URLs.
+ * What is transport-specific goes in {@link Notice.hints} and is read only at
+ * the far end.
  */
-import type { NtfyDelivery, NtfyPublisher } from "./ntfy.ts";
 
 /** The bead, as the run finished knowing it. Every field here is already fact. */
 export interface BeadCompletion {
@@ -64,6 +80,87 @@ export interface NoticeContext {
   readonly model?: string;
   /** The `[pi-beads]` in the title. Empty string means no prefix at all. */
   readonly titlePrefix?: string;
+}
+
+// ── the seam ────────────────────────────────────────────────────────────────
+
+/**
+ * What gets handed to a publisher: a title, a body, and some hints.
+ *
+ * `hints` is the judgement call this refactor had to make, and the call is
+ * **hints, not first-class fields**. `priority`, `tags` and `click` were
+ * options on the notifier, which asserted something nobody can guarantee: that
+ * every transport has a notion of urgency, of emoji, of a URL to open. A
+ * webhook that ignores `priority` has not failed; a `Notice` with a
+ * `priority` field says it should have one. So the notice layer carries the
+ * bag and never reads it, and the transport decides what its own keys mean —
+ * which is also the only place an unrecognised hint can be reported as
+ * ignored instead of vanishing.
+ *
+ * Values are strings and lists of strings because that is what an environment
+ * variable can hold. Anything richer would have to be parsed by both ends and
+ * agreed on by neither; a transport that wants an integer parses its own
+ * string, and owns the error message when the string is wrong.
+ */
+export interface Notice {
+  readonly title: string;
+  readonly body: string;
+  /**
+   * Transport-specific wishes, passed through untouched. `{ priority: "high",
+   * tags: ["+1"] }` means something to ntfy and nothing to anything else —
+   * including this module.
+   */
+  readonly hints?: Readonly<Record<string, string | readonly string[]>>;
+}
+
+/**
+ * What a publish attempt came back as.
+ *
+ * Three kinds, because that is the whole set of things a publisher can say
+ * truthfully: it sent it, it did not send it, or it chose not to. The names
+ * are the ones the ntfy transport already used — they were never ntfy's, they
+ * are the loop's: `src/loop.ts` switches on `kind` and reports a sentence per
+ * kind without knowing which transport produced it, and `createNullNotifier`
+ * has always returned `{ kind: "skipped", reason }` with no transport in sight.
+ *
+ * `retryable` rides on the failure rather than being decided here. The notifier
+ * counts failures and gives up; it does not retry, because "retry this now"
+ * and "retry this after a backoff" are the transport's business and depend on
+ * the status code that only it can see.
+ */
+export type Delivery =
+  | {
+      readonly kind: "delivered";
+      readonly messageId: string | null;
+      readonly destination: string;
+      readonly transport: string;
+    }
+  | { readonly kind: "skipped"; readonly reason: string }
+  | {
+      readonly kind: "failed";
+      readonly reason: string;
+      readonly destination: string;
+      readonly retryable: boolean;
+    };
+
+/**
+ * A transport, as far as the notice layer is concerned: something that takes
+ * a {@link Notice} and reports a {@link Delivery}.
+ *
+ * `enabled` and `destination` are here so a notifier can answer "will anything
+ * go out, and where?" without publishing a probe — the loop prints both in its
+ * startup report. `transport` is a name for the report, never a thing this
+ * module branches on: if it ever were, the seam would be a lie.
+ *
+ * `publish` is expected not to throw. A throw is handled anyway, out at
+ * {@link Notifier.notifyCompletion} and in `src/loop.ts`, because a badly built
+ * transport must not be able to end a run whose work is already committed.
+ */
+export interface NoticePublisher {
+  readonly enabled: boolean;
+  readonly destination: string;
+  readonly transport: string;
+  publish(notice: Notice): Promise<Delivery>;
 }
 
 /** Long enough for an id and a sentence, short enough for a phone's lock screen. */
@@ -205,7 +302,7 @@ export function completionBody(completion: BeadCompletion, context: NoticeContex
 export function completionNotice(
   completion: BeadCompletion,
   context: NoticeContext,
-): { title: string; body: string } {
+): Notice {
   return {
     title: completionTitle(completion, context.titlePrefix ?? DEFAULT_TITLE_PREFIX),
     body: completionBody(completion, context),
@@ -222,18 +319,24 @@ export interface Notifier {
   readonly enabled: boolean;
   readonly destination: readonly string[];
   readonly transport: string;
-  notifyCompletion(completion: BeadCompletion): Promise<NtfyDelivery>;
+  notifyCompletion(completion: BeadCompletion): Promise<Delivery>;
 }
 
 export interface NotifierOptions {
-  readonly publisher: NtfyPublisher;
+  readonly publisher: NoticePublisher;
   readonly context: NoticeContext;
-  /** ntfy priority for these notices: 1–5 or a name. */
-  readonly priority?: string;
-  /** Emoji names for the notification. */
-  readonly tags?: readonly string[];
-  /** URL the notification opens. */
-  readonly click?: string;
+  /**
+   * Transport-specific wishes to put on every notice this notifier sends, in
+   * the {@link Notice.hints} bag — `{ priority: "high", tags: ["+1"],
+   * click: "https://board.test/tst.42" }` for the ntfy transport.
+   *
+   * This layer does not read them, does not validate them and does not know
+   * which of them its transport honours. That is deliberate and it is the
+   * whole seam: the composition root (`buildNotifier` in `src/app.ts`) knows
+   * the transport, so that is where `LOOP_NTFY_*` becomes a hint, and the
+   * transport is where a hint becomes a field. Between them the bag is opaque.
+   */
+  readonly hints?: Readonly<Record<string, string | readonly string[]>>;
   /**
    * Give up after this many failed publishes in a row. Default 3.
    *
@@ -251,7 +354,7 @@ export function createNullNotifier(reason: string): Notifier {
     enabled: false,
     destination: [],
     transport: "none",
-    async notifyCompletion(): Promise<NtfyDelivery> {
+    async notifyCompletion(): Promise<Delivery> {
       return { kind: "skipped", reason };
     },
   };
@@ -282,18 +385,17 @@ export function createNotifier(options: NotifierOptions): Notifier {
     },
     destination: [publisher.destination],
     transport: publisher.transport,
-    async notifyCompletion(completion: BeadCompletion): Promise<NtfyDelivery> {
+    async notifyCompletion(completion: BeadCompletion): Promise<Delivery> {
       if (disabled !== null) {
         return { kind: "skipped", reason: disabled };
       }
+      // The wording is built here; the hints are only carried. Nothing between
+      // these two lines interprets them, which is the property the seam exists
+      // to keep.
       const notice = completionNotice(completion, options.context);
-      const delivery = await publisher.publish({
-        title: notice.title,
-        body: notice.body,
-        ...(options.priority === undefined ? {} : { priority: options.priority }),
-        ...(options.tags === undefined ? {} : { tags: options.tags }),
-        ...(options.click === undefined ? {} : { click: options.click }),
-      });
+      const delivery = await publisher.publish(
+        options.hints === undefined ? notice : { ...notice, hints: options.hints },
+      );
       if (delivery.kind === "failed") {
         consecutiveFailures += 1;
         if (consecutiveFailures >= maxFailures) {

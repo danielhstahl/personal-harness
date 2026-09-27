@@ -76,8 +76,7 @@ import { describeFailure, toWorkEvent } from "./agent.ts";
 import type { FinalizeOutcome, FinalizeRequest } from "./finalize.ts";
 import { describeFinalizeFailure, toFinalizeEvents } from "./finalize.ts";
 import type { IdleOutcome } from "./idle.ts";
-import type { NtfyDelivery } from "./ntfy.ts";
-import type { BeadCompletion, Notifier } from "./notify.ts";
+import type { BeadCompletion, Delivery, Notifier } from "./notify.ts";
 import { createInitialState, failureKeyFor, handoffKeyFor, step } from "./orchestrator.ts";
 import type {
   AgentRunEffect,
@@ -917,7 +916,7 @@ export async function runLoop(
       return [];
     }
     const notifier = ports.notify;
-    let delivery: NtfyDelivery;
+    let delivery: Delivery;
     try {
       delivery = await notifier.notifyCompletion(completionFor(effect));
     } catch (error) {

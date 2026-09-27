@@ -18,7 +18,6 @@ import type { AppConfig, KanbanSetting, NotifySetting } from "./app.ts";
 import type { PanelPlacement } from "./panel.ts";
 import { LoopError } from "./loop.ts";
 import type { LoopResult } from "./loop.ts";
-import { NTFY_MAX_MESSAGE_BYTES, NTFY_MIN_MESSAGE_BYTES } from "./ntfy.ts";
 
 /**
  * The one environment-reading site in this module.
@@ -146,25 +145,27 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
   /**
    * Our declared understanding of the server's `limit-message-bytes`.
    *
-   * ntfy does not publish the number it is running, so a self-hosted server on
-   * a tighter setting is otherwise unknowable. Unset means "assume ntfy's
-   * default of 4096" — and if that guess is too high, the publisher shrinks on
-   * its own the first time the server complains. Setting it is how you skip
-   * that discovery: set the number your server actually has.
+   * This layer checks only that a byte count was *written* as one: a whole,
+   * safely representable number of bytes, at least one. Whether that number is
+   * one the transport can carry is not knowable from the environment — the CLI
+   * does not choose the transport, `buildNotifier` in `src/app.ts` does — so
+   * the range check lives there and reads the limits off the transport itself
+   * (`NTFY_MESSAGE_LIMITS` / `isNtfyMessageBytes`) instead of being two ntfy
+   * constants welded into the config parser.
+   *
+   * Unset means "assume the transport's own default", and if that default is
+   * too high the publisher shrinks on its own the first time the server
+   * complains. Setting it is how you skip that discovery: set the number your
+   * server actually runs.
    */
   const messageBytesSetting = (): number | undefined => {
     const raw = source.LOOP_NTFY_MAX_MESSAGE_BYTES;
     if (raw === undefined || raw.trim() === "") return undefined;
     const parsed = Number(raw);
-    if (
-      !Number.isSafeInteger(parsed) ||
-      parsed < NTFY_MIN_MESSAGE_BYTES ||
-      parsed > NTFY_MAX_MESSAGE_BYTES
-    ) {
+    if (!Number.isSafeInteger(parsed) || parsed < 1) {
       throw new LoopError(
         "notify-config",
-        `LOOP_NTFY_MAX_MESSAGE_BYTES must be a whole number of bytes between ` +
-          `${NTFY_MIN_MESSAGE_BYTES} and ${NTFY_MAX_MESSAGE_BYTES} (ntfy's default), not "${raw.trim()}"`,
+        `LOOP_NTFY_MAX_MESSAGE_BYTES must be a whole number of bytes, not "${raw.trim()}"`,
       );
     }
     return parsed;

@@ -65,11 +65,17 @@ src/kanban.ts       the mini kanban: ready / in progress / done, read through an
                     states per column (see ADR-004). `kanbanPanel()` wraps a source as
                     a pluggable strip
 src/notify.ts       the completion notice: what a finished bead says, in what order,
-                    and when to stop trying to say it. Wording only — no sockets
+                    and when to stop trying to say it. Wording only — no sockets,
+                    no server, and no transport in its signatures: it defines
+                    `Notice` / `Delivery` / `NoticePublisher` and imports nothing
+                    at all
 src/ntfy.ts       the ONLY module that talks to a notification server: topic
                     resolution, the JSON publish envelope, the byte limits, and
                     an HTTP publisher whose every failure path returns a
-                    delivery instead of throwing (see ADR-007)
+                    delivery instead of throwing (see ADR-007). It is the
+                    notice seam's only implementation — `NtfyPublisher extends
+                    NoticePublisher`, and ntfy's `priority` / `tags` / `click`
+                    are read out of `Notice.hints` on this side of it
 src/format.ts       one-line plain-log summaries — NOT the renderer (see ADR-001)
 src/gitlock.ts      the ONLY module that spawns git, and the only kill policy:
                     SIGTERM first, SIGKILL as escalation, because a killed git
@@ -828,6 +834,23 @@ It is shaped for a phone rather than a desk: the hash is short enough to read an
 long enough to paste, the file list folds past six, the next-step list says
 `(+2 more)` instead of running off the screen, and anything the run could not
 know says so rather than vanishing.
+
+**A notice is a notice, not an ntfy publish.** `src/notify.ts` builds the
+wording and hands it to a `NoticePublisher` — `{ title, body, hints? }` going
+out, `delivered` / `skipped` / `failed` coming back — and imports nothing: not
+ntfy, not a socket, not a byte limit. The three things that are ntfy's own
+vocabulary (`LOOP_NTFY_PRIORITY`, `LOOP_NTFY_TAGS`, `LOOP_NTFY_CLICK`) travel
+in the opaque `hints` bag and are interpreted only by the transport that reads
+them (`ntfyMessageFromNotice`), which is also the only place that can say a
+hint was ignored. That is a deliberate judgement call rather than an omission:
+making `priority` a field of a notice would assert that every transport has a
+notion of urgency, and a webhook that ignores it has not failed. Likewise the
+byte cap: `src/main.ts` checks that `LOOP_NTFY_MAX_MESSAGE_BYTES` was written
+as a byte count, and `buildNotifier` in `src/app.ts` — the one place that knows
+which transport was chosen — checks it against the limits that transport
+declares (`NTFY_MESSAGE_LIMITS`), so the config parser carries no ntfy
+constants. `test/notify.test.ts` checks this from the source: `notify.ts`,
+`loop.ts` and `main.ts` must not import `src/ntfy.ts` at all.
 
 **A notice is a report, never a dependency.** By the time one is due the bead is
 committed, handed off and closed, so nothing about the publish can change the

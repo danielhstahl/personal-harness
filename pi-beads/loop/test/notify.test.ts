@@ -6,12 +6,18 @@
  * the *behaviour* (a notifier that keeps its silence after a few failures
  * rather than warning once per bead until somebody notices).
  *
- * The publisher is a recording double: these tests are about what the notice
- * says and when it stops trying. The transport's own behaviour is
- * `test/ntfy.test.ts`'s problem, and the loop's reaction to a delivery report
- * is `test/loop.test.ts`'s.
+ * The publisher is a recording double built in this file: these tests are about
+ * what the notice says and when it stops trying. The transport's own behaviour
+ * is `test/ntfy.test.ts`'s problem, and the loop's reaction to a delivery
+ * report is `test/loop.test.ts`'s.
+ *
+ * The doubles satisfy `NoticePublisher`, not a transport's interface — that is
+ * the seam, and the last test in this file checks from the source that
+ * `src/notify.ts` imports nothing from `src/ntfy.ts`, so a notice cannot be
+ * quietly re-welded to one server.
  */
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import { buildApp } from "../src/app.ts";
@@ -21,9 +27,6 @@ import {
   createHttpTransport,
   createNtfyPublisher,
   resolveNtfyTarget,
-  type NtfyDelivery,
-  type NtfyMessage,
-  type NtfyPublisher,
   type NtfyRequestOptions,
   type NtfyTransport,
 } from "../src/ntfy.ts";
@@ -40,6 +43,9 @@ import {
   formatTimestamp,
   oneLine,
   type BeadCompletion,
+  type Delivery,
+  type Notice,
+  type NoticePublisher,
 } from "../src/notify.ts";
 import { publishedJson, startFakeNtfy } from "./ntfy-server.ts";
 
@@ -72,22 +78,20 @@ function completion(overrides: Partial<BeadCompletion> = {}): BeadCompletion {
 
 /** A publisher that records what it was asked to publish. */
 function recordingPublisher(deliveries: readonly ("delivered" | "failed" | "skipped")[] = ["delivered"]) {
-  const published: NtfyMessage[] = [];
+  const published: Notice[] = [];
   let index = 0;
-  const publisher: NtfyPublisher = {
+  const publisher: NoticePublisher = {
     enabled: true,
     destination: "http://ntfy.test/loop",
-    publishUrl: "http://ntfy.test/",
-    messageBytes: 4096,
     transport: "recorder",
-    async publish(message: NtfyMessage): Promise<NtfyDelivery> {
-      published.push(message);
+    async publish(notice: Notice): Promise<Delivery> {
+      published.push(notice);
       const kind = deliveries[Math.min(index, deliveries.length - 1)] ?? "delivered";
       index += 1;
       if (kind === "failed") {
         return {
           kind: "failed",
-          reason: "ntfy replied 502: bad gateway",
+          reason: "the server replied 502: bad gateway",
           destination: "http://ntfy.test/loop",
           retryable: true,
         };
@@ -245,24 +249,24 @@ test("the notifier hands the notice to the publisher and reports what came back"
   const notifier = createNotifier({
     publisher,
     context: CONTEXT,
-    priority: "high",
-    tags: ["+1"],
-    click: "http://board.test/tst.42",
+    hints: { priority: "high", tags: ["+1"], click: "http://board.test/tst.42" },
   });
   const delivery = await notifier.notifyCompletion(completion());
   assert.equal(delivery.kind, "delivered");
   assert.equal(published.length, 1);
   assert.equal(published[0]?.title, completionTitle(completion()));
-  assert.equal(published[0]?.priority, "high");
-  assert.deepEqual(published[0]?.tags, ["+1"]);
-  assert.equal(published[0]?.click, "http://board.test/tst.42");
+  // The hints arrive as they were given: carried, not interpreted. What they
+  // *mean* is the transport's business (`ntfyMessageFromNotice`).
+  assert.equal(published[0]?.hints?.priority, "high");
+  assert.deepEqual(published[0]?.hints?.tags, ["+1"]);
+  assert.equal(published[0]?.hints?.click, "http://board.test/tst.42");
   assert.deepEqual(notifier.destination, ["http://ntfy.test/loop"]);
   assert.equal(notifier.enabled, true);
 });
 
 test("a relay with no topic disables the notifier before anything is tried", async () => {
   const { publisher, published } = recordingPublisher();
-  const disabledPublisher: NtfyPublisher = { ...publisher, enabled: false };
+  const disabledPublisher: NoticePublisher = { ...publisher, enabled: false };
   const notifier = createNotifier({ publisher: disabledPublisher, context: CONTEXT });
   const delivery = await notifier.notifyCompletion(completion());
   assert.equal(delivery.kind, "skipped");
@@ -319,13 +323,11 @@ test("the switch-off is heard at the failure that caused it, not on the next bea
 test("one success clears the failure streak", async () => {
   const outcomes = ["failed", "failed", "delivered", "failed", "failed", "delivered"];
   let index = 0;
-  const publisher: NtfyPublisher = {
+  const publisher: NoticePublisher = {
     enabled: true,
     destination: "http://ntfy.test/loop",
-    publishUrl: "http://ntfy.test/",
-    messageBytes: 4096,
     transport: "stub",
-    async publish(): Promise<NtfyDelivery> {
+    async publish(): Promise<Delivery> {
       const kind = outcomes[index] ?? "delivered";
       index += 1;
       return kind === "failed"
@@ -392,18 +394,51 @@ test("the ntfy knobs are read from the environment, and unset means unset", () =
   assert.equal(configured.notify?.enabled, true);
 });
 
-test("LOOP_NTFY_MAX_MESSAGE_BYTES is refused when it is not a notice-sized byte count", () => {
-  for (const raw of ["0", "-1", "three", "1.5", "64"]) {
+test("LOOP_NTFY_MAX_MESSAGE_BYTES: the CLI checks it is a byte count, the transport checks the range", () => {
+  // The config parser does not know which transport it is configuring, so it
+  // refuses only what no reading of the value could mean.
+  for (const raw of ["0", "-1", "three", "1.5"]) {
     assert.throws(
       () => readEnv({ LOOP_NTFY_TOPIC: "loop", LOOP_NTFY_MAX_MESSAGE_BYTES: raw }),
       (error: unknown) => LoopError.is(error) && error.code === "notify-config",
       `"${raw}" should have been refused`,
     );
   }
+
+  // 64 bytes is a perfectly well-written byte count and an impossible notice.
+  // That is refused where the transport is known — `buildNotifier` in
+  // `src/app.ts`, which reads the bounds off ntfy instead of carrying them
+  // into the parser.
+  for (const raw of ["64", "8192"]) {
+    assert.equal(
+      readEnv({ LOOP_NTFY_TOPIC: "loop", LOOP_NTFY_MAX_MESSAGE_BYTES: raw }).notify?.maxMessageBytes,
+      Number(raw),
+      "a well-formed byte count passes through the CLI untouched",
+    );
+    assert.throws(
+      () =>
+        buildApp({
+          cwd: "/tmp",
+          notify: { topic: "loop", enabled: true, maxMessageBytes: Number(raw) },
+        }),
+      (error: unknown) => LoopError.is(error) && error.code === "notify-config",
+      `${raw} bytes is outside the range this transport carries`,
+    );
+  }
+
   // In range, including the two ends.
   for (const raw of [String(NTFY_MIN_MESSAGE_BYTES), "2048", String(NTFY_MAX_MESSAGE_BYTES)]) {
-    assert.equal(readEnv({ LOOP_NTFY_TOPIC: "loop", LOOP_NTFY_MAX_MESSAGE_BYTES: raw }).notify
-      ?.maxMessageBytes, Number(raw));
+    assert.equal(
+      readEnv({ LOOP_NTFY_TOPIC: "loop", LOOP_NTFY_MAX_MESSAGE_BYTES: raw }).notify?.maxMessageBytes,
+      Number(raw),
+    );
+  }
+  for (const bytes of [NTFY_MIN_MESSAGE_BYTES, 2048, NTFY_MAX_MESSAGE_BYTES]) {
+    const app = buildApp({
+      cwd: "/tmp",
+      notify: { topic: "loop", enabled: true, maxMessageBytes: bytes },
+    });
+    assert.equal(app.ports.notify?.enabled, true, `${bytes} bytes should have been accepted`);
   }
 });
 
@@ -526,8 +561,7 @@ test(
         transport: createHttpTransport(),
       }),
       context: CONTEXT,
-      priority: "high",
-      tags: ["+1"],
+      hints: { priority: "high", tags: ["+1"] },
     });
     const summary =
       "Fixed the parser — “fast” now ✓ (日本語 handled, \u{1F389} shipped)";
@@ -573,4 +607,88 @@ test("a configured notifier reaches the loop's ports with the endpoint it was po
 test("a full topic URL works the same way through the app as through the resolver", () => {
   const app = buildApp({ cwd: "/tmp", notify: { topic: "https://ntfy.sh/abc123", enabled: true } });
   assert.deepEqual(app.ports.notify?.destination, ["https://ntfy.sh/abc123"]);
+});
+
+// ── the seam: any transport will do ─────────────────────────────────────────
+
+test(
+  "the give-up-after-N path runs on a transport that is not ntfy at all",
+  async () => {
+    // A webhook-shaped fake, written here, with nothing from `src/ntfy.ts`
+    // involved: no topic, no envelope, no byte limit. If the runaway guard or
+    // the notice itself quietly depended on the ntfy transport, this is where
+    // it would show up.
+    const sent: Notice[] = [];
+    const webhook: NoticePublisher = {
+      enabled: true,
+      destination: "https://hooks.test/pi-beads",
+      transport: "webhook",
+      async publish(notice: Notice): Promise<Delivery> {
+        sent.push(notice);
+        return {
+          kind: "failed",
+          reason: "HTTP 503 from hooks.test",
+          destination: "https://hooks.test/pi-beads",
+          retryable: true,
+        };
+      },
+    };
+
+    const logged: string[] = [];
+    const notifier = createNotifier({
+      publisher: webhook,
+      context: CONTEXT,
+      hints: { channel: "#build" },
+      maxConsecutiveFailures: 2,
+      logger: (line) => logged.push(line),
+    });
+
+    assert.equal(
+      notifier.transport,
+      "webhook",
+      "the notice layer reports whichever transport it was handed, never assumes one",
+    );
+
+    assert.equal((await notifier.notifyCompletion(completion())).kind, "failed");
+    const second = await notifier.notifyCompletion(completion());
+    assert.equal(second.kind, "failed");
+    assert.match(
+      second.kind === "failed" ? second.reason : "",
+      /switched off for the rest of this run/u,
+      "the switch-off is heard on the failure that caused it, on any transport",
+    );
+
+    const third = await notifier.notifyCompletion(completion());
+    assert.equal(third.kind, "skipped", "a dead transport is discovered twice, not forever");
+    assert.equal(sent.length, 2, "and nothing was attempted after the giving-up");
+    assert.equal(notifier.enabled, false);
+    assert.match(logged.join("\n"), /2 completion notices in a row failed to publish/u);
+
+    // What reached a transport with none of ntfy's vocabulary was still the
+    // whole notice: the same title and body the wording layer built, and the
+    // hints carried across untouched.
+    assert.equal(sent[0]?.title, completionTitle(completion()));
+    assert.ok((sent[0]?.body ?? "").includes("bd show tst.42"), "the body is the body");
+    assert.deepEqual(sent[0]?.hints, { channel: "#build" });
+  },
+);
+
+test("the notice layer imports no transport: the seam is in the source, not the intent", () => {
+  // The one property this whole refactor is for, checked where it can actually
+  // be broken — an `import type { NtfyDelivery }` sneaking back into the
+  // wording layer, or a byte constant back into the config parser.
+  for (const name of ["notify.ts", "loop.ts", "main.ts"]) {
+    const source = readFileSync(new URL(`../src/${name}`, import.meta.url), "utf8");
+    assert.ok(
+      !/from\s+"\.\/ntfy\.ts"/u.test(source),
+      `src/${name} must not import ./ntfy.ts — the transport reaches it through NoticePublisher and Delivery`,
+    );
+  }
+  // And the notice module has no need of any transport at all.
+  const noticeSource = readFileSync(new URL("../src/notify.ts", import.meta.url), "utf8");
+  assert.equal(
+    (noticeSource.match(/^import /gmu) ?? []).length,
+    0,
+    "src/notify.ts imports nothing: it defines the shapes and stops there",
+  );
 });

@@ -57,11 +57,28 @@
  * refused topic, dropped socket, deadline, 5xx — returns a
  * {@link NtfyDelivery}. Nothing here throws at the caller except a
  * configuration error raised before any request is made.
+ *
+ * THE SEAM (workspace-k1o.3): this publisher **is** a `NoticePublisher`, and
+ * `NtfyPublisher extends NoticePublisher` is the clause that makes TypeScript
+ * check the claim rather than take it on faith. It takes a `Notice` — title,
+ * body, opaque `hints` — and everything ntfy-only is interpreted on this side
+ * of that line: {@link ntfyMessageFromNotice} turns `priority` / `tags` /
+ * `click` back into ntfy fields, {@link ntfyPublishPayload} builds the JSON
+ * envelope, and the clamping below owns `limit-message-bytes: 4096`,
+ * {@link NTFY_MESSAGE_BOUNDARY_SLACK_BYTES} and the JSON 2×-headroom rule.
+ * Those rules were never the notice's to know; before the seam they sat in
+ * `NotifierOptions`, where the wording layer had to name them in order to pass
+ * them along. `NTFY_MAX_MESSAGE_BYTES` and `NTFY_MIN_MESSAGE_BYTES` stay
+ * exported as this transport's declared limits, now grouped as
+ * {@link NTFY_MESSAGE_LIMITS} so the configuration layer can ask instead of
+ * hard-coding a range.
  */
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { Buffer } from "node:buffer";
 import { hostname } from "node:os";
+
+import type { Delivery, Notice, NoticePublisher } from "./notify.ts";
 
 /**
  * The host this run is on, for the notice's "where from" line.
@@ -74,6 +91,37 @@ export function localHostname(): string {
   const name = (hostname() ?? "").trim();
   return name === "" ? "localhost" : name;
 }
+
+/**
+ * The notice, in this transport's own words.
+ *
+ * This is what a {@link Notice} becomes once ntfy has read its hints — the
+ * transport's vocabulary (`priority`, `tags`, `click`) as opposed to the
+ * notice layer's (`title`, `body`, `hints?`). {@link ntfyMessageFromNotice}
+ * does the translation; nothing outside this module needs to name these fields.
+ */
+export interface NtfyMessage {
+  readonly title: string;
+  readonly body: string;
+  /** ntfy priority: 1–5, or `min`/`low`/`default`/`high`/`urgent`. */
+  readonly priority?: string;
+  /** Emoji *names*, comma separated in the header, e.g. `+1,warning`. */
+  readonly tags?: readonly string[];
+  /** URL the notification opens. */
+  readonly click?: string;
+}
+
+/**
+ * What came back from a publish.
+ *
+ * An **alias**, not a second definition. The three kinds — delivered, skipped,
+ * failed — were never ntfy's idea: they are the loop's report, and the shape now
+ * lives in `src/notify.ts` next to the thing that reads it. Keeping the old name
+ * here means the transport's own wording still reads as `NtfyDelivery` in a stack
+ * trace, while making a second shape impossible: if the two ever drifted, that is
+ * a compile error rather than a migration note.
+ */
+export type NtfyDelivery = Delivery;
 
 /** ntfy's default `limit-message-bytes`. Body is trimmed to fit under it. */
 export const NTFY_MAX_MESSAGE_BYTES = 4096;
@@ -126,6 +174,69 @@ const TRUNCATION_MARKER = "… (truncated)";
 /** The only content type this module sends. */
 export const NTFY_JSON_CONTENT_TYPE = "application/json";
 
+/**
+ * A `Notice`, read the way ntfy reads it.
+ *
+ * The whole of the transport's side of the seam: {@link Notice} arrives with an
+ * opaque `hints` bag, and this is where `priority`, `tags` and `click` stop
+ * being strings somebody passed through and become ntfy's fields. The notice
+ * layer never learns any of this, which is the point — see the note on
+ * `Notice.hints` for why they are hints rather than fields of a notice.
+ *
+ * Unrecognised keys are not an error: a hint written for another transport is
+ * exactly what a hint is for. They are reported through `onUnknownHint` so a
+ * typo (`pirority`) shows up in a log instead of quietly arriving unstyled.
+ */
+export function ntfyMessageFromNotice(
+  notice: Notice,
+  onUnknownHint?: (key: string) => void,
+): NtfyMessage {
+  const hints = notice.hints ?? {};
+  const priority = hintString(hints.priority);
+  const click = hintString(hints.click);
+  const tags = hintList(hints.tags);
+  if (onUnknownHint !== undefined) {
+    for (const key of Object.keys(hints)) {
+      if (!isNtfyHintKey(key)) onUnknownHint(key);
+    }
+  }
+  return {
+    title: notice.title,
+    body: notice.body,
+    ...(priority === undefined ? {} : { priority }),
+    ...(tags.length === 0 ? {} : { tags }),
+    ...(click === undefined ? {} : { click }),
+  };
+}
+
+/**
+ * The hint keys this transport reads. Anything else is somebody else's — and
+ * is named in the log rather than dropped, so a typo costs a line, not a
+ * silently unstyled notice.
+ */
+export const NTFY_HINT_KEYS: readonly string[] = ["priority", "tags", "click"];
+
+export function isNtfyHintKey(key: string): boolean {
+  return NTFY_HINT_KEYS.includes(key);
+}
+
+/** One-value hint. A list where a single value was wanted is not guessed at. */
+function hintString(value: string | readonly string[] | undefined): string | undefined {
+  if (typeof value !== "string") return undefined;
+  return value.trim() === "" ? undefined : value;
+}
+
+/**
+ * List-valued hint. A bare string is split on commas and spaces, because that
+ * is the shape these values arrive in from the environment
+ * (`LOOP_NTFY_TAGS="+1 beads"`), and the transport that reads a hint is the
+ * place that knows what shape it takes.
+ */
+function hintList(value: string | readonly string[] | undefined): string[] {
+  const parts = typeof value === "string" ? value.split(/[,\s]+/u) : value ?? [];
+  return parts.map((part) => part.trim()).filter((part) => part !== "");
+}
+
 /** Where a notice goes: a server base, and one topic on it. */
 export interface NtfyTarget {
   /** e.g. `http://192.168.1.20:8080` — no trailing slash. */
@@ -145,32 +256,6 @@ export interface NtfyTarget {
    */
   readonly publishUrl: string;
 }
-
-export interface NtfyMessage {
-  readonly title: string;
-  readonly body: string;
-  /** ntfy priority: 1–5, or `min`/`low`/`default`/`high`/`urgent`. */
-  readonly priority?: string;
-  /** Emoji *names*, comma separated in the header, e.g. `+1,warning`. */
-  readonly tags?: readonly string[];
-  /** URL the notification opens. */
-  readonly click?: string;
-}
-
-export type NtfyDelivery =
-  | {
-      kind: "delivered";
-      readonly messageId: string | null;
-      readonly destination: string;
-      readonly transport: string;
-    }
-  | { readonly kind: "skipped"; readonly reason: string }
-  | {
-      readonly kind: "failed";
-      readonly reason: string;
-      readonly destination: string;
-      readonly retryable: boolean;
-    };
 
 /** How the message reaches the server. Injectable so tests can be a real server. */
 export interface NtfyTransport {
@@ -352,6 +437,36 @@ const SHRINK_STEP_DIVISOR = 2;
 const MAX_SHRINKS_PER_RUN = 3;
 /** Below this a "notice" is a fragment, so the shrink stops rather than go on. */
 export const NTFY_MIN_MESSAGE_BYTES = 256;
+
+/**
+ * The band a declared message cap may land in for this transport.
+ *
+ * Grouped and exported so the configuration layer can ask the transport what it
+ * accepts instead of copy-pasting two numbers out of it. That is the same seam
+ * as {@link Notice.hints}, one level further out: `src/main.ts` checks that a
+ * byte count was *written* as one, and the layer that chose the transport —
+ * `buildNotifier` in `src/app.ts` — checks that it is a byte count this
+ * transport can carry.
+ */
+export const NTFY_MESSAGE_LIMITS: Readonly<{
+  minBytes: number;
+  maxBytes: number;
+  defaultBytes: number;
+}> = {
+  minBytes: NTFY_MIN_MESSAGE_BYTES,
+  maxBytes: NTFY_MAX_MESSAGE_BYTES,
+  defaultBytes: NTFY_MAX_MESSAGE_BYTES,
+};
+
+/** Whether a declared cap is a whole number of bytes this transport will take. */
+export function isNtfyMessageBytes(value: unknown): boolean {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= NTFY_MESSAGE_LIMITS.minBytes &&
+    value <= NTFY_MESSAGE_LIMITS.maxBytes
+  );
+}
 
 /**
  * Which refusals are really "too much message, and I will not make an
@@ -700,12 +815,9 @@ export interface NtfyPublisherOptions {
   readonly userAgent?: string;
 }
 
-export interface NtfyPublisher {
-  readonly enabled: boolean;
-  readonly destination: string;
+export interface NtfyPublisher extends NoticePublisher {
   /** Where the request goes: the server root/prefix, with the topic in the body. */
   readonly publishUrl: string;
-  readonly transport: string;
   /**
    * The message cap in force right now, in bytes.
    *
@@ -715,7 +827,8 @@ export interface NtfyPublisher {
    * uses.
    */
   readonly messageBytes: number;
-  publish(message: NtfyMessage): Promise<NtfyDelivery>;
+  /** `enabled`, `destination` and `transport` come from {@link NoticePublisher}. */
+  publish(notice: Notice): Promise<NtfyDelivery>;
 }
 
 export function createNtfyPublisher(options: NtfyPublisherOptions): NtfyPublisher {
@@ -810,6 +923,13 @@ export function createNtfyPublisher(options: NtfyPublisherOptions): NtfyPublishe
     };
   }
 
+  /**
+   * Unknown hint keys are reported once each rather than once per bead: the
+   * typo is one typo, and noticing it on the first notice is the whole value
+   * of reporting it.
+   */
+  const reportedHints = new Set<string>();
+
   return {
     enabled: options.target.topic.trim() !== "",
     destination,
@@ -818,7 +938,17 @@ export function createNtfyPublisher(options: NtfyPublisherOptions): NtfyPublishe
     get messageBytes(): number {
       return messageCap;
     },
-    async publish(message: NtfyMessage): Promise<NtfyDelivery> {
+    async publish(notice: Notice): Promise<NtfyDelivery> {
+      // The transport's side of the seam: the notice's hints become ntfy's
+      // fields here, and nowhere else. Everything below this line speaks ntfy.
+      const message = ntfyMessageFromNotice(notice, (key) => {
+        if (reportedHints.has(key)) return;
+        reportedHints.add(key);
+        log(
+          `ntfy ignored the notice hint "${key}" — this transport reads ` +
+            `${NTFY_HINT_KEYS.join(", ")} and nothing else`,
+        );
+      });
       const title = clipTitle(message.title, maxTitle);
       if (message.body.trim() === "") {
         return { kind: "skipped", reason: "the notice had no body to publish" };

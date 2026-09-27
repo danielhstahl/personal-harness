@@ -430,8 +430,7 @@ test("the whole chain: a closed bead publishes to a real HTTP server, id in the 
       transport: createHttpTransport(),
     }),
     context: { cwd: "/work/project", hostname: "buildhost", model: "fake/model" },
-    priority: "high",
-    tags: ["+1"],
+    hints: { priority: "high", tags: ["+1"] },
   });
   const h = harness({ scripts: WORK_SCRIPTS, idleTexts: [SPLIT_REQUEST], notifier });
   prepareWalk(h);

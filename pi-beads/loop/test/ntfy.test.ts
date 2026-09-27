@@ -20,6 +20,7 @@ import {
   NTFY_MAX_JSON_BODY_BYTES,
   NTFY_MAX_MESSAGE_BYTES,
   NTFY_MAX_TITLE_LENGTH,
+  NTFY_MESSAGE_LIMITS,
   NTFY_MIN_MESSAGE_BYTES,
   NTFY_TOPIC_PATTERN,
   classifyResponse,
@@ -29,7 +30,9 @@ import {
   fitJsonBytes,
   isHeaderSafe,
   isMessageTooLargeRefusal,
+  isNtfyMessageBytes,
   localHostname,
+  ntfyMessageFromNotice,
   ntfyPriorityNumber,
   ntfyPublishBody,
   ntfyPublishPayload,
@@ -37,10 +40,12 @@ import {
   shrinkMessageLimit,
   transportHeaders,
   truncateToBytes,
+  type NtfyDelivery,
   type NtfyRequestOptions,
   type NtfyTransport,
 } from "../src/ntfy.ts";
 import { publishedJson, startFakeNtfy } from "./ntfy-server.ts";
+import type { Delivery, Notice } from "../src/notify.ts";
 
 // ── the target: where a notice goes ─────────────────────────────────────────
 
@@ -173,6 +178,101 @@ test("every priority spelling becomes an integer, because ntfy's field is an int
   assert.equal(ntfyPriorityNumber(" 3 "), 3);
   assert.throws(() => ntfyPriorityNumber("urgentish"), /not an ntfy priority/u);
   assert.throws(() => ntfyPriorityNumber("9"), /not an ntfy priority/u);
+});
+
+// ── the seam: a `Notice` becomes an ntfy publish ───────────────────────────
+
+/**
+ * The claim `NtfyPublisher extends NoticePublisher` is checked against: the
+ * publisher is handed a plain notice and nothing else, and everything ntfy is
+ * expected to make of it.
+ */
+test("a notice with hints becomes ntfy's own message shape", () => {
+  const notice: Notice = {
+    title: "[pi-beads] tst.42 completed: the parser change",
+    body: "line one\nline two",
+    hints: { priority: "high", tags: ["+1", "beads"], click: "https://example.test/bead/42" },
+  };
+  assert.deepEqual(ntfyMessageFromNotice(notice), {
+    title: "[pi-beads] tst.42 completed: the parser change",
+    body: "line one\nline two",
+    priority: "high",
+    tags: ["+1", "beads"],
+    click: "https://example.test/bead/42",
+  });
+});
+
+test("a notice with no hints is just a title and a body — no invented ntfy fields", () => {
+  assert.deepEqual(
+    ntfyMessageFromNotice({ title: "t", body: "b" }),
+    { title: "t", body: "b" },
+    "absent hints must not become empty ones, or every publish carries a pointless field",
+  );
+  assert.deepEqual(
+    ntfyMessageFromNotice({ title: "t", body: "b", hints: { priority: "  " } }),
+    { title: "t", body: "b" },
+    "a blank hint is unset, not a value",
+  );
+});
+
+test("a tags hint written the way an environment variable arrives is split here", () => {
+  // `LOOP_NTFY_TAGS="+1 beads"` reaches a hint as one string. The transport
+  // that knows tags is a list is the transport that splits it.
+  assert.deepEqual(ntfyMessageFromNotice({ title: "t", body: "b", hints: { tags: "+1 beads" } }).tags, [
+    "+1",
+    "beads",
+  ]);
+});
+
+test("a hint this transport does not read is reported, not swallowed", async () => {
+  const logged: string[] = [];
+  const transport: NtfyTransport = {
+    name: "recorder",
+    async publish(): Promise<{ statusCode: number; body: string }> {
+      return { statusCode: 200, body: '{"id":"x"}' };
+    },
+  };
+  const publisher = createNtfyPublisher({
+    target: resolveNtfyTarget({ url: "http://localhost:9", topic: "t" }),
+    transport,
+    logger: (line) => logged.push(line),
+  });
+  await publisher.publish({ title: "a", body: "b", hints: { pirority: "high" } });
+  await publisher.publish({ title: "c", body: "d", hints: { pirority: "high" } });
+
+  const complaints = logged.filter((line) => line.includes("pirority"));
+  assert.equal(complaints.length, 1, `one typo, one complaint: ${JSON.stringify(logged)}`);
+  assert.match(complaints[0] ?? "", /ignored the notice hint/u);
+  assert.match(complaints[0] ?? "", /priority, tags, click/u, "and it says what it does read");
+  assert.equal((await publisher.publish({ title: "e", body: "f" })).kind, "delivered");
+});
+
+test("the message limits the config layer checks against are this transport's own", () => {
+  // `src/app.ts` validates `LOOP_NTFY_MAX_MESSAGE_BYTES` with these numbers;
+  // if they ever stopped being the numbers the publisher uses, a config that
+  // passes the check would not be a config that works.
+  assert.equal(NTFY_MESSAGE_LIMITS.minBytes, NTFY_MIN_MESSAGE_BYTES);
+  assert.equal(NTFY_MESSAGE_LIMITS.maxBytes, NTFY_MAX_MESSAGE_BYTES);
+  assert.equal(NTFY_MESSAGE_LIMITS.defaultBytes, NTFY_MAX_MESSAGE_BYTES);
+  assert.equal(isNtfyMessageBytes(NTFY_MIN_MESSAGE_BYTES), true);
+  assert.equal(isNtfyMessageBytes(NTFY_MAX_MESSAGE_BYTES), true);
+  assert.equal(isNtfyMessageBytes(NTFY_MIN_MESSAGE_BYTES - 1), false, "the floor is the floor");
+  assert.equal(isNtfyMessageBytes(NTFY_MAX_MESSAGE_BYTES + 1), false);
+  assert.equal(isNtfyMessageBytes(2048.5), false, "half a byte is not a byte count");
+  assert.equal(isNtfyMessageBytes("2048"), false, "and neither is one written as a string");
+});
+
+test("the delivery this transport reports IS the notice layer's Delivery, not a cousin", () => {
+  // Compile-time claim: `NtfyDelivery` is an alias of `Delivery`, so the loop's
+  // switch on `kind` covers everything a transport can answer with.
+  const fromNtfy: NtfyDelivery = {
+    kind: "failed",
+    reason: "nope",
+    destination: "http://x/y",
+    retryable: true,
+  };
+  const asNoticeLayer: Delivery = fromNtfy;
+  assert.equal(asNoticeLayer.kind, "failed");
 });
 
 test("nothing the work wrote goes in a header — the header set is three constants and a token", () => {
@@ -524,7 +624,7 @@ test("a good publish: POST the envelope to the server root, JSON ack read back",
     const delivery = await publisher.publish({
       title: "[pi-beads] tst.7 completed: fixed it",
       body: "tst.7 — fixed it\nthe details",
-      priority: "3",
+      hints: { priority: "3" },
     });
     assert.equal(delivery.kind, "delivered");
     assert.equal(

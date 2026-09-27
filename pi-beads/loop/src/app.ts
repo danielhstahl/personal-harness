@@ -30,9 +30,11 @@ import {
   type KanbanSource,
 } from "./kanban.ts";
 import {
+  NTFY_MESSAGE_LIMITS,
   createHttpTransport,
   createNtfyPublisher,
   isHeaderSafe,
+  isNtfyMessageBytes,
   localHostname,
   resolveNtfyTarget,
 } from "./ntfy.ts";
@@ -184,11 +186,20 @@ export interface NotifySetting {
   readonly url?: string;
   /** Bearer token, for a server that requires one. */
   readonly token?: string;
-  /** ntfy priority: 1–5 or `min`/`low`/`default`/`high`/`urgent`. */
+  /**
+   * ntfy priority: 1–5 or `min`/`low`/`default`/`high`/`urgent`.
+   * Reaches the transport as the `priority` hint.
+   */
   readonly priority?: string;
-  /** Emoji names shown on the notification, e.g. `["+1"]`. */
+  /**
+   * Emoji names shown on the notification, e.g. `["+1"]`.
+   * Reaches the transport as the `tags` hint.
+   */
   readonly tags?: readonly string[];
-  /** URL the notification opens. */
+  /**
+   * URL the notification opens.
+   * Reaches the transport as the `click` hint.
+   */
   readonly click?: string;
   /** The `[pi-beads]` in the title. */
   readonly titlePrefix?: string;
@@ -666,6 +677,39 @@ function buildNotifier(
       ? undefined
       : `${config.modelRef.provider}/${config.modelRef.id}`;
 
+  /**
+   * The declared message cap, checked against the transport that was chosen.
+   *
+   * `src/main.ts` established that a byte count was *written* as one. Whether
+   * this transport can carry it is only knowable here, because only here is
+   * the transport known — so the range is read off the transport
+   * ({@link NTFY_MESSAGE_LIMITS}) rather than restated. A range copied into
+   * the config layer is a range that drifts.
+   */
+  if (setting.maxMessageBytes !== undefined && !isNtfyMessageBytes(setting.maxMessageBytes)) {
+    throw new LoopError(
+      "notify-config",
+      `LOOP_NTFY_MAX_MESSAGE_BYTES must be a whole number of bytes between ` +
+        `${NTFY_MESSAGE_LIMITS.minBytes} and ${NTFY_MESSAGE_LIMITS.maxBytes} ` +
+        `(${NTFY_MESSAGE_LIMITS.defaultBytes} is the transport's own default), ` +
+        `not ${setting.maxMessageBytes}`,
+    );
+  }
+
+  /**
+   * The ntfy-only wishes, put into the notice's opaque hint bag.
+   *
+   * Naming these here is fine: this is the layer that chose the transport. What
+   * the seam is about is not making the *wording* layer name them — so they go
+   * in as hints, `src/notify.ts` carries them without reading them, and
+   * `src/ntfy.ts` turns them back into ntfy fields at the far end
+   * (`ntfyMessageFromNotice`).
+   */
+  const hints: Record<string, string | readonly string[]> = {};
+  if (setting.priority !== undefined) hints.priority = setting.priority;
+  if (setting.tags !== undefined && setting.tags.length > 0) hints.tags = setting.tags;
+  if (setting.click !== undefined && setting.click.trim() !== "") hints.click = setting.click;
+
   return createNotifier({
     publisher: createNtfyPublisher({
       target,
@@ -682,9 +726,7 @@ function buildNotifier(
       ...(model === undefined ? {} : { model }),
       ...(setting.titlePrefix === undefined ? {} : { titlePrefix: setting.titlePrefix }),
     },
-    ...(setting.priority === undefined ? {} : { priority: setting.priority }),
-    ...(setting.tags === undefined ? {} : { tags: setting.tags }),
-    ...(setting.click === undefined ? {} : { click: setting.click }),
+    ...(Object.keys(hints).length === 0 ? {} : { hints }),
     ...(maxFailures === undefined ? {} : { maxConsecutiveFailures: maxFailures }),
   });
 }
