@@ -28,7 +28,13 @@ import {
   type KanbanRead,
   type KanbanSource,
 } from "./kanban.ts";
-import { createNtfyPublisher, createHttpTransport, localHostname, resolveNtfyTarget } from "./ntfy.ts";
+import {
+  createHttpTransport,
+  createNtfyPublisher,
+  isHeaderSafe,
+  localHostname,
+  resolveNtfyTarget,
+} from "./ntfy.ts";
 import { createNotifier, createNullNotifier, type Notifier } from "./notify.ts";
 import {
   PLAIN_MONITOR_THEME,
@@ -601,6 +607,23 @@ function buildNotifier(
       "notify-config",
       `LOOP_NTFY_PRIORITY must be 1-5 or one of ${NTFY_PRIORITY_NAMES.join(", ")}, ` +
         `not "${setting.priority}"`,
+    );
+  }
+
+  /**
+   * The one value this feature still has to put in a header.
+   *
+   * Everything the run wrote goes in the JSON body, where any character the run
+   * produced is fine. A bearer token has to be a header value, and a header
+   * value that is not printable ASCII is refused by Node at the socket layer —
+   * which is a delivery failure, which is a silent run. Checked here instead,
+   * where the operator is looking.
+   */
+  if (setting.token !== undefined && !isHeaderSafe(setting.token.trim())) {
+    throw new LoopError(
+      "notify-config",
+      "LOOP_NTFY_TOKEN contains characters that cannot be sent in an HTTP header " +
+        "(only printable ASCII can be) — check for a stray line break or a pasted non-ASCII character",
     );
   }
 

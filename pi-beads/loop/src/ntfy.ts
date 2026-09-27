@@ -1,25 +1,42 @@
 /**
  * `src/ntfy.ts` — publishing a notice to ntfy.
  *
- * ntfy's publish API is the whole feature: an HTTP `POST` to
- * `<server>/<topic>` whose body is the message, with the presentation carried
- * in ordinary headers (`Title`, `Priority`, `Tags`, `Click`). There is no
- * handshake, no session, no protocol to keep alive, and the topic model means
- * the loop never needs to know who is listening. That is why this replaced email
- * — see [ADR-007](../docs/ADR-007-ntfy-notices.md) — and it is why this module
- * is about eighty lines of transport instead of thirteen hundred: there is
+ * ntfy's publish API is the whole feature: an HTTP `POST` with the message in
+ * the request body. There is no handshake, no session, no protocol to keep
+ * alive, and the topic model means the loop never needs to know who is
+ * listening. That is why this replaced email — see
+ * [ADR-007](../docs/ADR-007-ntfy-notices.md) — and it is why this module is
+ * about a hundred lines of transport instead of thirteen hundred: there is
  * nothing here that the previous transport needed and ntfy does not.
  *
- * Self-hosting is the same shape with a different base URL, which is the point of
- * `LOOP_NTFY_URL`: `http://192.168.1.20:8080` is as valid as
- * `https://ntfy.sh`, and nothing downstream knows the difference.
+ * **The wire format is a JSON envelope posted to the server root, not headers
+ * posted to the topic URL.** That was not the original shape, and the original
+ * shape broke: the title is an agent-written sentence, and a sentence can hold
+ * a character HTTP headers cannot carry. Node refuses one at the socket layer
+ * with `Invalid character in header content ["Title"]` — so a bead whose
+ * summary contained an em dash, a curly quote, a `✓` or anything outside
+ * Latin-1 could not be announced, while a bead whose summary was plain ASCII was
+ * announced fine. The failure was *in the content*, which is the worst place
+ * for it: intermittent, invisible to review, and blaming the notice for the
+ * wording of the work.
  *
- * Two limits worth designing around, both from ntfy's own defaults
- * (`limit-message-bytes: 4096`, `limit-message-title-length: 200`):
+ * ntfy's documented JSON publish takes the whole message — `topic`, `title`,
+ * `message`, `priority`, `tags`, `click` — as a UTF-8 JSON body at the server
+ * **root** (`POST https://ntfy.sh/`, not `POST https://ntfy.sh/mytopic`),
+ * which is what a notification body is: text. Anything the work wrote can go in
+ * it verbatim. The only header left in this module is the one that *has* to be a
+ * header — `Authorization: Bearer …` — plus the constant `Content-Type` and
+ * `User-Agent`, none of which an agent ever writes.
  *
- * - The body is truncated at a byte boundary rather than letting the server
+ * Three limits worth designing around, all from ntfy's own defaults
+ * (`limit-message-bytes: 4096`, and its JSON reader's 2× headroom):
+ *
+ * - The message is truncated at a byte boundary rather than letting the server
  *   refuse it with `413`. A notice that arrives slightly short is a better
  *   outcome than a notice that arrives never, and the truncation says so.
+ * - The whole JSON document is then clamped to twice that, because ntfy reads a
+ *   JSON publish body with `MessageSizeLimit*2` bytes and escaping (`\n`, `\"`)
+ *   inflates a message that already fitted on its own.
  * - The title is capped the same way, because the bead id has to survive it —
  *   the title is the field the notification is *found by* on a phone.
  *
@@ -47,10 +64,33 @@ export function localHostname(): string {
 
 /** ntfy's default `limit-message-bytes`. Body is trimmed to fit under it. */
 export const NTFY_MAX_MESSAGE_BYTES = 4096;
+/**
+ * ntfy's ceiling for a JSON publish body: `readJSONWithLimit(..., MessageSizeLimit*2)`
+ * in `server.go`, "2x to account for JSON format overhead". A message that fit
+ * 4096 bytes on its own does not fit once every newline is spelled `\n`, so the
+ * envelope gets clamped too — otherwise the notice that survived the message
+ * limit dies on the document limit instead.
+ */
+export const NTFY_MAX_JSON_BODY_BYTES = NTFY_MAX_MESSAGE_BYTES * 2;
 /** ntfy's `limit-message-title-length`. */
 export const NTFY_MAX_TITLE_LENGTH = 200;
+/**
+ * ntfy's own topic pattern (`topicRegex` in `server.go`): 1–64 of
+ * `-_A-Za-z0-9`, and no `/`.
+ *
+ * Checked at startup because a topic outside it is a guaranteed `400` on every
+ * bead, and a guaranteed failure is worth having once, in the terminal where the
+ * typo was made.
+ */
+export const NTFY_TOPIC_PATTERN = /^[-_A-Za-z0-9]{1,64}$/u;
+/** What an HTTP header value may contain: printable ASCII, no control characters. */
+const HEADER_SAFE_PATTERN = /^[\t\x20-\x7E]*$/u;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_RESPONSE_BYTES = 64 * 1024;
+/** Appended wherever text was cut to fit a limit. */
+const TRUNCATION_MARKER = "… (truncated)";
+/** The only content type this module sends. */
+export const NTFY_JSON_CONTENT_TYPE = "application/json";
 
 /** Where a notice goes: a server base, and one topic on it. */
 export interface NtfyTarget {
@@ -59,6 +99,17 @@ export interface NtfyTarget {
   readonly topic: string;
   /** `base` + `/` + `topic`, as one string for logs and delivery reports. */
   readonly destination: string;
+  /**
+   * Where the publish request itself goes: the server root, or the reverse-proxy
+   * prefix, with **no topic in the path** — the topic travels in the JSON body.
+   *
+   * ntfy routes a JSON publish on `r.URL.Path == "/"` alone, so
+   * `POST /topic` with a JSON body is not "the same thing said differently":
+   * the server takes the topic out of the path, never the body, and the entire
+   * JSON document becomes the text of the notification. Hence a field of its
+   * own rather than a string built at the call site.
+   */
+  readonly publishUrl: string;
 }
 
 export interface NtfyMessage {
@@ -126,27 +177,55 @@ export function resolveNtfyTarget(
 
   if (looksLikeUrl(rawTopic)) {
     const parsed = parseHttpUrl(rawTopic, "the ntfy topic URL");
-    const topic = parsed.pathname.replace(/^\/+|\/+$/gu, "");
+    // The topic is the last path segment; anything above it is a proxy prefix,
+    // which is what a self-hosted ntfy behind nginx actually looks like.
+    const segments = parsed.pathname.split("/").filter((part) => part !== "");
+    const topic = segments[segments.length - 1] ?? "";
     if (topic === "") {
       throw new NtfyError("config", `"${rawTopic}" names no topic`);
     }
+    assertTopicName(topic, "the ntfy topic");
+    const origin = `${parsed.protocol}//${parsed.host}`;
+    const prefixPath = segments.slice(0, -1).join("/");
     return {
-      base: `${parsed.protocol}//${parsed.host}`,
+      base: origin,
       topic,
-      destination: parsed.toString().replace(/\/+$/u, ""),
+      destination: parsed.toString().replace(/\/+$/gu, ""),
+      publishUrl: `${origin}/${prefixPath}${prefixPath === "" ? "" : "/"}`,
     };
   }
 
   const fallback = setting.defaultBase ?? defaults.defaultBase ?? "https://ntfy.sh";
   const baseRaw = (setting.url ?? fallback).trim().replace(/\/+$/u, "");
   const baseParsed = parseHttpUrl(baseRaw, "the ntfy server URL");
+  assertTopicName(rawTopic, "the ntfy topic");
   return {
     base: `${baseParsed.protocol}//${baseParsed.host}`,
     topic: rawTopic,
-    // A base with a path prefix (`http://host/ntfy`) is kept: the topic goes
-    // under it, which is what a reverse-proxied ntfy actually serves.
+    // A base with a path prefix (`http://host/ntfy`) is kept: the publish goes
+    // to the prefix, which is the root of the ntfy behind it, and the topic is
+    // carried inside the JSON body rather than bolted onto the end of the URL.
+    publishUrl: `${baseRaw}/`,
+    // The human-readable form: what a subscription looks like, what a delivery
+    // report names. It is not where the request goes.
     destination: `${baseRaw}/${encodeURIComponent(rawTopic)}`,
   };
+}
+
+/**
+ * Refuse a topic ntfy would refuse, before the first bead is closed.
+ *
+ * The alternative is a `400 invalid request: topic invalid` per notice, which
+ * after {@link NtfyPublisher} gives up is a run that quietly stopped telling
+ * anybody anything.
+ */
+function assertTopicName(topic: string, what: string): void {
+  if (NTFY_TOPIC_PATTERN.test(topic)) return;
+  throw new NtfyError(
+    "config",
+    `${what} — "${topic}" is not a valid ntfy topic name ` +
+      "(1-64 letters, digits, dashes or underscores; no slashes, spaces or accents)",
+  );
 }
 
 function looksLikeUrl(value: string): boolean {
@@ -206,7 +285,7 @@ export class NtfyError extends Error {
  * produced less.
  */
 export function truncateToBytes(text: string, maxBytes: number): string {
-  const marker = "… (truncated)";
+  const marker = TRUNCATION_MARKER;
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
   if (maxBytes <= Buffer.byteLength(marker, "utf8")) {
     return clipBytes(text, Math.max(0, maxBytes));
@@ -234,34 +313,200 @@ function clipBytes(text: string, maxBytes: number): string {
   return "";
 }
 
-/** The ntfy header set for one message, with unset fields simply absent. */
-export function ntfyHeaders(
+/** One publish document, as ntfy's `publishMessage` struct reads it. */
+export interface NtfyPublishEnvelope {
+  readonly topic: string;
+  readonly message: string;
+  readonly title?: string;
+  readonly priority?: number;
+  readonly tags?: readonly string[];
+  readonly click?: string;
+}
+
+/**
+ * The JSON document ntfy reads for a publish.
+ *
+ * Field names and types are ntfy's (`publishMessage` in `server/types.go`), and
+ * two of them are traps worth a comment each:
+ *
+ * - `priority` is an **int**. The names ntfy's own header API accepts
+ *   (`high`, `urgent`, …) are translated here by {@link ntfyPriorityNumber},
+ *   because a `"priority":"high"` in a JSON body does not unmarshal into an
+ *   `int` and comes back as a `400`.
+ * - `tags` is an **array of strings**, not the comma-joined string the header
+ *   took.
+ *
+ * `title` is kept on one line. With a JSON body that is no longer a security
+ * requirement — nothing in the body can become a header — but a notification
+ * title with an embedded newline is still a broken-looking list entry, and the
+ * summary that produced it is written by an agent.
+ */
+export function ntfyPublishPayload(
   message: NtfyMessage,
+  topic: string,
+  options: { maxMessageBytes?: number; maxJsonBytes?: number } = {},
+): NtfyPublishEnvelope {
+  const maxMessageBytes = options.maxMessageBytes ?? NTFY_MAX_MESSAGE_BYTES;
+  const maxJsonBytes = options.maxJsonBytes ?? NTFY_MAX_JSON_BODY_BYTES;
+  const rest: {
+    title?: string;
+    priority?: number;
+    tags?: readonly string[];
+    click?: string;
+  } = {};
+  const title = singleLine(message.title);
+  if (title !== "") rest.title = title;
+  if (message.priority !== undefined && message.priority.trim() !== "") {
+    rest.priority = ntfyPriorityNumber(message.priority);
+  }
+  const tags = (message.tags ?? []).map((tag) => tag.trim()).filter((tag) => tag !== "");
+  if (tags.length > 0) rest.tags = tags;
+  const click = (message.click ?? "").trim();
+  if (click !== "") rest.click = click;
+
+  // What the envelope costs with an empty message inside it; `- 2` is the pair
+  // of quotes that empty message occupies, which is exactly the room `message`
+  // itself may still use.
+  const envelopeBytes =
+    Buffer.byteLength(JSON.stringify({ topic, message: "", ...rest }), "utf8") - 2;
+  const messageBudget = Math.max(0, maxJsonBytes - envelopeBytes);
+  return {
+    topic,
+    message: fitJsonBytes(truncateToBytes(message.body, maxMessageBytes), messageBudget),
+    ...rest,
+  };
+}
+
+/**
+ * The same document, serialized — the request body of one publish.
+ *
+ * The message inside it is clamped twice on the way: to ntfy's message limit,
+ * then to whatever the document limit leaves once the envelope and the escaping
+ * are paid for. Both clamps say so, because a notice that reads shorter than
+ * the run that produced it should tell the reader that rather than invite the
+ * question.
+ */
+export function ntfyPublishBody(
+  message: NtfyMessage,
+  topic: string,
+  options: { maxMessageBytes?: number; maxJsonBytes?: number } = {},
+): string {
+  return JSON.stringify(ntfyPublishPayload(message, topic, options));
+}
+
+/** ntfy's priority names, as the numbers the JSON body needs. */
+const NTFY_PRIORITY_BY_NAME: Readonly<Record<string, number>> = {
+  min: 1,
+  low: 2,
+  default: 3,
+  high: 4,
+  urgent: 5,
+};
+
+/**
+ * `high` -> 4, `3` -> 3, anything else -> a config error.
+ *
+ * The number is what `priority` has to be; sending the name would trade one
+ * undeliverable notice for a different undeliverable notice, and saying
+ * "the priority is not a priority" here is more useful than Go's "cannot
+ * unmarshal string into int" arriving later as somebody's 400.
+ */
+export function ntfyPriorityNumber(value: string): number {
+  const raw = value.trim().toLowerCase();
+  const named = NTFY_PRIORITY_BY_NAME[raw];
+  if (named !== undefined) return named;
+  if (/^[1-5]$/.test(raw)) return Number(raw);
+  throw new NtfyError(
+    "config",
+    `"${value}" is not an ntfy priority (1-5, or min / low / default / high / urgent)`,
+  );
+}
+
+/** Bytes the UTF-8 encoding of this string's JSON form occupies. */
+function jsonBytes(text: string): number {
+  return Buffer.byteLength(JSON.stringify(text), "utf8");
+}
+
+/**
+ * Trim `text` so its JSON encoding fits `maxEncodedBytes`, on the same
+ * "cut and say so" terms as {@link truncateToBytes}.
+ *
+ * Escaping is why this exists: a message of all newlines doubles in size once
+ * every `\n` is spelled with a backslash, and a stray control character costs
+ * six bytes per character. Every candidate is measured with `JSON.stringify`
+ * rather than estimated, because estimating what needs escaping is the same bug
+ * with more steps.
+ */
+export function fitJsonBytes(text: string, maxEncodedBytes: number): string {
+  if (jsonBytes(text) <= maxEncodedBytes) return text;
+  const base = text.endsWith(TRUNCATION_MARKER)
+    ? text.slice(0, -TRUNCATION_MARKER.length)
+    : text;
+  const markerBytes = jsonBytes(TRUNCATION_MARKER);
+  if (maxEncodedBytes <= markerBytes) return "";
+  // Largest prefix that still fits with the marker on the end.
+  let lo = 0;
+  let hi = base.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (jsonBytes(base.slice(0, mid) + TRUNCATION_MARKER) <= maxEncodedBytes) lo = mid;
+    else hi = mid - 1;
+  }
+  return `${base.slice(0, lo)}${TRUNCATION_MARKER}`;
+}
+
+/** Collapse a value to one line for a header or a notification title. */
+function singleLine(value: string): string {
+  return value.replace(/[\r\n]+/gu, " ").trim();
+}
+
+/**
+ * The headers a publish carries — which is deliberately not the interesting
+ * part of the request any more.
+ *
+ * Everything an agent wrote lives in the JSON body. What is left here is three
+ * constants and one operator-supplied secret, all of which have to be a header
+ * because that is where a bearer token goes. A value among them that cannot be
+ * put on the wire is a configuration error, and it is named as one instead of
+ * arriving as Node's `ERR_INVALID_CHAR` from the socket layer — the exact error
+ * that killed this feature in its header-only form.
+ */
+export function transportHeaders(
   options: { token?: string; userAgent?: string } = {},
 ): Record<string, string> {
   const headers: Record<string, string> = {
-    "Content-Type": "text/plain; charset=utf-8",
-    "User-Agent": options.userAgent ?? "pi-beads-loop",
+    "Content-Type": NTFY_JSON_CONTENT_TYPE,
+    "User-Agent": headerValue(options.userAgent ?? "pi-beads-loop", "the user agent"),
   };
-  const title = message.title.trim();
-  if (title !== "") headers["Title"] = flattenHeader(title);
-  if (message.priority !== undefined && message.priority !== "") {
-    headers["Priority"] = flattenHeader(message.priority);
-  }
-  const tags = (message.tags ?? []).map((tag) => tag.trim()).filter((tag) => tag !== "");
-  if (tags.length > 0) headers["Tags"] = flattenHeader(tags.join(","));
-  if (message.click !== undefined && message.click !== "") {
-    headers["Click"] = flattenHeader(message.click);
-  }
-  if (options.token !== undefined && options.token !== "") {
-    headers.Authorization = `Bearer ${options.token.trim()}`;
+  const token = (options.token ?? "").trim();
+  if (token !== "") {
+    headers.Authorization = `Bearer ${headerValue(token, "LOOP_NTFY_TOKEN")}`;
   }
   return headers;
 }
 
-/** No CR, no LF, no folding tricks in a header value. */
-function flattenHeader(value: string): string {
-  return value.replace(/[\r\n]+/gu, " ").trim();
+/** Whether a string can be used as an HTTP header value at all. */
+export function isHeaderSafe(value: string): boolean {
+  return HEADER_SAFE_PATTERN.test(value);
+}
+
+/**
+ * A header value, flattened and checked.
+ *
+ * The offending string is deliberately not quoted back: one of the two things
+ * this can be is a bearer token, and a token that fails validation is still a
+ * token. Naming the setting is enough to fix it.
+ */
+function headerValue(value: string, what: string): string {
+  const flattened = value.replace(/[\r\n]+/gu, " ").trim();
+  if (!isHeaderSafe(flattened)) {
+    throw new NtfyError(
+      "config",
+      `${what} contains characters that cannot be sent in an HTTP header ` +
+        "(only printable ASCII can be)",
+    );
+  }
+  return flattened;
 }
 
 /**
@@ -361,6 +606,8 @@ export interface NtfyPublisherOptions {
   readonly token?: string;
   readonly timeoutMs?: number;
   readonly maxMessageBytes?: number;
+  /** Ceiling for the whole JSON document, escaping included. */
+  readonly maxJsonBytes?: number;
   readonly maxTitleLength?: number;
   readonly logger?: (line: string) => void;
   readonly userAgent?: string;
@@ -369,6 +616,8 @@ export interface NtfyPublisherOptions {
 export interface NtfyPublisher {
   readonly enabled: boolean;
   readonly destination: string;
+  /** Where the request goes: the server root/prefix, with the topic in the body. */
+  readonly publishUrl: string;
   readonly transport: string;
   publish(message: NtfyMessage): Promise<NtfyDelivery>;
 }
@@ -377,31 +626,39 @@ export function createNtfyPublisher(options: NtfyPublisherOptions): NtfyPublishe
   const transport = options.transport ?? createHttpTransport();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxBytes = options.maxMessageBytes ?? NTFY_MAX_MESSAGE_BYTES;
+  const maxJson = options.maxJsonBytes ?? NTFY_MAX_JSON_BODY_BYTES;
   const maxTitle = options.maxTitleLength ?? NTFY_MAX_TITLE_LENGTH;
   const log = options.logger ?? (() => undefined);
   const destination = options.target.destination;
+  const publishUrl = options.target.publishUrl;
+  const topic = options.target.topic;
 
   return {
     enabled: options.target.topic.trim() !== "",
     destination,
     transport: transport.name,
+    publishUrl,
     async publish(message: NtfyMessage): Promise<NtfyDelivery> {
-      const body = truncateToBytes(message.body, maxBytes);
       const title = clipTitle(message.title, maxTitle);
-      if (body.trim() === "") {
+      if (message.body.trim() === "") {
         return { kind: "skipped", reason: "the notice had no body to publish" };
       }
-      const headers = ntfyHeaders(
-        { ...message, title, body },
-        {
-          ...(options.token === undefined ? {} : { token: options.token }),
-          ...(options.userAgent === undefined ? {} : { userAgent: options.userAgent }),
-        },
-      );
 
       let response: NtfyRawResponse;
       try {
-        response = await transport.publish(destination, {
+        // Built inside the try, because building it can refuse something: a
+        // priority that is not a priority, a token that is not a header value.
+        // Both are operator errors, and both come back as a delivery rather than
+        // an exception thrown into a loop that has already done the work.
+        const body = ntfyPublishBody({ ...message, title }, topic, {
+          maxMessageBytes: maxBytes,
+          maxJsonBytes: maxJson,
+        });
+        const headers = transportHeaders({
+          ...(options.token === undefined ? {} : { token: options.token }),
+          ...(options.userAgent === undefined ? {} : { userAgent: options.userAgent }),
+        });
+        response = await transport.publish(publishUrl, {
           headers,
           body,
           timeoutMs,
@@ -412,11 +669,15 @@ export function createNtfyPublisher(options: NtfyPublisherOptions): NtfyPublishe
           : error instanceof Error
             ? error.message
             : String(error);
+        // A config refusal (a bad priority, a token that is not a header value)
+        // will not be fixed by asking again, so it is not marked retryable the
+        // way a dropped socket is.
+        const retryable = !(NtfyError.is(error) && error.kind === "config");
         // The topic identifies the channel, so it stays in the log; the token
         // never appears anywhere in this module, by construction — it only ever
         // exists inside the header value built above.
         log(`ntfy publish to ${destination} failed: ${reason}`);
-        return { kind: "failed", reason, destination, retryable: true };
+        return { kind: "failed", reason, destination, retryable };
       }
 
       const verdict = classifyResponse(response.statusCode);
@@ -464,6 +725,7 @@ export function createNullPublisher(reason: string): NtfyPublisher {
   return {
     enabled: false,
     destination: "none",
+    publishUrl: "none",
     transport: "none",
     async publish(): Promise<NtfyDelivery> {
       return { kind: "skipped", reason };

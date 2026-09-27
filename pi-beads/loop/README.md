@@ -56,9 +56,9 @@ src/kanban.ts       the mini kanban: ready / in progress / done, read through an
 src/notify.ts       the completion notice: what a finished bead says, in what order,
                     and when to stop trying to say it. Wording only — no sockets
 src/ntfy.ts       the ONLY module that talks to a notification server: topic
-                    resolution, the ntfy headers, the byte limits, and an HTTP
-                    publisher whose every failure path returns a delivery instead
-                    of throwing (see ADR-007)
+                    resolution, the JSON publish envelope, the byte limits, and
+                    an HTTP publisher whose every failure path returns a
+                    delivery instead of throwing (see ADR-007)
 src/format.ts       one-line plain-log summaries — NOT the renderer (see ADR-001)
 src/gitlock.ts      the ONLY module that spawns git, and the only kill policy:
                     SIGTERM first, SIGKILL as escalation, because a killed git
@@ -680,11 +680,13 @@ not quietly remembered until the next bead happens to close. The behaviour is
 not a knob; the count is (`LOOP_NTFY_MAX_FAILURES`).
 
 **Bad config stops the run; bad delivery never does.** A URL with no scheme, a
-URL with credentials stuffed into it, a topic that resolves to nothing, a
-priority that is neither 1–5 nor one of ntfy's names — these stop the loop at
-startup with `notify-config` and exit 2, the same way an unknown thinking level
-does, so a typo is found in the terminal it was typed in rather than as a day of
-missing notifications. What *cannot* fail the run is a server refusing a message.
+URL with credentials stuffed into it, a topic that resolves to nothing or is not
+a legal ntfy topic name (`1`–`64` of `A-Za-z0-9-_`), a priority that is neither
+1–5 nor one of ntfy's names, a token that cannot be sent in a header — these
+stop the loop at startup with `notify-config` and exit 2, the same way an unknown
+thinking level does, so a typo is found in the terminal it was typed in rather
+than as a day of missing notifications. What *cannot* fail the run is a server
+refusing a message.
 
 **Notice, not noise.** `LOOP_NTFY_TOPIC` unset means no publisher and no socket.
 A dry run sends nothing: a dry run never reaches the close that triggers the
@@ -694,8 +696,8 @@ under the failure key.
 
 | Variable | What it does | Default |
 | --- | --- | --- |
-| `LOOP_NTFY_TOPIC` | The topic: a bare name, or a full `http(s)://host/topic` URL. **This is the switch.** | unset — no notices |
-| `LOOP_NTFY_URL` | The server a bare topic is joined onto. A path prefix (`https://host/ntfy`) is preserved | `https://ntfy.sh` |
+| `LOOP_NTFY_TOPIC` | The topic: a bare name (`1`–`64` of `A-Za-z0-9-_`), or a full `http(s)://host/topic` URL. **This is the switch.** | unset — no notices |
+| `LOOP_NTFY_URL` | The server a bare topic is joined onto, and where the publish itself is POSTed. A path prefix (`https://host/ntfy`) is preserved | `https://ntfy.sh` |
 | `LOOP_NTFY_TOKEN` | Bearer token, for a server that requires one | unset — anonymous |
 | `LOOP_NTFY_PRIORITY` | `1`–5 or `min` / `low` / `default` / `high` / `urgent` | unset — ntfy's default |
 | `LOOP_NTFY_TAGS` | Emoji names on the notification, space or comma separated | unset |
@@ -706,17 +708,31 @@ under the failure key.
 
 A few defaults are worth knowing about:
 
+- **The whole notice is a JSON body, not a set of headers.** `POST <server>/`
+  with `{"topic":…,"title":…,"message":…,"priority":4,"tags":[…]}`. This is
+  ntfy's own "Publish as JSON" form, and it is what the loop uses because the
+  alternative broke: the title is an agent-written sentence, HTTP headers
+  cannot carry anything above Latin-1, and Node answered a `✓` in a summary with
+  `Invalid character in header content ["Title"]` — so some beads announced
+  themselves and some did not, depending on the *wording* of the work. In a JSON
+  string, anything the run produced is legal. The only header left is the bearer
+  token, which has nowhere else to go. Full story in
+  [ADR-007's amendment](docs/ADR-007-ntfy-notices.md).
 - **Nothing unvalidated goes on the wire.** The target is resolved at startup —
   scheme checked, credentials in the URL refused (ntfy uses a bearer header, and
-  a URL is a string that gets echoed into logs) — and header values, including
-  the title, which is an agent-written sentence, have line breaks flattened out
-  of them so a summary cannot forge a header.
+  a URL is a string that gets echoed into logs), the topic checked against
+  ntfy's own pattern. Titles are kept to one line, because a two-line
+  notification title is a broken-looking list entry now that a line break in one
+  can no longer forge a header.
 - **The token never appears in a log line.** There is a test that publishes with a
   token and asserts the string shows up nowhere.
-- **ntfy's limits are honoured, not discovered.** The body is cut at 4096 bytes
-  on a character boundary and marked `… (truncated)`; the title is clipped so the
-  leading `[prefix] bead.id` survives. Cutting beats a `413`, and marking the cut
-  beats a notice that silently reads as shorter than the run.
+- **ntfy's limits are honoured, not discovered.** The message is cut at 4096
+  bytes on a character boundary and marked `… (truncated)`; the title is clipped
+  so the leading `[prefix] bead.id` survives; and the whole JSON document is
+  clamped to the 8 KiB ntfy gives it, because escaping a body full of quotes and
+  newlines inflates a message that already fitted on its own. Cutting beats a
+  `413`, and marking the cut beats a notice that silently reads as shorter than
+  the run.
 - **TLS with a self-signed certificate:** point Node's trust store at your CA with
   `NODE_EXTRA_CA_CERTS` rather than disabling verification. This module has no
   "skip TLS" setting, and adding one should be its own decision.
