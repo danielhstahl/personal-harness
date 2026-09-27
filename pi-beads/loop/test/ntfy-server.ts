@@ -9,7 +9,7 @@
  * It answers the way ntfy answers — `200 {"id":…,"time":…,"expires":…}` on a
  * good publish — and it *checks* the way ntfy checks, because a fake that only
  * echoes what the client believes proves nothing. The rules below are ntfy's,
- * read out of `server/server.go` / `server/types.go`:
+ * read out of `server/server.go`, `server/types.go` and `util/peek.go`:
  *
  * - A JSON publish is routed on the path being exactly `/`. The topic comes from
  *   the body. `POST /mytopic` with a JSON body is not the same request said
@@ -19,17 +19,25 @@
  *   nonsense notice.
  * - The topic must match `^[-_A-Za-z0-9]{1,64}$`, else `400` / code 40009.
  * - `priority` unmarshals into an `int`: a `"high"` in the JSON is a `400`, even
- *   though the header API accepts that name.
- * - `tags` unmarshals into `[]string`.
+ *   though the header API accepts that name. Same for `tags` and `[]string`.
+ * - **The message-vs-attachment decision.** `util.Peek` reports
+ *   `LimitReached: read == limit`, so a message of *exactly*
+ *   `limit-message-bytes` counts as having hit the limit; `handlePublishBody`
+ *   takes the text path only when the limit was *not* reached, and otherwise
+ *   falls through to `handleBodyAsAttachment` — which answers
+ *   `40014 attachments not allowed` on a server with no attachment store
+ *   (ntfy's default) and turns the notice into a downloadable file on one that
+ *   has one. Both of those outcomes are modelled here, because both were
+ *   reachable from a notice truncated to exactly 4096 bytes.
  *
  * It can be told to fail in the four ways that matter to the client's promises:
  * `403` (bad topic or token), `404` (no such topic), `429` (rate limited),
  * `500` (server broke), or never answering at all so the client's deadline is
  * what replies.
  *
- * Every request is recorded: method, path, headers, raw body, and the parsed
- * JSON envelope when there was one. The tests assert the conversation rather
- * than inferring it from a delivery result.
+ * Every request is recorded: method, path, headers, raw body, the parsed JSON
+ * envelope when there was one, and whether it landed on the attachment path.
+ * The tests assert the conversation rather than inferring it from a delivery.
  */
 import http from "node:http";
 import assert from "node:assert/strict";
@@ -50,6 +58,25 @@ export interface FakeNtfyBehaviour {
    * should care; nothing in this repo publishes that way.
    */
   readonly allowTopicUrlJson?: boolean;
+  /**
+   * The server's `limit-message-bytes`. Default 4096 — lower it to stand in
+   * for a tightened self-hosted server.
+   *
+   * The comparison is **inclusive of equality**, because that is what
+   * `util.Peek` does: `LimitReached: read == limit`. A message of exactly this
+   * size is not a long message, it is an attachment.
+   */
+  readonly messageLimitBytes?: number;
+  /**
+   * Whether this server has an attachment store (`attachment-cache-dir`).
+   * Default **false**, which is ntfy's default: anything going down the
+   * attachment path is refused with `40014 attachments not allowed`. Set true
+   * to model a server that would quietly make a file of it instead; the record
+   * says which happened either way.
+   */
+  readonly attachmentsAllowed?: boolean;
+  /** Ceiling for the whole JSON publish document. Default 8192 (2x the message limit). */
+  readonly maxJsonBytes?: number;
 }
 
 export interface FakeNtfyRequest {
@@ -61,6 +88,8 @@ export interface FakeNtfyRequest {
   readonly json: Readonly<Record<string, unknown>> | null;
   /** The topic the server took this message for, from the body or the path. */
   readonly topic: string;
+  /** True when the server routed this to the attachment path, not the text one. */
+  readonly asAttachment: boolean;
 }
 
 export interface FakeNtfy {
@@ -73,6 +102,15 @@ export interface FakeNtfy {
 
 /** ntfy's own `topicRegex`. No `/`, 1-64 of `-_A-Za-z0-9`. */
 const TOPIC_PATTERN = /^[-_A-Za-z0-9]{1,64}$/u;
+/** ntfy's `limit-message-bytes` default, and the 2x ceiling on a JSON document. */
+const DEFAULT_MESSAGE_LIMIT_BYTES = 4096;
+const DEFAULT_JSON_LIMIT_BYTES = 8192;
+
+interface Limits {
+  readonly messageLimitBytes: number;
+  readonly maxJsonBytes: number;
+  readonly attachmentsAllowed: boolean;
+}
 
 interface Refusal {
   readonly status: number;
@@ -84,19 +122,27 @@ interface JsonPublishInspection {
   readonly json: Record<string, unknown> | null;
   readonly topic: string;
   readonly refusal: Refusal | null;
+  /** True when the message went down ntfy's attachment path instead of the text one. */
+  readonly asAttachment: boolean;
 }
 
 /**
  * Read a JSON publish the way ntfy reads one, and refuse it for the same reasons.
  *
- * Extracted from the request handler so the rules above are one readable list
- * rather than an if-chain inside a closure.
+ * Extracted from the request handler so the rules are one readable list rather
+ * than an if-chain inside a closure.
  */
 function inspectJsonPublish(
   body: string,
   url: string,
-  allowTopicUrlJson: boolean | undefined,
+  behaviour: FakeNtfyBehaviour,
 ): JsonPublishInspection {
+  const limits: Limits = {
+    messageLimitBytes: behaviour.messageLimitBytes ?? DEFAULT_MESSAGE_LIMIT_BYTES,
+    maxJsonBytes: behaviour.maxJsonBytes ?? DEFAULT_JSON_LIMIT_BYTES,
+    attachmentsAllowed: behaviour.attachmentsAllowed === true,
+  };
+
   let parsed: unknown = null;
   try {
     parsed = JSON.parse(body);
@@ -107,7 +153,7 @@ function inspectJsonPublish(
     return refused(null, "", 400, 40017, "invalid request: request body must be message JSON");
   }
   const json = parsed as Record<string, unknown>;
-  if (allowTopicUrlJson !== true && url !== "/") {
+  if (behaviour.allowTopicUrlJson !== true && url !== "/") {
     return refused(
       json,
       "",
@@ -124,7 +170,13 @@ function inspectJsonPublish(
   if (!TOPIC_PATTERN.test(topic)) {
     return refused(json, "", 400, 40009, "invalid request: topic invalid");
   }
-  if (json.priority !== undefined && !(typeof json.priority === "number" && Number.isInteger(json.priority))) {
+  if (Buffer.byteLength(body, "utf8") > limits.maxJsonBytes) {
+    return refused(json, topic, 400, 40000, "request body too large");
+  }
+  if (
+    json.priority !== undefined &&
+    !(typeof json.priority === "number" && Number.isInteger(json.priority))
+  ) {
     return refused(
       json,
       topic,
@@ -145,7 +197,15 @@ function inspectJsonPublish(
       "json: cannot unmarshal non-array into Go struct field publishMessage.tags of type []string",
     );
   }
-  return { json, topic, refusal: null };
+
+  // The boundary that cost a run of missing notices: equality is already
+  // "limit reached", and limit reached is the attachment path.
+  const message = typeof json.message === "string" ? json.message : "";
+  const limitReached = Buffer.byteLength(message, "utf8") >= limits.messageLimitBytes;
+  if (limitReached && !limits.attachmentsAllowed) {
+    return refused(json, topic, 400, 40014, "invalid request: attachments not allowed");
+  }
+  return { json, topic, refusal: null, asAttachment: limitReached };
 }
 
 function refused(
@@ -155,7 +215,7 @@ function refused(
   code: number,
   message: string,
 ): JsonPublishInspection {
-  return { json, topic, refusal: { status, code, message } };
+  return { json, topic, refusal: { status, code, message }, asAttachment: false };
 }
 
 export async function startFakeNtfy(behaviour: FakeNtfyBehaviour = {}): Promise<FakeNtfy> {
@@ -172,13 +232,12 @@ export async function startFakeNtfy(behaviour: FakeNtfyBehaviour = {}): Promise<
       const url = req.url ?? "/";
       const pathTopic = url.replace(/^\//u, "").replace(/\/+$/u, "");
 
-      // The rules this fake enforces are ntfy's, read out of `server.go`:
-      // see the module comment above. Every request is recorded, including the
-      // ones refused, so a test can see what was sent rather than infer it from
-      // what came back.
+      // The rules this fake enforces are ntfy's; see the module comment. Every
+      // request is recorded, including the ones refused, so a test can see what
+      // was sent rather than infer it from what came back.
       const inspected: JsonPublishInspection = isJson
-        ? inspectJsonPublish(body, url, behaviour.allowTopicUrlJson)
-        : { json: null, topic: pathTopic, refusal: null };
+        ? inspectJsonPublish(body, url, behaviour)
+        : { json: null, topic: pathTopic, refusal: null, asAttachment: false };
       const refusal = inspected.refusal;
 
       requests.push({
@@ -188,6 +247,7 @@ export async function startFakeNtfy(behaviour: FakeNtfyBehaviour = {}): Promise<
         body,
         json: inspected.json,
         topic: inspected.topic,
+        asAttachment: inspected.asAttachment,
       });
 
       if (behaviour.hang === true) {
@@ -220,15 +280,17 @@ export async function startFakeNtfy(behaviour: FakeNtfyBehaviour = {}): Promise<
     });
   });
 
-  const socketsOf = server as unknown as { on(event: string, cb: (s: import("node:net").Socket) => void): void };
+  const socketsOf = server as unknown as {
+    on(event: string, cb: (s: import("node:net").Socket) => void): void;
+  };
   socketsOf.on("connection", (socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
     socket.on("error", () => sockets.delete(socket));
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
+  await new Promise<void>((resolve, rejectListen) => {
+    server.once("error", rejectListen);
     server.listen(0, "127.0.0.1", () => resolve());
   });
   const address = server.address() as AddressInfo | null;
@@ -254,7 +316,7 @@ function rejectResponse(
   message: string,
 ): void {
   res.writeHead(httpStatus, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ code, http: httpStatus, httpMessage: message }));
+  res.end(JSON.stringify({ code, http: httpStatus, httpMessage: message, error: message }));
 }
 
 /** The JSON envelope of request `n` (default: the only/last one), or fail the test. */

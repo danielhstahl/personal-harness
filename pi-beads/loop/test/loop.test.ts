@@ -44,7 +44,8 @@ import { createIdleMode, IdleError } from "../src/idle.ts";
 import type { IdleHandle, IdleOutcome } from "../src/idle.ts";
 import { createNullPresenter } from "../src/render.ts";
 import type { WorkPresenter } from "../src/render.ts";
-import { createGitWriter } from "../src/vcs.ts";
+import { createGitWriter, VcsError } from "../src/vcs.ts";
+import { treeChangeReason, treeDelta } from "../src/loop.ts";
 import {
   createScriptBoard,
   doneParams,
@@ -988,6 +989,255 @@ test("a lost handoff after the commit recovers without a second commit", async (
   } finally {
     repo.dispose();
   }
+});
+
+// ── rule 4's exception: a bead with nothing to commit is parked, not fatal ───
+
+test(
+  "nothing to commit parks the bead, says why, and the run goes on to the next ticket",
+  async () => {
+    const board = createScriptBoard();
+    const repo = makeRepo();
+    try {
+      board.seed({ id: "tst.1", title: "Already landed", status: "open", priority: 1 });
+      board.seed({ id: "tst.2", title: "Real change", status: "open", priority: 2 });
+      // The first bead's file is already committed and untouched, so the tree has
+      // nothing to stage for it — the shape that used to end the whole run.
+      repo.write("src/landed.ts", "export const landed = true;\n");
+      repo.git("add", "--", "src/landed.ts");
+      repo.git("commit", "-q", "-m", "landed by someone else earlier");
+      const commitsBefore = repo.commitCount();
+      // The second bead's change waits in the tree for its turn.
+      repo.write("src/new-thing.ts", "export const newThing = true;\n");
+
+      const notifier = recordingNotifier();
+      const h = harness({
+        board,
+        repo,
+        scripts: [
+          {
+            tools: [
+              {
+                name: "report_done",
+                params: doneParams({
+                  summary: "Already satisfied by what is in HEAD.",
+                  changed_files: ["src/landed.ts"],
+                }),
+              },
+            ],
+          },
+          {
+            tools: [
+              {
+                name: "report_done",
+                params: doneParams({
+                  summary: "Added the new thing.",
+                  changed_files: ["src/new-thing.ts"],
+                }),
+              },
+            ],
+          },
+        ],
+        idleTexts: [],
+        notifier,
+      });
+      const result = await h.run();
+
+      assert.notEqual(
+        result.kind,
+        "blocked",
+        `a bead with no diff must not stop the run: ${result.kind}: ${result.reason ?? ""}`,
+      );
+      assert.equal(board.statusOf("tst.1"), "deferred", "parked out of both board reads");
+      assert.equal(
+        board.memories.has(handoffKeyFor("tst.1")),
+        false,
+        "no handoff note without a commit to point at",
+      );
+      const why = board.memories.get(failureKeyFor("tst.1")) ?? "";
+      assert.match(why, /Nothing to commit for tst\.1/u);
+      assert.match(why, /was NOT closed/u);
+      assert.match(why, /bd update tst\.1 --status open/u, "the way back is written down");
+      assert.match(why, /identical to HEAD/u, "which path, and why it was skipped");
+      assert.equal(repo.commitCount(), commitsBefore + 1, "exactly one commit: the second bead's");
+      assert.deepEqual(repo.filesInHead().slice(-1), ["src/new-thing.ts"]);
+      assert.equal(board.statusOf("tst.2"), "closed", "the next ticket got its full ritual");
+      assert.deepEqual(
+        notifier.notices.map((notice) => notice.issueId),
+        ["tst.2"],
+        "no completion notice for a bead that landed nothing",
+      );
+      assert.ok(
+        h.ui.warned.some((line) => /Nothing to commit for tst\.1/u.test(line)),
+        `the park is said out loud: ${JSON.stringify(h.ui.warned)}`,
+      );
+      assert.ok(
+        board.calls.includes("setStatus(tst.1, deferred, ifStatus=in_progress)"),
+        `the park write is the guarded one: ${JSON.stringify(board.calls)}`,
+      );
+    } finally {
+      repo.dispose();
+    }
+  },
+);
+
+test(
+  "a bead that cannot be deferred stops the run instead of being worked again into the same nothing",
+  async () => {
+    const board = createScriptBoard();
+    const repo = makeRepo();
+    try {
+      board.seed({ id: "tst.1", title: "Already landed", status: "open", priority: 1 });
+      repo.write("src/landed.ts", "export const landed = true;\n");
+      repo.git("add", "--", "src/landed.ts");
+      repo.git("commit", "-q", "-m", "landed by someone else earlier");
+      const commitsBefore = repo.commitCount();
+
+      // The park write is the only thing that keeps this bead out of the pick
+      // queue. Make exactly that write fail.
+      const realSetStatus = board.setStatus.bind(board);
+      board.setStatus = async (id, status, options) => {
+        if (status === "deferred") {
+          throw new BdError({
+            kind: "exit-1",
+            message: "bd update: database is locked",
+            exitCode: 1,
+          });
+        }
+        return realSetStatus(id, status, options);
+      };
+
+      const h = harness({
+        board,
+        repo,
+        scripts: [
+          {
+            tools: [
+              {
+                name: "report_done",
+                params: doneParams({
+                  summary: "Already satisfied by what is in HEAD.",
+                  changed_files: ["src/landed.ts"],
+                }),
+              },
+            ],
+          },
+          {
+            tools: [
+              {
+                name: "report_done",
+                params: doneParams({ summary: "Second pass", changed_files: ["src/landed.ts"] }),
+              },
+            ],
+          },
+        ],
+        idleTexts: [],
+      });
+      const result = await h.run();
+
+      assert.equal(result.kind, "blocked", `expected a stop, got ${result.kind}`);
+      assert.match(result.reason ?? "", /tst\.1 had nothing to commit and could not be deferred/u);
+      assert.match(result.reason ?? "", /bd update tst\.1 --status open/u);
+      assert.match(result.reason ?? "", /database is locked/u, "the real cause survives into the reason");
+      assert.equal(board.statusOf("tst.1"), "in_progress", "it stayed put: nothing was parked");
+      assert.equal(repo.commitCount(), commitsBefore, "no commit was invented for an empty tree");
+      assert.equal(
+        h.sessions.sessions.length,
+        1,
+        "the bead was not worked a second time before the stop",
+      );
+      assert.equal(
+        h.board.memories.has(failureKeyFor("tst.1")),
+        true,
+        "the reason was still recorded before the failed park",
+      );
+    } finally {
+      repo.dispose();
+    }
+  },
+);
+
+// ── the planner holds a shell now, so the tree is checked ────────────────────
+
+test("a planning session that changed the tree has its split refused before any child exists", async () => {
+  const h = harness({ idleTexts: [SPLIT_REQUEST] });
+  prepareWalk(h);
+  try {
+    const inner = fakeSplitPort([SPLIT_BATCH]);
+    const dirtySplitter = {
+      async propose(request: string) {
+        const answer = await inner.propose(request);
+        // The classic "just wanted to see what it would look like".
+        h.repo.write("planner_left_this.txt", "a planner's scribble\n");
+        return answer;
+      },
+    } as unknown as typeof h.ports.splitter;
+
+    const result = await runLoop({ ...h.ports, splitter: dirtySplitter }, {});
+
+    assert.equal(result.kind, "blocked", `expected a stop, got ${result.kind}`);
+    assert.match(result.reason ?? "", /planning session changed the working tree/u);
+    assert.match(result.reason ?? "", /planner_left_this\.txt/u, "it names what appeared");
+    assert.match(result.reason ?? "", /batch was not created/u);
+    assert.equal(h.board.issues.size, 0, "no children, and not even the epic: the check came first");
+  } finally {
+    h.repo.dispose();
+  }
+});
+
+test("a tree that cannot be read is reported as unverified, never as unchanged", async () => {
+  const h = harness({ scripts: WORK_SCRIPTS, idleTexts: [SPLIT_REQUEST] });
+  prepareWalk(h);
+  try {
+    const brokenGit = {
+      ...h.ports.git,
+      async worktreeChanges(): Promise<string[]> {
+        throw new VcsError({
+          kind: "exit",
+          message: "git status: cannot open '.git': Permission denied",
+          exitCode: 128,
+        });
+      },
+    };
+
+    const result = await runLoop({ ...h.ports, git: brokenGit }, {});
+
+    assert.notEqual(
+      result.kind,
+      "blocked",
+      `an unreadable tree is not a changed tree: ${result.kind}: ${result.reason ?? ""}`,
+    );
+    assert.ok(
+      h.ui.warned.some((line) => /could not read the working tree before the split/u.test(line)),
+      `the failure is said where it happened: ${JSON.stringify(h.ui.warned)}`,
+    );
+    assert.ok(
+      h.ui.warned.some((line) => /proceeds unverified/u.test(line)),
+      "and it says what that means for the guarantee",
+    );
+    assert.ok(h.board.issues.size >= 3, "the split still landed");
+  } finally {
+    h.repo.dispose();
+  }
+});
+
+test("treeDelta: before and after decide it, and a missing read decides nothing", () => {
+  assert.equal(treeDelta(["M a.ts"], ["M a.ts"]), null, "same list, no change");
+  assert.equal(treeDelta([], []), null);
+  assert.equal(treeDelta(null, []), null, "a read that failed is not evidence of a clean tree");
+  assert.equal(treeDelta([], null), null);
+
+  const added = treeDelta(["M a.ts"], ["M a.ts", "?? scribble.txt"]);
+  assert.deepEqual(added?.added, ["?? scribble.txt"]);
+  assert.deepEqual(added?.removed, []);
+
+  const reverted = treeDelta(["M a.ts"], []);
+  assert.deepEqual(reverted?.added, []);
+  assert.deepEqual(reverted?.removed, ["M a.ts"]);
+
+  const long = treeDelta([], Array.from({ length: 20 }, (_, i) => `?? f${i}`));
+  assert.match(treeChangeReason(long ?? { added: [], removed: [] }), /and 12 more/u);
+  assert.match(treeChangeReason(long ?? { added: [], removed: [] }), /git checkout -- <path>/u);
 });
 
 // ── rule 12: fatal exits ───────────────────────────────────────────────────

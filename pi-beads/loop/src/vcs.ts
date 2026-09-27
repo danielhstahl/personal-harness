@@ -464,6 +464,26 @@ export interface GitWriter {
   commitPaths(hash: string): Promise<string[]>;
   /** `git rev-parse --verify HEAD`, or `null` on a repo with no commits. */
   headHash(): Promise<string | null>;
+  /**
+   * What differs from HEAD right now, as sorted `"XY path"` records
+   * (`"M src/a.ts"`, `"?? scratch.txt"`, `"AD gone.ts"`).
+   *
+   * Asked deliberately without a pathspec, because the question is not "did the
+   * reported paths move" but "is this still the working tree I handed over".
+   * Take it before a session that holds a shell and again after it, and compare:
+   * anything in the difference is a change nobody asked the loop for.
+   *
+   * Untracked paths come at **directory** granularity (`--untracked-files=normal`),
+   * which is what makes this cheap: an untracked `node_modules/` is one record
+   * here rather than fifty thousand, and a change to a *tracked* file — the thing
+   * that actually matters — is still reported exactly. Consequence worth knowing:
+   * adding a file inside a directory that was already untracked is not visible,
+   * because the directory was already in the difference before the session ran.
+   *
+   * Unlike the plan-time status, a failed read **throws**: a status that could not
+   * be read must never be mistaken for a tree that was left alone.
+   */
+  worktreeChanges(): Promise<string[]>;
 }
 
 function splitLines(stdout: string): string[] {
@@ -978,6 +998,39 @@ export function createGitWriter(options: GitWriterOptions = {}): GitWriter {
     return SHA_RE.test(line) ? line : null;
   }
 
+  async function worktreeChanges(): Promise<string[]> {
+    const res = await git([
+      "status",
+      "--porcelain",
+      "--untracked-files=normal",
+      "--no-renames",
+      "-z",
+    ]);
+    if (res.exitCode !== 0) {
+      // "No changes" and "could not tell" are different answers, and only one of
+      // them is safe to act on. `dirtyPaths` folds a failed read to an empty set
+      // because a plan can survive that; a guarantee cannot.
+      throw new VcsError({
+        kind: "exit",
+        message: `git status failed (exit ${res.exitCode}): ${trimTrailingNewline(res.stderr).trim() || "no output"}`,
+        exitCode: res.exitCode,
+      });
+    }
+    const records: string[] = [];
+    const seen = new Set<string>();
+    for (const record of res.stdout.split("\0")) {
+      // Each record is "XY <path>"; a shorter one carried no path.
+      if (record.length < 4) continue;
+      const path = record.slice(3);
+      if (path === "" || seen.has(path)) continue;
+      seen.add(path);
+      records.push(`${record.slice(0, 2)} ${path}`);
+    }
+    // git prints in index-then-worktree order; sorting makes the before/after
+    // comparison independent of that order.
+    return records.sort();
+  }
+
   return {
     repoRoot,
     planCommit,
@@ -985,6 +1038,7 @@ export function createGitWriter(options: GitWriterOptions = {}): GitWriter {
     findCommitByTrailer,
     commitPaths,
     headHash,
+    worktreeChanges,
   };
 }
 

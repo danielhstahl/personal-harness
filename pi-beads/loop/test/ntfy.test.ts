@@ -20,6 +20,7 @@ import {
   NTFY_MAX_JSON_BODY_BYTES,
   NTFY_MAX_MESSAGE_BYTES,
   NTFY_MAX_TITLE_LENGTH,
+  NTFY_MIN_MESSAGE_BYTES,
   NTFY_TOPIC_PATTERN,
   classifyResponse,
   createHttpTransport,
@@ -27,11 +28,13 @@ import {
   createNullPublisher,
   fitJsonBytes,
   isHeaderSafe,
+  isMessageTooLargeRefusal,
   localHostname,
   ntfyPriorityNumber,
   ntfyPublishBody,
   ntfyPublishPayload,
   resolveNtfyTarget,
+  shrinkMessageLimit,
   transportHeaders,
   truncateToBytes,
   type NtfyRequestOptions,
@@ -328,6 +331,136 @@ test("a notice whose JSON form is too big for the server is clamped, not rejecte
   );
   const message = String((JSON.parse(sent.body) as Record<string, unknown>).message);
   assert.match(message, /… \(truncated\)$/u, "and the reader is told, not left counting quotes");
+});
+
+// ── the attachment boundary ─────────────────────────────────────────────
+
+test(
+  "REGRESSION: nothing lands on ntfy's message limit, because there it stops being a message",
+  async () => {
+    // `util.Peek` reports `LimitReached: read == limit`, and `handlePublishBody`
+    // takes the text-message path only when the limit was NOT reached. A notice
+    // truncated to exactly `limit-message-bytes` is therefore routed to
+    // `handleBodyAsAttachment`, which answers `40014 attachments not allowed`
+    // on a server with no attachment store — ntfy's default. The previous code
+    // hit that exactly: cut to `4096 - marker`, put the marker back, 4096.
+    // A body with no line break in it is the worst case, because the "prefer
+    // the last whole line" rule has nothing to cut on.
+    const server = await startFakeNtfy();
+    try {
+      const publisher = createNtfyPublisher({
+        target: resolveNtfyTarget({ url: server.base, topic: "loop" }),
+        transport: createHttpTransport(),
+      });
+      const long = "x".repeat(6000);
+      const delivery = await publisher.publish({ title: "t", body: long });
+      assert.equal(
+        delivery.kind,
+        "delivered",
+        `a long single-line notice must not be an attachment: ${JSON.stringify(delivery)}`,
+      );
+      const sent = String(publishedJson(server.requests[0]).message);
+      const bytes = Buffer.byteLength(sent, "utf8");
+      assert.ok(
+        bytes < NTFY_MAX_MESSAGE_BYTES,
+        `message was ${bytes} bytes; at 4096 ntfy reads an attachment`,
+      );
+      assert.equal(server.requests[0]?.asAttachment, false, "the server agrees it was a message");
+      assert.match(sent, /… \(truncated\)$/u, "and the cut is still marked");
+    } finally {
+      await server.close();
+    }
+  },
+);
+
+test("every message the payload builder produces is strictly under the limit", () => {
+  for (const size of [0, 1, 4095, 4096, 4097, 8192, 100_000]) {
+    const payload = ntfyPublishPayload({ title: "t", body: "y".repeat(size) }, "loop");
+    const bytes = Buffer.byteLength(payload.message, "utf8");
+    assert.ok(
+      bytes < NTFY_MAX_MESSAGE_BYTES,
+      `a ${size}-byte body produced a ${bytes}-byte message, at or over the limit`,
+    );
+  }
+});
+
+test("a tighter server is discovered once and the smaller cap is kept", async () => {
+  // ntfy does not publish the `limit-message-bytes` it is running, so a
+  // self-hosted box on 1 KiB is unknowable in advance. One refusal is enough
+  // to learn it: the cap comes down and stays down, so the next bead does not
+  // pay for the same discovery again.
+  const logged: string[] = [];
+  const server = await startFakeNtfy({ messageLimitBytes: 1024 });
+  try {
+    const publisher = createNtfyPublisher({
+      target: resolveNtfyTarget({ url: server.base, topic: "loop" }),
+      transport: createHttpTransport(),
+      logger: (line) => logged.push(line),
+    });
+    const long = "z".repeat(4000);
+
+    const first = await publisher.publish({ title: "first", body: long });
+    assert.equal(first.kind, "delivered", JSON.stringify(first));
+    const afterFirst = server.requests.length;
+    assert.ok(afterFirst > 1, "the refusal should have caused a retry, not a give-up");
+    assert.ok(
+      publisher.messageBytes < NTFY_MAX_MESSAGE_BYTES,
+      `the cap should have moved; it is still ${publisher.messageBytes}`,
+    );
+    assert.ok(
+      logged.some((line) => /attachment/iu.test(line) && /cap/iu.test(line)),
+      `the shrink should be in the log: ${logged.join(" | ")}`,
+    );
+
+    const second = await publisher.publish({ title: "second", body: long });
+    assert.equal(second.kind, "delivered", JSON.stringify(second));
+    assert.equal(
+      server.requests.length,
+      afterFirst + 1,
+      "the learned cap means the second notice costs one request",
+    );
+    const lastMessage = String(publishedJson(server.requests[server.requests.length - 1]).message);
+    assert.ok(
+      Buffer.byteLength(lastMessage, "utf8") < 1024,
+      "and it is inside what the server actually takes",
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("shrinking stops when there is nothing useful left to try", () => {
+  assert.equal(shrinkMessageLimit(4096), 2048);
+  assert.equal(shrinkMessageLimit(512), 256);
+  assert.equal(
+    shrinkMessageLimit(NTFY_MIN_MESSAGE_BYTES),
+    null,
+    "below the floor this is a fragment, not a notice",
+  );
+});
+
+test("which refusals shrinking cures, and which it does not", () => {
+  assert.equal(
+    isMessageTooLargeRefusal(
+      400,
+      '{"code":40014,"error":"invalid request: attachments not allowed"}',
+    ),
+    true,
+  );
+  assert.equal(
+    isMessageTooLargeRefusal(
+      400,
+      '{"code":40014,"httpMessage":"invalid request: attachments not allowed"}',
+    ),
+    true,
+  );
+  assert.equal(isMessageTooLargeRefusal(413, ""), true);
+  assert.equal(isMessageTooLargeRefusal(400, "request body too large"), true);
+  // Wrong topic, wrong token, rate limit: sending less fixes none of these.
+  assert.equal(isMessageTooLargeRefusal(403, '{"code":40030,"error":"forbidden"}'), false);
+  assert.equal(isMessageTooLargeRefusal(400, "invalid request: topic invalid"), false);
+  assert.equal(isMessageTooLargeRefusal(429, "too many requests"), false);
+  assert.equal(isMessageTooLargeRefusal(500, "boom"), false);
 });
 
 test("a title too long for a phone is clipped without losing the leading id", async () => {

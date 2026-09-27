@@ -19,6 +19,8 @@ import {
   AgentError,
   bareToolsetSystemPrompt,
   buildSplitPrompt,
+  planSplitSession,
+  planningSystemPrompt,
   buildWorkContext,
   classifyRunEvidence,
   collectAssistantText,
@@ -458,6 +460,7 @@ function runnerHarness(
     repoError?: boolean;
     workThinkingLevel?: ThinkingLevel;
     splitThinkingLevel?: ThinkingLevel;
+    splitRepoAccess?: boolean;
   } = {},
 ): RunnerHarness {
   const sessions: FakeSession[] = [];
@@ -494,6 +497,7 @@ function runnerHarness(
     wrapUpMs: options.wrapUpMs,
     workThinkingLevel: options.workThinkingLevel,
     splitThinkingLevel: options.splitThinkingLevel,
+    splitRepoAccess: options.splitRepoAccess,
     now: clock.now,
     onEvent: (event) => events.push(event),
   });
@@ -1378,13 +1382,23 @@ test("a valid report_split yields specs and creates nothing itself", async () =>
   assert.equal(h.calls.length, 0, "split must not touch bd at all");
 });
 
-test("the split session runs with no built-in tools; work does not", async () => {
+test("the split session sees the repo and never edits it; work keeps pi's own tools and prompt", async () => {
   const splitRun = runnerHarness([
     { tools: [{ name: "report_split", params: { issues: [{ title: "X" }] } }] },
   ]);
   await splitRun.runner.split("plan please");
-  assert.equal(splitRun.specs[0]?.kind, "split");
-  assert.equal(splitRun.specs[0]?.noBuiltinTools, true, "planning must not be editing");
+  const split = splitRun.specs[0];
+  assert.equal(split?.kind, "split");
+  assert.equal(split?.noBuiltinTools, false, "a planner that cannot look at the repo guesses at it");
+  assert.deepEqual(split?.builtinTools, ["read", "bash"], "look, do not touch");
+  assert.deepEqual(split?.excludeTools, ["edit", "write"], "belt to the allowlist's braces");
+  assert.ok(
+    (split?.builtinTools ?? []).concat(split?.customTools.map((tool) => tool.name) ?? []).includes(
+      "report_split",
+    ),
+    "the report tool is reachable from the allowlist — pi filters custom tools by it, " +
+      "so leaving it out takes the planner's answer away",
+  );
 
   const workRun = runnerHarness([{ tools: [{ name: "report_done", params: DONE_PARAMS }] }]);
   await workRun.runner.run("loop-42");
@@ -1397,7 +1411,30 @@ test("the split session runs with no built-in tools; work does not", async () =>
   );
 });
 
-test("a session with no built-in tools is told its whole, and only, inventory", async () => {
+test("LOOP_SPLIT_REPO_ACCESS=off restores the sealed planner", async () => {
+  const h = runnerHarness(
+    [{ tools: [{ name: "report_split", params: { issues: [{ title: "X" }] } }] }],
+    { splitRepoAccess: false },
+  );
+  await h.runner.split("plan please");
+
+  const spec = h.specs[0];
+  assert.equal(spec?.noBuiltinTools, true, "off means no built-ins at all");
+  assert.equal(spec?.builtinTools, undefined, "nothing to allowlist");
+  assert.deepEqual(spec?.excludeTools, ["edit", "write"]);
+  const systemPrompt = spec?.systemPromptOverride ?? "";
+  assert.match(
+    systemPrompt,
+    /^## Your tool inventory is exactly: `report_split`$/mu,
+    "the inventory is the report tool alone",
+  );
+  const task = h.sessions[0]?.promptTexts.join("\n") ?? "";
+  assert.doesNotMatch(task, /Look before you plan/u, "nothing to look at, so no instruction to");
+  assert.match(task, /## The request/u);
+  assert.equal(toolInventoryGap(spec ?? { customTools: [] }), null, systemPrompt);
+});
+
+test("a planning session is told its whole, and only, inventory", async () => {
   const h = runnerHarness([
     { tools: [{ name: "report_split", params: { issues: [{ title: "X" }] } }] },
   ]);
@@ -1410,6 +1447,77 @@ test("a session with no built-in tools is told its whole, and only, inventory", 
     prompt.split("\n").find((line) => line.startsWith("## Your tool inventory")) ??
     "<no inventory line>";
 
+  assert.equal(inventoryLine, "## Your tool inventory is exactly: `read`, `bash`, `report_split`");
+  assert.match(prompt, /no `edit` and no `write`/u, "what it does NOT have is stated too");
+  assert.match(prompt, /read-only, and the loop checks/u);
+  assert.match(prompt, /git status/u, "it is told what the check actually is");
+  assert.match(
+    prompt,
+    /Tool "<name>" not found/u,
+    "the consequence of reaching for a tool that is not there must be stated",
+  );
+  // The gap check the production factory enforces is clean for the real wiring.
+  assert.equal(toolInventoryGap(spec), null, prompt);
+});
+
+test("the planning prompt grounds the batch in the repository, bounded", () => {
+  const prompt = buildSplitPrompt("Add CSV export to the report tool", { repoAccess: true });
+
+  assert.match(prompt, /## The request/u);
+  assert.match(prompt, /Add CSV export to the report tool/u, "the human's words survive");
+  assert.match(prompt, /## Look before you plan/u);
+  // The rules that make a ticket about THIS repository rather than the request.
+  assert.match(prompt, /Name real paths/u);
+  assert.match(prompt, /Acceptance must be checkable here/u);
+  assert.match(prompt, /Do not invent/u);
+  assert.match(prompt, /git log --oneline -15/u, "do not re-propose what already landed");
+  assert.match(prompt, /git status --short/u, "do not re-propose what is already in flight");
+  assert.match(prompt, /does not fit this repository/u, "the honest no-fit answer exists");
+  // And the exploration is bounded, because the plan is the deliverable.
+  assert.match(prompt, /head -n 40/u);
+  assert.match(prompt, /rg -l/u);
+  assert.match(prompt, /do not run the suite/u, "reading is free; artifacts are not");
+});
+
+test("planSplitSession keeps the grant and the announcement paired", () => {
+  const on = planSplitSession(["report_split"], { repoAccess: true });
+  assert.deepEqual(on.builtinTools, ["read", "bash"]);
+  assert.deepEqual(on.excludedTools, ["edit", "write"]);
+  assert.equal(toolInventoryGap({
+    customTools: [{ name: "report_split" }],
+    builtinTools: on.builtinTools,
+    systemPromptOverride: on.systemPrompt,
+  }), null);
+
+  const off = planSplitSession(["report_split"], { repoAccess: false });
+  assert.deepEqual(off.builtinTools, []);
+  assert.equal(off.repoAccess, false);
+
+  // An allowlist shipped without a system prompt is the same defect pointing the
+  // other way: pi's default prompt promises all four built-ins.
+  assert.match(
+    toolInventoryGap({ customTools: [{ name: "report_split" }], builtinTools: ["read", "bash"] }) ??
+      "",
+    /must set systemPromptOverride/u,
+  );
+  assert.match(
+    toolInventoryGap({
+      customTools: [{ name: "report_split" }],
+      builtinTools: ["read", "bash"],
+      systemPromptOverride: "You have `read` and `report_split`.",
+    }) ?? "",
+    /does not name every tool the session has: bash/u,
+  );
+  assert.throws(() => planningSystemPrompt(["read"], []), /at least one report tool/u);
+});
+
+test("the sealed planner prompt names its one tool and nothing else", () => {
+  const prompt = bareToolsetSystemPrompt(["report_split"]);
+  const inventoryLine =
+    prompt.split("\n").find((line) => line.startsWith("## Your tool inventory")) ??
+    "<no inventory line>";
+
+  assert.equal(inventoryLine, "## Your tool inventory is exactly: `report_split`");
   assert.match(inventoryLine, /^## Your tool inventory is exactly: `report_split`$/u);
   assert.doesNotMatch(inventoryLine, /bash|read|edit|write/u);
   assert.match(prompt, /no shell, no\s*`bash`/u);
@@ -1418,8 +1526,15 @@ test("a session with no built-in tools is told its whole, and only, inventory", 
     /Tool "<name>" not found/u,
     "the consequence of reaching for a tool that is not there must be stated",
   );
-  // The gap check the production factory enforces is clean for the real wiring.
-  assert.equal(toolInventoryGap(spec), null, prompt);
+  assert.equal(
+    toolInventoryGap({
+      customTools: [{ name: "report_split" }],
+      noBuiltinTools: true,
+      systemPromptOverride: prompt,
+    }),
+    null,
+    prompt,
+  );
 });
 
 test("toolInventoryGap refuses a bare session whose prompt does not name its own tools", () => {

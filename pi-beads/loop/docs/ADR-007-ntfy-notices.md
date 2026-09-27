@@ -302,3 +302,100 @@ an operator error, reported where it was typed) and checked again inside the
 publisher, where all it can become is a `failed` delivery that names
 `LOOP_NTFY_TOKEN` instead of an `ERR_INVALID_CHAR` that names nothing a person
 can act on.
+
+## Amendment: a notice is never an attachment — the limit is exclusive
+
+- **Status:** Accepted. Amends §5 above.
+- **Trigger:** the next failure of the same notice, after the header problem was
+  fixed:
+
+  ```
+  Could not publish the completion notice for workspace-mm6: ntfy replied 400:
+  {"code":40014,"http":400,"error":"invalid request: attachments not allowed",
+   "link":"https://ntfy.sh/docs/config/#attachments"}
+  ```
+
+  The reasonable question is the one that was asked: *why are attachments even
+  being used?* They are not. Nothing in this feature mentions an attachment. The
+  notice was simply the wrong size to be anything else.
+
+### What happened
+
+The decision is made by three lines of ntfy that have never been read together:
+
+```go
+// util/peek.go
+read, err := io.ReadFull(underlying, peeked)          // peeked is `limit` bytes long
+return &PeekedReadCloser{ LimitReached: read == limit, … }
+
+// server/server.go — handlePublishBody
+} else if !body.LimitReached && utf8.Valid(body.PeekedBytes) {
+    return s.handleBodyAsTextMessage(m, body)          // Case 6: a message
+}
+return s.handleBodyAsAttachment(r, v, m, body)         // Case 7: a file
+
+// server/server.go — handleBodyAsAttachment
+if s.attachment == nil || s.config.BaseURL == "" {
+    return errHTTPBadRequestAttachmentsDisallowed      // 40014
+}
+```
+
+`LimitReached` is `read == limit`. **Exactly at the limit counts as reached.**
+A message that lands on `limit-message-bytes` therefore fails the Case 6 guard
+and falls to Case 7 — and `attachment-cache-dir` is unset by default, so Case 7
+answers `40014 attachments not allowed`. On a server that *does* have an
+attachment store it answers `200`, and the notice arrives as a file to be
+downloaded rather than a message to be read, which is a worse failure and a
+louder one to nobody.
+
+And our own truncation was landing there. The rule was: cut to
+`4096 - markerBytes`, then put `… (truncated)` back on the end.
+
+| body | cut to | sent | at the limit? |
+| --- | --- | --- | --- |
+| multi-line text, 5 000 B | last whole line | 4 064 B | no — lucky |
+| one long line, 6 000 B | `4096 − 15` | **4 096 B** | yes — an attachment |
+
+That is the whole bug, and it explains the shape of the report: it only happens
+when the text has no line break in the last stretch of the window, which means
+it depends on the length of a paragraph. The multi-line notices that worked were
+not working because they were safe; they were working because they happened to
+cut early.
+
+### The fix
+
+**Treat ntfy's limit as exclusive.** The message is built under
+`limit − 1` bytes, so it is always a message. The slack is a named constant with
+this reasoning attached to it (`NTFY_MESSAGE_BOUNDARY_SLACK_BYTES`) rather than
+a `- 1` somewhere, because the next person to touch a byte budget is going to
+ask why the boundary is reserved.
+
+Two things come with it, because "the server's limit" is not knowable at
+compile time:
+
+- **`LOOP_NTFY_MAX_MESSAGE_BYTES`** declares what your server runs. ntfy does
+  not publish its own number, so on a tightened self-hosted box the default of
+  4096 is a guess; this makes it a fact.
+- **A learned cap.** If a refusal means "too much message" — `40014`, `413`,
+  or the "too large" wording — the publisher halves the cap, keeps it for the
+  rest of the run, and logs the act. Against a 1 KiB server that is three
+  requests on the first notice (`4095 → 2047 → 1023`) and one on every notice
+  after. It stops in three places rather than grinding: the floor of a useful
+  notice, the run's shrink budget, and — the one that matters most — the
+  notice's own size. A 100-byte notice under a 4 KiB cap sends the same bytes
+  under a 1 KiB cap, so once the next cap is not smaller than what is already
+  being sent there is no "less" left to try and the refusal is about something
+  else.
+
+The last of those is why a `413` from a proxy is not retried into a hole:
+shrinking a notice that is already small is not a retry, it is the same
+request sent twice.
+
+### What is still true
+
+A notice bigger than the server's limit on a server **with** attachments
+enabled will still be filed as a file — the server accepted it, so there is
+nothing for the client to react to. That is what the knob is for: if you run an
+attachment store and do not want your completion notices in it, set
+`LOOP_NTFY_MAX_MESSAGE_BYTES` to the limit you configured, and the loop will
+never produce one that long.

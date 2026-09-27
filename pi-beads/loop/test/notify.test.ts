@@ -16,12 +16,16 @@ import { test } from "node:test";
 
 import { buildApp } from "../src/app.ts";
 import {
+  NTFY_MAX_MESSAGE_BYTES,
+  NTFY_MIN_MESSAGE_BYTES,
   createHttpTransport,
   createNtfyPublisher,
   resolveNtfyTarget,
   type NtfyDelivery,
   type NtfyMessage,
   type NtfyPublisher,
+  type NtfyRequestOptions,
+  type NtfyTransport,
 } from "../src/ntfy.ts";
 import { LoopError } from "../src/loop.ts";
 import { readEnv } from "../src/main.ts";
@@ -74,6 +78,7 @@ function recordingPublisher(deliveries: readonly ("delivered" | "failed" | "skip
     enabled: true,
     destination: "http://ntfy.test/loop",
     publishUrl: "http://ntfy.test/",
+    messageBytes: 4096,
     transport: "recorder",
     async publish(message: NtfyMessage): Promise<NtfyDelivery> {
       published.push(message);
@@ -318,6 +323,7 @@ test("one success clears the failure streak", async () => {
     enabled: true,
     destination: "http://ntfy.test/loop",
     publishUrl: "http://ntfy.test/",
+    messageBytes: 4096,
     transport: "stub",
     async publish(): Promise<NtfyDelivery> {
       const kind = outcomes[index] ?? "delivered";
@@ -371,6 +377,7 @@ test("the ntfy knobs are read from the environment, and unset means unset", () =
     LOOP_NTFY_TITLE_PREFIX: "nightly",
     LOOP_NTFY_TIMEOUT_MS: "4500",
     LOOP_NTFY_MAX_FAILURES: "9",
+    LOOP_NTFY_MAX_MESSAGE_BYTES: "2048",
   });
   assert.equal(configured.notify?.topic, "loop-notices");
   assert.equal(configured.notify?.url, "http://192.168.1.20:8080");
@@ -381,8 +388,48 @@ test("the ntfy knobs are read from the environment, and unset means unset", () =
   assert.equal(configured.notify?.titlePrefix, "nightly");
   assert.equal(configured.notify?.timeoutMs, 4_500);
   assert.equal(configured.notify?.maxConsecutiveFailures, 9);
+  assert.equal(configured.notify?.maxMessageBytes, 2048);
   assert.equal(configured.notify?.enabled, true);
 });
+
+test("LOOP_NTFY_MAX_MESSAGE_BYTES is refused when it is not a notice-sized byte count", () => {
+  for (const raw of ["0", "-1", "three", "1.5", "64"]) {
+    assert.throws(
+      () => readEnv({ LOOP_NTFY_TOPIC: "loop", LOOP_NTFY_MAX_MESSAGE_BYTES: raw }),
+      (error: unknown) => LoopError.is(error) && error.code === "notify-config",
+      `"${raw}" should have been refused`,
+    );
+  }
+  // In range, including the two ends.
+  for (const raw of [String(NTFY_MIN_MESSAGE_BYTES), "2048", String(NTFY_MAX_MESSAGE_BYTES)]) {
+    assert.equal(readEnv({ LOOP_NTFY_TOPIC: "loop", LOOP_NTFY_MAX_MESSAGE_BYTES: raw }).notify
+      ?.maxMessageBytes, Number(raw));
+  }
+});
+
+test("a declared message cap reaches the publisher, so the config is not decorative", async () => {
+  const seen: number[] = [];
+  const transport: NtfyTransport = {
+    name: "recorder",
+    async publish(_url: string, options: NtfyRequestOptions) {
+      seen.push(Buffer.byteLength(String(ntfyFields(options.body).message), "utf8"));
+      return { statusCode: 200, body: '{"id":"x"}' };
+    },
+  };
+  const publisher = createNtfyPublisher({
+    target: resolveNtfyTarget({ url: "http://localhost:9", topic: "t" }),
+    transport,
+    maxMessageBytes: 512,
+  });
+  const delivery = await publisher.publish({ title: "t", body: "q".repeat(4000) });
+  assert.equal(delivery.kind, "delivered");
+  assert.ok(seen[0] !== undefined && seen[0] < 512, `sent ${seen[0]} bytes under a 512 cap`);
+});
+
+/** Just enough of the envelope to read the message field back out of a request. */
+function ntfyFields(body: string): Record<string, unknown> {
+  return JSON.parse(body) as Record<string, unknown>;
+}
 
 test("the topic is the switch", () => {
   assert.equal(

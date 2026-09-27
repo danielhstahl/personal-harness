@@ -494,6 +494,66 @@ test("(d4) a failed finalize stage writes nothing else and retry repeats just th
   );
 });
 
+test("(d4n) nothing to commit defers the bead and takes the run back to the board", () => {
+  const commitStage = finalizingMachine("commit");
+  const noop = step(commitStage, {
+    type: "finalize_noop",
+    reason: "no reported path produced anything to stage — src/a.ts (tracked but identical to HEAD)",
+  });
+
+  assert.equal(noop.applied, true);
+  assert.deepEqual(
+    kinds(noop.effects),
+    [
+      "beads.remember",
+      "beads.set_status",
+      "ui.warn",
+      "drop_context",
+      "beads.list_in_progress",
+      "beads.list_ready",
+    ],
+    "the reason goes down before the bead moves, then the board is read again",
+  );
+
+  const [note, park] = noop.effects;
+  assert.ok(note?.kind === "beads.remember");
+  assert.equal(note.key, failureKeyFor("w-1"));
+  assert.match(note.text, /Nothing to commit for w-1/u);
+  assert.match(note.text, /was NOT closed/u);
+  assert.match(note.text, /bd update w-1 --status open/u);
+  assert.ok(park?.kind === "beads.set_status");
+  assert.equal(park.id, "w-1");
+  assert.deepEqual(
+    { status: park.status, ifStatus: park.ifStatus },
+    { status: "deferred", ifStatus: "in_progress" },
+    "deferred so neither board read picks it again, and only if nobody moved it first",
+  );
+
+  assert.equal(noop.state.name, "check_work");
+  assert.equal(noop.state.activeIssueId, null);
+  assert.equal(noop.state.finalizeStage, null);
+  assert.equal(noop.state.iteration, commitStage.iteration + 1);
+  assert.equal(
+    kinds(noop.effects).includes("beads.close_issue"),
+    false,
+    "an empty tree is not evidence a ticket was done; nothing closes on it",
+  );
+
+  for (const stage of ["handoff", "close"] as const) {
+    const wrong = step(finalizingMachine(stage), { type: "finalize_noop", reason: "nothing to stage" });
+    assert.equal(wrong.applied, false, `a no-op reported in the ${stage} stage must be rejected`);
+    assert.equal(wrong.rejection?.code, "stage-mismatch");
+  }
+
+  const orphan = step({ ...commitStage, activeIssueId: null }, { type: "finalize_noop", reason: "nothing" });
+  assert.equal(orphan.applied, false, "there has to be a bead to park");
+  assert.equal(orphan.rejection?.code, "no-active-issue");
+
+  const elsewhere = step(run(EMPTY_BOARD).state, { type: "finalize_noop", reason: "nothing" });
+  assert.equal(elsewhere.applied, false);
+  assert.equal(elsewhere.rejection?.code, "unexpected-event");
+});
+
 test("(d5) nothing closes before its commit exists, across a whole iteration", () => {
   const { steps } = run(
     [
@@ -573,6 +633,7 @@ function eventVariants(): OrchestratorEvent[] {
     { type: "committed", hash: "abcd" },
     { type: "remembered", key: handoffKeyFor("w-1") },
     { type: "closed", id: "w-1" },
+    { type: "finalize_noop", reason: "no reported path produced anything to stage" },
     { type: "finalize_failed", stage: "commit", reason: "locked" },
     { type: "finalize_failed", stage: "handoff", reason: "memory store down" },
     { type: "finalize_failed", stage: "close", reason: "bd refused" },

@@ -74,6 +74,10 @@ docs/               ADR-001: transport + rendering decision
                              that strands it
                     ADR-007: the notice on ntfy — a URL instead of an address,
                              and what that made simpler
+                    ADR-008: nothing to commit is a no-op — park the bead with a
+                             reason and carry on, instead of ending the run
+                    ADR-009: the planner gets eyes — the split pass can read the
+                             repository, cannot change it, and is checked
 spikes/             throwaway prototypes + captured evidence backing ADR-001
 test/               unit tests, plus the whole walk in test/loop.test.ts
 ```
@@ -164,10 +168,20 @@ now stops git with `SIGTERM` first, retries *only* lock contention, and ages a
 lock before calling it stale — removing one is opt-in, because pulling a live
 process's lock out is how you corrupt an index. See "The index lock" below.
 
+And [`docs/ADR-008-nothing-to-commit-is-a-noop.md`](docs/ADR-008-nothing-to-commit-is-a-noop.md):
+"nothing to commit" used to be routed as a blocked finalize, so one bead whose
+tree already matched what the agent reported ended the whole run — with every
+other ready bead behind it, and a `retry` hint that could only recompute the same
+nothing. It is now its own event: the reason goes to the bead's note, the bead is
+deferred rather than closed, and the run carries on to the next ticket. The
+refusal to make an empty commit is unchanged; only what happens after it is.
+See "A bead with nothing to commit is parked, not a dead end" below.
+
 Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`,
 `LOOP_WIDTH`, the per-pass thinking levels `LOOP_WORK_THINKING` /
 `LOOP_SPLIT_THINKING` — one of `off`, `minimal`, `low`, `medium`, `high`,
-`xhigh`, `max` — the budget knobs `LOOP_WORK_TIMEOUT_MS`, `LOOP_WRAP_UP_MS` and
+`xhigh`, `max` — the split's repository access `LOOP_SPLIT_REPO_ACCESS` (see
+"The planner has eyes" below) — the budget knobs `LOOP_WORK_TIMEOUT_MS`, `LOOP_WRAP_UP_MS` and
 `LOOP_RETRY_UNFIT_WORK` (see "Two clocks" below), the startup audit knobs
 `LOOP_AUDIT`, `LOOP_AUDIT_STRICT`, `LOOP_AUDIT_VERBOSE`, `LOOP_AUDIT_WRITE` and
 `LOOP_HEALTH_URL` (see "Startup: the provider comparison" below), the monitor
@@ -268,6 +282,54 @@ does not honour. So:
 - No transition claims another pass is coming. The orchestrator says the bead is
   open on the board again, which is the only part of that sentence it knows.
 
+### A bead with nothing to commit is parked, not a dead end
+
+The agent reports `done`, names the files it changed, and the tree has nothing to
+stage for them — because the change is already in `HEAD`, or because the ticket
+turned out to need no code at all. The finalizer refuses to make an empty commit
+(a commit that says "done" over an empty diff is worse than no commit), and that
+refusal used to be routed as a blocked finalize:
+
+```
+Finalize commit failed: nothing to commit for workspace-jzj.1; no commit, no memory,
+no close. Nothing else was written; send retry to repeat just that stage.
+```
+
+So one already-satisfied bead stopped the board, and the suggested remedy —
+`retry` — re-issues the same commit against the same unchanged tree. That bucket
+was wrong: nothing is half-written and there is nothing to repair. `nothing-to-commit`
+now has its own event, `finalize_noop`, and the run does this instead:
+
+1. **The reason is written down first**, under `loop:failure:<id>`, with the path
+   list and why each path produced nothing ("identical to HEAD" vs "not in the
+   working tree"). Same invariant as failed work: a parked bead nobody can
+   explain is worse than one that stayed put.
+2. **The bead is deferred, not closed.** `deferred` is in neither of the two reads
+   the loop picks from (`bd ready`, `bd list --status in_progress`), so it stops
+   being worked while staying on the board and one command from a retry. Not
+   closed, because "no diff" is not evidence a ticket was finished — only that
+   this run had nothing to add. The write is guarded with `if-status in_progress`,
+   so a status you changed in the meantime is left as you left it.
+3. **The run carries on to the next ticket**, and when there is no next ticket it
+   lands in idle and asks you.
+4. **The park may not fail quietly.** If the `deferred` write fails, the run stops
+   `blocked` naming the bead and both ways out: with the bead still `in_progress`
+   the next read resumes it, and the loop is a wheel with the brake cut. The
+   check sits where the re-pick would have happened, so no second agent session
+   starts first.
+
+Bringing one back is an ordinary board command — and it is usually worth changing
+what the ticket asks before you do it, because a bead that produced no diff will
+produce no diff again:
+
+```sh
+bd update workspace-jzj.1 --status open
+```
+
+Everything else about a blocked finalize still blocks: an unsafe path, foreign
+staged paths under strict, a failed commit, a failed handoff and a failed close
+all end the run naming what exists and what is still open.
+
 ### One clock per work unit
 
 The presenter used to reset its elapsed field when the *issue* changed. Work the
@@ -282,6 +344,75 @@ that doubled rather than a ticket that failed twice. Two fixes, both pinned:
 - The `timeout` event carries `elapsedMs` and `budgetMs` from the runner, which
   is the only party that knows them. The surface's own clock is a fallback, not
   the answer.
+
+### The planner has eyes: repo access for the split pass
+
+A split planned from one sentence is a guess about a repository nobody looked
+at. The planning session used to hold exactly that: the text of the request and
+one report tool, `noBuiltinTools: true`. Its tickets named
+`src/export/csv.py` and `tests/test_export.py` in a repository with no `src/`
+and no Python — plausible, unverifiable, and expensive two passes later when the
+work agent went looking for files that had never existed.
+
+The split session now holds `read` and `bash`. Not `edit`, not `write` — those
+are in `excludeTools` as well as outside the allowlist, so a name collision
+cannot quietly reopen them. And the grant is **checked** rather than trusted.
+
+What the prompt makes it do, bounded to a handful of commands:
+
+- read the top-level truth: `README*`, the manifest, `AGENTS.md`;
+- find out how the project is built and checked — and *read* the scripts rather
+  than run them;
+- list the area the request touches and read the two or four files that own it,
+  so the ticket names real symbols instead of the request's vocabulary;
+- check `git log --oneline -15` and `git status --short`, so it cannot
+  re-propose something already landed or already sitting uncommitted in the tree.
+
+What that has to produce: descriptions naming **real paths**, acceptance
+criteria checkable with a command this repo has, the repo's own conventions
+followed, and nothing invented — when the work needs a file that does not exist
+yet, the ticket says so with what *was* seen ("create `src/export/csv.ts`;
+`src/export/` holds `json.ts` and `ndjson.ts`, follow those"). A request that
+does not fit this repository at all gets one `decision` issue saying so, rather
+than invented filler.
+
+The read-only part is not a request. Before the planning session opens, and
+again when the proposal is in hand, the loop takes `git status` and compares.
+Any difference refuses the split and stops the run, naming what changed —
+**before the epic is recorded and before any child exists**, so a refused split
+leaves nothing but the request itself on the board. A change the planner made
+belongs to no issue; carrying on would hand the next work session a diff it
+never reported and never caused. The loop does not revert it either — that would
+be the loop making an unowned change of its own — so the stop message names the
+command to run.
+
+Two details keep the check honest: untracked paths are compared at directory
+granularity, so an untracked `node_modules/` is one record instead of fifty
+thousand (and adding a file inside a directory that was already untracked is
+therefore invisible — pre-existing state, not the planner's doing); and a status
+that cannot be read **throws** rather than reading as "clean". An unreadable
+tree warns `the split proceeds unverified`, which is a different sentence and
+is allowed to have different consequences.
+
+Off switch: `LOOP_SPLIT_REPO_ACCESS=off` restores the sealed planner from
+before. It is a strict value (`1/true/yes/on`, `0/false/no/off`) — a typo is
+refused at startup rather than silently turning the lights off.
+
+One trap in the wiring, because it will bite whoever touches it: **pi's `tools`
+allowlist filters custom tools too.** `tools: ["read","bash"]` with a registered
+`report_split` leaves the model with no report tool at all — verified against a
+real session:
+
+```
+WITH report in allowlist        => active: [ 'read', 'bash', 'report_split' ]
+WITHOUT report in allowlist    => active: [ 'read', 'bash' ]
+```
+
+So `defaultSessionFactory` always appends the custom tool names to any allowlist
+it passes. Without that, the failure surfaces as "split produced no structured
+proposal" and blames the model for a line of ours.
+
+See [`docs/ADR-009-planner-repo-access.md`](docs/ADR-009-planner-repo-access.md).
 
 ### What the next attempt reads
 
@@ -705,6 +836,7 @@ under the failure key.
 | `LOOP_NTFY_TITLE_PREFIX` | The `[pi-beads]` in the title | `pi-beads` |
 | `LOOP_NTFY_TIMEOUT_MS` | Deadline for the publish request | `10000` |
 | `LOOP_NTFY_MAX_FAILURES` | Give up after this many failures in a row | `3` |
+| `LOOP_NTFY_MAX_MESSAGE_BYTES` | What you declare the server's `limit-message-bytes` to be (`256`–`4096`). Set it to what your server actually runs | `4096` — ntfy's default |
 
 A few defaults are worth knowing about:
 
@@ -726,13 +858,30 @@ A few defaults are worth knowing about:
   can no longer forge a header.
 - **The token never appears in a log line.** There is a test that publishes with a
   token and asserts the string shows up nowhere.
-- **ntfy's limits are honoured, not discovered.** The message is cut at 4096
-  bytes on a character boundary and marked `… (truncated)`; the title is clipped
-  so the leading `[prefix] bead.id` survives; and the whole JSON document is
-  clamped to the 8 KiB ntfy gives it, because escaping a body full of quotes and
-  newlines inflates a message that already fitted on its own. Cutting beats a
-  `413`, and marking the cut beats a notice that silently reads as shorter than
-  the run.
+- **A notice is never an attachment, and the limit that decides it is
+  exclusive.** ntfy's `util.Peek` reports `LimitReached: read == limit`, and
+  `handlePublishBody` takes the text-message path only when the limit was *not*
+  reached. So a message of **exactly** `limit-message-bytes` is not a long
+  message — it is an attachment, which a server with no attachment store (the
+  default) refuses with `40014 attachments not allowed`, and one that has a
+  store silently turns into a downloadable file. Truncating to `limit - marker`
+  and putting the marker back lands exactly there whenever the text has no line
+  break late in it, which is what this used to do. The message now stays
+  strictly under the limit.
+- **A tighter server is learned once.** ntfy does not report the
+  `limit-message-bytes` it is running, so a self-hosted box on 1 KiB cannot be
+  known in advance. Set `LOOP_NTFY_MAX_MESSAGE_BYTES` to skip the discovery; if
+  it is not set, the first `too big / attachments not allowed` refusal halves
+  the cap, keeps it for the rest of the run, and stops when sending less would
+  no longer change anything — the same "discover it once" rule as the give-up
+  streak. A `1024`-byte server costs three requests on the first notice and one
+  on every notice after.
+- **ntfy's other limits are honoured, not discovered.** The message is cut on a
+  character boundary and marked `… (truncated)`; the title is clipped so the
+  leading `[prefix] bead.id` survives; and the whole JSON document is clamped to
+  the 8 KiB ntfy gives it, because escaping a body full of quotes and newlines
+  inflates a message that already fitted on its own. Cutting beats a `413`, and
+  marking the cut beats a notice that silently reads as shorter than the run.
 - **TLS with a self-signed certificate:** point Node's trust store at your CA with
   `NODE_EXTRA_CA_CERTS` rather than disabling verification. This module has no
   "skip TLS" setting, and adding one should be its own decision.
