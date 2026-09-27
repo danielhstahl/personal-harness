@@ -31,14 +31,27 @@
  * Three limits worth designing around, all from ntfy's own defaults
  * (`limit-message-bytes: 4096`, and its JSON reader's 2× headroom):
  *
- * - The message is truncated at a byte boundary rather than letting the server
- *   refuse it with `413`. A notice that arrives slightly short is a better
- *   outcome than a notice that arrives never, and the truncation says so.
- * - The whole JSON document is then clamped to twice that, because ntfy reads a
- *   JSON publish body with `MessageSizeLimit*2` bytes and escaping (`\n`, `\"`)
- *   inflates a message that already fitted on its own.
- * - The title is capped the same way, because the bead id has to survive it —
- *   the title is the field the notification is *found by* on a phone.
+ * - The message is truncated rather than letting the server refuse it, and the
+ *   truncation says so. A notice that arrives slightly short is a better
+ *   outcome than a notice that arrives never.
+ * - **The limit is exclusive, not inclusive** — see
+ *   {@link NTFY_MESSAGE_BOUNDARY_SLACK_BYTES}. Landing exactly on
+ *   `limit-message-bytes` is not "a long message" to ntfy, it is an
+ *   attachment, and with no attachment store (the default) that is
+ *   `40014 attachments not allowed`. A notice cut to `4096 - marker` and put
+ *   back together landed there exactly, which is how "attachments not allowed"
+ *   came to be printed about a feature that never mentions an attachment.
+ * - The whole JSON document is clamped to twice the message limit, because
+ *   ntfy reads a JSON publish body with `MessageSizeLimit*2` bytes and
+ *   escaping (`\n`, `\"`) inflates a message that already fitted on its own.
+ *   The title is capped too, because the bead id has to survive it — the title
+ *   is the field the notification is *found by* on a phone.
+ *
+ * And one thing that cannot be known in advance: ntfy does not report the
+ * `limit-message-bytes` it is running. Declare yours with
+ * `LOOP_NTFY_MAX_MESSAGE_BYTES`, or let the publisher learn it — a refusal
+ * that means "too much message" halves the cap once, keeps it for the rest of
+ * the run, and stops rather than grinding when sending less would not help.
  *
  * As everywhere else in this loop, delivery is **data**: every failure path —
  * refused topic, dropped socket, deadline, 5xx — returns a
@@ -64,6 +77,27 @@ export function localHostname(): string {
 
 /** ntfy's default `limit-message-bytes`. Body is trimmed to fit under it. */
 export const NTFY_MAX_MESSAGE_BYTES = 4096;
+/**
+ * The boundary byte is not ours to spend, so ntfy's limit is treated as
+ * **exclusive**.
+ *
+ * This is not caution, it is the arithmetic in ntfy itself:
+ *
+ * - `util.Peek(r.Body, limit)` reports `LimitReached: read == limit` — a
+ *   message of exactly `limit` bytes counts as having hit the limit.
+ * - `handlePublishBody` takes the *text message* path only when
+ *   `!body.LimitReached`; otherwise it falls through to
+ *   `handleBodyAsAttachment`.
+ * - That handler answers `40014 attachments not allowed` when the server has
+ *   no attachment store — which is ntfy's **default** — and silently turns the
+ *   notice into a downloadable file when it does.
+ *
+ * So a notice truncated to exactly 4096 bytes is not "a long message", it is
+ * an attachment request, and the previous code landed there whenever the text
+ * had no line break in the last stretch of the window: cut to `4096 - marker`,
+ * put the marker back, 4096 exactly. One byte shorter and it is a message.
+ */
+export const NTFY_MESSAGE_BOUNDARY_SLACK_BYTES = 1;
 /**
  * ntfy's ceiling for a JSON publish body: `readJSONWithLimit(..., MessageSizeLimit*2)`
  * in `server.go`, "2x to account for JSON format overhead". A message that fit
@@ -313,6 +347,44 @@ function clipBytes(text: string, maxBytes: number): string {
   return "";
 }
 
+/** Two ways a server can say "that is too much message", and one floor to stop at. */
+const SHRINK_STEP_DIVISOR = 2;
+const MAX_SHRINKS_PER_RUN = 3;
+/** Below this a "notice" is a fragment, so the shrink stops rather than go on. */
+export const NTFY_MIN_MESSAGE_BYTES = 256;
+
+/**
+ * Which refusals are really "too much message, and I will not make an
+ * attachment out of it".
+ *
+ * `40014` is the exact one. `413` and the "too large" wording are the same
+ * shape from a proxy or a differently-configured server, and the same fix —
+ * send less — applies, so they are treated alike rather than each getting
+ * their own detection later.
+ */
+export function isMessageTooLargeRefusal(status: number, body: string): boolean {
+  if (status === 413) return true;
+  if (status !== 400) return false;
+  const text = body.toLowerCase();
+  return (/"code"\s*:\s*40014/u.test(text)
+    ? true
+    : text.includes("attachments not allowed") || text.includes("too large"));
+}
+
+/**
+ * The next cap worth trying after one was refused, or `null` when going smaller
+ * would stop being a notice.
+ *
+ * Halving rather than jumping to the floor: the floor of this loop is the
+ * smallest server that could still be told something, and arriving there in one
+ * step over-delivers the lesson. Three halvings from 4096 gets to 512, which
+ * covers the tight configurations people actually run.
+ */
+export function shrinkMessageLimit(limit: number): number | null {
+  const next = Math.floor(limit / SHRINK_STEP_DIVISOR);
+  return next >= NTFY_MIN_MESSAGE_BYTES ? next : null;
+}
+
 /** One publish document, as ntfy's `publishMessage` struct reads it. */
 export interface NtfyPublishEnvelope {
   readonly topic: string;
@@ -346,8 +418,12 @@ export function ntfyPublishPayload(
   topic: string,
   options: { maxMessageBytes?: number; maxJsonBytes?: number } = {},
 ): NtfyPublishEnvelope {
-  const maxMessageBytes = options.maxMessageBytes ?? NTFY_MAX_MESSAGE_BYTES;
+  /** The server's `limit-message-bytes`, as we understand it. */
+  const messageLimitBytes = options.maxMessageBytes ?? NTFY_MAX_MESSAGE_BYTES;
   const maxJsonBytes = options.maxJsonBytes ?? NTFY_MAX_JSON_BODY_BYTES;
+  // Exclusive, per NTFY_MESSAGE_BOUNDARY_SLACK_BYTES: exactly at the limit is
+  // an attachment as far as ntfy is concerned, not a long message.
+  const messageCeiling = Math.max(0, messageLimitBytes - NTFY_MESSAGE_BOUNDARY_SLACK_BYTES);
   const rest: {
     title?: string;
     priority?: number;
@@ -369,10 +445,15 @@ export function ntfyPublishPayload(
   // itself may still use.
   const envelopeBytes =
     Buffer.byteLength(JSON.stringify({ topic, message: "", ...rest }), "utf8") - 2;
-  const messageBudget = Math.max(0, maxJsonBytes - envelopeBytes);
+  // Also exclusive: ntfy's JSON reader has a ceiling of its own, and a document
+  // sitting on a boundary is how the next boundary bug starts.
+  const messageBudget = Math.max(
+    0,
+    maxJsonBytes - NTFY_MESSAGE_BOUNDARY_SLACK_BYTES - envelopeBytes,
+  );
   return {
     topic,
-    message: fitJsonBytes(truncateToBytes(message.body, maxMessageBytes), messageBudget),
+    message: fitJsonBytes(truncateToBytes(message.body, messageCeiling), messageBudget),
     ...rest,
   };
 }
@@ -605,6 +686,12 @@ export interface NtfyPublisherOptions {
   readonly transport?: NtfyTransport;
   readonly token?: string;
   readonly timeoutMs?: number;
+  /**
+   * Our understanding of the server's `limit-message-bytes`. Default 4096,
+   * which is ntfy's default. Declared exclusive — the message stays under it,
+   * never on it — and lowered mid-run if the server says the notice is too big
+   * to accept without turning it into an attachment.
+   */
   readonly maxMessageBytes?: number;
   /** Ceiling for the whole JSON document, escaping included. */
   readonly maxJsonBytes?: number;
@@ -619,13 +706,21 @@ export interface NtfyPublisher {
   /** Where the request goes: the server root/prefix, with the topic in the body. */
   readonly publishUrl: string;
   readonly transport: string;
+  /**
+   * The message cap in force right now, in bytes.
+   *
+   * A getter because it can move during a run: see {@link NtfyPublisherOptions
+   * `maxMessageBytes`} and the shrink-on-refusal rule in the publisher. A
+   * snapshot taken at construction would be a number the publisher no longer
+   * uses.
+   */
+  readonly messageBytes: number;
   publish(message: NtfyMessage): Promise<NtfyDelivery>;
 }
 
 export function createNtfyPublisher(options: NtfyPublisherOptions): NtfyPublisher {
   const transport = options.transport ?? createHttpTransport();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const maxBytes = options.maxMessageBytes ?? NTFY_MAX_MESSAGE_BYTES;
   const maxJson = options.maxJsonBytes ?? NTFY_MAX_JSON_BODY_BYTES;
   const maxTitle = options.maxTitleLength ?? NTFY_MAX_TITLE_LENGTH;
   const log = options.logger ?? (() => undefined);
@@ -633,70 +728,171 @@ export function createNtfyPublisher(options: NtfyPublisherOptions): NtfyPublishe
   const publishUrl = options.target.publishUrl;
   const topic = options.target.topic;
 
+  /**
+   * The message cap for the rest of this run. It only ever goes down.
+   *
+   * `options.maxMessageBytes` is our guess at the server's
+   * `limit-message-bytes` — ntfy does not publish the number it is running,
+   * so a self-hosted box on a tighter setting cannot be known in advance. When
+   * a refusal says "too much message", the cap is halved and kept there
+   * instead of being re-learned per bead: a limit worth discovering is worth
+   * discovering once, and every later notice is cheaper for it.
+   */
+  let messageCap = options.maxMessageBytes ?? NTFY_MAX_MESSAGE_BYTES;
+  let shrinksLeft = MAX_SHRINKS_PER_RUN;
+
+  /**
+   * One try at `limit` bytes. Never throws, and reports one thing a
+   * {@link NtfyDelivery} cannot: whether this particular refusal is something
+   * sending less would fix.
+   */
+  async function attempt(limit: number, payload: NtfyMessage): Promise<Attempt> {
+    let response: NtfyRawResponse;
+    let sentBytes = 0;
+    try {
+      // Built inside the try, because building either half can refuse
+      // something: a priority that is not a priority, a token that is not a
+      // header value. Both are operator errors, and both come back as a
+      // delivery rather than an exception thrown into a loop that has already
+      // done the work the notice is about.
+      const envelope = ntfyPublishPayload(payload, topic, {
+        maxMessageBytes: limit,
+        maxJsonBytes: maxJson,
+      });
+      // What this attempt actually put on the wire, as opposed to the cap it was
+      // built under: a short notice under a big cap sends the same bytes at any
+      // cap, which is the fact the shrink decision needs.
+      sentBytes = Buffer.byteLength(envelope.message, "utf8");
+      const body = JSON.stringify(envelope);
+      const headers = transportHeaders({
+        ...(options.token === undefined ? {} : { token: options.token }),
+        ...(options.userAgent === undefined ? {} : { userAgent: options.userAgent }),
+      });
+      response = await transport.publish(publishUrl, { headers, body, timeoutMs });
+    } catch (error) {
+      const reason = NtfyError.is(error)
+        ? `${error.kind}: ${error.message}`
+        : error instanceof Error
+          ? error.message
+          : String(error);
+      // A config refusal (a bad priority, a token that is not a header value)
+      // will not be fixed by asking again, so it is not marked retryable the
+      // way a dropped socket is.
+      const retryable = !(NtfyError.is(error) && error.kind === "config");
+      // The topic identifies the channel, so it stays in the log; the token
+      // never appears anywhere in this module, by construction — it only ever
+      // exists inside the header value built above.
+      log(`ntfy publish to ${destination} failed: ${reason}`);
+      return { delivery: { kind: "failed", reason, destination, retryable }, tooBig: false, sentBytes };
+    }
+
+    const verdict = classifyResponse(response.statusCode);
+    if (verdict.ok) {
+      return {
+        delivery: {
+          kind: "delivered",
+          messageId: parseMessageId(response.body),
+          destination,
+          transport: transport.name,
+        },
+        tooBig: false,
+        sentBytes,
+      };
+    }
+    const reason =
+      `ntfy replied ${response.statusCode}` +
+      (response.body.trim() === "" ? "" : `: ${oneLine(response.body, 180)}`);
+    log(`ntfy publish to ${destination} refused: ${reason}`);
+    return {
+      delivery: { kind: "failed", reason, destination, retryable: verdict.retryable },
+      tooBig: isMessageTooLargeRefusal(response.statusCode, response.body),
+      sentBytes,
+    };
+  }
+
   return {
     enabled: options.target.topic.trim() !== "",
     destination,
     transport: transport.name,
     publishUrl,
+    get messageBytes(): number {
+      return messageCap;
+    },
     async publish(message: NtfyMessage): Promise<NtfyDelivery> {
       const title = clipTitle(message.title, maxTitle);
       if (message.body.trim() === "") {
         return { kind: "skipped", reason: "the notice had no body to publish" };
       }
-
-      let response: NtfyRawResponse;
-      try {
-        // Built inside the try, because building it can refuse something: a
-        // priority that is not a priority, a token that is not a header value.
-        // Both are operator errors, and both come back as a delivery rather than
-        // an exception thrown into a loop that has already done the work.
-        const body = ntfyPublishBody({ ...message, title }, topic, {
-          maxMessageBytes: maxBytes,
-          maxJsonBytes: maxJson,
-        });
-        const headers = transportHeaders({
-          ...(options.token === undefined ? {} : { token: options.token }),
-          ...(options.userAgent === undefined ? {} : { userAgent: options.userAgent }),
-        });
-        response = await transport.publish(publishUrl, {
-          headers,
-          body,
-          timeoutMs,
-        });
-      } catch (error) {
-        const reason = NtfyError.is(error)
-          ? `${error.kind}: ${error.message}`
-          : error instanceof Error
-            ? error.message
-            : String(error);
-        // A config refusal (a bad priority, a token that is not a header value)
-        // will not be fixed by asking again, so it is not marked retryable the
-        // way a dropped socket is.
-        const retryable = !(NtfyError.is(error) && error.kind === "config");
-        // The topic identifies the channel, so it stays in the log; the token
-        // never appears anywhere in this module, by construction — it only ever
-        // exists inside the header value built above.
-        log(`ntfy publish to ${destination} failed: ${reason}`);
-        return { kind: "failed", reason, destination, retryable };
+      const payload = { ...message, title };
+      // Shrinking is bounded three ways over, because it is the one place this
+      // publisher could spend request after request on a refusal that will
+      // never clear:
+      //
+      // - The floor of a useful notice (`shrinkMessageLimit`).
+      // - The notice's own size, which is the floor that actually matters: a
+      //   100-byte notice under a 4 KiB cap sends the same bytes under a 1 KiB
+      //   cap, so once the next cap is not smaller than what is already being
+      //   sent there is no "less" left to send and the refusal is about
+      //   something else entirely.
+      // - `shrinksLeft`, which belongs to the publisher and not to this call,
+      //   so the whole run discovers a tighter server once instead of once per
+      //   bead.
+      for (;;) {
+        const result = await attempt(messageCap, payload);
+        if (!result.tooBig) return result.delivery;
+        if (shrinksLeft === 0) {
+          return {
+            ...result.delivery,
+            reason: `${result.delivery.reason} (this run's shrink budget is spent)`,
+          };
+        }
+        const next = shrinkMessageLimit(messageCap);
+        if (next === null) {
+          return {
+            ...result.delivery,
+            reason:
+              `${result.delivery.reason} ` +
+              `(${messageCap} bytes is already as small as a notice usefully gets)`,
+          };
+        }
+        if (next >= result.sentBytes) {
+          return {
+            ...result.delivery,
+            reason:
+              `${result.delivery.reason} (the notice is only ${result.sentBytes} bytes, ` +
+              "so this refusal is not about how much we are sending)",
+          };
+        }
+        shrinksLeft -= 1;
+        log(
+          `ntfy will not take a ${messageCap}-byte message without an attachment store; ` +
+            `sending this notice at ${next} bytes and keeping that cap for the rest of the run`,
+        );
+        messageCap = next;
       }
-
-      const verdict = classifyResponse(response.statusCode);
-      if (verdict.ok) {
-        return {
-          kind: "delivered",
-          messageId: parseMessageId(response.body),
-          destination,
-          transport: transport.name,
-        };
-      }
-      const reason =
-        `ntfy replied ${response.statusCode}` +
-        (response.body.trim() === "" ? "" : `: ${oneLine(response.body, 180)}`);
-      log(`ntfy publish to ${destination} refused: ${reason}`);
-      return { kind: "failed", reason, destination, retryable: verdict.retryable };
     },
   };
 }
+
+/**
+ * One attempt's outcome.
+ *
+ * `tooBig` only ever comes with a *failed* delivery — a delivered notice is not
+ * sitting there waiting to be resized — so that invariant is in the type rather
+ * than left for the reader to remember. `sentBytes` is what this attempt
+ * actually put on the wire, which is not the cap it was built under.
+ */
+type Attempt =
+  | {
+      readonly delivery: NtfyDelivery;
+      readonly tooBig: false;
+      readonly sentBytes: number;
+    }
+  | {
+      readonly delivery: Extract<NtfyDelivery, { kind: "failed" }>;
+      readonly tooBig: true;
+      readonly sentBytes: number;
+    };
 
 function clipTitle(title: string, maxChars: number): string {
   const trimmed = title.trim();
@@ -726,6 +922,7 @@ export function createNullPublisher(reason: string): NtfyPublisher {
     enabled: false,
     destination: "none",
     publishUrl: "none",
+    messageBytes: 0,
     transport: "none",
     async publish(): Promise<NtfyDelivery> {
       return { kind: "skipped", reason };

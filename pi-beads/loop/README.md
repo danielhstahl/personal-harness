@@ -705,6 +705,7 @@ under the failure key.
 | `LOOP_NTFY_TITLE_PREFIX` | The `[pi-beads]` in the title | `pi-beads` |
 | `LOOP_NTFY_TIMEOUT_MS` | Deadline for the publish request | `10000` |
 | `LOOP_NTFY_MAX_FAILURES` | Give up after this many failures in a row | `3` |
+| `LOOP_NTFY_MAX_MESSAGE_BYTES` | What you declare the server's `limit-message-bytes` to be (`256`–`4096`). Set it to what your server actually runs | `4096` — ntfy's default |
 
 A few defaults are worth knowing about:
 
@@ -726,13 +727,30 @@ A few defaults are worth knowing about:
   can no longer forge a header.
 - **The token never appears in a log line.** There is a test that publishes with a
   token and asserts the string shows up nowhere.
-- **ntfy's limits are honoured, not discovered.** The message is cut at 4096
-  bytes on a character boundary and marked `… (truncated)`; the title is clipped
-  so the leading `[prefix] bead.id` survives; and the whole JSON document is
-  clamped to the 8 KiB ntfy gives it, because escaping a body full of quotes and
-  newlines inflates a message that already fitted on its own. Cutting beats a
-  `413`, and marking the cut beats a notice that silently reads as shorter than
-  the run.
+- **A notice is never an attachment, and the limit that decides it is
+  exclusive.** ntfy's `util.Peek` reports `LimitReached: read == limit`, and
+  `handlePublishBody` takes the text-message path only when the limit was *not*
+  reached. So a message of **exactly** `limit-message-bytes` is not a long
+  message — it is an attachment, which a server with no attachment store (the
+  default) refuses with `40014 attachments not allowed`, and one that has a
+  store silently turns into a downloadable file. Truncating to `limit - marker`
+  and putting the marker back lands exactly there whenever the text has no line
+  break late in it, which is what this used to do. The message now stays
+  strictly under the limit.
+- **A tighter server is learned once.** ntfy does not report the
+  `limit-message-bytes` it is running, so a self-hosted box on 1 KiB cannot be
+  known in advance. Set `LOOP_NTFY_MAX_MESSAGE_BYTES` to skip the discovery; if
+  it is not set, the first `too big / attachments not allowed` refusal halves
+  the cap, keeps it for the rest of the run, and stops when sending less would
+  no longer change anything — the same "discover it once" rule as the give-up
+  streak. A `1024`-byte server costs three requests on the first notice and one
+  on every notice after.
+- **ntfy's other limits are honoured, not discovered.** The message is cut on a
+  character boundary and marked `… (truncated)`; the title is clipped so the
+  leading `[prefix] bead.id` survives; and the whole JSON document is clamped to
+  the 8 KiB ntfy gives it, because escaping a body full of quotes and newlines
+  inflates a message that already fitted on its own. Cutting beats a `413`, and
+  marking the cut beats a notice that silently reads as shorter than the run.
 - **TLS with a self-signed certificate:** point Node's trust store at your CA with
   `NODE_EXTRA_CA_CERTS` rather than disabling verification. This module has no
   "skip TLS" setting, and adding one should be its own decision.

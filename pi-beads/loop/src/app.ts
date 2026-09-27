@@ -191,6 +191,12 @@ export interface NotifySetting {
   readonly titlePrefix?: string;
   /** Request deadline. Default 10s. */
   readonly timeoutMs?: number;
+  /**
+   * Our declared understanding of the server's `limit-message-bytes`.
+   * Default 4096 (ntfy's own). If it is set too high the publisher finds out
+   * and lowers itself; setting it skips that discovery.
+   */
+  readonly maxMessageBytes?: number;
   /** Stop trying after this many failed publishes in a row. Default 3. */
   readonly maxConsecutiveFailures?: number;
 }
@@ -654,6 +660,9 @@ function buildNotifier(
       transport: createHttpTransport(),
       ...(setting.token === undefined ? {} : { token: setting.token }),
       ...(setting.timeoutMs === undefined ? {} : { timeoutMs: setting.timeoutMs }),
+      ...(setting.maxMessageBytes === undefined
+        ? {}
+        : { maxMessageBytes: setting.maxMessageBytes }),
     }),
     context: {
       cwd: config.cwd,

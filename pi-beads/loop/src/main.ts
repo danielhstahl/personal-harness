@@ -17,6 +17,7 @@ import { runApp } from "./app.ts";
 import type { AppConfig, KanbanSetting, NotifySetting } from "./app.ts";
 import { LoopError } from "./loop.ts";
 import type { LoopResult } from "./loop.ts";
+import { NTFY_MAX_MESSAGE_BYTES, NTFY_MIN_MESSAGE_BYTES } from "./ntfy.ts";
 
 /**
  * The one environment-reading site in this module.
@@ -122,6 +123,33 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
   };
 
   /**
+   * Our declared understanding of the server's `limit-message-bytes`.
+   *
+   * ntfy does not publish the number it is running, so a self-hosted server on
+   * a tighter setting is otherwise unknowable. Unset means "assume ntfy's
+   * default of 4096" — and if that guess is too high, the publisher shrinks on
+   * its own the first time the server complains. Setting it is how you skip
+   * that discovery: set the number your server actually has.
+   */
+  const messageBytesSetting = (): number | undefined => {
+    const raw = source.LOOP_NTFY_MAX_MESSAGE_BYTES;
+    if (raw === undefined || raw.trim() === "") return undefined;
+    const parsed = Number(raw);
+    if (
+      !Number.isSafeInteger(parsed) ||
+      parsed < NTFY_MIN_MESSAGE_BYTES ||
+      parsed > NTFY_MAX_MESSAGE_BYTES
+    ) {
+      throw new LoopError(
+        "notify-config",
+        `LOOP_NTFY_MAX_MESSAGE_BYTES must be a whole number of bytes between ` +
+          `${NTFY_MIN_MESSAGE_BYTES} and ${NTFY_MAX_MESSAGE_BYTES} (ntfy's default), not "${raw.trim()}"`,
+      );
+    }
+    return parsed;
+  };
+
+  /**
    * The completion notice: one optional feature with the topic as its switch.
    *
    * `undefined` when nothing ntfy-related is set at all, which keeps "this run
@@ -146,11 +174,13 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
       source.LOOP_NTFY_TITLE_PREFIX,
       source.LOOP_NTFY_TIMEOUT_MS,
       source.LOOP_NTFY_MAX_FAILURES,
+      source.LOOP_NTFY_MAX_MESSAGE_BYTES,
     ];
     if (knobs.every((value) => value === undefined || value.trim() === "")) return undefined;
     const topic = (source.LOOP_NTFY_TOPIC ?? "").trim();
     const tags = tagList(source.LOOP_NTFY_TAGS);
     const maxFailures = maxFailuresSetting();
+    const maxMessageBytes = messageBytesSetting();
     return {
       // The topic is the switch. A server configured with nowhere to publish is
       // a server that will never be exercised, and saying so beats pretending.
@@ -170,6 +200,7 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
         ? {}
         : { timeoutMs: number("LOOP_NTFY_TIMEOUT_MS") }),
       ...(maxFailures === undefined ? {} : { maxConsecutiveFailures: maxFailures }),
+      ...(maxMessageBytes === undefined ? {} : { maxMessageBytes }),
     };
   };
 
