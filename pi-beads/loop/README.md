@@ -198,7 +198,7 @@ refusal to make an empty commit is unchanged; only what happens after it is.
 See "A bead with nothing to commit is parked, not a dead end" below.
 
 Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`,
-`LOOP_WIDTH`, the per-pass thinking levels `LOOP_WORK_THINKING` /
+the per-pass thinking levels `LOOP_WORK_THINKING` /
 `LOOP_SPLIT_THINKING` — one of `off`, `minimal`, `low`, `medium`, `high`,
 `xhigh`, `max` — the split's repository access `LOOP_SPLIT_REPO_ACCESS` (see
 "The planner has eyes" below) — the budget knobs `LOOP_WORK_TIMEOUT_MS`, `LOOP_WRAP_UP_MS` and
@@ -216,6 +216,37 @@ configured default and then pi's own, so a ticket is never run at a level nobody
 chose. A value pi
 does not recognise stops the loop with the list of what it accepts, rather than
 being quietly dropped.
+
+**Every knob follows that rule, not just the thinking levels.** `readEnv` in
+`src/main.ts` reads each `LOOP_*` key through a helper that yields the declared
+type or throws, and the throw names the key, the value exactly as it arrived
+and the whole accepted set:
+
+```
+LOOP_KANBAN="bord" is not a board setting — accepted: 0, off, no, false, row, board
+LOOP_KANBAN_AT="middle" is not a panel placement — accepted: band, top
+LOOP_MONITOR_TIMEOUT_MS="1x" is not a whole number of milliseconds — accepted: a whole number, at least 1
+LOOP_VERBOSE="ture" is not a yes/no value — accepted: 1, true, yes, on (on) or 0, false, no, off (off)
+LOOP_KANBAN_MODE is not a knob this loop reads — did you mean LOOP_KANBAN?
+```
+
+Three consequences worth knowing before you set anything:
+
+- **Unset means unset.** An absent key falls to the default its section
+  documents. That is the only way to get a default.
+- **Set means valid.** A key that is present with nothing in it — the shape a
+  bare `LOOP_KANBAN_MS=` line in an env file leaves behind — is refused, not
+  read as "absent". Same for a number written with a unit in it, a
+  hexadecimal one, or a switch spelled almost right.
+- **An unknown `LOOP_*` key is an error, not a nothing.** A typo'd name is set
+  as far as the shell is concerned and unset as far as the loop is concerned,
+  so it keeps every default and the run looks configured. The run refuses it,
+  names the nearest real knob, and prints the accepted list. `PI_*` keys are
+  pi's business and pass through untouched.
+
+All of it is read before the loop starts, so a typo costs one line in the
+terminal it was typed in rather than a half-started run that claimed a bead and
+took over the screen.
 
 ### Two clocks: the budget and the context wall
 
@@ -761,7 +792,7 @@ write's: it shows `?` and backs off.
 | Knob | Effect |
 | --- | --- |
 | `LOOP_KANBAN=0` \| `off` | no board at all (a null source that draws nothing and reads nothing) |
-| `LOOP_KANBAN=row\|board` | pick the shape; anything else, including unset, leaves each surface on its own default |
+| `LOOP_KANBAN=row\|board` | pick the shape; unset leaves each surface on its own default — anything else is refused |
 | `LOOP_KANBAN_MS` | read interval (default 5000, floor 500 — each poll is a process spawn) |
 | `LOOP_KANBAN_LINES=n` | rows the grid may take, borders included |
 | `LOOP_KANBAN_DONE=n` | how many closed tickets the `done` column keeps (default 12) |
@@ -1006,7 +1037,7 @@ module in `src/` that spawns git at all, which the spawn-allowlist test enforces
 | `LOOP_GIT_LOCK_WAIT_MS` | How long a write waits out somebody else's lock | `30000` |
 | `LOOP_GIT_KILL_GRACE_MS` | Grace after `SIGTERM` before the child is killed | `5000` |
 | `LOOP_GIT_STALE_LOCK_AFTER_MS` | When a lock starts to look abandoned | `60000` |
-| `LOOP_GIT_STALE_LOCK` | `remove` lets the loop clear a stale lock once; anything else reports instead | off (`report`) |
+| `LOOP_GIT_STALE_LOCK` | `remove` lets the loop clear a stale lock once; `report` only reports it. Anything else is refused | off (`report`) |
 
 Read [`docs/ADR-006-index-lock.md`](docs/ADR-006-index-lock.md) before changing
 any of it — in particular why the retry covers *only* the lock error, why an
