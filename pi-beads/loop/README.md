@@ -46,13 +46,24 @@ src/beads.ts         the ONLY module that shells out to `bd` (typed, side-effect
 src/idle.ts          the idle surface: pi's own TUI input, clean exits, raw text back.
                      Single-shot by contract — one surface answers once, then it is
                      torn down, so the root builds a fresh one per idle turn
+src/panel.ts        the panel contract: how a strip of the screen plugs into the work
+                    surface. `id` + `placement` ("band" above the footer, "top" above
+                    the transcript) + a row budget + `render()` + optional
+                    `subscribe`/`refresh`/`dispose`/`setCurrent`, and `createNullPanel`
+                    for the off case. Both HUDs satisfy it; the presenter imports this
+                    module and nothing strip-shaped (see `WorkPresenterOptions.panels`)
+src/render.ts       the work presenter: the transcript, the footer, and the fixed chrome
+                    the panels are laid into. Decides nothing, owns one output region,
+                    and reaches every HUD through `src/panel.ts`
 src/monitor.ts      the backend monitor: read-only polling of /health, /metrics, /cache,
                     /v1/models, with a tolerant field reader and a panel. GET-only, and
-                    no bd/session handle exists in it, so it cannot touch the run
+                    no bd/session handle exists in it, so it cannot touch the run.
+                    `monitorPanel()` wraps a source as a pluggable strip
 src/kanban.ts       the mini kanban: ready / in progress / done, read through an injected
                     `read()` closure — no BdClient in its signature, so nothing in the
                     module could move a ticket. Two layouts, backoff, and three honest
-                    states per column (see ADR-004)
+                    states per column (see ADR-004). `kanbanPanel()` wraps a source as
+                    a pluggable strip
 src/notify.ts       the completion notice: what a finished bead says, in what order,
                     and when to stop trying to say it. Wording only — no sockets
 src/ntfy.ts       the ONLY module that talks to a notification server: topic
@@ -630,6 +641,14 @@ proper. When the session is released the band stops being drawn: those lines
 describe what the server is doing *now*, and after a handoff “now” is no longer
 describing the work you are looking at. A piped log never sees the panel at all.
 
+It reaches that region as a **panel**, not as a favour from the renderer:
+`monitorPanel(source, { placement, lines })` wraps the poller in the contract
+from `src/panel.ts`, and `src/app.ts` puts it in the array it hands the work
+surface. The presenter orders that array by `placement`, reserves `lines` rows
+for each entry, subscribes for repaints while it holds the terminal, and has no
+idea that an HTTP request is involved anywhere. `LOOP_MONITOR_AT=top` sets the
+panel's `placement`; nothing downstream knows which knob it came from.
+
 **It is read-only, by shape.** No `bd` handle, no issue id, no `POST`. Every
 failure path returns a value rather than throwing. A field it cannot find is
 `—`, never a guess: if nothing exposes the KV capacity, the panel says
@@ -667,7 +686,7 @@ slow server produces one long wait, not a queue of them.
 node tools/monitor-stub.mjs   # the panel, against a stub backend — no GPU needed
 LOOP_MONITOR=0 npm start                    # work without it
 LOOP_MONITOR_LINES=3 LOOP_MONITOR_VERBOSE=1 npm start   # wide panel + what the server exposed
-node --test test/monitor.test.ts         # 75 tests over the reader, poller and surfaces
+node --test test/monitor.test.ts         # 79 tests over the reader, poller, panel and surfaces
 ```
 
 ## The board: what is left, what is being worked, what will be picked next
@@ -743,19 +762,26 @@ write's: it shows `?` and backs off.
 | `LOOP_KANBAN_AT=band\|top` | above the footer (default) or above the transcript, independently of the monitor |
 | `LOOP_KANBAN_VERBOSE=1` | at startup, print each column's state, its totals, and the interval and backoff ceiling |
 
-The two HUDs are placed independently of each other, and the surface's child order
-is the *same rule* the frame assembly uses, stated once. That is not pedantry:
-with them stated twice, `LOOP_KANBAN_AT=top` combined with a banded monitor dropped
-the board out of every captured frame while it was still on screen — a bug that
-looks correct in the terminal and correct in the tests, and is only wrong in the
-capture.
+The two HUDs are placed independently of each other because they are two
+entries in one array, not two knobs on one surface. `workChrome()` in
+`src/app.ts` builds `[monitorPanel(...), kanbanPanel(...)]`, and the order of
+that array *is* the layout: the monitor leads, so it stays outermost whichever
+band it is pinned to, and the board sits between it and the transcript. The
+presenter partitions by `placement` once, in the constructor, and
+`captureFrame()` reads the same partition the child order came from — stated
+once, in one place. That is not pedantry: with the rule stated twice,
+`LOOP_KANBAN_AT=top` combined with a banded monitor dropped the board out of
+every captured frame while it was still on screen — a bug that looks correct in
+the terminal and correct in the tests, and is only wrong in the capture. A
+third strip is one more entry in that array; `src/render.ts` is not part of
+that change, which is the whole point of `src/panel.ts`.
 
 ```sh
 node tools/kanban-demo.mjs          # every shape, no board needed
 node tools/kanban-demo.mjs --live   # the same renderer over a real bd, read-only
 LOOP_KANBAN=board npm start         # the grid on the work surface too
 LOOP_KANBAN=0 npm start             # no board
-node --test test/kanban.test.ts     # 84 tests over model, layout, poller and surfaces
+node --test test/kanban.test.ts     # 88 tests over model, layout, poller, panel and surfaces
 ```
 
 There is a full web kanban in this repo's `harness.sh` (`bdui`). It stays, and it

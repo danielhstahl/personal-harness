@@ -38,6 +38,7 @@ import {
   compactAge,
   createKanbanSource,
   createNullKanban,
+  kanbanPanel,
   kanbanView,
   renderKanban,
   renderKanbanBoard,
@@ -49,6 +50,8 @@ import {
   type KanbanSource,
   type KanbanView,
 } from "../src/kanban.ts";
+import { monitorPanel, type MonitorSource } from "../src/monitor.ts";
+import { panelLines, type Panel, type PanelPlacement } from "../src/panel.ts";
 import { createNullPresenter, createWorkPresenter } from "../src/render.ts";
 import { createIdleMode, type IdleHandle } from "../src/idle.ts";
 import { buildApp, refreshBoardOnWrite } from "../src/app.ts";
@@ -998,8 +1001,8 @@ interface MonitorLike {
 
 async function workHarness(options: {
   kanban?: KanbanSource | null;
-  monitorPlacement?: "band" | "top";
-  kanbanPlacement?: "band" | "top";
+  monitorPlacement?: PanelPlacement;
+  kanbanPlacement?: PanelPlacement;
   kanbanMode?: "row" | "board";
   kanbanLines?: number;
   monitor?: MonitorLike | null;
@@ -1022,6 +1025,20 @@ async function workHarness(options: {
   // is read before the first frame: a frame painted over a never-read board is
   // what it looks like before the first poll lands, not what is under test.
   if (source !== null && source.view.at === 0) await source.refresh().catch(() => undefined);
+  // Both strips arrive through the panel contract (`src/panel.ts`): the board
+  // wrapped with its shape, height and placement, the monitor the same way.
+  // The array's order is the layout — monitor first, board next — which is
+  // what used to be a rule inside the presenter.
+  const panels: Panel[] = [
+    monitorPanel((options.monitor ?? null) as MonitorSource | null, {
+      ...(options.monitorPlacement === undefined ? {} : { placement: options.monitorPlacement }),
+    }),
+    kanbanPanel(source, {
+      mode: options.kanbanMode ?? "row",
+      ...(options.kanbanPlacement === undefined ? {} : { placement: options.kanbanPlacement }),
+      ...(options.kanbanLines === undefined ? {} : { lines: options.kanbanLines }),
+    }),
+  ];
   const presenter = createWorkPresenter({
     terminal: term as never,
     tty: options.tty ?? true,
@@ -1030,13 +1047,8 @@ async function workHarness(options: {
     coalesceMs: 33,
     heartbeatMs: 500,
     write: (chunk: string) => written.push(chunk),
-    ...(options.monitor === undefined ? {} : { monitor: options.monitor as never }),
-    kanban: source,
-    kanbanMode: options.kanbanMode ?? "row",
-    ...(options.kanbanPlacement === undefined ? {} : { kanbanPlacement: options.kanbanPlacement }),
-    ...(options.kanbanLines === undefined ? {} : { kanbanLines: options.kanbanLines }),
-    ...(options.monitorPlacement === undefined ? {} : { monitorPlacement: options.monitorPlacement }),
-  } as never);
+    panels,
+  });
   return {
     presenter,
     source,
@@ -1239,6 +1251,74 @@ describe("kanban on the work surface", () => {
     failing.stop();
   });
 });
+
+// ── the panel contract, as the board satisfies it ─────────────────────────
+
+describe("kanbanPanel: the board as a plug-in strip", () => {
+  it("carries the shape it was given, including the height that shape needs", () => {
+    const source = createKanbanSource({ read: async () => sampleRead(), mode: "row" });
+    const row = kanbanPanel(source, { mode: "row" });
+    assert.equal(row.id, "kanban");
+    assert.equal(row.placement, "band");
+    assert.equal(row.lines, 1, "one line of row is one row of budget");
+    const board = kanbanPanel(source, { mode: "board" });
+    assert.equal(board.lines, 4, "a grid gets its borders: four by default");
+    assert.equal(kanbanPanel(source, { mode: "board", lines: 7 }).lines, 7);
+    assert.equal(
+      kanbanPanel(source, { placement: "top" }).placement,
+      "top",
+      "and the knob is what moves it",
+    );
+    source.stop();
+  });
+
+  it("draws the board it wraps, at the width it was asked for", async () => {
+    const source = createKanbanSource({ read: async () => sampleRead(), mode: "row" });
+    await source.refresh();
+    const lines = plain(panelDraws(kanbanPanel(source, { mode: "row" }), 90));
+    assert.equal(lines.length, 1, lines.join(" | "));
+    assert.ok(lines[0]?.includes("ready"), lines.join(" | "));
+    source.stop();
+  });
+
+  it("passes refresh and the current-ticket mark straight through", async () => {
+    let reads = 0;
+    const source = createKanbanSource({
+      read: async () => {
+        reads += 1;
+        return sampleRead();
+      },
+      mode: "row",
+    });
+    const panel = kanbanPanel(source, { mode: "board", lines: 5 });
+    await panel.refresh?.();
+    assert.equal(reads, 1, "a refresh on the strip is a read on the board");
+    panel.setCurrent?.("kb-7");
+    assert.ok(
+      plain(panelDraws(panel, 90)).some((line) => line.includes("▸ kb-7")),
+      "the mark reaches the grid through the contract, not through a side door",
+    );
+    source.stop();
+  });
+
+  it("a missing board is a strip that draws nothing, not a strip that is missing", () => {
+    const off = kanbanPanel(null, { placement: "top" });
+    assert.equal(off.placement, "top", "the knob still says where the nothing goes");
+    assert.deepEqual(panelDraws(off, 90), []);
+    // The surface will subscribe to whatever is in the array, so the absent
+    // board has to answer that call and answer it with something callable.
+    const stop = off.subscribe?.(() => undefined);
+    assert.equal(typeof stop, "function");
+    stop?.();
+    stop?.();
+  });
+});
+
+/** Draw a panel through the contract's own helper, colours stripped. */
+function panelDraws(panel: Panel, width: number): string[] {
+  const theme = { color: (_role: string, text: string) => text, bold: (text: string) => text };
+  return panelLines(panel, width, theme);
+}
 
 // ── the idle surface ───────────────────────────────────────────────────────
 

@@ -15,6 +15,7 @@ import { AgentError, parseThinkingLevel } from "./agent.ts";
 import type { ThinkingLevel } from "./agent.ts";
 import { runApp } from "./app.ts";
 import type { AppConfig, KanbanSetting, NotifySetting } from "./app.ts";
+import type { PanelPlacement } from "./panel.ts";
 import { LoopError } from "./loop.ts";
 import type { LoopResult } from "./loop.ts";
 import { NTFY_MAX_MESSAGE_BYTES, NTFY_MIN_MESSAGE_BYTES } from "./ntfy.ts";
@@ -92,7 +93,7 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
    * of above the footer. That scrolls with the transcript, so it is the option
    * for a surface known to stay short — not the default for a long-running one.
    */
-  const monitorPlacement = (): "band" | "top" =>
+  const monitorPlacement = (): PanelPlacement =>
     source.LOOP_MONITOR_AT?.trim().toLowerCase() === "top" ? "top" : "band";
   /**
    * The mini kanban, read as one knob with three answers: `0`/`off` hides it,

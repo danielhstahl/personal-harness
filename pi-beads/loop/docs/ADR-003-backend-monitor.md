@@ -84,10 +84,13 @@ ctx 262k · out 66k · draft mtp · cache 89% hit · req 2.0/s (415 served)
 issue 9f2c · main · 2 files changed · 12/256k ctx · ⌃Q quit
 ```
 
-`monitorPlacement: "top"` puts the same band first on the surface for anyone who
+`LOOP_MONITOR_AT=top` puts the same band first on the surface for anyone who
 prefers it there; it will scroll, and that is the trade-off they chose rather
-than one the code hid from them. The idle surface has no transcript, so there the
-monitor **is** the top line — above the board status, above the prompt.
+than one the code hid from them. (When this was written that knob set a presenter
+option called `monitorPlacement`; it now sets the panel's `placement`, which is
+the same decision with a name that outlived the pair it was invented for.) The
+idle surface has no transcript, so there the monitor **is** the top line —
+above the board status, above the prompt.
 
 When the presenter is released (session over, waiting for the finalizer; or
 finalize → idle) the monitor stops being drawn. Those lines describe what the

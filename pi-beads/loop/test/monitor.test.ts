@@ -64,7 +64,10 @@ import {
   urlsForBase,
   type BackendSnapshot,
   type EndpointState,
+  type MonitorSource,
+  monitorPanel,
 } from "../src/monitor.ts";
+import { panelLines, type Panel, type PanelPlacement } from "../src/panel.ts";
 
 initTheme("dark", false);
 
@@ -962,13 +965,19 @@ interface BackendMonitorLike {
 
 function workHarness(options: {
   readonly monitor?: BackendMonitorLike | null;
-  readonly placement?: "band" | "top";
+  readonly placement?: PanelPlacement;
   readonly tty?: boolean;
   readonly columns?: number;
 }) {
   const term = new FakeTerminal(options.columns ?? 80, 24);
   const time = fakeTime();
   const written: string[] = [];
+  // The monitor reaches the surface through the panel contract now, and the
+  // absent case is a panel that draws nothing rather than the absence of one:
+  // `panels` is always an array, its contents are the only question.
+  const panel = monitorPanel((options.monitor ?? null) as MonitorSource | null, {
+    ...(options.placement === undefined ? {} : { placement: options.placement }),
+  });
   const presenter = createWorkPresenter({
     terminal: term as never,
     tty: options.tty ?? true,
@@ -977,8 +986,7 @@ function workHarness(options: {
     coalesceMs: 33,
     heartbeatMs: 500,
     write: (chunk: string) => written.push(chunk),
-    monitor: options.monitor ?? null,
-    ...(options.placement === undefined ? {} : { monitorPlacement: options.placement }),
+    panels: [panel],
   });
   return {
     term,
@@ -1430,3 +1438,60 @@ describe("cycle joining", () => {
     assert.equal(asked, 2, "the joined cycle did not consume the next one");
   });
 });
+
+// ── the panel contract, as the monitor satisfies it ───────────────────────
+
+describe("monitorPanel: the monitor as a plug-in strip", () => {
+  it("carries placement and height, and defaults to the band it always sat in", () => {
+    const panel = monitorPanel(new FakeMonitor());
+    assert.equal(panel.id, "monitor");
+    assert.equal(panel.placement, "band");
+    assert.equal(panel.lines, 2);
+    const moved = monitorPanel(new FakeMonitor(), { placement: "top", lines: 4 });
+    assert.deepEqual([moved.placement, moved.lines], ["top", 4]);
+  });
+
+  it("draws the panel it wraps, at the width it was asked for", () => {
+    const monitor = new FakeMonitor();
+    const lines = panelDraws(monitorPanel(monitor), 80);
+    assert.equal(lines.length, 1, lines.join(" | "));
+    assert.ok(lines[0]?.includes("MONITOR"), lines.join(" | "));
+  });
+
+  it("refresh reaches the poller when there is one, and shrugs when there is not", async () => {
+    const pollable = new FakeMonitor();
+    let polls = 0;
+    pollable.poll = async (): Promise<void> => {
+      polls += 1;
+    };
+    await monitorPanel(pollable).refresh?.();
+    assert.equal(polls, 1, "a refresh on the strip is a poll on the monitor");
+
+    // A bare `MonitorSource` has no `poll()`. The honest answer to "read now"
+    // from something that cannot read is nothing at all, not a thrown TypeError.
+    const bare: MonitorSource = {
+      lines: () => ["bare"],
+      subscribe: () => () => undefined,
+      snapshot: { at: 0, ageMs: 0, anyLive: false, endpoints: [] },
+    };
+    const panel = monitorPanel(bare);
+    assert.equal(typeof panel.refresh, "function");
+    await panel.refresh?.();
+    assert.deepEqual(panelDraws(panel, 40), ["bare"]);
+  });
+
+  it("a monitor that is off is a strip that draws nothing, not a hole in the layout", () => {
+    const off = monitorPanel(null);
+    assert.deepEqual(panelDraws(off, 80), []);
+    const stop = off.subscribe?.(() => undefined);
+    assert.equal(typeof stop, "function");
+    stop?.();
+    stop?.();
+  });
+});
+
+/** Draw a panel through the contract's own helper, colours stripped. */
+function panelDraws(panel: Panel, width: number): string[] {
+  const theme = { color: (_role: string, text: string) => text, bold: (text: string) => text };
+  return panelLines(panel, width, theme);
+}

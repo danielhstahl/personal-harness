@@ -38,6 +38,12 @@ import { truncateToWidth, visibleWidth, type Component } from "@earendil-works/p
 
 import { normaliseDependencies, type Issue } from "./beads.ts";
 import { PLAIN_MONITOR_THEME, type MonitorTheme } from "./monitor.ts";
+import {
+  createNullPanel,
+  type Panel,
+  type PanelPlacement,
+  type PanelRender,
+} from "./panel.ts";
 
 // ── the view model ─────────────────────────────────────────────────────────
 
@@ -942,6 +948,12 @@ export function createKanbanSource(options: KanbanSourceOptions): KanbanSource {
  * The board for a run that must not show one — the same trick as
  * `createNullMonitor()`, so no surface ever has to reason about whether a
  * board exists.
+ *
+ * This is the *source*-shaped null, for consumers that want a poller (the idle
+ * surface, `buildKanban`'s disabled path). Its surface-shaped equivalent is
+ * `createNullPanel()` in `src/panel.ts`, which is what `kanbanPanel(null)`
+ * returns: one null implementation of "absent" per shape, rather than each
+ * surface inventing its own.
  */
 export function createNullKanban(reason?: string): KanbanSource {
   return {
@@ -1008,4 +1020,69 @@ export class KanbanComponent implements Component {
   invalidate(): void {
     /* nothing cached between frames */
   }
+}
+
+// ── the panel contract ─────────────────────────────────────────────────────
+
+/** What {@link kanbanPanel} wraps: shape, height, and where it goes. */
+export interface KanbanPanelOptions {
+  /** `row` (one line) or `board` (bordered grid). Default `"row"`. */
+  readonly mode?: KanbanMode;
+  /**
+   * Row budget, borders included. Default 1 with `row`, 4 with `board` — the
+   * height that matches the shape asked for, so nobody has to remember which
+   * mode needs how many rows and get a half-drawn grid.
+   */
+  readonly lines?: number;
+  /** Which side of the transcript the board sits on. Default `"band"`. */
+  readonly placement?: PanelPlacement;
+  /** Leading gutter the board is drawn inside. Default one space. */
+  readonly indent?: string;
+  /** What the strip is called on this surface. Default `"kanban"`. */
+  readonly id?: string;
+}
+
+/**
+ * The board as a pluggable strip — see `src/panel.ts`.
+ *
+ * Nothing here draws anything: it hands the presenter a {@link KanbanComponent}
+ * and the two facts it needs to lay out around it. Which makes the board's
+ * arrival at the work surface the same operation as any future strip's, and
+ * leaves every mode/height/placement decision in this module, where the board
+ * is defined, rather than in the presenter, which should never have heard of it.
+ *
+ * A `null` source is a null panel, not a missing one: a run with the board
+ * switched off still passes an array of the right shape, so no surface ever has
+ * to reason about whether a board exists.
+ */
+export function kanbanPanel(
+  source: KanbanSource | null | undefined,
+  options: KanbanPanelOptions = {},
+): Panel {
+  const placement = options.placement ?? "band";
+  const id = options.id ?? "kanban";
+  if (source === null || source === undefined) {
+    return createNullPanel("no board source", { id, placement });
+  }
+  const mode = options.mode ?? "row";
+  const lines = Math.max(1, options.lines ?? (mode === "row" ? 1 : 4));
+  const component = new KanbanComponent(source, lines, options.indent ?? " ");
+  component.setMode(mode);
+  return {
+    id,
+    placement,
+    lines,
+    render(): PanelRender {
+      return component;
+    },
+    subscribe(listener: () => void): () => void {
+      return source.subscribe(listener);
+    },
+    refresh(): Promise<void> {
+      return source.refresh();
+    },
+    setCurrent(current: string | undefined): void {
+      component.setCurrent(current);
+    },
+  };
 }

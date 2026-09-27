@@ -35,6 +35,12 @@ import { truncateToWidth, visibleWidth, type Component } from "@earendil-works/p
 
 import { healthUrlFor, isRecord } from "./health.ts";
 import type { JsonRecord } from "./health.ts";
+import {
+  createNullPanel,
+  type Panel,
+  type PanelPlacement,
+  type PanelRender,
+} from "./panel.ts";
 
 // ── what the panel needs from a theme ────────────────────────────────────────
 
@@ -1978,6 +1984,64 @@ export function createNullMonitor(reason?: string): BackendMonitor {
     },
     describe(): string[] {
       return [`  monitor: off${reason === undefined ? "" : ` — ${reason}`}`];
+    },
+  };
+}
+
+// ── the panel contract ─────────────────────────────────────────────────────
+
+/** What {@link monitorPanel} wraps: height, gutter, and where it goes. */
+export interface MonitorPanelOptions {
+  /** Row budget. Default 2. */
+  readonly lines?: number;
+  /** Which side of the transcript the panel sits on. Default `"band"`. */
+  readonly placement?: PanelPlacement;
+  /** Leading gutter the panel is drawn inside. Default one space. */
+  readonly indent?: string;
+  /** What the strip is called on this surface. Default `"monitor"`. */
+  readonly id?: string;
+}
+
+/**
+ * The monitor as a pluggable strip — see `src/panel.ts`.
+ *
+ * A {@link MonitorSource} behind a {@link Panel}, which is all the work stream
+ * needs to draw it: the poller stays where it is, the panel carries the
+ * placement and the row budget, and the presenter never learns that an HTTP
+ * request is involved anywhere.
+ *
+ * `refresh()` reaches {@link BackendMonitor.poll} when the source has one and is
+ * a no-op when it is a bare {@link MonitorSource}, which is the honest answer:
+ * a source that cannot poll cannot be made to.
+ *
+ * `dispose()` deliberately stops nothing. The same monitor is read by the work
+ * surface and by the idle prompt; the composition root started it, and that is
+ * who stops it. A panel that owned its poller would be free to stop it here.
+ */
+export function monitorPanel(
+  source: MonitorSource | null | undefined,
+  options: MonitorPanelOptions = {},
+): Panel {
+  const placement = options.placement ?? "band";
+  const id = options.id ?? "monitor";
+  if (source === null || source === undefined) {
+    return createNullPanel("no monitor source", { id, placement });
+  }
+  const lines = Math.max(1, options.lines ?? 2);
+  const component = new MonitorComponent(source, lines, options.indent ?? " ");
+  return {
+    id,
+    placement,
+    lines,
+    render(): PanelRender {
+      return component;
+    },
+    subscribe(listener: () => void): () => void {
+      return source.subscribe(listener);
+    },
+    refresh(): void | Promise<void> {
+      const poll = (source as Partial<BackendMonitor>).poll;
+      return typeof poll === "function" ? poll.call(source) : undefined;
     },
   };
 }

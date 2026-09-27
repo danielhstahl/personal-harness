@@ -12,14 +12,20 @@
  *   - one-line tool-call summaries built from `src/format.ts` instead of the raw
  *     JSON the agent protocol carries;
  *   - collapsed tool results with pi's own expand keybinding (`app.tools.expand`);
+ *   - the fixed chrome: the strips above and below the transcript arrive through
+ *     {@link WorkPresenterOptions.panels} as {@link Panel}s from
+ *     `src/panel.ts`, ordered by `placement` and laid out by `lines`. This file
+ *     names no board and no server, and adding a third strip changes nothing in
+ *     it;
  *   - the footer: issue, phase, elapsed, tokens, model, thinking level, legend.
  *
  * What it deliberately is not:
  *
  *   - **a state machine.** Phases arrive through {@link WorkPresenter.setContext}
  *     as data and are only ever displayed. This file imports neither the
- *     orchestrator nor the loop, and holds no board or git handle at all, so it
- *     cannot decide anything about the run it is watching.
+ *     orchestrator nor the loop nor a strip module — not `kanban.ts`, not
+ *     `monitor.ts` — and holds no board or git handle at all, so it cannot
+ *     decide anything about the run it is watching.
  *   - **a second owner of the terminal.** Only one surface may be live at a time.
  *     When the idle prompt needs the keyboard it calls {@link WorkPresenter.release}:
  *     this surface flushes, hides its footer, stops painting, and keeps its output
@@ -53,11 +59,10 @@ import {
 
 import { formatToolArgs, formatToolResult, indentContent } from "./format.ts";
 import {
-  KanbanComponent,
-  type KanbanMode,
-  type KanbanSource,
-} from "./kanban.ts";
-import { MonitorComponent, type MonitorSource } from "./monitor.ts";
+  PanelComponent,
+  splitByPlacement,
+  type Panel,
+} from "./panel.ts";
 import type { RunnerEvent } from "./agent.ts";
 
 // ── theme ────────────────────────────────────────────────────────────────────
@@ -688,54 +693,23 @@ export interface WorkPresenterOptions {
   /** Put the key legend in the footer. Default true (dropped if no key is known). */
   readonly legend?: boolean;
   /**
-   * The backend monitor source (see `src/monitor.ts`). `null` or omitted means
-   * no monitor: the surface is exactly what it was without this option.
-   */
-  readonly monitor?: MonitorSource | null;
-  /**
-   * Where the monitor sits, in the one piece of the layout that is always on
-   * screen. Default `"band"` — directly above the footer.
+   * The strips plugged into the fixed chrome — see `src/panel.ts`.
    *
-   * Why not the literal top of the screen: `TuiMainScreen` renders the whole
-   * content column and keeps the *bottom* `rows` lines in view, so anything at
-   * the top of the content scrolls into scrollback the moment the transcript
-   * outgrows the terminal — which it does, every unit, early. A block pinned at
-   * the top would therefore be visible at the start of a ticket and gone for
-   * the rest of it, and the only ways to prevent that (capping the body, or
-   * drawing over the top rows out of band) both cost the transcript its
-   * scrollback. Above the footer the panel is always visible, covers no
-   * content, and never forces the full-screen redraw the diff renderer falls
-   * back to when something above the viewport changes.
+   * This is the whole interface between the presenter and anything that is not
+   * the transcript. The presenter orders them by `placement` (`"top"` above
+   * the transcript, `"band"` between it and the footer), reserves `lines` rows
+   * for each, subscribes for repaints while the surface is held, and knows
+   * nothing about boards, servers or whatever else is in the array. Within a
+   * band the order is the order given, which is how the composition root says
+   * "monitor outermost, board nearer the text" without the presenter holding
+   * that fact.
    *
-   * `"top"` is there for a surface whose content is known to stay short.
+   * Absent, `null` or `[]` means no chrome at all: the surface is exactly what
+   * it was before the option existed. A strip that is switched off arrives as a
+   * panel that draws nothing (`createNullPanel()`), so nothing here has to ask
+   * whether a HUD exists — only what it drew.
    */
-  readonly monitorPlacement?: "band" | "top";
-  /** How many rows the monitor may take. Default 2. */
-  readonly monitorLines?: number;
-  /**
-   * The mini kanban source (see `src/kanban.ts`): the board as ready / in
-   * progress / done. `null` or omitted means no board.
-   *
-   * It sits in the same fixed chrome as the monitor, below it and above the
-   * footer, for the same reason — the transcript flows into scrollback and
-   * this has to not. The default mode here is `"row"`, one line, because this
-   * surface already carries the transcript, the monitor and the footer, and a
-   * three-column grid on top of all three is a lot of chrome for a screen
-   * whose job is to show a session. Idle, which has the room, defaults to
-   * `"board"`.
-   */
-  readonly kanban?: KanbanSource | null;
-  /** `row` (one line) or `board` (bordered grid). Default `"row"` here. */
-  readonly kanbanMode?: KanbanMode;
-  /** Rows the board may take, borders included. Default 1 with `row`, 4 with `board`. */
-  readonly kanbanLines?: number;
-  /** Same meaning as {@link monitorPlacement}. Default `"band"`. */
-  readonly kanbanPlacement?: "band" | "top";
-}
-
-/** Whether a mode is the one-line one, so the default height matches it. */
-function modeIsRow(mode: KanbanMode | undefined): boolean {
-  return (mode ?? "row") === "row";
+  readonly panels?: readonly Panel[] | null;
 }
 
 export interface PresenterStats {
@@ -751,6 +725,8 @@ export interface PresenterStats {
   readonly animating: boolean;
   /** A frame has been asked for and has not been drawn yet. */
   readonly paintPending: boolean;
+  /** Strips plugged into the fixed chrome, so the composition is checkable. */
+  readonly panels: number;
   readonly live: boolean;
   readonly expanded: boolean;
 }
@@ -942,6 +918,35 @@ export function describeOutcome(facts: OutcomeFacts): {
   }
 }
 
+/**
+ * One plugged-in strip, plus the `Component` the live surface draws it with.
+ *
+ * The component is made once, in the constructor, so the container holds a
+ * stable child and the panel is asked for its lines at render time — the same
+ * deal `MonitorComponent` and `KanbanComponent` have with their sources.
+ */
+interface PanelSlot {
+  readonly panel: Panel;
+  readonly view: Component;
+}
+
+/** The fixed chrome, partitioned by placement. */
+interface Chrome {
+  readonly top: readonly PanelSlot[];
+  readonly band: readonly PanelSlot[];
+}
+
+function buildChrome(panels: readonly Panel[], theme: PresenterTheme): Chrome {
+  const slot = (panel: Panel): PanelSlot => ({ panel, view: new PanelComponent(panel, theme) });
+  const placed = splitByPlacement(panels);
+  return { top: placed.top.map(slot), band: placed.band.map(slot) };
+}
+
+/** Every slot, top band first — the order a surface walks them in. */
+function panelSlots(chrome: Chrome): PanelSlot[] {
+  return [...chrome.top, ...chrome.band];
+}
+
 class Presenter implements WorkPresenter {
   readonly path: "live" | "plain";
   private readonly theme: PresenterTheme;
@@ -967,22 +972,13 @@ class Presenter implements WorkPresenter {
   private readonly body = new Container();
   private readonly surface = new Container();
   /**
-   * The monitor band. Null when no source was supplied, in which case this
-   * surface is byte-for-byte what it was before the option existed.
+   * The fixed chrome: every plugged-in strip, plus the `Component` the live
+   * surface draws it with, partitioned once so child order and
+   * {@link captureFrame} can never disagree about where a panel went.
    */
-  private readonly monitorComponent: MonitorComponent | null;
-  /** Kept alongside the component so the subscribe/unsubscribe pair has a handle. */
-  private readonly monitorSource: MonitorSource | null;
-  /** Where the monitor sits — see {@link WorkPresenterOptions.monitorPlacement}. */
-  private readonly monitorPlacement: "band" | "top";
-  /** Unsubscribes the surface from the monitor's "new data landed" signal. */
-  private monitorUnsub: (() => void) | null = null;
-  /** The mini kanban, in the fixed chrome below the monitor. */
-  private readonly kanbanSource: KanbanSource | null;
-  private readonly kanbanComponent: KanbanComponent | null;
-  private readonly kanbanPlacement: "band" | "top";
-  /** Unsubscribes the surface from the board's "new read landed" signal. */
-  private kanbanUnsub: (() => void) | null = null;
+  private readonly chrome: Chrome;
+  /** Detaches the surface from each panel's "my content changed" signal. */
+  private panelUnsubs: (() => void)[] = [];
 
   private terminal: Terminal | null = null;
   private tui: TUI | null = null;
@@ -1086,70 +1082,31 @@ class Presenter implements WorkPresenter {
     };
 
     this.footer = new FooterBlock(this.theme, this.legend);
-    // The monitor goes in the fixed chrome, never inside `body`: `body` is the
-    // transcript, and the transcript's job is to flow into scrollback. The
-    // monitor's job is the opposite — stay put — so it is a sibling.
-    this.monitorPlacement = options.monitorPlacement ?? "band";
-    this.monitorSource = options.monitor ?? null;
-    this.monitorComponent =
-      this.monitorSource === null
-        ? null
-        : new MonitorComponent(this.monitorSource, Math.max(1, options.monitorLines ?? 2), " ");
-    // The board goes under the monitor and above the footer. With both HUDs set
-    // to `"top"` the monitor ends up outermost, since the freshest number is
-    // the one worth reading first.
-    this.kanbanPlacement = options.kanbanPlacement ?? "band";
-    this.kanbanSource = options.kanban ?? null;
-    this.kanbanComponent =
-      this.kanbanSource === null
-        ? null
-        : new KanbanComponent(
-            this.kanbanSource,
-            Math.max(1, options.kanbanLines ?? (modeIsRow(options.kanbanMode) ? 1 : 4)),
-            " ",
-          );
-    this.kanbanComponent?.setMode(options.kanbanMode ?? "row");
-    // Two HUDs, each independently `"top"` or `"band"`, and the child order here
-    // is the same rule `captureFrame()` uses. It is stated once, in one order,
-    // on purpose: the day the two disagree is the day a HUD silently disappears
-    // from a captured frame while still being on screen (or the reverse), which
-    // is the kind of bug that eats an afternoon because the render path looks
-    // fine and the test path looks fine.
-    const head: Component[] = [];
-    const tail: Component[] = [];
-    const place = (component: Component | null, placement: "band" | "top"): void => {
-      if (component === null) return;
-      (placement === "top" ? head : tail).push(component);
-    };
-    // Monitor first in both bands, so whichever way they are pinned the panel
-    // stays outermost and the board sits between it and the transcript.
-    place(this.monitorComponent, this.monitorPlacement);
-    place(this.kanbanComponent, this.kanbanPlacement);
-    for (const component of head) this.surface.addChild(component);
+    // The panels go in the fixed chrome, never inside `body`: `body` is the
+    // transcript, and the transcript's job is to flow into scrollback. A
+    // panel's job is the opposite — stay put — so each one is a sibling.
+    //
+    // The order here is the same rule `captureFrame()` uses, stated once, in
+    // one place, on purpose: the day the two disagree is the day a panel
+    // silently disappears from a captured frame while still being on screen (or
+    // the reverse), which is the kind of bug that eats an afternoon because
+    // the render path looks fine and the test path looks fine.
+    this.chrome = buildChrome(options.panels ?? [], this.theme);
+    for (const part of this.chrome.top) this.surface.addChild(part.view);
     this.surface.addChild(this.body);
-    for (const component of tail) this.surface.addChild(component);
+    for (const part of this.chrome.band) this.surface.addChild(part.view);
     this.surface.addChild(this.footer);
   }
 
   /**
-   * The monitor's lines at the current width, or none when there is no monitor
-   * or the surface is not ours to draw on. Ties the panel to the same
-   * live/released rule the footer obeys, so a released surface leaves no stale
-   * dashboard in scrollback pretending to be current.
+   * One band's panel lines at the current width, or none when the surface is
+   * not ours to draw on. Ties every panel to the same live/released rule the
+   * footer obeys: a released surface leaves no stale dashboard, and no stale
+   * board claiming that the queue is what it was two reads ago.
    */
-  private monitorLines(width: number): string[] {
-    if (this.monitorComponent === null || !this.live) return [];
-    return this.monitorComponent.render(width);
-  }
-
-  /**
-   * The board's lines, under the same live/released rule as the monitor: a
-   * released surface leaves no stale board in scrollback claiming that the
-   * queue is what it was two reads ago.
-   */
-  private kanbanLines(width: number): string[] {
-    if (this.kanbanComponent === null || !this.live) return [];
-    return this.kanbanComponent.render(width);
+  private chromeLines(slots: readonly PanelSlot[], width: number): string[] {
+    if (!this.live) return [];
+    return slots.flatMap((slot) => slot.view.render(width));
   }
 
   get isLive(): boolean {
@@ -1172,14 +1129,14 @@ class Presenter implements WorkPresenter {
     this.tui = tui;
     this.live = true;
     this.footer.show();
-    // A poll landing is a content change from the surface's point of view: hook
-    // it into the same coalesced path everything else uses, so the monitor's
-    // two-second cadence costs one frame and not one per field that moved.
-    if (this.monitorComponent !== null) {
-      this.monitorUnsub = this.monitorSource?.subscribe(() => this.markDirty()) ?? null;
-    }
-    if (this.kanbanComponent !== null) {
-      this.kanbanUnsub = this.kanbanSource?.subscribe(() => this.markDirty()) ?? null;
+    // A read landing behind a panel is a content change from the surface's
+    // point of view: hook every panel into the same coalesced path everything
+    // else uses, so a strip's two-second cadence costs one frame and not one
+    // per field that moved. A panel with nothing to subscribe to is skipped.
+    this.panelUnsubs = [];
+    for (const { panel } of panelSlots(this.chrome)) {
+      const detach = panel.subscribe?.(() => this.markDirty());
+      if (detach !== undefined) this.panelUnsubs.push(detach);
     }
     this.syncFooter();
     this.paint();
@@ -1192,14 +1149,8 @@ class Presenter implements WorkPresenter {
   release(): void {
     if (this.closed) return;
     this.stopHeartbeat();
-    if (this.monitorUnsub !== null) {
-      this.monitorUnsub();
-      this.monitorUnsub = null;
-    }
-    if (this.kanbanUnsub !== null) {
-      this.kanbanUnsub();
-      this.kanbanUnsub = null;
-    }
+    for (const detach of this.panelUnsubs) detach();
+    this.panelUnsubs = [];
     if (this.path === "plain") {
       this.emitPlainTail(true);
       this.emitPlainFooter(true);
@@ -1285,7 +1236,7 @@ class Presenter implements WorkPresenter {
     if (this.workStartedAt === null && this.fields.issueId !== undefined) {
       this.workStartedAt = this.now();
     }
-    this.kanbanComponent?.setCurrent(this.fields.issueId);
+    for (const { panel } of panelSlots(this.chrome)) panel.setCurrent?.(this.fields.issueId);
     this.syncFooter();
     if (this.path === "plain") this.emitPlainFooter(false);
     else this.markDirty();
@@ -1743,23 +1694,16 @@ class Presenter implements WorkPresenter {
   /** What the live surface shows right now, colours included. */
   captureFrame(): string[] {
     const width = this.width();
-    const monitor = this.monitorLines(width);
-    const kanban = this.kanbanLines(width);
+    // The same placement rule the surface's children were built with, read off
+    // the one partition the constructor made: a panel pinned `"top"` goes above
+    // the transcript, one pinned `"band"` below it, each band in the order the
+    // composition root listed them. Every combination of placements keeps
+    // every panel — a knob that made a strip vanish rather than move it would
+    // be a knob nobody could debug.
+    const head = this.chromeLines(this.chrome.top, width);
+    const tail = this.chromeLines(this.chrome.band, width);
     const lines = this.visibleBlocks().flatMap((block) => block.render(width));
     const footer = this.footer.render(width);
-    // The same placement rule the surface's children were built with: a HUD
-    // pinned `"top"` goes above the transcript, one pinned `"band"` below it,
-    // monitor before board in whichever band each landed in. Every combination of
-    // the two knobs keeps both HUDs — a placement option that made a HUD vanish
-    // rather than move it would be a switch nobody could debug.
-    const head = [
-      ...(this.monitorPlacement === "top" ? monitor : []),
-      ...(this.kanbanPlacement === "top" ? kanban : []),
-    ];
-    const tail = [
-      ...(this.monitorPlacement === "top" ? [] : monitor),
-      ...(this.kanbanPlacement === "top" ? [] : kanban),
-    ];
     const body = [...head, ...lines, ...tail];
     return footer.length > 0 ? [...body, ...footer] : body;
   }
@@ -1843,6 +1787,7 @@ class Presenter implements WorkPresenter {
       spinnerMs: this.spinnerMs,
       animating: this.animatingNow(),
       paintPending: this.dirty,
+      panels: this.chrome.top.length + this.chrome.band.length,
       live: this.live,
       expanded: this.expandedAll,
     };
@@ -1855,6 +1800,10 @@ class Presenter implements WorkPresenter {
     this.closed = true;
     this.cancelPending();
     this.stopHeartbeat();
+    // Every plugged-in strip gets told the surface is gone: one chance to put
+    // down whatever it owns. A panel over a shared poller deliberately stops
+    // nothing — this surface did not start it. See `src/panel.ts`.
+    for (const { panel } of panelSlots(this.chrome)) panel.dispose?.();
     this.body.clear();
     this.surface.clear();
     this.tools.clear();
@@ -1908,6 +1857,7 @@ export function createNullPresenter(): WorkPresenter {
       spinnerMs: 0,
       animating: false,
       paintPending: false,
+      panels: 0,
       live: false,
       expanded: false,
     }),

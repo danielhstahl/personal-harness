@@ -26,7 +26,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { buildApp, idleStatusFrom, perTurnIdle } from "../src/app.ts";
+import { buildApp, idleStatusFrom, perTurnIdle, workChrome } from "../src/app.ts";
+import { createNullKanban } from "../src/kanban.ts";
+import { createNullMonitor } from "../src/monitor.ts";
 import { readEnv, runFromEnv } from "../src/main.ts";
 import { createAgentRunner } from "../src/agent.ts";
 import { createHttpTransport, createNtfyPublisher, resolveNtfyTarget } from "../src/ntfy.ts";
@@ -1948,6 +1950,50 @@ test("the kanban knob answers off, shape and tuning without trapping anyone", ()
   assert.equal(tuned.kanban?.verbose, true);
   assert.equal(readEnv({}).kanban?.placement, "band");
   assert.equal(readEnv({}).kanban?.intervalMs, undefined, "unset means the source's own default");
+});
+
+test("the HUD knobs arrive at the surface as panels, in the order they read", () => {
+  // `LOOP_MONITOR_AT` / `LOOP_KANBAN_AT` used to be two of the presenter's
+  // seven named options. They are now a panel's `placement`, and the one place
+  // a knob becomes a panel is `workChrome` — so that is what gets checked, end
+  // to end from the environment string to the thing the presenter lays out.
+  const chromeOf = (env: Record<string, string | undefined>) =>
+    workChrome(createNullMonitor("off in this test"), createNullKanban("off in this test"), readEnv(env));
+
+  assert.deepEqual(
+    chromeOf({ LOOP_MONITOR_AT: "top", LOOP_KANBAN_AT: "top" }).map((panel) => [
+      panel.id,
+      panel.placement,
+    ]),
+    [
+      ["monitor", "top"],
+      ["kanban", "top"],
+    ],
+    "monitor leads the array, so it stays outermost when both are pinned up",
+  );
+  assert.deepEqual(
+    chromeOf({ LOOP_KANBAN_AT: "top" }).map((panel) => [panel.id, panel.placement]),
+    [
+      ["monitor", "band"],
+      ["kanban", "top"],
+    ],
+    "and one knob moving does not move the other",
+  );
+  assert.deepEqual(
+    chromeOf({}).map((panel) => panel.placement),
+    ["band", "band"],
+    "unset is the fixed chrome above the footer, for both",
+  );
+  assert.deepEqual(
+    chromeOf({ LOOP_MONITOR_LINES: "3", LOOP_KANBAN_LINES: "6" }).map((panel) => panel.lines),
+    [3, 6],
+    "the row knobs reach the row budget",
+  );
+  assert.deepEqual(
+    chromeOf({ LOOP_KANBAN: "board" }).map((panel) => panel.lines),
+    [2, 4],
+    "unset budget is each strip's own rule, and the board's rule knows its shape",
+  );
 });
 
 test("the kanban is read-only by shape: no client, no write call, no spawn", () => {

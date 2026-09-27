@@ -47,6 +47,7 @@ import {
 import type { RunnerEvent, WorkOutcome } from "../src/agent.ts";
 import { buildApp } from "../src/app.ts";
 import { createIdleMode } from "../src/idle.ts";
+import { createNullPanel, type NullPanel, type Panel, type PanelPlacement } from "../src/panel.ts";
 import {
   MISSING,
   PRESENTER_ROLES,
@@ -235,6 +236,7 @@ function presenterHarness(
     expandKey?: string;
     keybindings?: KeybindingsManager;
     live?: boolean;
+    panels?: readonly Panel[];
   } = {},
 ): PresenterHarness {
   const term = new FakeTerminal(options.columns ?? 80, 24);
@@ -251,6 +253,7 @@ function presenterHarness(
     maxExpandedChars: options.maxExpandedChars ?? 4_000,
     expandKey: options.expandKey,
     keybindings: options.keybindings,
+    ...(options.panels === undefined ? {} : { panels: options.panels }),
   });
   if (options.live ?? true) presenter.acquire();
 
@@ -2168,5 +2171,240 @@ describe("rule 13: timeout, abort and failure render as themselves", () => {
     h.presenter.flushSync();
     assert.ok(h.frame().length > before, "the frame did not grow: nothing was shown");
     assert.match(h.plain().join("\n"), /boom/u);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// the panel contract — how a strip plugs in (`src/panel.ts`)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * A strip that is nothing the presenter has ever heard of: not a board, not a
+ * server, just a thing with an id, a placement, a row budget and news. If the
+ * contract is real, this lands exactly as well as the two strips it was derived
+ * from — which is the only test that distinguishes a contract from a rename of
+ * two hard-coded fields.
+ */
+class Strip {
+  readonly id: string;
+  readonly placement: PanelPlacement;
+  readonly lines: number;
+  subscribes = 0;
+  unsubscribes = 0;
+  refreshes = 0;
+  disposals = 0;
+  readonly currents: (string | undefined)[] = [];
+  private readonly listeners = new Set<() => void>();
+  private readonly drawn: (width: number) => string[];
+
+  constructor(options: {
+    id: string;
+    placement?: PanelPlacement;
+    lines?: number;
+    draw?: (width: number) => string[];
+  }) {
+    this.id = options.id;
+    this.placement = options.placement ?? "band";
+    this.lines = options.lines ?? 1;
+    this.drawn = options.draw ?? ((width: number) => [`${this.id}@${width}`]);
+  }
+
+  render(width: number): string[] {
+    return this.drawn(width);
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.subscribes += 1;
+    this.listeners.add(listener);
+    return () => {
+      this.unsubscribes += 1;
+      this.listeners.delete(listener);
+    };
+  }
+
+  refresh(): void {
+    this.refreshes += 1;
+  }
+
+  dispose(): void {
+    this.disposals += 1;
+  }
+
+  setCurrent(id: string | undefined): void {
+    this.currents.push(id);
+  }
+
+  notify(): void {
+    for (const listener of [...this.listeners]) listener();
+  }
+}
+
+const indexOfLine = (frame: readonly string[], needle: string): number =>
+  frame.findIndex((line) => stripTerminalSequences(line).includes(needle));
+
+describe("the panel contract: strips plug in, the surface knows nothing about them", () => {
+  it("render.ts names neither of the two strips it used to know by heart", () => {
+    const source = stripComments(sourceOf("render.ts"));
+    for (const forbidden of ["./kanban.ts", "./monitor.ts", "Kanban", "Monitor"]) {
+      assert.ok(
+        !source.includes(forbidden),
+        `render.ts still mentions ${forbidden}; the presenter must reach strips only through src/panel.ts`,
+      );
+    }
+  });
+
+  it("WorkPresenterOptions carries no field beginning with kanban or monitor", () => {
+    const source = stripComments(sourceOf("render.ts"));
+    const block = /interface WorkPresenterOptions \{[\s\S]*?\n\}/u.exec(source);
+    assert.ok(block, "WorkPresenterOptions was not found to check");
+    const fields = [...(block?.[0] ?? "").matchAll(/^\s*readonly (\w+)\??:/gmu)].map(
+      (match) => match[1] ?? "",
+    );
+    const named = fields.filter((name) => /^(kanban|monitor)/u.test(name));
+    assert.deepEqual(named, [], "named-strip option(s) came back: " + named.join(", "));
+    assert.ok(fields.includes("panels"), "the options lost the strips and never gained an array");
+  });
+
+  it("a strip the surface has never met lands in the band, above the footer", () => {
+    const strip = new Strip({ id: "gauge" });
+    const h = presenterHarness({ panels: [strip] });
+    h.presenter.say("a line of transcript");
+    h.presenter.flushSync();
+    const frame = h.plain();
+    const contentAt = indexOfLine(frame, "a line of transcript");
+    const stripAt = indexOfLine(frame, "gauge@");
+    const footerAt = indexOfLine(frame, "issue");
+    assert.ok(stripAt >= 0, `the strip was drawn: ${frame.join(" | ")}`);
+    assert.ok(contentAt < stripAt, "under it is the transcript");
+    assert.ok(stripAt < footerAt, "and the footer is still last");
+  });
+
+  it("`top` means above the transcript, not gone", () => {
+    const strip = new Strip({ id: "ticker", placement: "top" });
+    const h = presenterHarness({ panels: [strip] });
+    h.presenter.say("sandwiched");
+    h.presenter.flushSync();
+    const frame = h.plain();
+    assert.ok(indexOfLine(frame, "ticker@") < indexOfLine(frame, "sandwiched"));
+  });
+
+  it("a band keeps the order the array gave it, both bands keep every strip", () => {
+    const topA = new Strip({ id: "top-a", placement: "top" });
+    const topB = new Strip({ id: "top-b", placement: "top" });
+    const bandA = new Strip({ id: "band-a" });
+    const bandB = new Strip({ id: "band-b" });
+    const h = presenterHarness({ panels: [topA, bandA, topB, bandB] });
+    h.presenter.say("middle");
+    h.presenter.flushSync();
+    const frame = h.plain();
+    const order = ["top-a@", "top-b@", "middle", "band-a@", "band-b@"].map((needle) =>
+      indexOfLine(frame, needle),
+    );
+    assert.deepEqual(
+      order.every((at) => at >= 0) ? order : [],
+      [0, 1, 2, 3, 4],
+      `every strip, in the order the root listed them: ${frame.join(" | ")}`,
+    );
+  });
+
+  it("the row budget is a budget, not a suggestion", () => {
+    const greedy = new Strip({
+      id: "greedy",
+      lines: 2,
+      draw: () => ["one", "two", "three", "four"],
+    });
+    const h = presenterHarness({ panels: [greedy] });
+    h.presenter.say("body");
+    h.presenter.flushSync();
+    const drawn = h.plain().filter((line) => ["one", "two", "three", "four"].includes(line));
+    assert.deepEqual(drawn, ["one", "two"], "two rows were reserved, two rows appeared");
+  });
+
+  it("a released surface unsubscribes every strip, so scrollback stops being kept warm", () => {
+    const strip = new Strip({ id: "warm" });
+    const h = presenterHarness({ panels: [strip] });
+    h.presenter.acquire();
+    h.presenter.flushSync();
+    assert.equal(strip.subscribes, 1, "one subscription while the surface is held");
+    assert.equal(strip.unsubscribes, 0);
+    h.presenter.release();
+    assert.equal(strip.unsubscribes, 1, "and none after the handoff");
+    const paints = h.presenter.stats().paints;
+    strip.notify();
+    h.time.tick(40);
+    assert.equal(h.presenter.stats().paints, paints, "a detached strip cannot repaint");
+  });
+
+  it("a strip's news costs one frame, in the same window as everything else", () => {
+    const strip = new Strip({ id: "news" });
+    const h = presenterHarness({ panels: [strip] });
+    h.presenter.acquire();
+    h.presenter.flushSync();
+    const before = h.presenter.stats().paints;
+    strip.notify();
+    h.time.tick(40);
+    assert.equal(h.presenter.stats().paints, before + 1);
+    strip.notify();
+    strip.notify();
+    h.time.tick(40);
+    assert.equal(h.presenter.stats().paints, before + 2, "two in one window are still one frame");
+  });
+
+  it("the surface tells every strip which item it is about", () => {
+    const a = new Strip({ id: "marks" });
+    const b = new Strip({ id: "marks-too", placement: "top" });
+    const h = presenterHarness({ panels: [a, b] });
+    h.presenter.setContext({ issueId: "ws.panel", phase: "work" });
+    h.presenter.flushSync();
+    assert.deepEqual(a.currents, ["ws.panel"]);
+    assert.deepEqual(b.currents, ["ws.panel"]);
+  });
+
+  it("dispose reaches every strip exactly once, and twice dispose reaches none", () => {
+    const strip = new Strip({ id: "cleanup" });
+    const h = presenterHarness({ panels: [strip] });
+    h.presenter.dispose();
+    assert.equal(strip.disposals, 1);
+    h.presenter.dispose();
+    assert.equal(strip.disposals, 1, "a disposed surface does not re-notify its strips");
+  });
+
+  it("a null strip draws nothing, needs no case anywhere, and still counts as absent chrome", () => {
+    const off: Panel = createNullPanel("switched off by a knob", { id: "ghost" });
+    const h = presenterHarness({ panels: [off] });
+    h.presenter.say("plain as day");
+    h.presenter.flushSync();
+    const frame = h.plain();
+    assert.ok(!frame.some((line) => line.includes("ghost")), frame.join(" | "));
+    assert.ok(frame.some((line) => line.includes("plain as day")));
+    assert.equal(
+      h.presenter.stats().panels,
+      1,
+      "plugged in and drawing nothing — which is what `off` means here",
+    );
+    assert.equal(
+      (off as NullPanel).reason,
+      "switched off by a knob",
+      "and it can still say why it drew nothing",
+    );
+  });
+
+  it("a component-shaped strip is drawn through its component, width and all", () => {
+    // `KanbanComponent` and `MonitorComponent` both return a Component from
+    // `render()`; the lines form is the other half of the union. Both have to
+    // work or the contract only describes half of what already existed.
+    const componentStrip: Panel = {
+      id: "component",
+      placement: "band",
+      lines: 3,
+      render: () => ({
+        render: (w: number) => [`component:${w}`, "second"],
+        invalidate: () => undefined,
+      }),
+    };
+    const h = presenterHarness({ panels: [componentStrip], columns: 42 });
+    h.presenter.say("body text");
+    h.presenter.flushSync();
+    assert.ok(h.plain().includes("component:42"), h.plain().join(" | "));
   });
 });

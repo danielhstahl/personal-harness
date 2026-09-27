@@ -23,6 +23,7 @@ import type { IdleHandle, IdleOutcome, IdleStatus } from "./idle.ts";
 import {
   createKanbanSource,
   createNullKanban,
+  kanbanPanel,
   type KanbanColumnKey,
   type KanbanMode,
   type KanbanRead,
@@ -40,10 +41,12 @@ import {
   PLAIN_MONITOR_THEME,
   createBackendMonitor,
   createNullMonitor,
+  monitorPanel,
   resolveMonitorUrls,
   type BackendMonitor,
   type MonitorTheme,
 } from "./monitor.ts";
+import type { Panel, PanelPlacement } from "./panel.ts";
 import {
   createNullPresenter,
   createPresenterTheme,
@@ -115,7 +118,7 @@ export interface MonitorSetting {
    * of the work surface, which scrolls with the transcript; the idle surface
    * always draws it at the top of the screen, where nothing scrolls.
    */
-  readonly placement?: "band" | "top";
+  readonly placement?: PanelPlacement;
   readonly verbose?: boolean;
 }
 
@@ -144,7 +147,7 @@ export interface KanbanSetting {
   /** How many closed tickets the `done` column keeps. Default 12. */
   readonly doneLimit?: number;
   /** Where the board sits on the work surface. Default `"band"`. */
-  readonly placement?: "band" | "top";
+  readonly placement?: PanelPlacement;
   readonly verbose?: boolean;
 }
 
@@ -755,6 +758,9 @@ export function buildApp(config: AppConfig): App {
   // seam, the loop's `ui` port, and the footer context this root supplies from
   // the calls the loop already makes. It never decides anything — the loop tells
   // it what is running by calling `run(issueId)`.
+  //
+  // The HUDs reach it as an array of panels rather than seven named options
+  // (see `src/panel.ts`), built by {@link workChrome} below.
   const presenter: WorkPresenter =
     overrides.presenter === null
       ? createNullPresenter()
@@ -764,13 +770,7 @@ export function buildApp(config: AppConfig): App {
           coalesceMs: config.coalesceMs,
           heartbeatMs: config.heartbeatMs,
           spinnerMs: config.spinnerMs,
-          monitor,
-          monitorPlacement: config.monitor?.placement ?? "band",
-          monitorLines: config.monitor?.lines ?? 2,
-          kanban,
-          kanbanMode: config.kanban?.mode ?? "row",
-          kanbanPlacement: config.kanban?.placement ?? "band",
-          ...(config.kanban?.lines === undefined ? {} : { kanbanLines: config.kanban.lines }),
+          panels: workChrome(monitor, kanban, config),
         });
 
   /**
@@ -1221,6 +1221,47 @@ function buildKanban(
     ...(setting.intervalMs === undefined ? {} : { intervalMs: setting.intervalMs }),
     verbose: setting.verbose === true,
   });
+}
+
+/**
+ * The work surface's fixed chrome: the strips that plug into it, in the order
+ * they should read.
+ *
+ * This is where the knobs become a layout. `LOOP_MONITOR_AT` / `LOOP_KANBAN_AT`
+ * pick a panel's `placement`, `LOOP_*_LINES` pick its row budget, and a knob
+ * nobody set falls through to whatever the panel's own rule is — the surface
+ * does not have an opinion about how tall a board is, and neither should the
+ * root beyond what it was told.
+ *
+ * The order of the array *is* the layout: the monitor leads, so it stays
+ * outermost whichever band it is pinned to, and the board sits between it and
+ * the transcript. A third strip is one more entry here and nothing else — the
+ * presenter, the config and the environment reader already agreed on the shape
+ * a strip arrives in, which is the entire point of `src/panel.ts`.
+ *
+ * A strip that is switched off still arrives. `buildMonitor` and `buildKanban`
+ * answer a disabled knob with a null *source* — one that reads nothing and draws
+ * nothing — and `monitorPanel` / `kanbanPanel` also accept a literal `null` and
+ * return `createNullPanel()` for it. Either way the array's length never
+ * depends on the configuration, and no surface downstream has to ask whether a
+ * HUD exists.
+ */
+export function workChrome(
+  monitor: BackendMonitor,
+  kanban: KanbanSource,
+  config: AppConfig,
+): readonly Panel[] {
+  return [
+    monitorPanel(monitor, {
+      placement: config.monitor?.placement ?? "band",
+      ...(config.monitor?.lines === undefined ? {} : { lines: config.monitor.lines }),
+    }),
+    kanbanPanel(kanban, {
+      mode: config.kanban?.mode ?? "row",
+      placement: config.kanban?.placement ?? "band",
+      ...(config.kanban?.lines === undefined ? {} : { lines: config.kanban.lines }),
+    }),
+  ];
 }
 
 /** Build and run. The single entry the CLI and the spike share. */
