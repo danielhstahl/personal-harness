@@ -78,6 +78,9 @@ docs/               ADR-001: transport + rendering decision
                              reason and carry on, instead of ending the run
                     ADR-009: the planner gets eyes — the split pass can read the
                              repository, cannot change it, and is checked
+                    ADR-010: pi stays — it is the execution runtime, not a plugin
+                             host we skipped; the keep/drop ledger per package,
+                             and the six files the pi boundary is confined to
 spikes/             throwaway prototypes + captured evidence backing ADR-001
 test/               unit tests, plus the whole walk in test/loop.test.ts
 ```
