@@ -718,6 +718,11 @@ export interface SessionSpec {
   readonly customTools: readonly ToolDefinition[];
   /** Built-in allowlist. Omitted → pi's defaults (read, bash, edit, write). */
   readonly builtinTools?: readonly string[];
+  /**
+   * Never enabled, even if some other source (an extension, a changed default)
+   * offers the name. Applied by the factory on top of the allowlist.
+   */
+  readonly excludeTools?: readonly string[];
   /** True → no built-in tools at all, only {@link SessionSpec.customTools}. */
   readonly noBuiltinTools?: boolean;
   readonly systemPromptOverride?: string;
@@ -883,7 +888,21 @@ export const defaultSessionFactory: SessionFactory = async (spec) => {
     if (gap !== null) throw new AgentError("invalid-arguments", gap);
     options.noTools = "builtin";
   } else if (spec.builtinTools !== undefined) {
-    options.tools = [...spec.builtinTools];
+    // The same rule in the other direction: a narrowed built-in set makes pi's
+    // default prompt a lie about `edit`/`write`, so it has to be replaced too.
+    const gap = toolInventoryGap(spec);
+    if (gap !== null) throw new AgentError("invalid-arguments", gap);
+    // pi's allowlist covers **every** tool the session can see — custom tools
+    // included. `tools: ["read","bash"]` alongside a registered `report_split`
+    // is `report_split` filtered out of existence, which reads to the model as a
+    // harness that took its report tool away. The custom tools were handed over on
+    // purpose, so they are part of the allowlist always.
+    options.tools = [
+      ...new Set([...spec.builtinTools, ...spec.customTools.map((tool) => tool.name)]),
+    ];
+  }
+  if (spec.excludeTools !== undefined) {
+    options.excludeTools = [...spec.excludeTools];
   }
   if (spec.systemPromptOverride !== undefined) {
     const loader = new DefaultResourceLoader({
@@ -1090,7 +1109,95 @@ and the work counts as incomplete. Same for a JSON block that does not validate.
 Do not commit or close the issue yourself — the loop does that after you report.`;
 
 /** Prompt for the split pass. Deliberately lean; it plans, it does not implement. */
-export function buildSplitPrompt(text: string): string {
+export function buildSplitPrompt(
+  text: string,
+  options: { readonly repoAccess?: boolean } = {},
+): string {
+  if (options.repoAccess === false) return buildBlindSplitPrompt(text);
+  return `# Split this request into work items
+
+A human asked for the following. Turn it into a small number of issues that can be
+worked one at a time, in a fresh session each, with nothing carried between them.
+
+You have \`bash\` and \`read\` for this pass, so use them. A split planned from the
+request alone is a guess about a repository nobody looked at: its tickets name
+files that may not exist and acceptance criteria nothing can run.
+
+## The request
+
+${text.trim()}
+
+## Look before you plan
+
+A few cheap commands, roughly in this order:
+
+1. **What this project is.** \`pwd\`, \`ls\`, and the top-level truth files —
+   \`README*\`, \`package.json\` / \`pyproject.toml\` / \`Cargo.toml\` / \`Makefile\`,
+   \`AGENTS.md\` / \`CONTRIBUTING*\` if they exist.
+2. **How it is built and checked.** The scripts and targets that actually exist
+   (\`npm run\`, \`make -n\`), the test directory and its naming convention.
+   Read the config; do not run the suite. Acceptance criteria must be checkable
+   with a command this repository really has.
+3. **Where the request lands.** For each area the request touches, list it and read
+   the two or four files that own it: \`ls src/parser\`,
+   \`rg -l "tokeniz" src\`, then \`read\` with line ranges. Enough to name the real
+   symbols, not to echo the request's vocabulary.
+4. **What already exists or is already moving.** \`git log --oneline -15\` for
+   direction and \`git status --short\` for work in flight. Do not re-propose what
+   is already implemented, already landed, or already sitting uncommitted here.
+
+Budget the look: 5-10 commands is normally plenty; go beyond that only when the
+request really spans areas. Bound everything you run — \`| head -n 40\`, \`rg -l\`
+rather than \`rg\`, one directory rather than the tree. The plan is the deliverable;
+the exploration is not.
+
+## Rules that keep the tickets about THIS repository
+
+- **Name real paths.** Every \`description\` names the concrete files and
+  directories the work will touch, from what you listed — not paths inferred from
+  how the request was phrased.
+- **Name real symbols and entry points** where they carry the work: the function,
+  class, command, config key or CLI flag the change starts at.
+- **Acceptance must be checkable here.** The command that passes, the file that
+  must exist, or the behaviour with a named entry point. If you cannot say how a
+  person verifies it in this repo, look longer — or make the ticket a \`spike\` or
+  \`decision\` whose deliverable is the answer.
+- **Do not invent.** No file, module, command, config key, directory or CI step
+  you did not see. When the work needs something that does not exist yet, say so
+  with what you did see: "create \`src/export/csv.ts\` (does not exist;
+  \`src/export/\` holds \`json.ts\` and \`ndjson.ts\` — follow those)".
+- **Fit the repo's conventions.** Tests where its tests live, docs where its docs
+  live, config where its config lives. Do not propose a lint/build/CI step for a
+  project that has none unless the request asks for one.
+- **Match the size of the ask.** Small request, one or two tickets. An honest
+  single issue beats an invented cascade.
+- **If the request does not fit this repository** — you looked and nothing here
+  matches it — report ONE \`decision\` issue that says what you looked at, what
+  this repository actually is, and why the request does not map onto it. Do not
+  invent adjacent work to fill out the batch.
+
+## Report the split with the \`report_split\` tool
+
+Each issue needs:
+- \`title\`: a specific, actionable title.
+- \`description\`: what to do, self-contained. Someone with no other context has
+  to be able to start from this alone — and the paths in it are the ones you saw.
+- \`acceptance\`: how to tell it is done, in this repo.
+- \`priority\`: integer 0 (urgent) to 4 (later).
+- \`type\`: task, feature, bug, spike or decision.
+- \`depends_on\`: the 0-based **positions** of other issues in this same array
+  that must be finished before this one can start, e.g. \`[0]\` or \`[0, 1]\`.
+  Positions, never ids — no ids exist yet. Omit it when nothing is needed, and
+  never list an issue's own position. Two issues that can be worked in parallel
+  have no dependency between them.
+
+Keep it to the smallest number of issues that is still honest about the work. Do
+not implement any of it here, and change nothing on disk — the loop checks the
+working tree when you finish.`;
+}
+
+/** The old sealed-planner task prompt: no shell, so no looking. */
+function buildBlindSplitPrompt(text: string): string {
   return `# Split this request into work items
 
 A human asked for the following. Turn it into a small number of issues that can be
@@ -1122,13 +1229,18 @@ not start implementing any of it here.`;
 // ── report tools ────────────────────────────────────────────────────────────
 
 /**
- * What a session with no built-in tools is told it can do.
+ * What a session with **no built-in tools** is told it can do — the sealed
+ * planner, `LOOP_SPLIT_REPO_ACCESS=off`.
  *
  * pi's default system prompt is written for a coding agent holding bash, read,
- * edit and write. A split session holds none of those — it is a planner with one
- * reporting tool. Left on the default prompt the model reaches for `bash`, gets
- * `Tool "bash" not found` back, and reads *that* as a flaky harness. The failure
- * was ours, not the model's, and it costs a turn every time it happens.
+ * edit and write. A session holding none of those must not inherit it: the model
+ * reaches for `bash`, gets `Tool "bash" not found` back, and reads *that* as a
+ * flaky harness. The failure was ours, not the model's, and it costs a turn
+ * every time it happens.
+ *
+ * The default planner prompt is {@link planningSystemPrompt}, which keeps this
+ * file's rule — inventory generated from the tools actually handed over — while
+ * telling the model it may look at the repository. Same rule, different grant.
  *
  * The inventory is generated from the tools actually handed to the session, so a
  * tool cannot be advertised without existing, and one that exists cannot be left
@@ -1170,17 +1282,44 @@ has it, so anything said afterwards is never read.`;
 }
 
 /**
- * The invariant behind {@link bareToolsetSystemPrompt}, as a function so it can
- * be tested instead of trusted: a session that was denied the built-in tools has
- * to be told, in its own system prompt, about every tool it *does* have. The
- * answer is `null` when there is no gap, or the sentence that explains one.
+ * The invariant behind {@link bareToolsetSystemPrompt} and
+ * {@link planningSystemPrompt}, as a function so it can be tested instead of
+ * trusted: a session whose tools were narrowed has to be told, in its own system
+ * prompt, about every tool it *does* have. The answer is `null` when there is no
+ * gap, or the sentence that explains one.
  */
 export function toolInventoryGap(spec: {
   readonly customTools: readonly { name: string }[];
+  /** An explicit built-in allowlist, as opposed to pi's default four. */
+  readonly builtinTools?: readonly string[];
   readonly noBuiltinTools?: boolean;
   readonly systemPromptOverride?: string;
 }): string | null {
-  if (spec.noBuiltinTools !== true) return null;
+  const named = (name: string): boolean => spec.systemPromptOverride?.includes(name) === true;
+
+  if (spec.noBuiltinTools !== true) {
+    // An explicit allowlist is a claim about what the session holds, and pi's
+    // default prompt promises all four built-ins. So an allowlist shipped without
+    // a matching system prompt is the same defect pointing the other way: a model
+    // told it has `bash` when it does not, or never told about the one tool that
+    // was added for it.
+    if (spec.builtinTools === undefined) return null;
+    if (spec.systemPromptOverride === undefined) {
+      return (
+        `a session with a built-in allowlist [${spec.builtinTools.join(", ")}] must set ` +
+        "systemPromptOverride: pi's default prompt promises read/bash/edit/write, and a " +
+        "model holding it will call tools that are not there"
+      );
+    }
+    const missing = [...spec.builtinTools, ...spec.customTools.map((tool) => tool.name)].filter(
+      (name) => !named(name),
+    );
+    if (missing.length > 0) {
+      return `the system prompt does not name every tool the session has: ${missing.join(", ")}`;
+    }
+    return null;
+  }
+
   if (spec.customTools.length === 0) {
     return "a session with no built-in tools and no custom tool has nothing to do; do not open one";
   }
@@ -1193,13 +1332,137 @@ export function toolInventoryGap(spec: {
   }
   const missing = spec.customTools
     .map((tool) => tool.name)
-    .filter((name) => !spec.systemPromptOverride?.includes(name));
+    .filter((name) => !named(name));
   if (missing.length > 0) {
     return (
       `the system prompt does not name every tool the session has: ${missing.join(", ")}`
     );
   }
   return null;
+}
+
+/**
+ * The built-ins a planning session gets when it may look at the repository.
+ *
+ * `bash` for orientation (`ls`, `git log`, `rg`) and `read` for the files
+ * themselves. Not `edit`/`write`: a planner's output is the batch of issues, not
+ * a diff. The dedicated `grep`/`find`/`ls` tools are left out on purpose —
+ * `bash` covers them, and one unbounded recursive search is all it takes for a
+ * planning run to eat its own context window. What bounds the output here is the
+ * prompt, and it says so.
+ */
+export const SPLIT_REPO_TOOLS = ["read", "bash"] as const;
+
+/**
+ * Never enabled for a planner, whatever else the session holds. A belt to the
+ * allowlist's braces: should a name ever collide with an extension tool or a
+ * changed default, the planner still cannot rewrite the tree.
+ */
+export const NEVER_FOR_A_PLANNER = ["edit", "write"] as const;
+
+export interface SplitSessionPlan {
+  readonly repoAccess: boolean;
+  readonly builtinTools: readonly string[];
+  readonly excludedTools: readonly string[];
+  readonly systemPrompt: string;
+}
+
+/**
+ * The split session's whole tool decision in one pure function, so the pairing of
+ * *what the session can do* and *what it is told it can do* is asserted rather
+ * than hoped for.
+ *
+ * `repoAccess: false` is the sealed planner this used to be: no built-ins, the
+ * bare inventory prompt, and a plan built from the words of the request alone.
+ */
+export function planSplitSession(
+  customToolNames: readonly string[],
+  options: { readonly repoAccess?: boolean } = {},
+): SplitSessionPlan {
+  const excluded: string[] = [...NEVER_FOR_A_PLANNER];
+  if (options.repoAccess === false) {
+    return {
+      repoAccess: false,
+      builtinTools: [],
+      excludedTools: excluded,
+      systemPrompt: bareToolsetSystemPrompt(customToolNames),
+    };
+  }
+  return {
+    repoAccess: true,
+    builtinTools: [...SPLIT_REPO_TOOLS],
+    excludedTools: excluded,
+    systemPrompt: planningSystemPrompt(SPLIT_REPO_TOOLS, customToolNames),
+  };
+}
+
+/**
+ * The system prompt for a planning session that can see the repository.
+ *
+ * The same shape as {@link bareToolsetSystemPrompt} — inventory named exactly,
+ * and the fact that anything outside it fails — plus the read-only contract,
+ * because this one holds a shell. The last section is what makes the grant safe:
+ * it is not a request for good behaviour, it is a statement that the loop checks
+ * afterwards and what the consequence is.
+ */
+export function planningSystemPrompt(
+  builtinTools: readonly string[],
+  customToolNames: readonly string[],
+): string {
+  if (customToolNames.length === 0) {
+    throw new AgentError(
+      "invalid-arguments",
+      "a planning session needs at least one report tool to be worth opening",
+    );
+  }
+  const inventory = [...builtinTools, ...customToolNames]
+    .map((name) => `\`${name}\``)
+    .join(", ");
+  const report = customToolNames[0] as string;
+  const look = builtinTools.length > 0 ? builtinTools.map((n) => `\`${n}\``).join(" and ") : "nothing";
+  return `# You are the planner for a beads-driven agent loop
+
+You do one thing: turn one human sentence into a batch of board issues about
+this repository. You do not implement any of them.
+
+## Your tool inventory is exactly: ${inventory}
+
+That is the whole list. There is **no \`edit\` and no \`write\`**, no web access and
+no sub-agents. A call to anything outside the list fails with
+\`Tool "<name>" not found\`, tells you nothing, and shortens the run.
+
+${look} are here for one purpose: to make the tickets *true about this repository*.
+They are for looking, not for changing.
+
+## You are read-only, and the loop checks
+
+Do not create, edit, delete, move, stage or install anything — and do not run
+anything that would:
+
+- **write files** — no \`touch\`, \`mkdir\`, \`rm\`, \`mv\`, \`cp\`, \`tee\`, no
+  \`>\` or \`>>\` redirects, no formatter or codegen invocation;
+- **install or fetch** — no \`npm install\`, \`pip install\`, \`cargo add\`, no
+  \`git clone\`, no downloads;
+- **build or run tests** — compiling writes artifacts (\`dist/\`, coverage,
+  caches). Read the tests instead of running them. You are planning, not
+  verifying;
+- **change git** — no \`add\`, \`commit\`, \`checkout\`, \`switch\`, \`reset\`,
+  \`stash\`, \`clean\`, \`rebase\`, \`merge\`, \`apply\`. \`git status\`,
+  \`git log\`, \`git show\` and \`git diff\` are what you want.
+
+When you finish, the loop compares \`git status\` against what it recorded before
+you started. Any difference refuses the split and stops the run, naming what
+changed. A planner that "just ran the build to see" and left a \`dist/\` behind
+costs the whole batch; a planner that edited a file has done work no issue will
+ever own.
+
+Want to know what something does? Read it.
+
+## Report once, then stop
+
+Call \`${report}\` one time, with the whole batch, and stop there. The loop
+creates the issues from that single call and stops listening to you as soon as it
+has it, so anything said afterwards is never read.`;
 }
 
 /**
@@ -1475,6 +1738,13 @@ export interface AgentRunnerOptions {
    */
   readonly wrapUpMs?: number;
   readonly cwd?: string;
+  /**
+   * Give the planning session `read` and `bash` so it can ground its tickets in
+   * the repository instead of guessing at them from the wording of the request.
+   * On unless set to `false`. The session gets no `edit`/`write`, and the loop
+   * verifies the working tree is unchanged when the planning run ends.
+   */
+  readonly splitRepoAccess?: boolean;
   /** Explicit model; otherwise pi's configured default is used. Never env. */
   readonly modelRef?: { provider: string; id: string };
   readonly workThinkingLevel?: ThinkingLevel;
@@ -1567,6 +1837,11 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
   const now = options.now ?? ((): number => Date.now());
   const emit = options.onEvent ?? ((): void => {});
   const includeRepo = options.includeRepoSnapshot ?? true;
+  /**
+   * Whether a planning session may look at the repository. On unless turned off:
+   * a split that cannot see the repo is a split guessing at file names.
+   */
+  const splitRepoAccess = options.splitRepoAccess !== false;
 
   const live = new Map<string, LiveSession>();
   let created = 0;
@@ -1611,7 +1886,33 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
     }
   }
 
-  async function openAndRun<T>(
+  /**
+ * The tool half of a session spec, per kind.
+ *
+ * Kept in one function because the two decisions — what is enabled and what the
+ * model is *told* — have to come from the same place. {@link planSplitSession}
+ * returns both; a factory that set one without the other is exactly the defect
+ * {@link toolInventoryGap} exists to catch.
+ */
+function splitToolOptions(
+  kind: RunnerSessionKind,
+  customToolNames: readonly string[],
+  repoAccess: boolean,
+): Pick<
+  SessionSpec,
+  "noBuiltinTools" | "builtinTools" | "excludeTools" | "systemPromptOverride"
+> {
+  if (kind !== "split") return {};
+  const plan = planSplitSession(customToolNames, { repoAccess });
+  return {
+    noBuiltinTools: !plan.repoAccess,
+    ...(plan.repoAccess ? { builtinTools: plan.builtinTools } : {}),
+    excludeTools: plan.excludedTools,
+    systemPromptOverride: plan.systemPrompt,
+  };
+}
+
+async function openAndRun<T>(
     kind: RunnerSessionKind,
     prompt: string,
     tools: readonly ToolDefinition[],
@@ -1624,13 +1925,7 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
       customTools: tools,
       thinkingLevel,
       modelRef: options.modelRef,
-      noBuiltinTools: kind === "split",
-      // A session with nothing but its report tool has to be told so; see
-      // {@link bareToolsetSystemPrompt}.
-      systemPromptOverride:
-        kind === "split"
-          ? bareToolsetSystemPrompt(tools.map((tool) => tool.name))
-          : undefined,
+      ...splitToolOptions(kind, tools.map((tool) => tool.name), splitRepoAccess),
     });
     const runStartedAt = now();
     created += 1;
@@ -2016,7 +2311,7 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
 
     const core = await openAndRun(
       "split",
-      buildSplitPrompt(trimmed),
+      buildSplitPrompt(trimmed, { repoAccess: splitRepoAccess }),
       tools,
       options.splitThinkingLevel,
       capture,

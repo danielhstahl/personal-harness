@@ -247,6 +247,15 @@ export interface AppConfig extends LoopConfig {
    */
   readonly workThinkingLevel?: ThinkingLevel;
   readonly splitThinkingLevel?: ThinkingLevel;
+  /**
+   * Whether the planning pass may look at the repository (`read` + `bash`, no
+   * `edit`/`write`). On by default: a split that cannot see the repo names files
+   * it guessed at, and acceptance criteria nothing can run. `LOOP_SPLIT_REPO_ACCESS=off`
+   * restores the sealed planner. Whatever the setting, the loop compares the
+   * working tree before and after the planning run and refuses the batch if the
+   * session changed it.
+   */
+  readonly splitRepoAccess?: boolean;
   /** The startup provider comparison. See {@link ProviderAuditSetting}. */
   readonly providerAudit?: ProviderAuditSetting;
   /** The read-only server panel. See {@link MonitorSetting}. */
@@ -802,6 +811,7 @@ export function buildApp(config: AppConfig): App {
       wrapUpMs: config.wrapUpMs,
       workThinkingLevel: config.workThinkingLevel,
       splitThinkingLevel: config.splitThinkingLevel,
+      splitRepoAccess: config.splitRepoAccess,
       // The streaming half of the seam: every runner event lands on the
       // presenter, which is the only thing that draws them.
       onEvent: (event) => presenter.feed(event),

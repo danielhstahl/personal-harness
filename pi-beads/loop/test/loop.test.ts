@@ -44,7 +44,8 @@ import { createIdleMode, IdleError } from "../src/idle.ts";
 import type { IdleHandle, IdleOutcome } from "../src/idle.ts";
 import { createNullPresenter } from "../src/render.ts";
 import type { WorkPresenter } from "../src/render.ts";
-import { createGitWriter } from "../src/vcs.ts";
+import { createGitWriter, VcsError } from "../src/vcs.ts";
+import { treeChangeReason, treeDelta } from "../src/loop.ts";
 import {
   createScriptBoard,
   doneParams,
@@ -1155,6 +1156,89 @@ test(
     }
   },
 );
+
+// ── the planner holds a shell now, so the tree is checked ────────────────────
+
+test("a planning session that changed the tree has its split refused before any child exists", async () => {
+  const h = harness({ idleTexts: [SPLIT_REQUEST] });
+  prepareWalk(h);
+  try {
+    const inner = fakeSplitPort([SPLIT_BATCH]);
+    const dirtySplitter = {
+      async propose(request: string) {
+        const answer = await inner.propose(request);
+        // The classic "just wanted to see what it would look like".
+        h.repo.write("planner_left_this.txt", "a planner's scribble\n");
+        return answer;
+      },
+    } as unknown as typeof h.ports.splitter;
+
+    const result = await runLoop({ ...h.ports, splitter: dirtySplitter }, {});
+
+    assert.equal(result.kind, "blocked", `expected a stop, got ${result.kind}`);
+    assert.match(result.reason ?? "", /planning session changed the working tree/u);
+    assert.match(result.reason ?? "", /planner_left_this\.txt/u, "it names what appeared");
+    assert.match(result.reason ?? "", /batch was not created/u);
+    assert.equal(h.board.issues.size, 0, "no children, and not even the epic: the check came first");
+  } finally {
+    h.repo.dispose();
+  }
+});
+
+test("a tree that cannot be read is reported as unverified, never as unchanged", async () => {
+  const h = harness({ scripts: WORK_SCRIPTS, idleTexts: [SPLIT_REQUEST] });
+  prepareWalk(h);
+  try {
+    const brokenGit = {
+      ...h.ports.git,
+      async worktreeChanges(): Promise<string[]> {
+        throw new VcsError({
+          kind: "exit",
+          message: "git status: cannot open '.git': Permission denied",
+          exitCode: 128,
+        });
+      },
+    };
+
+    const result = await runLoop({ ...h.ports, git: brokenGit }, {});
+
+    assert.notEqual(
+      result.kind,
+      "blocked",
+      `an unreadable tree is not a changed tree: ${result.kind}: ${result.reason ?? ""}`,
+    );
+    assert.ok(
+      h.ui.warned.some((line) => /could not read the working tree before the split/u.test(line)),
+      `the failure is said where it happened: ${JSON.stringify(h.ui.warned)}`,
+    );
+    assert.ok(
+      h.ui.warned.some((line) => /proceeds unverified/u.test(line)),
+      "and it says what that means for the guarantee",
+    );
+    assert.ok(h.board.issues.size >= 3, "the split still landed");
+  } finally {
+    h.repo.dispose();
+  }
+});
+
+test("treeDelta: before and after decide it, and a missing read decides nothing", () => {
+  assert.equal(treeDelta(["M a.ts"], ["M a.ts"]), null, "same list, no change");
+  assert.equal(treeDelta([], []), null);
+  assert.equal(treeDelta(null, []), null, "a read that failed is not evidence of a clean tree");
+  assert.equal(treeDelta([], null), null);
+
+  const added = treeDelta(["M a.ts"], ["M a.ts", "?? scribble.txt"]);
+  assert.deepEqual(added?.added, ["?? scribble.txt"]);
+  assert.deepEqual(added?.removed, []);
+
+  const reverted = treeDelta(["M a.ts"], []);
+  assert.deepEqual(reverted?.added, []);
+  assert.deepEqual(reverted?.removed, ["M a.ts"]);
+
+  const long = treeDelta([], Array.from({ length: 20 }, (_, i) => `?? f${i}`));
+  assert.match(treeChangeReason(long ?? { added: [], removed: [] }), /and 12 more/u);
+  assert.match(treeChangeReason(long ?? { added: [], removed: [] }), /git checkout -- <path>/u);
+});
 
 // ── rule 12: fatal exits ───────────────────────────────────────────────────
 

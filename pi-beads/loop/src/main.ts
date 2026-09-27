@@ -41,6 +41,26 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
     if (raw === undefined) return undefined;
     return raw === "1" || raw.toLowerCase() === "true" || raw.toLowerCase() === "yes";
   };
+  /**
+   * A switch that is **on unless told otherwise**, with a strict vocabulary.
+   *
+   * `flag()` cannot serve here: it reads anything it does not recognise as false,
+   * and for a default-on knob a typo (`LOOP_SPLIT_REPO_ACCESS=of`) would quietly
+   * take the shell away from the planner — which from outside looks exactly like a
+   * split that was configured to be blind. So an unrecognised value is refused
+   * with the list of what is accepted, before the loop starts.
+   */
+  const defaultOnFlag = (name: string): boolean => {
+    const raw = (source[name] ?? "").trim().toLowerCase();
+    if (raw === "") return true;
+    if (raw === "1" || raw === "true" || raw === "yes" || raw === "on") return true;
+    if (raw === "0" || raw === "false" || raw === "no" || raw === "off") return false;
+    throw new LoopError(
+      "bad-config",
+      `${name}="${(source[name] ?? "").trim()}" is not a yes/no value — ` +
+        "accepted: 1, true, yes, on (enabled) and 0, false, no, off (disabled)",
+    );
+  };
   const cwd = source.LOOP_CWD ?? process.cwd();
   const provider = source.PI_PROVIDER;
   const model = source.PI_MODEL;
@@ -253,6 +273,12 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
     retryUnfitWork: flag("LOOP_RETRY_UNFIT_WORK"),
     workThinkingLevel: thinking("LOOP_WORK_THINKING"),
     splitThinkingLevel: thinking("LOOP_SPLIT_THINKING"),
+    /**
+     * The planning pass gets `read` + `bash` so its tickets name files that
+     * actually exist. On unless turned off; `off` restores the sealed planner
+     * that works from the words of the request alone.
+     */
+    splitRepoAccess: defaultOnFlag("LOOP_SPLIT_REPO_ACCESS"),
     /**
      * The startup provider comparison. Default on: the failures it catches cost
      * a whole work pass each and are free to see before one starts. It is a

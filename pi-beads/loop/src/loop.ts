@@ -32,7 +32,11 @@
  *      same ledger, so the writes the machine asked for are the writes that
  *      happen — plus the epic record and the dependency edges, which the
  *      effect vocabulary has no kind for. Those extras are logged, never
- *      invisible.
+ *      invisible. That session holds `read` and `bash` so its tickets can name
+ *      files that exist — which is why the unit also takes `git status` before
+ *      it opens and again when the proposal is in hand: any difference refuses
+ *      the split before the epic record or a single child, because a change the
+ *      planner made belongs to no issue (see ADR-009).
  *    - `vcs.commit` runs `.8`'s whole ritual (commit → remember → close).
  *      Running the three machine effects one by one instead would mean the
  *      handoff note is the machine's two-line summary with **no commit hash**
@@ -355,6 +359,53 @@ function stripClosePrefix(reason: string): string {
 }
 
 // ── the engine ──────────────────────────────────────────────────────────────
+
+/**
+ * What changed between two working-tree reads. `null` means nothing did.
+ *
+ * `null` on either side also returns `null`, and the caller has to say out loud
+ * that it therefore cannot claim the tree was untouched — a failed read is not
+ * evidence of a clean tree, it is the absence of one.
+ */
+export function treeDelta(
+  before: readonly string[] | null,
+  after: readonly string[] | null,
+): { readonly added: readonly string[]; readonly removed: readonly string[] } | null {
+  if (before === null || after === null) return null;
+  const was = new Set(before);
+  const is = new Set(after);
+  const added = after.filter((entry) => !was.has(entry));
+  const removed = before.filter((entry) => !is.has(entry));
+  if (added.length === 0 && removed.length === 0) return null;
+  return { added, removed };
+}
+
+/** How much of the difference to print before counting the rest. */
+const TREE_REPORT_CAP = 8;
+
+function listTreeEntries(entries: readonly string[]): string {
+  const head = entries.slice(0, TREE_REPORT_CAP).join(", ");
+  return entries.length > TREE_REPORT_CAP
+    ? `${head} (and ${entries.length - TREE_REPORT_CAP} more)`
+    : head;
+}
+
+/** The reason a split is refused because its own session changed the tree. */
+export function treeChangeReason(touched: {
+  readonly added: readonly string[];
+  readonly removed: readonly string[];
+}): string {
+  const parts: string[] = [];
+  if (touched.added.length > 0) parts.push(`appeared or changed: ${listTreeEntries(touched.added)}`);
+  if (touched.removed.length > 0) parts.push(`gone: ${listTreeEntries(touched.removed)}`);
+  return (
+    `the planning session changed the working tree (${parts.join("; ")}). A split is a plan, ` +
+    "not a patch: nothing owns that change, and the next work session would inherit a diff it " +
+    "never reported. The batch was not created. Put the tree back the way it was " +
+    "(git status, then git checkout -- <path>, or git restore --staged <path> if it was staged) " +
+    "and ask for the split again."
+  );
+}
 
 /** A unit in flight: a group of machine effects executed as one transaction. */
 type Unit =
@@ -1002,12 +1053,56 @@ export async function runLoop(
    * the human's request, and the `#index`-to-id dependency bindings — happen
    * inside the ledger and are named in the transcript.
    */
+  /**
+   * `git status`, as the two halves of the split check.
+   *
+   * `null` means "could not read", which is a different answer from "clean" and
+   * is never to be read as it. The failure is reported here rather than at the
+   * comparison, because that is where the reason still exists.
+   */
+  async function readWorktree(
+    phase: "before" | "after",
+  ): Promise<readonly string[] | null> {
+    try {
+      return await ports.git.worktreeChanges();
+    } catch (error) {
+      warn(
+        `could not read the working tree ${phase} the split (${kindOf(error)}: ${messageOf(error)}). ` +
+          "The planner holds a shell, so \"it changed nothing\" is not a claim we can make; " +
+          "the split proceeds unverified.",
+      );
+      return null;
+    }
+  }
+
   async function runSplitUnit(text: string): Promise<readonly Effect[]> {
     if (unit !== null) {
       throw new LoopError("unit-nesting", `a ${unit.kind} unit is already in flight`);
     }
 
+    /**
+     * The planner holds a shell, so "it only looked" has to be checked rather
+     * than assumed. Read the tree before it runs; read it again when the
+     * proposal is in hand; compare.
+     */
+    const treeBefore = await readWorktree("before");
+
     const proposal = await ports.splitter.propose(text);
+    const touched = treeDelta(treeBefore, await readWorktree("after"));
+    if (touched !== null) {
+      // Checked before the epic is recorded and before a single child exists. A
+      // change the planner made belongs to no issue — and a batch built on top of
+      // it would hand the next work session a diff it never asked for and never
+      // reported, which is the one thing the commit stage cannot forgive.
+      const reason = treeChangeReason(touched);
+      blockedReason = reason;
+      guardTripped = { kind: "blocked", reason };
+      return feed({ type: "split_failed", reason, createdIds: [] });
+    }
+    if (treeBefore !== null) {
+      notes.push("split left the working tree unchanged");
+    }
+
     if (!proposal.ok) {
       return feed({ type: "split_failed", reason: describeProposalFailure(proposal), createdIds: [] });
     }

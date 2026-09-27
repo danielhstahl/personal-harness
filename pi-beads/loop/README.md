@@ -76,6 +76,8 @@ docs/               ADR-001: transport + rendering decision
                              and what that made simpler
                     ADR-008: nothing to commit is a no-op — park the bead with a
                              reason and carry on, instead of ending the run
+                    ADR-009: the planner gets eyes — the split pass can read the
+                             repository, cannot change it, and is checked
 spikes/             throwaway prototypes + captured evidence backing ADR-001
 test/               unit tests, plus the whole walk in test/loop.test.ts
 ```
@@ -178,7 +180,8 @@ See "A bead with nothing to commit is parked, not a dead end" below.
 Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`,
 `LOOP_WIDTH`, the per-pass thinking levels `LOOP_WORK_THINKING` /
 `LOOP_SPLIT_THINKING` — one of `off`, `minimal`, `low`, `medium`, `high`,
-`xhigh`, `max` — the budget knobs `LOOP_WORK_TIMEOUT_MS`, `LOOP_WRAP_UP_MS` and
+`xhigh`, `max` — the split's repository access `LOOP_SPLIT_REPO_ACCESS` (see
+"The planner has eyes" below) — the budget knobs `LOOP_WORK_TIMEOUT_MS`, `LOOP_WRAP_UP_MS` and
 `LOOP_RETRY_UNFIT_WORK` (see "Two clocks" below), the startup audit knobs
 `LOOP_AUDIT`, `LOOP_AUDIT_STRICT`, `LOOP_AUDIT_VERBOSE`, `LOOP_AUDIT_WRITE` and
 `LOOP_HEALTH_URL` (see "Startup: the provider comparison" below), the monitor
@@ -341,6 +344,75 @@ that doubled rather than a ticket that failed twice. Two fixes, both pinned:
 - The `timeout` event carries `elapsedMs` and `budgetMs` from the runner, which
   is the only party that knows them. The surface's own clock is a fallback, not
   the answer.
+
+### The planner has eyes: repo access for the split pass
+
+A split planned from one sentence is a guess about a repository nobody looked
+at. The planning session used to hold exactly that: the text of the request and
+one report tool, `noBuiltinTools: true`. Its tickets named
+`src/export/csv.py` and `tests/test_export.py` in a repository with no `src/`
+and no Python — plausible, unverifiable, and expensive two passes later when the
+work agent went looking for files that had never existed.
+
+The split session now holds `read` and `bash`. Not `edit`, not `write` — those
+are in `excludeTools` as well as outside the allowlist, so a name collision
+cannot quietly reopen them. And the grant is **checked** rather than trusted.
+
+What the prompt makes it do, bounded to a handful of commands:
+
+- read the top-level truth: `README*`, the manifest, `AGENTS.md`;
+- find out how the project is built and checked — and *read* the scripts rather
+  than run them;
+- list the area the request touches and read the two or four files that own it,
+  so the ticket names real symbols instead of the request's vocabulary;
+- check `git log --oneline -15` and `git status --short`, so it cannot
+  re-propose something already landed or already sitting uncommitted in the tree.
+
+What that has to produce: descriptions naming **real paths**, acceptance
+criteria checkable with a command this repo has, the repo's own conventions
+followed, and nothing invented — when the work needs a file that does not exist
+yet, the ticket says so with what *was* seen ("create `src/export/csv.ts`;
+`src/export/` holds `json.ts` and `ndjson.ts`, follow those"). A request that
+does not fit this repository at all gets one `decision` issue saying so, rather
+than invented filler.
+
+The read-only part is not a request. Before the planning session opens, and
+again when the proposal is in hand, the loop takes `git status` and compares.
+Any difference refuses the split and stops the run, naming what changed —
+**before the epic is recorded and before any child exists**, so a refused split
+leaves nothing but the request itself on the board. A change the planner made
+belongs to no issue; carrying on would hand the next work session a diff it
+never reported and never caused. The loop does not revert it either — that would
+be the loop making an unowned change of its own — so the stop message names the
+command to run.
+
+Two details keep the check honest: untracked paths are compared at directory
+granularity, so an untracked `node_modules/` is one record instead of fifty
+thousand (and adding a file inside a directory that was already untracked is
+therefore invisible — pre-existing state, not the planner's doing); and a status
+that cannot be read **throws** rather than reading as "clean". An unreadable
+tree warns `the split proceeds unverified`, which is a different sentence and
+is allowed to have different consequences.
+
+Off switch: `LOOP_SPLIT_REPO_ACCESS=off` restores the sealed planner from
+before. It is a strict value (`1/true/yes/on`, `0/false/no/off`) — a typo is
+refused at startup rather than silently turning the lights off.
+
+One trap in the wiring, because it will bite whoever touches it: **pi's `tools`
+allowlist filters custom tools too.** `tools: ["read","bash"]` with a registered
+`report_split` leaves the model with no report tool at all — verified against a
+real session:
+
+```
+WITH report in allowlist        => active: [ 'read', 'bash', 'report_split' ]
+WITHOUT report in allowlist    => active: [ 'read', 'bash' ]
+```
+
+So `defaultSessionFactory` always appends the custom tool names to any allowlist
+it passes. Without that, the failure surfaces as "split produced no structured
+proposal" and blames the model for a line of ours.
+
+See [`docs/ADR-009-planner-repo-access.md`](docs/ADR-009-planner-repo-access.md).
 
 ### What the next attempt reads
 

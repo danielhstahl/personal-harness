@@ -191,6 +191,7 @@ function recordWriter(order: string[], inner: GitWriter): GitWriter {
     findCommitByTrailer: (value) => inner.findCommitByTrailer(value),
     commitPaths: (hash) => inner.commitPaths(hash),
     headHash: () => inner.headHash(),
+    worktreeChanges: () => inner.worktreeChanges(),
   };
 }
 
@@ -215,6 +216,10 @@ interface VcsOptions {
   committedPaths?: string[];
   trailerHit?: string | null;
   pathsByHash?: Record<string, readonly string[]>;
+  /** What `worktreeChanges()` reports. Default: a clean tree. */
+  worktreeChanges?: string[];
+  /** Make the tree read fail, the way a broken git would. */
+  worktreeError?: Error | null;
 }
 
 function derivedBlock(input: {
@@ -315,6 +320,12 @@ function fakeVcs(order: string[], options: VcsOptions): GitWriter {
     },
     async headHash(): Promise<string | null> {
       return options.hash ?? "abc123def4567890";
+    },
+    async worktreeChanges(): Promise<string[]> {
+      // No `order.push` here: this read is not part of the ritual the order
+      // assertions are about, and inventing one would rewrite them all.
+      if (options.worktreeError) throw options.worktreeError;
+      return [...(options.worktreeChanges ?? [])];
     },
   };
 }
