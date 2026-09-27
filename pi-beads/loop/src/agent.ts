@@ -38,6 +38,14 @@
  */
 import {
   createAgentSession,
+  createBashToolDefinition,
+  createEditToolDefinition,
+  createFindToolDefinition,
+  createGrepToolDefinition,
+  createLsToolDefinition,
+  createPowerShellToolDefinition,
+  createReadToolDefinition,
+  createWriteToolDefinition,
   DefaultResourceLoader,
   defineTool,
   getAgentDir,
@@ -52,6 +60,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+import { withToolTimeout, withToolTimeouts } from "./tool-timeouts.ts";
+import type { AnyToolDefinition, ToolTimeoutInfo } from "./tool-timeouts.ts";
 import type { BdClient, Issue, NewIssueSpec } from "./beads.ts";
 import { BdError, normaliseDependencies } from "./beads.ts";
 import { failureKeyFor, handoffKeyFor } from "./orchestrator.ts";
@@ -681,6 +691,17 @@ export class AgentError extends Error {
   }
 }
 
+/**
+ * Re-exported beside {@link AgentError} because a timed-out tool call is the
+ * other error this module's callers need to recognise, and both are defined once,
+ * in `src/tool-timeouts.ts` (ADR-010 §6). The wrapper catches this class itself
+ * and turns it into a returned result, so it does not normally cross the module
+ * boundary — but `isToolTimeoutError` is what any later code asks of a value it
+ * found in a transcript or a caught unknown.
+ */
+export { isToolTimeoutError, ToolTimeoutError } from "./tool-timeouts.ts";
+export type { ToolTimeoutDetails, ToolTimeoutInfo } from "./tool-timeouts.ts";
+
 // ── session abstraction ─────────────────────────────────────────────────────
 
 /**
@@ -728,6 +749,26 @@ export interface SessionSpec {
   readonly systemPromptOverride?: string;
   readonly thinkingLevel?: ThinkingLevel;
   readonly modelRef?: { provider: string; id: string };
+  /**
+   * Per-tool-call cap for everything this session runs — the built-ins it has
+   * and the harness's own report tools (`ADR-010` §4). `undefined` is *no cap*,
+   * which is the default and the current behaviour exactly.
+   *
+   * The factory is the only place this can be honoured for the built-ins: pi has
+   * no per-tool timeout option, so the definitions have to be replaced with
+   * capped ones at the one site that assembles the session (see
+   * {@link defaultSessionFactory} and {@link cappedBuiltinTools}).
+   */
+  readonly toolTimeoutMs?: number;
+  /**
+   * Where a cap firing inside this session reports to.
+   *
+   * Threaded through the spec rather than left to the session events because the
+   * runner owns the event sink and the factory owns the tool definitions, and
+   * the two meet here. The built-in shadows are created inside the factory, where
+   * nothing else knows the run's session id or run kind.
+   */
+  readonly onToolTimeout?: (info: ToolTimeoutInfo) => void;
 }
 
 export type SessionFactory = (spec: SessionSpec) => Promise<AgentSessionLike>;
@@ -852,6 +893,99 @@ export function resolveThinkingLevelForRun(
 }
 
 /**
+ * pi's own default active built-in set (`core/sdk.js:138`), restated here
+ * because it is what an unset {@link SessionSpec.builtinTools} means.
+ */
+const PI_DEFAULT_BUILTIN_TOOLS: readonly string[] = ["read", "bash", "edit", "write"];
+
+/**
+ * Rebuild one of pi's built-in tool definitions from pi's own factory, with the
+ * settings pi's `_buildRuntime` gives it (`core/agent-session.js:2183-2195`),
+ * read from the **same `SettingsManager` the session is handed**.
+ *
+ * Returning `null` means "not a built-in this module knows how to rebuild", and
+ * the caller leaves pi's own definition alone rather than inventing a
+ * lookalike. The settings half is not decoration: `createBashToolDefinition(cwd)`
+ * with a bare cwd silently drops the configured shell prefix and shell path, so a
+ * shadow would run a different shell from the one the user configured.
+ */
+function builtinDefinition(
+  name: string,
+  cwd: string,
+  settings: SettingsManager,
+): AnyToolDefinition | null {
+  switch (name) {
+    case "read":
+      return createReadToolDefinition(cwd, { autoResizeImages: settings.getImageAutoResize() });
+    case "bash":
+      return createBashToolDefinition(cwd, {
+        commandPrefix: settings.getShellCommandPrefix(),
+        shellPath: settings.getShellPath(),
+      });
+    case "edit":
+      return createEditToolDefinition(cwd);
+    case "write":
+      return createWriteToolDefinition(cwd);
+    case "grep":
+      return createGrepToolDefinition(cwd);
+    case "find":
+      return createFindToolDefinition(cwd);
+    case "ls":
+      return createLsToolDefinition(cwd);
+    case "powershell":
+      return createPowerShellToolDefinition(cwd);
+    default:
+      return null;
+  }
+}
+
+/**
+ * The capped shadows of the built-ins this session can use.
+ *
+ * Mechanism ADR-010 §1 chose: a `customTools` entry named `bash` *wins* over the
+ * built-in — pi's registry is last-write-wins by name, and customs are written
+ * last — so a wrapper registered under the real name is the way to wrap a tool
+ * this harness does not own. Probe P1 measured the resulting system prompt as
+ * byte-identical to the unshadowed baseline, because the wrapper spreads the
+ * definition it wraps: same description, same `promptSnippet`, same renderers.
+ *
+ * What it deliberately does **not** do is change what any of this repo's
+ * inventory machinery sees. The shadows are injected here, never smuggled
+ * through the caller-visible {@link SessionSpec.customTools}, so
+ * {@link toolInventoryGap} keeps reading exactly `builtinTools` plus the
+ * caller's report tools, and `bareToolsetSystemPrompt` / `planningSystemPrompt`
+ * need no new clause for "built-ins re-registered as customs".
+ *
+ * Order matters twice over: these come *before* the caller's customs at the
+ * injection site, so a harness tool that ever claims one of these names still
+ * wins; and the list is `builtinTools` or pi's default four, so a name the
+ * session reaches by some other route — a `defaultTools` setting that names
+ * `grep`, say — is outside it and stays uncapped. That is the named hole of
+ * ADR-010 §6, and it is empty for every session this runner opens today.
+ */
+export function cappedBuiltinTools(
+  spec: SessionSpec,
+  settings: SettingsManager,
+): AnyToolDefinition[] {
+  if (spec.noBuiltinTools === true) return [];
+  const names = spec.builtinTools ?? PI_DEFAULT_BUILTIN_TOOLS;
+  const capped: AnyToolDefinition[] = [];
+  for (const name of names) {
+    const definition = builtinDefinition(name, spec.cwd, settings);
+    if (definition === null) continue;
+    const wrapped = withToolTimeout(definition, spec.toolTimeoutMs, {
+      onTimeout: spec.onToolTimeout,
+    });
+    // With no cap configured `withToolTimeout` hands back the definition
+    // untouched; registering an unwrapped shadow would be a no-op worse than
+    // not registering one at all, so skip it and leave pi's own entry.
+    if (wrapped === definition) continue;
+    capped.push(wrapped);
+  }
+  return capped;
+}
+
+/**
  * The production session factory.
  *
  * `SessionManager.inMemory()` + `SettingsManager.inMemory({compaction:{enabled:false}})`
@@ -876,7 +1010,16 @@ export const defaultSessionFactory: SessionFactory = async (spec) => {
     thinkingLevel,
     sessionManager: SessionManager.inMemory(spec.cwd),
     settingsManager,
-    customTools: [...spec.customTools],
+    // The capped shadows of the built-ins first, then the caller's own tools
+    // (also capped): pi writes customs last, last wins by name, so this is the
+    // one place where a built-in can be wrapped without being re-owned. See
+    // {@link cappedBuiltinTools}.
+    customTools: [
+      ...cappedBuiltinTools(spec, settingsManager),
+      ...withToolTimeouts(spec.customTools, spec.toolTimeoutMs, {
+        onTimeout: spec.onToolTimeout,
+      }),
+    ],
   };
   if (model !== undefined) {
     options.model = model;
@@ -1689,11 +1832,22 @@ export function createReportSplitTool(capture: Capture<NewIssueSpec[]>): ToolDef
 
 // ── runner ──────────────────────────────────────────────────────────────────
 
+/**
+ * What the runner tells the surface.
+ *
+ * `tool_timeout` and `timeout` are different events for different things, and
+ * keeping them apart is the whole point of the per-call cap: `timeout` is the run
+ * budget spent, which ends the run; `tool_timeout` is one call cut off, after
+ * which the run continues with whatever the model does next. A surface that
+ * conflated them would report a killed `grep` as a failed run.
+ */
 export interface RunnerEvent {
   readonly type:
     | "session_created"
     | "session_disposed"
     | "tool_call"
+    /** One tool call hit the per-call cap and was killed; the run goes on. */
+    | "tool_timeout"
     | "agent_event"
     | "timeout"
     | "wrap_up"
@@ -1709,6 +1863,11 @@ export interface RunnerEvent {
    * keeps one clock across a re-queued pass of the same ticket reports the sum of
    * both passes, which reads exactly like a budget that doubled. The runner knows
    * the number; it says it.
+   *
+   * One exception, for `tool_timeout` only: there the pair is **per call**, not
+   * per run — `elapsedMs` is how long *that tool call* had been out, and
+   * {@link RunnerEvent.budgetMs} the cap it ran into. The run's own clock is
+   * still available to the surface; what it could not know is the call.
    */
   readonly elapsedMs?: number;
   /** The budget {@link elapsedMs} is being read against. */
@@ -1727,6 +1886,27 @@ export interface AgentRunnerOptions {
   readonly repo?: RepoReaderLike;
   /** Wall-clock budget per run. Default 20 minutes — real work is slow. */
   readonly timeoutMs?: number;
+  /**
+   * Wall-clock budget per **tool call**, nested inside {@link timeoutMs}.
+   *
+   * `undefined` means no per-call cap: a call that never returns is paid for
+   * with the whole run, which is what the run budget alone has always done. Set,
+   * it is the harness's backstop for the one failure mode the run budget answers
+   * worst — a child that never exits, where the cost of the cut is every model
+   * turn already spent. Capping the call instead keeps the iteration: the model
+   * gets `tool "bash" timed out …` and still has its budget to do something
+   * with. See `ADR-010` and {@link withToolTimeout}.
+   */
+  readonly toolTimeoutMs?: number;
+  /**
+   * Extra tools every session this runner opens gets, alongside the report tool.
+   *
+   * A narrow seam, and an honest reason for it: a tool has to be in the list the
+   * runner assembles to be covered by the per-call cap, and without a seam here
+   * the only way to add one to a run is to replace the whole runner. The suite
+   * uses it to hand a wedged tool to a real run (see the `tool_timeout` tests).
+   */
+  readonly extraTools?: readonly ToolDefinition[];
   /** How long to wait for the session to settle after abort(). Default 5s. */
   readonly abortGraceMs?: number;
   /**
@@ -1847,6 +2027,8 @@ export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
   let created = 0;
   let disposed = 0;
   const wrapUpMs = options.wrapUpMs;
+  /** Said once per process; see the ordering note in {@link openAndRun}. */
+  let warnedCapOrder = false;
 
   async function disposeSession(entry: LiveSession): Promise<boolean> {
     if (entry.disposed) return false;
@@ -1919,14 +2101,91 @@ async function openAndRun<T>(
     thinkingLevel: ThinkingLevel | undefined,
     capture: Capture<T>,
   ): Promise<RunEvidence<T>> {
+    /**
+     * Set as soon as the session exists; a tool call cannot fire before it does,
+     * because a tool only runs inside a prompt on a session that is already
+     * open. The hook has to be built before the factory call, since the factory
+     * is what installs the wrappers for the built-ins.
+     */
+    let sessionId: string | undefined;
+
+    /**
+     * The one place a killed call is reported. Both wrap sites — this one, for
+     * the tools handed to the session, and {@link cappedBuiltinTools} inside
+     * the factory — point at it, so one event shape covers a wedged `bash` and a
+     * wedged `report_done`.
+     *
+     * Reporting it does not end anything. The wrapper returned a result rather
+     * than throwing, so the session took the result and the model is still
+     * working; contrast the run-level `timeout` below, which aborts.
+     */
+    const onToolTimeout = (info: ToolTimeoutInfo): void => {
+      emit({
+        type: "tool_timeout",
+        sessionId,
+        kind,
+        detail:
+          `tool "${info.toolName}" hit its per-call cap and was killed; the run goes on; ` +
+          (info.partialOutput === ""
+            ? "nothing had been streamed before the kill"
+            : `${info.partialOutput.length} char(s) of output before the kill`),
+        elapsedMs: info.elapsedMs,
+        budgetMs: info.timeoutMs,
+        raw: {
+          toolName: info.toolName,
+          timeoutMs: info.timeoutMs,
+          elapsedMs: info.elapsedMs,
+          partialChars: info.partialOutput.length,
+        },
+      });
+    };
+
+    // The cap is applied to the list handed to the session, not to a named list
+    // of tool kinds somebody has to remember: a tool added to the array later —
+    // here, through `extraTools` — is capped exactly like one added first.
+    const sessionTools =
+      options.extraTools === undefined ? tools : [...tools, ...options.extraTools];
+    const cappedTools = withToolTimeouts(sessionTools, options.toolTimeoutMs, {
+      now,
+      onTimeout: onToolTimeout,
+    });
+
+    /**
+     * The ordering trap ADR-010 §4 names: a per-tool cap at or above the run
+     * budget is a cap that never fires, because the run is cut first and the
+     * operator is left with exactly the behaviour they thought they had capped.
+     * Said once per process and *not* refused — "cap bigger than the budget" is a
+     * legitimate way of writing "no cap", and which of the two was meant is the
+     * operator's business, not this file's.
+     */
+    if (
+      options.toolTimeoutMs !== undefined &&
+      options.toolTimeoutMs >= budgetMs &&
+      !warnedCapOrder
+    ) {
+      warnedCapOrder = true;
+      emit({
+        type: "context_note",
+        kind,
+        detail:
+          `the per-tool cap (${formatDuration(options.toolTimeoutMs)}) is at or above the run ` +
+          `budget (${formatDuration(budgetMs)}), so no tool call will ever be cut off before the ` +
+          "run itself. Lower LOOP_TOOL_TIMEOUT_MS or raise LOOP_WORK_TIMEOUT_MS if that is not what " +
+          "was meant.",
+      });
+    }
+
     const session = await sessionFactory({
       kind,
       cwd,
-      customTools: tools,
+      customTools: cappedTools,
       thinkingLevel,
       modelRef: options.modelRef,
-      ...splitToolOptions(kind, tools.map((tool) => tool.name), splitRepoAccess),
+      toolTimeoutMs: options.toolTimeoutMs,
+      onToolTimeout,
+      ...splitToolOptions(kind, sessionTools.map((tool) => tool.name), splitRepoAccess),
     });
+    sessionId = session.sessionId;
     const runStartedAt = now();
     created += 1;
     const entry: LiveSession = { session, kind, disposed: false, disposeCount: 0 };

@@ -231,6 +231,16 @@ export interface AppConfig extends LoopConfig {
   readonly modelRef?: { provider: string; id: string };
   readonly workTimeoutMs?: number;
   /**
+   * Wall-clock cap on a **single tool call**, nested inside `workTimeoutMs`.
+   *
+   * Unset means no per-call cap, which is what every run before this knob was.
+   * Set, one wedged child — a `docker push` to a registry that stopped answering,
+   * a server that never closes the socket — costs that call instead of the whole
+   * iteration, and the model is told so in terms it cannot mistake for an
+   * ordinary tool error. See `ADR-010` and {@link createAgentRunner}.
+   */
+  readonly toolTimeoutMs?: number;
+  /**
    * When the work session is asked to land what it has, in ms from the start of
    * the run. Unset means the runner's own rule: the budget minus
    * `WRAP_UP_LEAD_MS`. See {@link createAgentRunner}.
@@ -808,6 +818,7 @@ export function buildApp(config: AppConfig): App {
       cwd: config.cwd,
       modelRef: config.modelRef,
       timeoutMs: config.workTimeoutMs,
+      toolTimeoutMs: config.toolTimeoutMs,
       wrapUpMs: config.wrapUpMs,
       workThinkingLevel: config.workThinkingLevel,
       splitThinkingLevel: config.splitThinkingLevel,

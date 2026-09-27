@@ -1576,11 +1576,17 @@ test("rule 20: the git writer never bypasses hooks, forces, sweeps, or pushes", 
 test("the git writer's write path has exactly one caller in src", () => {
   // Staging and committing are dangerous enough to have one home. If a second
   // file starts calling the writer's write path, this test says so.
+  //
+  // Matched on `vcs.execute(` rather than a bare `.execute(`: the second one
+  // that now exists in src is `src/tool-timeouts.ts` calling a *pi tool's*
+  // `execute` to wrap it (ADR-010), which is not the git writer and never was.
+  // Naming the receiver keeps the rule about staging and committing instead of
+  // about any call that happens to be spelled `execute`.
   const directory = fileURLToPath(new URL("../src", import.meta.url));
   const callers = readdirSync(directory)
     .filter((name) => name.endsWith(".ts") && name !== "vcs.ts")
     .filter((name) =>
-      codeOnly(readFileSync(join(directory, name), "utf8")).includes(".execute("),
+      codeOnly(readFileSync(join(directory, name), "utf8")).includes("vcs.execute("),
     );
   assert.deepEqual(callers, ["finalize.ts"]);
 });

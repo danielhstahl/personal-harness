@@ -184,7 +184,9 @@ Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`
 `LOOP_WIDTH`, the per-pass thinking levels `LOOP_WORK_THINKING` /
 `LOOP_SPLIT_THINKING` — one of `off`, `minimal`, `low`, `medium`, `high`,
 `xhigh`, `max` — the split's repository access `LOOP_SPLIT_REPO_ACCESS` (see
-"The planner has eyes" below) — the budget knobs `LOOP_WORK_TIMEOUT_MS`, `LOOP_WRAP_UP_MS` and
+"The planner has eyes" below) — the budget knobs `LOOP_WORK_TIMEOUT_MS`,
+`LOOP_TOOL_TIMEOUT_MS` (the per-tool-call cap; see "A third clock inside it"
+below), `LOOP_WRAP_UP_MS` and
 `LOOP_RETRY_UNFIT_WORK` (see "Two clocks" below), the startup audit knobs
 `LOOP_AUDIT`, `LOOP_AUDIT_STRICT`, `LOOP_AUDIT_VERBOSE`, `LOOP_AUDIT_WRITE` and
 `LOOP_HEALTH_URL` (see "Startup: the provider comparison" below), the monitor
@@ -237,6 +239,60 @@ run budget (settled after abort)
   was never what stopped it. Either the declared `contextWindow` is smaller than
   what the server takes, or the ticket does not fit in the window it has. The
   first is a config fix; the second is a split.
+
+#### A third clock inside it: the per-tool cap
+
+`LOOP_TOOL_TIMEOUT_MS` is the run budget's finer-grained neighbour. It caps one
+**tool call**, not the run, and it exists for the one failure the run budget
+answers worst: a child that never exits. A `docker push` to a registry that has
+stopped answering, a dev server that never closes the socket, a search that walks
+onto a dead mount. The run budget *can* cut through all of those — after burning
+every model turn the iteration already spent, because `session.abort()` is its
+only lever over a live session and it forfeits the whole lot.
+
+Capping the call keeps the iteration. The model gets a result it cannot mistake
+for an ordinary tool error, nor for the run-level cutoff:
+
+```
+tool "bash" timed out after 120000ms and was killed — it did not run to completion.
+Partial output before the kill:
+pushing layers 1..7 of 9
+```
+
+- **Unset is the default, and means no cap** — exactly what every run before
+  this knob was. No number written into this file knows how long a real
+  `npm ci` takes in the repository it is pointed at, and a cap nobody asked for
+  is a cap that fails a working run at 2 a.m.
+- **Read strictly.** Set means a whole number of milliseconds, at least 1; any
+  other value stops the loop with `tool-timeout-config` naming what is accepted.
+  It is deliberately *not* read with the lenient `number()` helper in
+  `src/main.ts`: a cap that silently failed to parse is indistinguishable from a
+  run that never needed one, and this is the knob whose failure mode is "waits
+  forever".
+- **A killed call does not end the run.** It comes back as a tool result carrying
+  `details.timedOut: true`, plus a `tool_timeout` runner event, painted as
+  `bash killed after 02:00 of a 02:00 per-call cap (loop-7) — tool "bash" hit its
+  per-call cap and was killed; the run goes on`, and the model goes
+  on with the budget it has left. Contrast `timeout`, which *is* the run ending.
+  The wrapper returns that result rather than throwing it because throwing is how
+  pi sets `isError` and the throw path discards `details` — and `details.timedOut`
+  is the one field that separates "the harness capped this" from "the tool
+  failed by itself", which is the difference between work worth retrying and work
+  that is not.
+- **The hung child really dies.** The wrapper owns the `AbortController` it hands
+  down and forwards the session's own abort into it, so pi's `killProcessTree`
+  fires at the cap — and Ctrl-C / `session.abort()` still reach the child
+  through the wrapper. Checked with `ps -C sleep` before the call, at return, and
+  2.5 s after ([ADR-010](docs/ADR-010-tool-call-timeout.md) §3).
+- **It nests inside the run budget, and nothing enforces the nesting.** A cap at
+  or above `LOOP_WORK_TIMEOUT_MS` is announced once at startup rather than
+  refused, because such a cap never fires: the run always gets cut first.
+- **A cap, not a floor**, and not a rewrite of the model's own `timeout` argument
+  on `bash`. If the model passes `timeout: 5`, pi's own path wins and produces
+  pi's ordinary `Command timed out after 5 seconds`, not a `timedOut` result.
+  This knob is the backstop for calls that never come back at all.
+
+See [`docs/ADR-010-tool-call-timeout.md`](docs/ADR-010-tool-call-timeout.md).
 
 ### The off-ramp: ask before cutting
 

@@ -52,6 +52,7 @@ import {
 } from "@earendil-works/pi-tui";
 
 import { formatToolArgs, formatToolResult, indentContent } from "./format.ts";
+import { isTimedOutToolResult } from "./tool-timeouts.ts";
 import {
   KanbanComponent,
   type KanbanMode,
@@ -1329,6 +1330,26 @@ class Presenter implements WorkPresenter {
         );
         return;
       }
+      case "tool_timeout": {
+        // A call cut off, not a run cut off. The run is still going — which is
+        // the whole difference between this event and `timeout` below, and the
+        // reason it is a warning on its own line rather than a failure.
+        const raw = asRecord(event.raw);
+        const name = typeof raw?.toolName === "string" ? raw.toolName : "tool call";
+        const detail = event.detail === undefined ? "" : ` — ${oneLine(event.detail)}`;
+        const elapsed = event.elapsedMs ?? this.elapsedMs();
+        const cap =
+          event.budgetMs === undefined
+            ? ""
+            : ` of a ${formatElapsed(event.budgetMs)} per-call cap`;
+        this.notice(
+          "warn",
+          `${name} killed after ${formatElapsed(elapsed)}${cap}${
+            this.fields.issueId === undefined ? "" : ` (${this.fields.issueId})`
+          }${detail}`,
+        );
+        return;
+      }
       case "wrap_up": {
         const detail = event.detail === undefined ? "" : ` — ${oneLine(event.detail)}`;
         this.notice(
@@ -1443,7 +1464,16 @@ class Presenter implements WorkPresenter {
             : null;
         if (block === null) return;
         const wasPending = block.toolStatus === "pending";
-        block.finish(record?.result, record?.isError === true);
+        // A killed call must not render as `✓ ok`. The wrapper *returns* its
+        // timeout rather than throwing — throwing is how pi sets `isError`, and
+        // the throw path discards `details`, which is the one field that says
+        // "the harness capped this" rather than "the tool failed" — so the
+        // transcript's flag is still `false` and this is where the fact has to
+        // be picked up. ADR-010 §5.
+        block.finish(
+          record?.result,
+          record?.isError === true || isTimedOutToolResult(record?.result),
+        );
         if (wasPending) {
           // The call reported back: stop animating it, and stop paying for the
           // fast beat. The bookkeeping is deleted rather than zeroed so a long

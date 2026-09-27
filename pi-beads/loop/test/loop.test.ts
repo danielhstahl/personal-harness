@@ -35,7 +35,7 @@ import { publishedJson, startFakeNtfy } from "./ntfy-server.ts";
 import { BdError } from "../src/beads.ts";
 import { createFinalizer } from "../src/finalize.ts";
 import { normaliseDependencies } from "../src/beads.ts";
-import { HANDLED_EFFECT_KINDS, runLoop } from "../src/loop.ts";
+import { HANDLED_EFFECT_KINDS, LoopError, runLoop } from "../src/loop.ts";
 import type { LoopLogEntry, LoopPorts } from "../src/loop.ts";
 import { EFFECT_KINDS, failureKeyFor, handoffKeyFor, step } from "../src/orchestrator.ts";
 import type { OrchestratorEvent, OrchestratorState, StepResult } from "../src/orchestrator.ts";
@@ -1909,6 +1909,43 @@ test("the budget knobs are read, and reach the runner rather than the readme", (
   const source = readSource("app.ts");
   assert.match(source, /timeoutMs:\s*config\.workTimeoutMs/u);
   assert.match(source, /wrapUpMs:\s*config\.wrapUpMs/u);
+});
+
+test("the per-tool cap is read strictly: set is set, unset is no cap, junk stops the run", async () => {
+  // Read like `LOOP_NTFY_MAX_FAILURES`, not like `number()`. The reason is
+  // specific to this knob: a cap that silently failed to parse is a run that
+  // waits forever, and the operator has nothing on screen to tell them so.
+  assert.equal(readEnv({}).toolTimeoutMs, undefined, "unset means no per-tool cap");
+  assert.equal(readEnv({ LOOP_TOOL_TIMEOUT_MS: "" }).toolTimeoutMs, undefined, "empty is unset");
+  assert.equal(readEnv({ LOOP_TOOL_TIMEOUT_MS: "   " }).toolTimeoutMs, undefined);
+
+  assert.equal(readEnv({ LOOP_TOOL_TIMEOUT_MS: "12000" }).toolTimeoutMs, 12_000);
+  assert.equal(readEnv({ LOOP_TOOL_TIMEOUT_MS: " 120000 " }).toolTimeoutMs, 120_000);
+  assert.equal(readEnv({ LOOP_TOOL_TIMEOUT_MS: "1" }).toolTimeoutMs, 1, "1 ms is a cap, not junk");
+
+  for (const bad of ["0", "-5", "abc", "1.5", "1e21", "Infinity", "12s"]) {
+    assert.throws(
+      () => readEnv({ LOOP_TOOL_TIMEOUT_MS: bad }),
+      (error: unknown) =>
+        error instanceof LoopError &&
+        error.code === "tool-timeout-config" &&
+        /whole number of milliseconds, at least 1/u.test(error.message) &&
+        error.message.includes(`"${bad.trim()}"`),
+      `LOOP_TOOL_TIMEOUT_MS="${bad}" must be refused, not dropped`,
+    );
+  }
+
+  // And the refusal is one clean line before the loop starts, not a stack.
+  const lines: string[] = [];
+  const code = await runFromEnv(() => readEnv({ LOOP_TOOL_TIMEOUT_MS: "120s" }), (line) => {
+    lines.push(line);
+  });
+  assert.equal(code, 2);
+  assert.match(lines.join("\n"), /tool-timeout-config/u);
+
+  // Wired, not dropped on the floor.
+  const source = readSource("app.ts");
+  assert.match(source, /toolTimeoutMs:\s*config\.toolTimeoutMs/u);
 });
 
 test("the wiring builds no ANSI by hand and spawns no processes of its own", () => {
