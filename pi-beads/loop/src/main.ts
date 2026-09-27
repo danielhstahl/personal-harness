@@ -525,7 +525,8 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
       enabled: shape !== "off",
       // `off` is carried by `enabled`, not by a second way of saying the same
       // thing: a consumer that read `mode: "off"` while `enabled: true` would
-      // have to guess which of the two it was being told about.
+      // have to guess which of the two it was being told about. So `off` maps to
+      // no shape at all, and `set` keeps the key out of the config entirely.
       ...set("mode", shape === "off" ? undefined : shape),
       ...set("intervalMs", intervalMs),
       ...set("lines", lines),

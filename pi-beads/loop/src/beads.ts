@@ -145,6 +145,12 @@ export interface BdErrorInit {
   kind: BdErrorKind;
   message: string;
   argv?: readonly string[];
+  /**
+   * The child's exit code — or `null` because it had none and was killed by a
+   * signal. That is node's own distinction (`code: number | null`) at the
+   * spawner boundary, and it is kept rather than folded into "unset": a run
+   * that exited 1 and a run that was SIGKILLed are different facts.
+   */
   exitCode?: number | null;
   stderr?: string;
   stdoutSnippet?: string;
@@ -177,12 +183,12 @@ export class BdError extends Error {
 
 export interface BdClientOptions {
   /** bd executable. Default `"bd"` (resolved via PATH). */
-  readonly bin?: string;
+  readonly bin?: string | undefined;
   readonly cwd?: string;
   /** Extra env for every call. Cannot override {@link DISABLE_LAST_TOUCHED}. */
-  readonly env?: Readonly<Record<string, string>>;
+  readonly env?: Readonly<Record<string, string>> | undefined;
   /** Per-call timeout. Default 60s. */
-  readonly timeoutMs?: number;
+  readonly timeoutMs?: number | undefined;
   /** Enable debug logging even if `LOOP_DEBUG` is unset. */
   readonly debug?: boolean;
   /** Debug sink. Defaults to `console.error`. */

@@ -157,7 +157,9 @@ export function createScriptBoard(): ScriptBoard {
         priority: spec.priority ?? 2,
         issue_type: spec.type ?? "task",
         description: spec.description ?? "",
-        acceptance_criteria: spec.acceptance,
+        // No acceptance in the spec means no acceptance on the issue — the key
+        // absent, the way `bd` reports it, not `undefined` sitting in the field.
+        ...(spec.acceptance === undefined ? {} : { acceptance_criteria: spec.acceptance }),
         labels: spec.labels ? [...spec.labels] : [],
         dependencies: (spec.deps ?? []).map((target) => ({
           type: "blocks",

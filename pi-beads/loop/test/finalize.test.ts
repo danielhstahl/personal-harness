@@ -83,7 +83,7 @@ function request(overrides: Partial<FinalizeRequest> = {}): FinalizeRequest {
 
 interface BoardCalls {
   readonly remembered: { text: string; key: string }[];
-  readonly closed: { id: string; reason?: string }[];
+  readonly closed: { id: string; reason?: string | undefined }[];
 }
 
 interface BoardOptions {

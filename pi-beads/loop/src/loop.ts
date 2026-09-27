@@ -160,13 +160,30 @@ export interface FinalizerLike {
   finalize(request: FinalizeRequest): Promise<FinalizeOutcome>;
 }
 
+/**
+ * How the loop runs, as one bag of knobs.
+ *
+ * Every optional field here is declared `| undefined`, and that is the same
+ * statement about all of them: **the operator did not say**. `readEnv` in
+ * `src/main.ts` leaves an unset knob out, it arrives here as nothing, and the
+ * default is applied where the knob is consumed rather than at the read. With
+ * `exactOptionalPropertyTypes` on, whether "absent" and "`undefined`" are the
+ * same thing is a fact the type has to state, so it is stated once on the field
+ * instead of being re-guessed by every reader.
+ *
+ * What is deliberately *not* a member of any of these types is `null`. "Unset"
+ * and "set to something empty" are one state to this loop, and `readEnv`
+ * already refuses the second; `null` was a third spelling of the first, and the
+ * fields that used to carry it — the epic id here, the completion notice's
+ * commit — spell their unset this way now.
+ */
 export interface LoopConfig {
   /** Print the finalize plan; the loop reports it and stops without writing. */
-  readonly dryRun?: boolean;
+  readonly dryRun?: boolean | undefined;
   /** Log every effect and every completed handler. */
-  readonly verbose?: boolean;
+  readonly verbose?: boolean | undefined;
   /** Runaway guard. Default 1000 iterations. */
-  readonly maxIterations?: number;
+  readonly maxIterations?: number | undefined;
   /**
    * Stop after the same issue fails work this many times in a row.
    *
@@ -175,7 +192,7 @@ export interface LoopConfig {
    * one retry, then stop and tell a human. The reason is already on the board
    * under the failure key, so "what went wrong" is not lost by stopping.
    */
-  readonly maxConsecutiveFailures?: number;
+  readonly maxConsecutiveFailures?: number | undefined;
   /**
    * Retry a run that ran out of the harness's room — wall-clock time, or context.
    *
@@ -192,7 +209,7 @@ export interface LoopConfig {
    * Neither case loses the work. The bead is reopened either way, with the
    * previous attempt's own words in its failure note.
    */
-  readonly retryUnfitWork?: boolean;
+  readonly retryUnfitWork?: boolean | undefined;
   /**
    * Stop after this many claim attempts in a row that the board refused.
    *
@@ -201,27 +218,33 @@ export interface LoopConfig {
    * pick` forever and never bumps the iteration counter that would otherwise
    * save us. Default 3.
    */
-  readonly maxConsecutiveClaimFailures?: number;
+  readonly maxConsecutiveClaimFailures?: number | undefined;
   /**
    * Stop after this many idle turns in a row that did not move the machine.
    *
    * A person typing for an hour is not a runaway; input that the machine keeps
    * refusing is. Default 3.
    */
-  readonly maxIdleSpins?: number;
-  /** Record the human request on this epic instead of minting one. */
-  readonly epicId?: string | null;
-  readonly epicTitle?: string;
+  readonly maxIdleSpins?: number | undefined;
+  /**
+   * Record the human request on this epic instead of minting one.
+   *
+   * `| undefined`, not the `| null` this carried: "the operator named no epic"
+   * is one fact and it now has one spelling, so `readEnv`'s absent knob arrives
+   * here without being converted on the way through.
+   */
+  readonly epicId?: string | undefined;
+  readonly epicTitle?: string | undefined;
   /** An epic is a container, not a task: default 4 so children sort first. */
-  readonly epicPriority?: 0 | 1 | 2 | 3 | 4;
+  readonly epicPriority?: 0 | 1 | 2 | 3 | 4 | undefined;
   /** Let epic-type issues be picked as work. Default false. */
-  readonly workEpics?: boolean;
+  readonly workEpics?: boolean | undefined;
   /** Re-read the board once after a failed read. Default true. */
-  readonly autoRetryObserve?: boolean;
+  readonly autoRetryObserve?: boolean | undefined;
   /** Check that `bd` and a git work tree are reachable before starting. */
-  readonly preflight?: boolean;
+  readonly preflight?: boolean | undefined;
   /** Labels forwarded to the board reads. */
-  readonly labels?: readonly string[];
+  readonly labels?: readonly string[] | undefined;
   /**
    * The state function to run. Defaults to the real `step`.
    *
@@ -230,7 +253,10 @@ export interface LoopConfig {
    * asked for — cannot be produced by the real machine, so a test can only
    * check that they are survivable by substituting one that does them.
    */
-  readonly machine?: (state: OrchestratorState, event: OrchestratorEvent) => StepResult;
+  // `| undefined`: the loop's own machine is used unless one is handed in.
+  readonly machine?:
+    | ((state: OrchestratorState, event: OrchestratorEvent) => StepResult)
+    | undefined;
 }
 
 // ── what comes back ─────────────────────────────────────────────────────────
@@ -877,11 +903,15 @@ export async function runLoop(
       committed !== null && committed.committedPaths.length > 0
         ? committed.committedPaths
         : verdict?.changedFiles ?? [];
+    // The machine's state spells "no commit was ever recorded" as `null`. The
+    // notice spells it by leaving the field out, so the fold happens here, at the
+    // one place the two meet, rather than in the body builder that reads it.
+    const commit = (committed?.commitHash ?? effect.commit) ?? undefined;
     return {
       issueId: effect.issueId,
       title: effect.title,
       summary: verdict?.summary ?? stripClosePrefix(effect.closeReason),
-      commit: committed?.commitHash ?? effect.commit,
+      ...(commit === undefined ? {} : { commit }),
       committedAgain: committed?.reusedCommit ?? false,
       changedFiles,
       nextSteps: verdict?.nextSteps ?? [],
@@ -889,8 +919,12 @@ export async function runLoop(
       closeReason: effect.closeReason,
       handoffKey: effect.handoffKey,
       iteration: effect.iteration,
-      workKind: worked?.kind ?? null,
-      elapsedMs: worked?.elapsedMs ?? null,
+      // Absent-or-value, never `null`: `BeadCompletion` spells "the run never
+      // knew" by leaving these out, so the fact goes into the notice only if it
+      // exists — the same spread-omission `readEnv` uses for a knob nobody set.
+      ...(worked === null
+        ? {}
+        : { workKind: worked.kind, elapsedMs: worked.elapsedMs }),
       completedAt: now(),
     };
   }
@@ -1109,7 +1143,7 @@ export async function runLoop(
     let epicId: string;
     try {
       const epic = await recordHumanRequest(ports.beads, text, {
-        epicId: config.epicId ?? null,
+        epicId: config.epicId,
         epicTitle: config.epicTitle,
         epicPriority: config.epicPriority ?? 4,
       });

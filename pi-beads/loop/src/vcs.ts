@@ -128,6 +128,12 @@ export interface VcsErrorInit {
   kind: VcsErrorKind;
   message: string;
   argv?: readonly string[];
+  /**
+   * The child's exit code — or `null` because it had none and was killed by a
+   * signal. That is node's own distinction (`code: number | null`) at the
+   * spawner boundary, and it is kept rather than folded into "unset": a run
+   * that exited 1 and a run that was SIGKILLed are different facts.
+   */
   exitCode?: number | null;
   stderr?: string;
   cause?: unknown;
@@ -396,7 +402,7 @@ function lstatSyncSafe(target: string) {
 export interface GitWriterOptions {
   /** Directory inside the repository. Default `process.cwd()`. */
   readonly cwd?: string;
-  readonly bin?: string;
+  readonly bin?: string | undefined;
   readonly timeoutMs?: number;
   /**
    * How long the child gets to stop after `SIGTERM` before it is killed.

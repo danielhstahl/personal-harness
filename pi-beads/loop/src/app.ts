@@ -234,22 +234,31 @@ export interface GitLockSetting {
   readonly stalePolicy?: "report" | "remove";
 }
 
+/**
+ * Everything `readEnv` produces: the loop's own knobs (see {@link LoopConfig}
+ * for what an unset field means) plus the adapter settings and the test seam
+ * below. Same convention throughout — `| undefined` is "not configured", and
+ * `null` is not something a field here can hold. The one deliberate exception
+ * is {@link AppConfig}'s `overrides.presenter`, where `null` answers a
+ * different question from absence ("build no surface" vs "no opinion") and is
+ * therefore a different concept, not a second spelling of the same one.
+ */
 export interface AppConfig extends LoopConfig {
   /** Repository and board live here. */
   readonly cwd: string;
-  readonly bdBin?: string;
-  readonly gitBin?: string;
+  readonly bdBin?: string | undefined;
+  readonly gitBin?: string | undefined;
   /** Index-lock policy for every git write this run makes. */
   readonly gitLock?: GitLockSetting;
   /** Explicit model. Never read from the environment below this line. */
-  readonly modelRef?: { provider: string; id: string };
-  readonly workTimeoutMs?: number;
+  readonly modelRef?: { provider: string; id: string } | undefined;
+  readonly workTimeoutMs?: number | undefined;
   /**
    * When the work session is asked to land what it has, in ms from the start of
    * the run. Unset means the runner's own rule: the budget minus
    * `WRAP_UP_LEAD_MS`. See {@link createAgentRunner}.
    */
-  readonly wrapUpMs?: number;
+  readonly wrapUpMs?: number | undefined;
   /**
    * Thinking level per pass. Unset is not "low" — it is *not configured*, and the
    * runner resolves it in `src/agent.ts` against the user's own default,
@@ -259,8 +268,8 @@ export interface AppConfig extends LoopConfig {
    * paragraph it can hold in mind at once, a work run has to survive a repo. The
    * loop should not have to pick one number for both.
    */
-  readonly workThinkingLevel?: ThinkingLevel;
-  readonly splitThinkingLevel?: ThinkingLevel;
+  readonly workThinkingLevel?: ThinkingLevel | undefined;
+  readonly splitThinkingLevel?: ThinkingLevel | undefined;
   /**
    * Whether the planning pass may look at the repository (`read` + `bash`, no
    * `edit`/`write`). On by default: a split that cannot see the repo names files
@@ -269,15 +278,15 @@ export interface AppConfig extends LoopConfig {
    * working tree before and after the planning run and refuses the batch if the
    * session changed it.
    */
-  readonly splitRepoAccess?: boolean;
+  readonly splitRepoAccess?: boolean | undefined;
   /** The startup provider comparison. See {@link ProviderAuditSetting}. */
-  readonly providerAudit?: ProviderAuditSetting;
+  readonly providerAudit?: ProviderAuditSetting | undefined;
   /** The read-only server panel. See {@link MonitorSetting}. */
-  readonly monitor?: MonitorSetting;
-  readonly kanban?: KanbanSetting;
+  readonly monitor?: MonitorSetting | undefined;
+  readonly kanban?: KanbanSetting | undefined;
   /** The completion notice. Off unless `LOOP_NTFY_TOPIC` names a topic. */
-  readonly notify?: NotifySetting;
-  readonly themeName?: string;
+  readonly notify?: NotifySetting | undefined;
+  readonly themeName?: string | undefined;
   /**
    * The live surface's cadence, in ms.
    *
@@ -289,12 +298,12 @@ export interface AppConfig extends LoopConfig {
    * outstanding call visibly turns instead of looking hung. All are ignored
    * when `overrides.presenter` supplies the surface.
    */
-  readonly coalesceMs?: number;
-  readonly heartbeatMs?: number;
-  readonly spinnerMs?: number;
+  readonly coalesceMs?: number | undefined;
+  readonly heartbeatMs?: number | undefined;
+  readonly spinnerMs?: number | undefined;
   /** Commit identity. Defaults name the loop rather than a human. */
-  readonly authorName?: string;
-  readonly authorEmail?: string;
+  readonly authorName?: string | undefined;
+  readonly authorEmail?: string | undefined;
   /** Replace any adapter — the spike and the tests use exactly this seam. */
   readonly overrides?: {
     readonly beads?: BdClient;
@@ -496,7 +505,8 @@ export function idleStatusFrom(
   inProgress: readonly Issue[],
   options: {
     workEpics?: boolean;
-    model?: { provider: string; id: string };
+    /** `| undefined` because the config may name no model at all. */
+    model?: { provider: string; id: string } | undefined;
   } = {},
 ): IdleStatus {
   const workEpics = options.workEpics === true;
@@ -611,7 +621,12 @@ function buildNotifier(
       "LOOP_NTFY_TOPIC is unset, so no one is told when a bead closes",
     );
   }
-  if ((setting.topic ?? "").trim() === "") {
+  // Read once, then handed on as a string that is known not to be blank. The
+  // check above and the resolver below were each re-deriving "is there a topic"
+  // from a `string | undefined`, which is the same question asked twice in two
+  // different ways.
+  const topic = (setting.topic ?? "").trim();
+  if (topic === "") {
     return createNullNotifier(
       "LOOP_NTFY_TOPIC is set but empty, so there is nowhere to tell when a bead closes",
     );
@@ -621,7 +636,7 @@ function buildNotifier(
   let target;
   try {
     target = resolveNtfyTarget({
-      topic: setting.topic,
+      topic,
       ...(setting.url === undefined ? {} : { url: setting.url }),
     });
   } catch (error) {
@@ -742,7 +757,13 @@ function isNtfyPriority(value: string): boolean {
 
 export function buildApp(config: AppConfig): App {
   const overrides = config.overrides ?? {};
-  const labels = config.labels === undefined ? undefined : { labels: config.labels };
+  /**
+   * The board filter, spelled one way: an options object that either carries
+   * the labels or carries nothing. The `?? {}` this replaces was the same
+   * decision made again at every bd call.
+   */
+  const labels: { labels?: readonly string[] } =
+    config.labels === undefined ? {} : { labels: config.labels };
 
   const baseBeads = overrides.beads ?? createBdClient({ bin: config.bdBin, cwd: config.cwd });
   const git = overrides.git ?? createGitWriter({
@@ -900,7 +921,7 @@ export function buildApp(config: AppConfig): App {
   const splitter =
     overrides.splitter ??
     createSplitter({ agent: portFromAgentRunner(runner), beads }, {
-      epicId: config.epicId ?? null,
+      epicId: config.epicId,
       epicTitle: config.epicTitle,
     });
 
@@ -958,8 +979,8 @@ export function buildApp(config: AppConfig): App {
   async function statusProvider(): Promise<IdleStatus> {
     try {
       const [ready, inProgress] = await Promise.all([
-        beads.listReady(labels ?? {}),
-        beads.listInProgress(labels ?? {}),
+        beads.listReady(labels),
+        beads.listInProgress(labels),
       ]);
       return idleStatusFrom(ready, inProgress, {
         workEpics: config.workEpics === true,
@@ -1201,7 +1222,7 @@ function buildKanban(
   config: AppConfig,
   beads: BdClient,
   overrides: AppConfig["overrides"] = {},
-  labels: { labels: readonly string[] } | undefined,
+  labels: { labels?: readonly string[] },
 ): KanbanSource {
   const setting = config.kanban ?? { enabled: true };
   if (setting.enabled === false) {
@@ -1223,8 +1244,8 @@ function buildKanban(
     // window wider than the display.
     const windowSize = Math.max(doneLimit * 3, 30);
     const [ready, inProgress, closed] = await Promise.allSettled([
-      beads.listReady(labels ?? {}),
-      beads.listInProgress(labels ?? {}),
+      beads.listReady(labels),
+      beads.listInProgress(labels),
       beads.listClosed({ ...labels, limit: windowSize }),
     ]);
     const failed: KanbanColumnKey[] = [];

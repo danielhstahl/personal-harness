@@ -618,7 +618,10 @@ export function verbatimRecord(input: string): string {
  * *because* the description holds the text unchanged: the title is a handle, the
  * description is the record. Nothing is lost by shortening a handle.
  */
-export function epicTitleFor(input: string, config: { epicTitle?: string } = {}): string {
+export function epicTitleFor(
+  input: string,
+  config: { epicTitle?: string | undefined } = {},
+): string {
   const explicit = nonEmptyString(config.epicTitle);
   if (explicit !== null) return explicit;
 
@@ -645,8 +648,15 @@ export interface EpicHandling {
 }
 
 export interface EpicConfig {
-  readonly epicId?: string | null;
-  readonly epicTitle?: string;
+  /**
+   * The epic to append the record to. "No epic was named" is spelled by leaving
+   * it out (or handing over `undefined`), which is what
+   * {@link recordHumanRequest} reads; `null` used to be a second spelling of
+   * the same answer, and the `?? undefined` this field used to need at its own
+   * reader was the tell.
+   */
+  readonly epicId?: string | undefined;
+  readonly epicTitle?: string | undefined;
   readonly epicPriority?: SplitPriority;
 }
 
@@ -672,7 +682,7 @@ export async function recordHumanRequest(
     throw new SplitError("empty-input", "there is no request to record, so nothing is written");
   }
   const record = verbatimRecord(input);
-  const existing = nonEmptyString(config.epicId ?? undefined);
+  const existing = nonEmptyString(config.epicId);
 
   if (existing !== null) {
     const issue = await beads.appendNote(existing, record);
@@ -717,7 +727,7 @@ const SPEC_TO_INDEX = new WeakMap<NewIssueSpec, number>();
  */
 export function toNewIssueSpec(
   item: SplitItem,
-  epicId: string | null,
+  epicId: string | undefined,
   deps: readonly string[] = item.dependsOn.map((position) => `#${position}`),
   index?: number,
 ): NewIssueSpec {
@@ -728,13 +738,16 @@ export function toNewIssueSpec(
     priority: item.priority,
     type: item.type,
   };
-  if (epicId !== null) spec.parent = epicId;
+  if (epicId !== undefined) spec.parent = epicId;
   if (deps.length > 0) spec.deps = [...deps];
   if (index !== undefined) SPEC_TO_INDEX.set(spec, index);
   return spec;
 }
 
-export function toNewIssueSpecs(items: readonly SplitItem[], epicId: string | null): NewIssueSpec[] {
+export function toNewIssueSpecs(
+  items: readonly SplitItem[],
+  epicId: string | undefined,
+): NewIssueSpec[] {
   return items.map((item, index) => toNewIssueSpec(item, epicId, undefined, index));
 }
 
@@ -783,8 +796,9 @@ export type SplitLedgerEvent =
 export interface SplitLedgerOptions {
   readonly items: readonly SplitItem[];
   readonly beads: BdClient;
-  readonly epicId?: string | null;
-  readonly onEvent?: (event: SplitLedgerEvent) => void;
+  /** Parent epic, or nothing at all when the batch is not under one. */
+  readonly epicId?: string | undefined;
+  readonly onEvent?: ((event: SplitLedgerEvent) => void) | undefined;
 }
 
 export interface SplitLedger {
@@ -824,7 +838,7 @@ export interface SplitLedger {
 export function createSplitLedger(options: SplitLedgerOptions): SplitLedger {
   const { items, beads } = options;
   const emit = options.onEvent ?? ((): void => {});
-  const epicId = options.epicId ?? null;
+  const epicId = options.epicId;
 
   const byId = new Map<number, string>();
   const created: CreatedIssue[] = [];
@@ -1288,7 +1302,7 @@ export function createSplitter(
         return {
           ok: true,
           items: validated.items,
-          specs: toNewIssueSpecs(validated.items, config.epicId ?? null),
+          specs: toNewIssueSpecs(validated.items, config.epicId),
           attempts,
           problems: NO_PROBLEMS,
           rawOutputs,

@@ -51,26 +51,37 @@
  * the far end.
  */
 
-/** The bead, as the run finished knowing it. Every field here is already fact. */
+/**
+ * The bead, as the run finished knowing it. Every field here is already fact.
+ *
+ * The optional fields are plain optional, never "value or null", and that is
+ * the whole point of this type. A field the run could not know about is
+ * **absent** — it has one spelling. It used to have two: a commit typed as
+ * "string or null" let "no commit was recorded" arrive either as `null` or as
+ * a missing key, and the body builder had to ask which one it was holding for
+ * every line it printed. Absence carries no extra meaning here beyond "not
+ * known", so it is the only way to say it; what the notice never sees is a
+ * `null` that means one thing in one place and another thing somewhere else.
+ */
 export interface BeadCompletion {
   readonly issueId: string;
   readonly title: string;
   /** What the work reported it did. */
   readonly summary: string;
   /** The commit that carries it, once there is one. */
-  readonly commit?: string | null;
+  readonly commit?: string;
   readonly committedAgain?: boolean;
   readonly changedFiles?: readonly string[];
   readonly nextSteps?: readonly string[];
   readonly decisions?: readonly string[];
   /** The `bd close --reason` text, kept so the notice matches the board. */
-  readonly closeReason?: string | null;
-  readonly handoffKey?: string | null;
-  readonly iteration?: number | null;
+  readonly closeReason?: string;
+  readonly handoffKey?: string;
+  readonly iteration?: number;
   /** The runner's verdict kind: `done`, `incomplete`, … */
-  readonly workKind?: string | null;
-  readonly elapsedMs?: number | null;
-  readonly completedAt?: number | null;
+  readonly workKind?: string;
+  readonly elapsedMs?: number;
+  readonly completedAt?: number;
 }
 
 /** What the run, rather than the bead, contributes to the notice. */
@@ -181,9 +192,16 @@ function truncate(text: string, max: number): string {
   return `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
 }
 
-/** `3m 12s`, `812ms`, `1h 04m` — whatever fits a line without a calculator. */
-export function formatDuration(ms: number | null | undefined): string | null {
-  if (ms === null || ms === undefined || !Number.isFinite(ms) || ms < 0) return null;
+/**
+ * `3m 12s`, `812ms`, `1h 04m` — whatever fits a line without a calculator.
+ *
+ * `undefined` is the "cannot be said" answer, which is the same answer the rest
+ * of this module gives for a fact the run never had. It used to answer `null`
+ * here, which meant the caller had to know that this formatter's "no" and the
+ * notice's "no" were the same word.
+ */
+export function formatDuration(ms: number | undefined): string | undefined {
+  if (ms === undefined || !Number.isFinite(ms) || ms < 0) return undefined;
   if (ms < 1000) return `${Math.round(ms)}ms`;
   const seconds = Math.floor(ms / 1000) % 60;
   const minutes = Math.floor(ms / 60_000) % 60;
@@ -194,8 +212,8 @@ export function formatDuration(ms: number | null | undefined): string | null {
 }
 
 /** `2025-09-26 11:03 UTC` — short enough for a notice line, still unambiguous. */
-export function formatTimestamp(ms: number | null | undefined): string {
-  if (ms === null || ms === undefined || !Number.isFinite(ms)) return "unknown";
+export function formatTimestamp(ms: number | undefined): string {
+  if (ms === undefined || !Number.isFinite(ms)) return "unknown";
   const date = new Date(ms);
   const pad = (value: number): string => String(value).padStart(2, "0");
   return (
@@ -205,11 +223,23 @@ export function formatTimestamp(ms: number | null | undefined): string {
 }
 
 /** Join the pieces of a status line with ` · `, dropping whatever is missing. */
-function dotJoin(parts: readonly (string | null | undefined)[]): string {
+function dotJoin(parts: readonly (string | undefined)[]): string {
   return parts
     .map((part) => (typeof part === "string" ? part.trim() : ""))
     .filter((part) => part !== "")
     .join(" · ");
+}
+
+/**
+ * A line for the notice, but only if the run had the fact behind it.
+ *
+ * `dotJoin` already drops a nothing, so the call sites below read as the facts
+ * they render rather than as unset handling: the one branch that turns "no
+ * value" into "no text" lives here, in the one place that knows the two are the
+ * same thing, instead of being written out at every field.
+ */
+function lineIf<T>(value: T | undefined, render: (value: T) => string): string | undefined {
+  return value === undefined ? undefined : render(value);
 }
 
 // ── the message ─────────────────────────────────────────────────────────────
@@ -251,9 +281,7 @@ export function completionBody(completion: BeadCompletion, context: NoticeContex
   const status = dotJoin([
     completion.workKind ?? "unknown verdict",
     formatDuration(completion.elapsedMs) ?? "unknown duration",
-    completion.iteration === null || completion.iteration === undefined
-      ? null
-      : `iteration ${completion.iteration}`,
+    lineIf(completion.iteration, (turn) => `iteration ${turn}`),
     formatTimestamp(completion.completedAt),
   ]);
   const scope = dotJoin([
@@ -285,9 +313,7 @@ export function completionBody(completion: BeadCompletion, context: NoticeContex
 
   const reading = dotJoin([
     `bd show ${id}`,
-    completion.handoffKey === null || completion.handoffKey === undefined
-      ? null
-      : `bd recall ${completion.handoffKey}`,
+    lineIf(completion.handoffKey, (key) => `bd recall ${key}`),
   ]);
   if (reading !== "") lines.push(`read: ${reading}`);
   // The machine the work happened on, always: one phone is often wired to more
@@ -373,7 +399,11 @@ export function createNotifier(options: NotifierOptions): Notifier {
   const log = options.logger ?? (() => undefined);
   const publisher = options.publisher;
   let consecutiveFailures = 0;
-  let disabled: string | null = publisher.enabled ? null : "the publisher has no topic";
+  // The reason this notifier is silent, or nothing when it is not. `undefined`
+  // rather than `null`, for the reason spelled out on {@link BeadCompletion}:
+  // one concept, one spelling.
+  let disabled: string | undefined;
+  if (!publisher.enabled) disabled = "the publisher has no topic";
 
   return {
     // A getter, not a snapshot: after the guard trips, "is the notice on?" has
@@ -381,12 +411,12 @@ export function createNotifier(options: NotifierOptions): Notifier {
     // keep reporting `true` for the rest of a run in which nothing will ever be
     // sent again, which is the precise opposite of what the property is for.
     get enabled(): boolean {
-      return publisher.enabled && disabled === null;
+      return publisher.enabled && disabled === undefined;
     },
     destination: [publisher.destination],
     transport: publisher.transport,
     async notifyCompletion(completion: BeadCompletion): Promise<Delivery> {
-      if (disabled !== null) {
+      if (disabled !== undefined) {
         return { kind: "skipped", reason: disabled };
       }
       // The wording is built here; the hints are only carried. Nothing between

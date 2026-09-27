@@ -152,8 +152,11 @@ function fakeBoard(prefix = "fake"): FakeBoard {
       const issue: Issue = {
         id,
         title: spec.title,
-        description: spec.description,
-        acceptance_criteria: spec.acceptance,
+        // A spec with nothing in the field creates an issue with the field
+        // absent, which is how `bd` spells "no description". `undefined` is
+        // not a value a field of `Issue` can hold.
+        ...(spec.description === undefined ? {} : { description: spec.description }),
+        ...(spec.acceptance === undefined ? {} : { acceptance_criteria: spec.acceptance }),
         status: "open",
         priority: spec.priority ?? 2,
         issue_type: spec.type ?? "task",
@@ -756,7 +759,7 @@ test("a dependent asked for first drags its dependency in ahead of it", async ()
 
 test("a spec can be handed back to the ledger by identity, and only its own kind is", async () => {
   const items = [itemAt(0), itemAt(1, [0])];
-  const specs = toNewIssueSpecs(items, null);
+  const specs = toNewIssueSpecs(items, undefined);
   assert.equal(indexForSpec(specs[1]!), 1);
   assert.equal(indexForSpec({ title: "stranger" }), null);
 
@@ -783,7 +786,7 @@ test("toNewIssueSpec resolves #tokens to the ids the caller supplies", () => {
   assert.deepEqual(spec.deps, ["real-0", "real-2"]);
   assert.equal(spec.acceptance, "how item 1 is checked");
   assert.equal(spec.priority, 2);
-  assert.equal(toNewIssueSpec(itemAt(0), null, []).parent, undefined);
+  assert.equal(toNewIssueSpec(itemAt(0), undefined, []).parent, undefined);
 });
 
 // ── partial creation ─────────────────────────────────────────────────
@@ -957,7 +960,10 @@ test("toSplitEvent maps only a clean create onto split_created", () => {
   } as unknown as SplitOutcome;
   const failure = toSplitEvent(partial);
   assert.equal(failure.type, "split_failed");
-  assert.deepEqual((failure as { createdIds?: string[] }).createdIds, ["x-1"]);
+  assert.deepEqual(
+    (failure as { createdIds?: readonly string[] }).createdIds,
+    ["x-1"],
+  );
   assert.match((failure as { reason: string }).reason, /1 created, 1 failed/);
 
   const empty = { kind: "empty-input" } as unknown as SplitOutcome;

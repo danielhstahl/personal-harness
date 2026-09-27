@@ -223,6 +223,8 @@ export function isNtfyHintKey(key: string): boolean {
 /** One-value hint. A list where a single value was wanted is not guessed at. */
 function hintString(value: string | readonly string[] | undefined): string | undefined {
   if (typeof value !== "string") return undefined;
+  // A blank hint is no hint: `""` would reach the transport as a value that
+  // means nothing, and a transport that acts on it is worse than one that skips.
   return value.trim() === "" ? undefined : value;
 }
 

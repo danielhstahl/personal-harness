@@ -706,8 +706,12 @@ export type AgentSessionLike = Pick<
    * Only the two numbers the context check needs, not the SDK's whole model
    * type. Optional on purpose: a session that reports no model is a session this
    * check has no opinion about, and a fake that says nothing stays a valid port.
+   *
+   * `| undefined` mirrors pi, whose `model` is a getter typed
+   * `Model | undefined` ("not selected yet"). pi's declaration is not ours to
+   * tighten, so the port carries pi's own unset rather than inventing another.
    */
-  readonly model?: { readonly contextWindow: number; readonly maxTokens: number };
+  readonly model?: { readonly contextWindow: number; readonly maxTokens: number } | undefined;
 };
 
 export type RunnerSessionKind = "work" | "split";
@@ -726,8 +730,18 @@ export interface SessionSpec {
   /** True → no built-in tools at all, only {@link SessionSpec.customTools}. */
   readonly noBuiltinTools?: boolean;
   readonly systemPromptOverride?: string;
-  readonly thinkingLevel?: ThinkingLevel;
-  readonly modelRef?: { provider: string; id: string };
+  /**
+   * One way to be unset: absent, or handed over as `undefined`. Both mean "the
+   * caller named no level / no model, so resolve it" — which is exactly what
+   * {@link resolveThinkingLevelForRun} and {@link resolveModelForRun} below do
+   * with it. The runner builds a spec out of `AppConfig` fields that are
+   * themselves possibly unset, so refusing `undefined` here would not remove the
+   * question, it would only relocate it into a spread. What this type refuses is
+   * a *third* spelling: `null` is not how this loop says "unset", and with
+   * `exactOptionalPropertyTypes` on it cannot be made to.
+   */
+  readonly thinkingLevel?: ThinkingLevel | undefined;
+  readonly modelRef?: { provider: string; id: string } | undefined;
 }
 
 export type SessionFactory = (spec: SessionSpec) => Promise<AgentSessionLike>;
@@ -873,7 +887,12 @@ export const defaultSessionFactory: SessionFactory = async (spec) => {
   const options: CreateAgentSessionOptions = {
     cwd: spec.cwd,
     modelRuntime: runtime,
-    thinkingLevel,
+    // pi's own option is `thinkingLevel?: ThinkingLevel` with no `undefined`
+    // member, which under `exactOptionalPropertyTypes` means the only way to
+    // say "no level was chosen" is to leave the key out and let pi read it from
+    // settings. Spread-omission is the one spelling that keeps that meaning;
+    // `thinkingLevel: undefined` would be a different claim to pi.
+    ...(thinkingLevel === undefined ? {} : { thinkingLevel }),
     sessionManager: SessionManager.inMemory(spec.cwd),
     settingsManager,
     customTools: [...spec.customTools],
@@ -986,12 +1005,22 @@ export interface WorkContext {
 
 export interface WorkContextInput {
   readonly issue: Issue;
-  /** `recall(failureKeyFor(id))` — what went wrong last time, if anything. */
-  readonly priorFailure?: string | null;
+  /**
+   * `recall(failureKeyFor(id))` — what went wrong last time, if anything.
+   *
+   * `| undefined`, not `| null`, because the reader below cannot tell the two
+   * apart: `nonEmptyString(input.priorFailure)` treats absence and emptiness as
+   * one answer, "no prior attempt to report". Declaring the one concept is the
+   * point — a `null` here used to be a third way of saying it, alongside "absent"
+   * and "empty string", with every consumer left to re-decide. The bd boundary
+   * keeps its `null` (that is what `bd recall` reports); it is folded into
+   * absence once, in {@link safeRecall}, at the place that reads it.
+   */
+  readonly priorFailure?: string | undefined;
   /** `recall(handoffKeyFor(id))` — the previous finalize note, if any. */
-  readonly handoff?: string | null;
-  /** Repo state at iteration start, or `null` when not inside a git tree. */
-  readonly repo?: RepoSnapshot | null;
+  readonly handoff?: string | undefined;
+  /** Repo state at iteration start; absent when not inside a git tree. */
+  readonly repo?: RepoSnapshot | undefined;
   /** Extra `bd` memories the caller judged relevant. */
   readonly memories?: readonly { key: string; text: string }[];
   /** Per-field cap so one bloated description cannot crowd out the rest. */
@@ -1487,9 +1516,11 @@ export interface Capture<T> {
    * Installed by the runner before the prompt starts, called by a tool right
    * after it accepts. The runner ends the turn because the answer is already in
    * hand; every further model turn is a chance to reach for something that is
-   * not there.
+   * not there. `| undefined` because clearing it is part of the contract: the
+   * runner takes the handler back in the `finally`, and taking it back has to be
+   * expressible without deleting the property.
    */
-  onAccepted?: () => void;
+  onAccepted?: (() => void) | undefined;
 }
 
 /** A capture in its starting state: nothing accepted, nothing rejected. */
@@ -1726,9 +1757,9 @@ export interface AgentRunnerOptions {
   readonly sessionFactory?: SessionFactory;
   readonly repo?: RepoReaderLike;
   /** Wall-clock budget per run. Default 20 minutes — real work is slow. */
-  readonly timeoutMs?: number;
+  readonly timeoutMs?: number | undefined;
   /** How long to wait for the session to settle after abort(). Default 5s. */
-  readonly abortGraceMs?: number;
+  readonly abortGraceMs?: number | undefined;
   /**
    * When to ask the session to land, in ms from the start of the run.
    *
@@ -1736,19 +1767,25 @@ export interface AgentRunnerOptions {
    * off-ramp off, which leaves the hard abort as the only ending — the one that
    * reports nothing.
    */
-  readonly wrapUpMs?: number;
-  readonly cwd?: string;
+  readonly wrapUpMs?: number | undefined;
+  readonly cwd?: string | undefined;
   /**
    * Give the planning session `read` and `bash` so it can ground its tickets in
    * the repository instead of guessing at them from the wording of the request.
    * On unless set to `false`. The session gets no `edit`/`write`, and the loop
    * verifies the working tree is unchanged when the planning run ends.
    */
-  readonly splitRepoAccess?: boolean;
+  readonly splitRepoAccess?: boolean | undefined;
+  // The four fields below come straight out of `AppConfig`, where `readEnv`
+  // leaves them absent when the operator said nothing. `| undefined` is how that
+  // "nothing said" travels one more hop without being re-decided: the
+  // composition root hands over `config.wrapUpMs` as what it is, and the one
+  // reader here resolves it with `??`. Absent and `undefined` are one concept
+  // and are declared as one; `null` is not a way of being unset in this file.
   /** Explicit model; otherwise pi's configured default is used. Never env. */
-  readonly modelRef?: { provider: string; id: string };
-  readonly workThinkingLevel?: ThinkingLevel;
-  readonly splitThinkingLevel?: ThinkingLevel;
+  readonly modelRef?: { provider: string; id: string } | undefined;
+  readonly workThinkingLevel?: ThinkingLevel | undefined;
+  readonly splitThinkingLevel?: ThinkingLevel | undefined;
   /** Injectable clock, so elapsed time is testable. */
   readonly now?: () => number;
   readonly onEvent?: (event: RunnerEvent) => void;
@@ -1780,10 +1817,13 @@ interface LiveSession {
   disposed: boolean;
   disposeCount: number;
   /**
-   * The in-flight `prompt()` promise, or undefined once it has settled. Tracked so
-   * disposal can do the one thing `dispose()` alone cannot: stop a running turn.
+   * The in-flight `prompt()` promise, or undefined once it has settled. Tracked
+   * so disposal can do the one thing `dispose()` alone cannot: stop a running
+   * turn. `| undefined` because taking it back *is* the operation — the runner
+   * clears it in the `finally`, and clearing has to be expressible without
+   * deleting the property.
    */
-  running?: Promise<unknown>;
+  running?: Promise<unknown> | undefined;
 }
 
 const DEFAULT_TIMEOUT_MS = 20 * 60_000;
@@ -1830,10 +1870,14 @@ function delay(ms: number): Promise<void> {
 
 export function createAgentRunner(options: AgentRunnerOptions): AgentRunner {
   const sessionFactory = options.sessionFactory ?? defaultSessionFactory;
-  const repo = options.repo ?? createRepoReader({ cwd: options.cwd });
+  // Resolved here, once, so the reader is handed a directory rather than a
+  // "maybe, you default it" — the reader and the runner cannot then disagree
+  // about which tree a run is in, and no `undefined` has to be laundered to get
+  // from one to the other.
+  const cwd = options.cwd ?? process.cwd();
+  const repo = options.repo ?? createRepoReader({ cwd });
   const budgetMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const graceMs = options.abortGraceMs ?? DEFAULT_GRACE_MS;
-  const cwd = options.cwd ?? process.cwd();
   const now = options.now ?? ((): number => Date.now());
   const emit = options.onEvent ?? ((): void => {});
   const includeRepo = options.includeRepoSnapshot ?? true;
@@ -2124,26 +2168,31 @@ async function openAndRun<T>(
   }
 
   async function readContextFor(issue: Issue): Promise<{
-    priorFailure: string | null;
-    handoff: string | null;
+    priorFailure?: string | undefined;
+    handoff?: string | undefined;
     memories: { key: string; text: string }[];
     notes: string[];
-    repoSnapshot: RepoSnapshot | null;
+    repoSnapshot?: RepoSnapshot | undefined;
   }> {
     const notes: string[] = [];
     const memories: { key: string; text: string }[] = [];
 
-    async function safeRecall(key: string, label: string): Promise<string | null> {
+    /**
+     * bd's `recall` reports "no such memory" as `null` at the boundary. This
+     * loop's word for that is absence, so the fold happens here, once, where the
+     * boundary is read — not re-decided by every consumer of the context.
+     */
+    async function safeRecall(key: string, label: string): Promise<string | undefined> {
       try {
-        return await options.beads.recall(key);
+        return (await options.beads.recall(key)) ?? undefined;
       } catch (error) {
         // "No such memory" is a normal answer — a first attempt has none. Only a
         // real fault is worth a context note.
-        if (BdError.is(error) && error.kind === "not-found") return null;
+        if (BdError.is(error) && error.kind === "not-found") return undefined;
         const message = error instanceof Error ? error.message : String(error);
         notes.push(`${label} recall failed (${key}): ${message}`);
         emit({ type: "context_note", detail: `${label} recall failed for ${key}` });
-        return null;
+        return undefined;
       }
     }
 
@@ -2155,14 +2204,18 @@ async function openAndRun<T>(
 
     (options.extraMemoryKeys ?? []).forEach((key, index) => {
       const text = extras[index];
-      if (text !== null && text !== undefined) memories.push({ key, text });
+      if (text !== undefined) memories.push({ key, text });
     });
 
-    let repoSnapshot: RepoSnapshot | null = null;
+    let repoSnapshot: RepoSnapshot | undefined;
     if (includeRepo) {
       try {
-        repoSnapshot = await repo.describe();
-        if (repoSnapshot === null) {
+        const described = await repo.describe();
+        // git reports "not a working tree" as `null` at the boundary; this loop
+        // spells that absence, same as the recall above, so the context has one
+        // way to say "no repo section".
+        repoSnapshot = described ?? undefined;
+        if (described === null) {
           notes.push("not inside a git working tree: no repo snapshot in context");
         }
       } catch (error) {

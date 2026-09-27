@@ -140,6 +140,8 @@ function leafOf(path: unknown): string | undefined {
   const bare = path.trim().replace(/^\/+/u, "").replace(/\/+$/u, "");
   if (bare === "") return undefined;
   const leaf = bare.split("/").pop() ?? "";
+  // A trailing-only path (`/a/`) has no leaf to name; "" would hand back a path
+  // that points at nothing, which is worse than saying there is none.
   return leaf === "" ? undefined : leaf;
 }
 
@@ -178,6 +180,8 @@ export function refineUrls(urls: MonitorUrls, health: JsonRecord | undefined): M
   const next: { health?: string; metrics?: string; cache?: string; models?: string } = { ...urls };
   const byLeaf = (value: unknown): string | undefined => {
     const leaf = leafOf(value);
+    // No leaf means no URL: `${apiBase}/` would be a guessed path, and a guessed
+    // path is what makes an absent endpoint look like a broken one.
     return leaf === undefined ? undefined : `${apiBase}/${leaf}`;
   };
   const metrics = byLeaf(health.metrics ?? health.metrics_url ?? health.counters);
@@ -235,7 +239,7 @@ export interface BodySample {
    * rather than out of a reconstruction, so a path the flattener never looked at
    * is still visible to the code that needs it.
    */
-  readonly raw?: JsonRecord;
+  readonly raw?: JsonRecord | undefined;
 }
 
 export interface MetricSample {
@@ -339,6 +343,8 @@ export function parsePrometheus(
     series.push({ name, labels, value });
     numbers.set(name, (numbers.get(name) ?? 0) + value);
   }
+  // No samples means this was not metrics text; `undefined` is what tells the
+  // caller "nothing here to read" rather than "a server reporting zeroes".
   return series.length === 0 ? undefined : { numbers, series };
 }
 
@@ -379,12 +385,12 @@ export function parseBody(text: string): BodySample | undefined {
  */
 export interface EndpointState {
   readonly name: EndpointName;
-  readonly url?: string;
+  readonly url?: string | undefined;
   /** `absent` = answered 404/405 once and is never asked again. */
   readonly state: "unknown" | "live" | "absent" | "error";
-  readonly at?: number;
-  readonly latencyMs?: number;
-  readonly error?: string;
+  readonly at?: number | undefined;
+  readonly latencyMs?: number | undefined;
+  readonly error?: string | undefined;
   readonly failures: number;
   readonly body: BodySample;
   /**
@@ -844,11 +850,11 @@ class Reader {
 
 /** One KV cache pool — only shown separately when a server has more than one. */
 export interface KvPool {
-  readonly name?: string;
-  readonly capacity?: number;
-  readonly used?: number;
-  readonly slots?: number;
-  readonly slotsUsed?: number;
+  readonly name?: string | undefined;
+  readonly capacity?: number | undefined;
+  readonly used?: number | undefined;
+  readonly slots?: number | undefined;
+  readonly slotsUsed?: number | undefined;
 }
 
 /** Everything the panel can say, and the honesty fields that make it credible. */
@@ -860,38 +866,38 @@ export interface BackendSnapshot {
   /** At least one endpoint has answered since the monitor started. */
   readonly anyLive: boolean;
   /** The first error worth quoting, when nothing is answering. */
-  readonly error?: string;
+  readonly error?: string | undefined;
 
-  readonly model?: string;
-  readonly context?: number;
-  readonly slotCtx?: number;
-  readonly slots?: number;
-  readonly slotsUsed?: number;
-  readonly queued?: number;
-  readonly kvCapacity?: number;
-  readonly kvUsed?: number;
+  readonly model?: string | undefined;
+  readonly context?: number | undefined;
+  readonly slotCtx?: number | undefined;
+  readonly slots?: number | undefined;
+  readonly slotsUsed?: number | undefined;
+  readonly queued?: number | undefined;
+  readonly kvCapacity?: number | undefined;
+  readonly kvUsed?: number | undefined;
   /** 0..1 (values reported as percent are normalised). */
-  readonly kvUsage?: number;
-  readonly pools?: readonly KvPool[];
-  readonly maxTokens?: number;
-  readonly maxTokensDefault?: number;
-  readonly drafter?: string;
-  readonly drafters?: readonly string[];
+  readonly kvUsage?: number | undefined;
+  readonly pools?: readonly KvPool[] | undefined;
+  readonly maxTokens?: number | undefined;
+  readonly maxTokensDefault?: number | undefined;
+  readonly drafter?: string | undefined;
+  readonly drafters?: readonly string[] | undefined;
   /** Decoded tokens/second — the server's own if it reports one, else our slope. */
-  readonly tokensPerSecond?: number;
-  readonly requestsPerSecond?: number;
-  readonly requestsServed?: number;
+  readonly tokensPerSecond?: number | undefined;
+  readonly requestsPerSecond?: number | undefined;
+  readonly requestsServed?: number | undefined;
   /** Prompt-cache hit rate over the last interval, 0..1. */
-  readonly cacheHitRate?: number;
-  readonly cacheEnabled?: boolean;
-  readonly cacheCapMb?: number;
-  readonly busy?: boolean;
-  readonly busyForMs?: number;
-  readonly apiVersion?: string;
-  readonly engineVersion?: string;
-  readonly versionsMatch?: boolean;
+  readonly cacheHitRate?: number | undefined;
+  readonly cacheEnabled?: boolean | undefined;
+  readonly cacheCapMb?: number | undefined;
+  readonly busy?: boolean | undefined;
+  readonly busyForMs?: number | undefined;
+  readonly apiVersion?: string | undefined;
+  readonly engineVersion?: string | undefined;
+  readonly versionsMatch?: boolean | undefined;
   /** Round trip of the slowest source in the most recent completed poll. */
-  readonly latencyMs?: number;
+  readonly latencyMs?: number | undefined;
   readonly endpoints: readonly EndpointState[];
 }
 
@@ -904,7 +910,7 @@ export type RateMemo = Readonly<Record<string, Hit & { readonly at: number }>>;
 export interface SummariseInput {
   readonly endpoints: readonly EndpointState[];
   readonly now: number;
-  readonly previous?: RateMemo;
+  readonly previous?: RateMemo | undefined;
 }
 
 export interface SummariseResult {
@@ -1064,6 +1070,8 @@ export function summarise(input: SummariseInput): SummariseResult {
     apiVersion: versions.api,
     engineVersion: versions.engine,
     versionsMatch: versions.match,
+    // A poll that never completed has no round trip to report; 0 would read as
+    // "instantly", which is the opposite of what happened.
     latencyMs: latencies.length === 0 ? undefined : Math.max(...latencies),
     endpoints: input.endpoints,
   };
@@ -1072,6 +1080,8 @@ export function summarise(input: SummariseInput): SummariseResult {
 }
 
 function readSeconds(hit: Hit | undefined): number | undefined {
+  // Nothing reported is not zero reported: `0 * 1000` would put a made-up number
+  // on a panel whose whole job is to be truthful about the server.
   return hit === undefined ? undefined : hit.value * 1_000;
 }
 
@@ -1095,7 +1105,7 @@ function readDrafters(sources: OrderedSources): readonly string[] | undefined {
 
 function readVersions(
   sources: OrderedSources,
-): { api?: string; engine?: string; match?: boolean } {
+): { api?: string | undefined; engine?: string | undefined; match?: boolean | undefined } {
   const reader = new Reader(sources);
   return {
     api: reader.string(["version.api", "api_version", "api.version"]),
@@ -1178,6 +1188,8 @@ function pickNumber(entry: JsonRecord, keys: readonly string[]): number | undefi
 function sumDefined(values: readonly (number | undefined)[] | undefined): number | undefined {
   if (values === undefined) return undefined;
   const present = values.filter((value): value is number => value !== undefined);
+  // An empty set has no sum, and printing `0` for one would be a claim about a
+  // server that never made it.
   return present.length === 0 ? undefined : present.reduce((total, value) => total + value, 0);
 }
 
@@ -1570,8 +1582,12 @@ export interface BackendMonitorOptions {
   readonly now?: () => number;
   /** Timer injection; returns the cancel function. */
   readonly schedule?: (run: () => void, ms: number) => () => void;
-  /** `null` renders without colour, which is what the plain path wants. */
-  readonly theme?: MonitorTheme | null;
+  /**
+   * Colour. Left out means {@link PLAIN_MONITOR_THEME}: the panel never picks
+   * a colour by ambient means. The `| null` this used to allow was a second
+   * spelling of "no colour" next to a plain theme that already spells it.
+   */
+  readonly theme?: MonitorTheme | undefined;
   readonly maxLines?: number;
   readonly staleAfterMs?: number;
   /** Report what each endpoint exposed, once, so an unknown server is teachable. */

@@ -59,12 +59,12 @@ export interface AuditFinding {
 
 /** Which thinking levels are in play for the passes this loop is about to run. */
 export interface AuditLevels {
-  readonly work?: string;
-  readonly split?: string;
+  readonly work?: string | undefined;
+  readonly split?: string | undefined;
   /** The level saved in the user's pi settings. */
-  readonly savedDefault?: string;
+  readonly savedDefault?: string | undefined;
   /** The level the *server* applies when the request sends none. */
-  readonly serverDefault?: string;
+  readonly serverDefault?: string | undefined;
 }
 
 /**
@@ -538,6 +538,17 @@ const ruleEndpointRoutes: Rule = ({ health, view }) => {
 };
 
 /**
+ * One `name=value` fact for the rule's message.
+ *
+ * A number the health body never carried produces no fact at all: `context=0`
+ * would be a claim about the server, and this rule exists to compare claims.
+ * The one "no value, no text" branch in this rule lives here so the three call
+ * sites below say the fact instead of the absence handling.
+ */
+const limitFact = (name: string, value: number | undefined): string | undefined =>
+  value === undefined ? undefined : `${name}=${value}`;
+
+/**
  * The context window: the claim that decides where the loop stops.
  *
  * Too big and a full request is refused; too small and the run stops early
@@ -553,9 +564,9 @@ const ruleContextWindow: Rule = ({ health, view }) => {
   const pool = numberAt(health, ["kv_pool_positions"]);
   const limits = [named, slot, pool].filter((n): n is number => n !== undefined && n > 0);
   const facts = [
-    named === undefined ? undefined : `context=${named}`,
-    slot === undefined ? undefined : `slot_ctx=${slot}`,
-    pool === undefined ? undefined : `kv_pool_positions=${pool}`,
+    limitFact("context", named),
+    limitFact("slot_ctx", slot),
+    limitFact("kv_pool_positions", pool),
   ].filter((part): part is string => part !== undefined);
 
   if (limits.length === 0) {
@@ -1742,6 +1753,8 @@ export function applySuggestions(
     const key = `${suggestion.scope}:${suggestion.field}`;
     if (applied.has(key)) continue;
     applied.add(key);
+    // A `remove` suggestion is a deletion: handing `setAtPath` an undefined
+    // value is how this patcher spells "take the key out".
     setAtPath(cloned, rawPathFor(target, suggestion), suggestion.remove ? undefined : suggestion.value);
   }
   return cloned;
@@ -1815,7 +1828,7 @@ export function renderFinding(item: AuditFinding, target: ConfigTarget): string 
 /** The findings worth a human's attention, newest problems first. */
 export function notableFindings(
   report: AuditReport,
-  options: { readonly showOk?: boolean } = {},
+  options: { readonly showOk?: boolean | undefined } = {},
 ): AuditFinding[] {
   const rank: Readonly<Record<AuditSeverity, number>> = { error: 0, warn: 1, info: 2, ok: 3 };
   return report.findings
@@ -1843,7 +1856,7 @@ export function auditHeader(report: AuditReport, probeMs?: number): string {
 /** The whole report as plain lines: header, findings, tally. */
 export function renderAudit(
   report: AuditReport,
-  options: { readonly showOk?: boolean; readonly probeMs?: number } = {},
+  options: { readonly showOk?: boolean | undefined; readonly probeMs?: number | undefined } = {},
 ): string[] {
   const lines = [auditHeader(report, options.probeMs)];
   for (const item of notableFindings(report, { showOk: options.showOk })) {

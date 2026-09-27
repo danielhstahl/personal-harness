@@ -45,7 +45,7 @@ export interface StartupAuditOptions {
   /** Explicit `--provider/--model`. Wins over anything on disk. */
   readonly modelRef?: { provider: string; id: string };
   /** The user's saved default. Defaults to reading pi's settings. */
-  readonly defaultRef?: () => { provider?: string; id?: string } | undefined;
+  readonly defaultRef?: () => { provider?: string | undefined; id?: string | undefined } | undefined;
   readonly agentDir?: string;
   /** Defaults to `<agentDir>/models.json`. */
   readonly modelsPath?: string;
@@ -84,7 +84,10 @@ export interface StartupAuditResult {
 }
 
 /** The default model/provider this pi would pick, read the way a session reads it. */
-export function readDefaultModelRef(cwd: string, agentDir: string): { provider?: string; id: string } | undefined {
+export function readDefaultModelRef(
+  cwd: string,
+  agentDir: string,
+): { provider?: string | undefined; id: string } | undefined {
   try {
     const settings = SettingsManager.create(cwd, agentDir);
     const id = settings.getDefaultModel();
@@ -108,7 +111,7 @@ export function resolveTarget(
   raw: unknown,
   options: {
     readonly explicit?: { provider: string; id: string };
-    readonly fallback?: { provider?: string; id?: string };
+    readonly fallback?: { provider?: string | undefined; id?: string | undefined };
   } = {},
 ): ResolvedTarget {
   const providers = rawRaw(raw);
@@ -368,7 +371,7 @@ export function resolveProviderBaseUrl(
     readonly modelRef?: { provider: string; id: string };
     readonly agentDir?: string;
     readonly modelsPath?: string;
-    readonly defaultRef?: () => { provider?: string; id: string } | undefined;
+    readonly defaultRef?: () => { provider?: string | undefined; id: string } | undefined;
     readonly readFile?: (path: string) => string;
     readonly fileExists?: (path: string) => boolean;
   },

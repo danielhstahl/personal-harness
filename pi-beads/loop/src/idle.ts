@@ -93,8 +93,8 @@ export interface IdleStatus {
    * like a bug when the board clearly has something on it.
    */
   readonly heldOut?: number;
-  readonly model?: { readonly provider: string; readonly id: string };
-  readonly thinkingLevel?: string;
+  readonly model?: { readonly provider: string; readonly id: string } | undefined;
+  readonly thinkingLevel?: string | undefined;
 }
 
 /** The two colours the idle surface needs, supplied by pi's live theme. */
@@ -122,7 +122,7 @@ export interface IdleModeOptions {
   /** Double-press window in ms. Defaults to 500 — pi.dev's own value. */
   readonly doublePressWindowMs?: number;
   /** Theme name. Omitted means pi's configured default (see ADR-001). */
-  readonly themeName?: string;
+  readonly themeName?: string | undefined;
   /** Working directory used for path autocomplete. Defaults to the status cwd or `process.cwd()`. */
   readonly cwd?: string;
   /** Keybinding registry. Defaults to pi's bindings plus the idle app actions. */
@@ -147,8 +147,12 @@ export interface IdleModeOptions {
    * Read-only in the same sense as the status line: the monitor's own poll timer
    * drives it, no key here reads or writes anything, and the idle surface still
    * makes no model call (rule 1 is unchanged).
+   *
+   * `| undefined`, not `| null`: "this surface has no monitor" is one concept
+   * and gets one spelling. The `| null` this field used to carry made the check
+   * read it twice (`!== null && !== undefined`) to ask one question.
    */
-  readonly monitor?: MonitorSource | null;
+  readonly monitor?: MonitorSource | undefined;
   /** Rows the monitor may take at the top. Default 2. */
   readonly monitorLines?: number;
   /**
@@ -163,8 +167,11 @@ export interface IdleModeOptions {
    * Same read-only contract as everywhere else: the board's own poll timer
    * drives the repaint, nothing keyed here reads or writes a ticket, and the
    * idle surface still makes no model call.
+   *
+   * `| undefined` for the same reason as {@link IdleModeOptions.monitor}: one
+   * way to have no board.
    */
-  readonly kanban?: KanbanSource | null;
+  readonly kanban?: KanbanSource | undefined;
   /** `row` or `board`. Default `"board"` — idle has the room. */
   readonly kanbanMode?: KanbanMode;
   /** Rows the board may take, borders included. Default 5. */
@@ -255,6 +262,8 @@ export function parseSlashCommandName(text: string): string | undefined {
   const trimmed = text.trim();
   if (!trimmed.startsWith("/")) return undefined;
   const name = trimmed.slice(1).split(/\s+/u)[0]?.toLowerCase();
+  // `/` on its own carries no command name, and "" is not one: the caller
+  // distinguishes "not a command" from "a command with no word after the /".
   return name === undefined || name.length === 0 ? undefined : name;
 }
 
@@ -655,8 +664,13 @@ export function createIdleMode(options: IdleModeOptions = {}): IdleHandle {
     // No further submits, no further renders.
     if (editor !== undefined) {
       editor.disableSubmit = true;
-      editor.onSubmit = undefined;
-      editor.onChange = undefined;
+      // pi's `Editor` declares `onSubmit`/`onChange` as required members, so
+      // "nothing is listening any more" cannot be spelled by assigning
+      // `undefined` to them. An inert handler is the same statement in the
+      // language pi actually speaks: the editor still calls something, and that
+      // something is nothing.
+      editor.onSubmit = (): void => undefined;
+      editor.onChange = (): void => undefined;
     }
     for (const unsubscribe of signalUnsubs) {
       try {
@@ -719,7 +733,7 @@ export function createIdleMode(options: IdleModeOptions = {}): IdleHandle {
     // The monitor is the first child, so it is the first line of the screen: a
     // head-up display above the prompt, in the one place on this surface that is
     // never covered and never scrolled away. It takes no input and holds no focus.
-    if (options.monitor !== null && options.monitor !== undefined) {
+    if (options.monitor !== undefined) {
       const monitorComponent = new MonitorComponent(
         options.monitor,
         Math.max(1, options.monitorLines ?? 2),
@@ -731,7 +745,7 @@ export function createIdleMode(options: IdleModeOptions = {}): IdleHandle {
       // more than it can delay the beads read behind the status line.
       monitorUnsub = options.monitor.subscribe(() => paint());
     }
-    if (options.kanban !== null && options.kanban !== undefined) {
+    if (options.kanban !== undefined) {
       const kanbanComponent = new KanbanComponent(
         options.kanban,
         Math.max(2, options.kanbanLines ?? 5),

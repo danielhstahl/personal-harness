@@ -122,19 +122,19 @@ export interface KanbanView {
  * the pixels.
  */
 export interface KanbanRead {
-  readonly ready?: readonly Issue[];
-  readonly inProgress?: readonly Issue[];
-  readonly closed?: readonly Issue[];
+  readonly ready?: readonly Issue[] | undefined;
+  readonly inProgress?: readonly Issue[] | undefined;
+  readonly closed?: readonly Issue[] | undefined;
   /** Columns whose read failed. They render `?`, never `0`. */
-  readonly failed?: readonly KanbanColumnKey[];
+  readonly failed?: readonly KanbanColumnKey[] | undefined;
   /** The failure text, when there is one. Shown by `describe()`, not the board. */
-  readonly error?: string;
+  readonly error?: string | undefined;
   /**
    * The limit `closed` was read with, so a full window can be reported as a
    * floor rather than a count. Omit it and the closed count is taken at face
    * value — which is only honest when the read was unbounded.
    */
-  readonly closedWindow?: number;
+  readonly closedWindow?: number | undefined;
 }
 
 export interface KanbanViewOptions {
@@ -395,8 +395,9 @@ export interface KanbanRenderOptions {
   readonly indent?: string;
   /** Default `"board"`, falling back to `"row"` when the columns will not fit. */
   readonly mode?: KanbanMode;
-  /** Colour. `null` means none, which is what the plain path wants. */
-  readonly theme?: MonitorTheme | null;
+  // No `theme` here on purpose: the board's colour is the second argument of
+  // {@link renderKanban}, not an option on this bag. A field for it here would
+  // have been a second, ignorable way to say what the argument already says.
   /** Highlight this ticket, overriding whatever the read thought was ours. */
   readonly currentId?: string;
 }
@@ -725,8 +726,13 @@ export interface KanbanSourceOptions {
   readonly intervalMs?: number;
   readonly now?: () => number;
   readonly schedule?: (run: () => void, ms: number) => () => void;
-  /** `null` renders without colour — what the plain path wants. */
-  readonly theme?: MonitorTheme | null;
+  /**
+   * Colour. Left out — or `undefined` — means the plain theme, which is what
+   * the escape-free path wants; the board is never coloured by an ambient
+   * global. The `| null` this field used to allow was a second way of saying
+   * "no colour" next to a `PLAIN_MONITOR_THEME` that already says it.
+   */
+  readonly theme?: MonitorTheme | undefined;
   readonly maxLines?: number;
   readonly mode?: KanbanMode;
   readonly doneLimit?: number;

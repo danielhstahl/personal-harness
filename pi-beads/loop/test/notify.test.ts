@@ -165,19 +165,16 @@ test("a long commit hash is shortened rather than wrapped across the notice", ()
 });
 
 test("fields the run could not know say so instead of disappearing", () => {
+  // Every unknown here is *left out*, which is the one way `BeadCompletion`
+  // says "the run did not know this". It used to also accept `null` for the
+  // same fact, and the body builder had to handle both spellings per field.
   const body = completionBody(
     {
       issueId: "tst.7",
       title: "",
       summary: "",
-      commit: null,
       changedFiles: [],
       nextSteps: [],
-      handoffKey: null,
-      iteration: null,
-      workKind: null,
-      elapsedMs: null,
-      completedAt: null,
     },
     { cwd: "/srv/app" },
   );
@@ -229,13 +226,13 @@ test("formatDuration reads like a human's estimate, not a millisecond count", ()
   assert.equal(formatDuration(812), "812ms");
   assert.equal(formatDuration(3_110_000), "51m 50s");
   assert.equal(formatDuration(3_720_000), "1h 02m");
-  assert.equal(formatDuration(null), null);
-  assert.equal(formatDuration(-5), null);
+  assert.equal(formatDuration(undefined), undefined, "no duration is no text, not `0s`");
+  assert.equal(formatDuration(-5), undefined);
 });
 
 test("formatTimestamp is short enough for a notice line and still unambiguous", () => {
   assert.equal(formatTimestamp(Date.UTC(2025, 8, 26, 11, 3, 7)), "2025-09-26 11:03 UTC");
-  assert.equal(formatTimestamp(null), "unknown");
+  assert.equal(formatTimestamp(undefined), "unknown");
 });
 
 test("oneLine flattens a paragraph into a title-sized line", () => {

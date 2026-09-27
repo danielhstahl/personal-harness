@@ -143,8 +143,8 @@ export class RenderError extends Error {
 
 /** Everything the footer knows. Every field is optional; none renders `undefined`. */
 export interface FooterFields {
-  readonly issueId?: string;
-  readonly phase?: string;
+  readonly issueId?: string | undefined;
+  readonly phase?: string | undefined;
   /**
    * Which run of the surface this is. A new `runId` is a new work unit even when
    * the issue is the same one — the shape a re-queued ticket always takes.
@@ -154,16 +154,16 @@ export interface FooterFields {
    * budget shown as `40:01`, which reads like the budget doubled rather than the
    * ticket failing twice.
    */
-  readonly runId?: number;
-  readonly elapsedMs?: number;
-  readonly tokensIn?: number;
-  readonly tokensOut?: number;
-  readonly model?: string;
-  readonly thinkingLevel?: string;
+  readonly runId?: number | undefined;
+  readonly elapsedMs?: number | undefined;
+  readonly tokensIn?: number | undefined;
+  readonly tokensOut?: number | undefined;
+  readonly model?: string | undefined;
+  readonly thinkingLevel?: string | undefined;
 }
 
 export interface FooterSegment {
-  readonly label?: string;
+  readonly label?: string | undefined;
   readonly text: string;
   readonly role: PresenterRole;
 }
@@ -350,12 +350,18 @@ interface ToolViewOptions {
   readonly maxExpandedChars: number;
   readonly legend: string;
   /**
-   * Where the pending-call animation comes from. `null` (or no source at all)
-   * means there is no motion to show: the surface is not ours, the output is
-   * plain, the presenter has no clock, or the call has settled. The block never
-   * reads a clock itself — it is told what frame it is in.
+   * Where the pending-call animation comes from.
+   *
+   * No source at all, a source that answers `undefined`, and a settled call all
+   * mean the same thing — there is no motion to show: the surface is not ours,
+   * the output is plain, the presenter has no clock, or the call has ended. The
+   * block never reads a clock itself; it is told what frame it is in.
+   *
+   * `| undefined` rather than the `| null` this used to carry: the "no pulse"
+   * answer was being spelled two ways on the way here (`null` from the source,
+   * `undefined` from an absent source) and the reader had to know both.
    */
-  readonly pulse?: () => ToolPulse | null;
+  readonly pulse?: (() => ToolPulse | undefined) | undefined;
 }
 
 /**
@@ -492,12 +498,12 @@ class ToolBlock implements Component {
     if (this.status === "error") return "✗";
     if (this.status === "ok") return "✓";
     const pulse = this.pulseNow();
-    return pulse === null ? PENDING_GLYPH : spinnerFrame(pulse.tick);
+    return pulse === undefined ? PENDING_GLYPH : spinnerFrame(pulse.tick);
   }
 
-  private pulseNow(): ToolPulse | null {
-    if (this.status !== "pending") return null;
-    return this.view.pulse?.() ?? null;
+  private pulseNow(): ToolPulse | undefined {
+    if (this.status !== "pending") return undefined;
+    return this.view.pulse?.();
   }
 
   /**
@@ -507,7 +513,7 @@ class ToolBlock implements Component {
    */
   pendingTimePlain(): string {
     const pulse = this.pulseNow();
-    if (pulse === null || pulse.elapsedMs < 1_000) return "";
+    if (pulse === undefined || pulse.elapsedMs < 1_000) return "";
     return ` · ${formatElapsed(pulse.elapsedMs)}`;
   }
 
@@ -652,14 +658,14 @@ export interface WorkPresenterOptions {
   readonly tty?: boolean;
   readonly now?: () => number;
   /** Timer injection for the coalescing window; returns a cancel function. */
-  readonly schedule?: (run: () => void, ms: number) => () => void;
+  readonly schedule?: ((run: () => void, ms: number) => () => void) | undefined;
   /**
    * Frame coalescing window in ms — this is the refresh-rate knob. Default 33:
    * a *burst* of deltas costs one frame, so a stream paints at ~30fps however
    * fast the tokens arrive. 16 gives ~60fps; below that the terminal is being
    * written more often than it paints, and nothing looks smoother.
    */
-  readonly coalesceMs?: number;
+  readonly coalesceMs?: number | undefined;
   /**
    * Repaint cadence while the live surface is held, in ms. Default 500. Without
    * one, a frame only appears when an event arrives — so the footer's elapsed
@@ -667,7 +673,7 @@ export interface WorkPresenterOptions {
    * not a paint: it goes through the coalescing path and repaints only when
    * time-derived content has actually changed. 0 disables the heartbeat.
    */
-  readonly heartbeatMs?: number;
+  readonly heartbeatMs?: number | undefined;
   /**
    * Frame cadence while a call is outstanding, in ms. Default 120.
    *
@@ -678,20 +684,20 @@ export interface WorkPresenterOptions {
    * at this rate instead of its own, and drops back the moment it is not.
    * 0 turns the animation off and leaves the plain `…` pending glyph.
    */
-  readonly spinnerMs?: number;
-  readonly theme?: PresenterTheme;
-  readonly themeName?: string;
-  readonly keybindings?: KeybindingsManager;
+  readonly spinnerMs?: number | undefined;
+  readonly theme?: PresenterTheme | undefined;
+  readonly themeName?: string | undefined;
+  readonly keybindings?: KeybindingsManager | undefined;
   /** Key(s) that expand tool output. Default: pi's `app.tools.expand` binding. */
-  readonly expandKey?: string | readonly string[];
+  readonly expandKey?: string | readonly string[] | undefined;
   /** Result lines shown before the expand hint. Default 2. */
-  readonly collapsedPreviewLines?: number;
+  readonly collapsedPreviewLines?: number | undefined;
   /** Hard cap on rendered result characters, expanded included. Default 4000. */
-  readonly maxExpandedChars?: number;
+  readonly maxExpandedChars?: number | undefined;
   /** Width the plain path uses when there is no terminal to measure. */
-  readonly plainWidth?: number;
+  readonly plainWidth?: number | undefined;
   /** Put the key legend in the footer. Default true (dropped if no key is known). */
-  readonly legend?: boolean;
+  readonly legend?: boolean | undefined;
   /**
    * The strips plugged into the fixed chrome — see `src/panel.ts`.
    *
@@ -704,12 +710,16 @@ export interface WorkPresenterOptions {
    * "monitor outermost, board nearer the text" without the presenter holding
    * that fact.
    *
-   * Absent, `null` or `[]` means no chrome at all: the surface is exactly what
+   * Absent or `[]` means no chrome at all: the surface is exactly what
    * it was before the option existed. A strip that is switched off arrives as a
    * panel that draws nothing (`createNullPanel()`), so nothing here has to ask
    * whether a HUD exists — only what it drew.
+   *
+   * The `| null` this used to allow was a third spelling of "no chrome" next to
+   * "absent" and "empty array"; nothing ever passed it, and the presenter now
+   * reads one question (`?? []`) instead of three.
    */
-  readonly panels?: readonly Panel[] | null;
+  readonly panels?: readonly Panel[] | undefined;
 }
 
 export interface PresenterStats {
@@ -826,21 +836,21 @@ function stopReasonOf(message: unknown): string | null {
 /** The least the presenter needs to describe a finished work unit honestly. */
 export interface OutcomeFacts {
   readonly kind: string;
-  readonly issueId?: string;
+  readonly issueId?: string | undefined;
   /** Failure text, where the kind carries one. */
-  readonly message?: string;
+  readonly message?: string | undefined;
   /** Timeout budget, in ms. */
-  readonly budgetMs?: number;
+  readonly budgetMs?: number | undefined;
   /** How long the run had actually been going, in ms. Not the budget. */
-  readonly elapsedMs?: number;
+  readonly elapsedMs?: number | undefined;
   /** Did the session settle after `abort()`? */
-  readonly settledAfterAbort?: boolean;
+  readonly settledAfterAbort?: boolean | undefined;
   /** Assistant turns taken, for the kinds that stop early. */
-  readonly turns?: number;
+  readonly turns?: number | undefined;
   /** Where the context stood when the run was stopped, pre-formatted. */
-  readonly contextText?: string;
+  readonly contextText?: string | undefined;
   /** Extra context on what the run left behind (files, commits, verdicts). */
-  readonly leftBehind?: string;
+  readonly leftBehind?: string | undefined;
 }
 
 /**
@@ -1490,7 +1500,7 @@ class Presenter implements WorkPresenter {
     }
     const view: ToolViewOptions = {
       ...this.viewOptions,
-      pulse: (): ToolPulse | null => this.pulseFor(callId),
+      pulse: (): ToolPulse | undefined => this.pulseFor(callId),
     };
     const block = new ToolBlock(callId, name, args, this.theme, view, this.expandedAll);
     this.tools.set(callId, block);
@@ -1582,14 +1592,15 @@ class Presenter implements WorkPresenter {
   }
 
   /**
-   * The pulse a pending tool block is shown. Null whenever there is no motion to
-   * show: not live, no clock running, the call already settled. Computed at render
-   * time rather than pushed, so a frame always reflects the instant it was drawn.
+   * The pulse a pending tool block is shown. Nothing at all whenever there is no
+   * motion to show: not live, no clock running, the call already settled.
+   * Computed at render time rather than pushed, so a frame always reflects the
+   * instant it was drawn.
    */
-  private pulseFor(callId: string): ToolPulse | null {
-    if (!this.animatingNow()) return null;
+  private pulseFor(callId: string): ToolPulse | undefined {
+    if (!this.animatingNow()) return undefined;
     const openedAt = this.toolOpenedAt.get(callId);
-    if (openedAt === undefined) return null;
+    if (openedAt === undefined) return undefined;
     return { tick: this.spinnerTick, elapsedMs: Math.max(0, this.now() - openedAt) };
   }
 

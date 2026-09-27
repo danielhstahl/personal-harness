@@ -343,7 +343,7 @@ function issueFixture(overrides: Partial<Issue> = {}): Issue {
         title: "Toolchain is ready",
         dependency_type: "blocks",
       },
-    ] as unknown as Issue["dependencies"],
+    ],
     ...overrides,
   };
 }
@@ -1170,7 +1170,17 @@ test("a prior failure and a handoff both land in one prior_attempt section", () 
 });
 
 test("the prompt never renders the word undefined or null", () => {
-  const sparse = buildWorkContext({ issue: issueFixture({ description: undefined, acceptance_criteria: undefined, dependencies: undefined }) });
+  // Built without the optional keys rather than with them set to `undefined`:
+  // that is how `bd` reports "no description", and `Issue` has no other way to
+  // say it now that absent and `undefined` are not interchangeable.
+  const bare: Issue = {
+    id: "loop-42",
+    title: "Sparse",
+    status: "in_progress",
+    priority: 1,
+    issue_type: "task",
+  };
+  const sparse = buildWorkContext({ issue: bare });
   assert.equal(sparse.prompt.includes("undefined"), false);
   assert.equal(sparse.prompt.includes("null"), false);
 
@@ -1178,7 +1188,7 @@ test("the prompt never renders the word undefined or null", () => {
     issue: issueFixture(),
     priorFailure: "",
     handoff: "   ",
-    repo: null,
+    repo: undefined,
     memories: [{ key: "empty", text: "  " }],
   });
   assert.equal(full.prompt.includes("undefined"), false);
@@ -1230,7 +1240,7 @@ test("dependencies are read through the normalised shape, not depends_on_id", ()
   const shown = issueFixture({
     dependencies: [
       { id: "loop-3", title: "Adapter", dependency_type: "blocks" },
-    ] as unknown as Issue["dependencies"],
+    ],
   });
   const prompt = buildWorkContext({ issue: shown }).prompt;
   assert.match(prompt, /loop-3/u);
