@@ -74,6 +74,8 @@ docs/               ADR-001: transport + rendering decision
                              that strands it
                     ADR-007: the notice on ntfy — a URL instead of an address,
                              and what that made simpler
+                    ADR-008: nothing to commit is a no-op — park the bead with a
+                             reason and carry on, instead of ending the run
 spikes/             throwaway prototypes + captured evidence backing ADR-001
 test/               unit tests, plus the whole walk in test/loop.test.ts
 ```
@@ -163,6 +165,15 @@ so contention with an IDE or a second run is normal, not exceptional. The loop
 now stops git with `SIGTERM` first, retries *only* lock contention, and ages a
 lock before calling it stale — removing one is opt-in, because pulling a live
 process's lock out is how you corrupt an index. See "The index lock" below.
+
+And [`docs/ADR-008-nothing-to-commit-is-a-noop.md`](docs/ADR-008-nothing-to-commit-is-a-noop.md):
+"nothing to commit" used to be routed as a blocked finalize, so one bead whose
+tree already matched what the agent reported ended the whole run — with every
+other ready bead behind it, and a `retry` hint that could only recompute the same
+nothing. It is now its own event: the reason goes to the bead's note, the bead is
+deferred rather than closed, and the run carries on to the next ticket. The
+refusal to make an empty commit is unchanged; only what happens after it is.
+See "A bead with nothing to commit is parked, not a dead end" below.
 
 Env knobs read by the current entry point: `PI_PROVIDER`, `PI_MODEL`, `PI_THEME`,
 `LOOP_WIDTH`, the per-pass thinking levels `LOOP_WORK_THINKING` /
@@ -267,6 +278,54 @@ does not honour. So:
   `maxConsecutiveFailures`, for a timeout that could plausibly clear.
 - No transition claims another pass is coming. The orchestrator says the bead is
   open on the board again, which is the only part of that sentence it knows.
+
+### A bead with nothing to commit is parked, not a dead end
+
+The agent reports `done`, names the files it changed, and the tree has nothing to
+stage for them — because the change is already in `HEAD`, or because the ticket
+turned out to need no code at all. The finalizer refuses to make an empty commit
+(a commit that says "done" over an empty diff is worse than no commit), and that
+refusal used to be routed as a blocked finalize:
+
+```
+Finalize commit failed: nothing to commit for workspace-jzj.1; no commit, no memory,
+no close. Nothing else was written; send retry to repeat just that stage.
+```
+
+So one already-satisfied bead stopped the board, and the suggested remedy —
+`retry` — re-issues the same commit against the same unchanged tree. That bucket
+was wrong: nothing is half-written and there is nothing to repair. `nothing-to-commit`
+now has its own event, `finalize_noop`, and the run does this instead:
+
+1. **The reason is written down first**, under `loop:failure:<id>`, with the path
+   list and why each path produced nothing ("identical to HEAD" vs "not in the
+   working tree"). Same invariant as failed work: a parked bead nobody can
+   explain is worse than one that stayed put.
+2. **The bead is deferred, not closed.** `deferred` is in neither of the two reads
+   the loop picks from (`bd ready`, `bd list --status in_progress`), so it stops
+   being worked while staying on the board and one command from a retry. Not
+   closed, because "no diff" is not evidence a ticket was finished — only that
+   this run had nothing to add. The write is guarded with `if-status in_progress`,
+   so a status you changed in the meantime is left as you left it.
+3. **The run carries on to the next ticket**, and when there is no next ticket it
+   lands in idle and asks you.
+4. **The park may not fail quietly.** If the `deferred` write fails, the run stops
+   `blocked` naming the bead and both ways out: with the bead still `in_progress`
+   the next read resumes it, and the loop is a wheel with the brake cut. The
+   check sits where the re-pick would have happened, so no second agent session
+   starts first.
+
+Bringing one back is an ordinary board command — and it is usually worth changing
+what the ticket asks before you do it, because a bead that produced no diff will
+produce no diff again:
+
+```sh
+bd update workspace-jzj.1 --status open
+```
+
+Everything else about a blocked finalize still blocks: an unsafe path, foreign
+staged paths under strict, a failed commit, a failed handoff and a failed close
+all end the run naming what exists and what is still open.
 
 ### One clock per work unit
 

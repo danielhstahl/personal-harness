@@ -108,6 +108,7 @@ export const EVENT_TYPES = [
   "committed",
   "remembered",
   "closed",
+  "finalize_noop",
   "finalize_failed",
   "stop",
   "abort",
@@ -333,6 +334,20 @@ export type OrchestratorEvent =
   | { type: "closed"; id: string }
   /** A finalize stage failed. `stage` must be the one currently in flight. */
   | { type: "finalize_failed"; stage: FinalizeStage; reason: string }
+  /**
+   * The commit stage found nothing to record: no reported path differed from HEAD,
+   * so there is no commit to make — and no commit means no memory and no close
+   * (`.8`: an empty commit that says "done" is worse than no commit).
+   *
+   * This is deliberately NOT `finalize_failed`. Nothing broke, nothing is
+   * half-written, and `retry` would land in exactly the same place: the tree is
+   * unchanged. The bead goes back on the board `deferred`, with the reason
+   * recorded first, so the run can carry on to the next ticket instead of ending
+   * on a work item that cannot be finalized as written. `deferred` keeps it out of
+   * both board reads the loop picks from — visible to a human, one command away
+   * from a retry, and never silently re-run into the same nothing.
+   */
+  | { type: "finalize_noop"; reason: string }
   /** Re-issue the effect that is currently pending. Never advances on its own. */
   | { type: "retry" }
   /** Operator stop. Accepted only at a safe boundary. */
@@ -1018,6 +1033,61 @@ export function step(state: OrchestratorState, event: OrchestratorEvent): StepRe
                 handoffKey: state.handoffKey,
                 lastFailure: null,
               },
+            ),
+          );
+        }
+
+        case "finalize_noop": {
+          // Only the commit stage can find nothing to commit. If the commit had
+          // already landed we would be in `handoff`/`close` with a real hash, and
+          // a no-op reported there would mean the machine and the finalizer
+          // disagree about what already happened — which is a rejection, not a
+          // parking decision.
+          if (state.finalizeStage !== "commit") {
+            return rejected(
+              state,
+              "stage-mismatch",
+              `a no-op commit was reported during the ${state.finalizeStage ?? "unknown"} stage`,
+            );
+          }
+          const issueId = state.activeIssueId;
+          if (issueId === null) {
+            return rejected(
+              state,
+              "no-active-issue",
+              "nothing-to-commit reported with no active issue to park",
+            );
+          }
+          const failureKey = failureKeyFor(issueId);
+          // The reason goes down *before* the bead moves, exactly as `work_failed`
+          // does it: a deferred ticket nobody can explain is worse than one that
+          // stayed put. `ifStatus` keeps a status a human changed in the meantime
+          // exactly as that human left it.
+          return applied(
+            throughBoundary(
+              state,
+              event,
+              `${issueId}: nothing to commit`,
+              [
+                {
+                  kind: "beads.remember",
+                  key: failureKey,
+                  text:
+                    `Nothing to commit for ${issueId}: ${event.reason}. ` +
+                    `No commit was made, so nothing was remembered as done and ${issueId} was NOT closed. ` +
+                    `The loop deferred it rather than end the run on it; it will not be picked again ` +
+                    `while it is deferred. Set it back to open (bd update ${issueId} --status open) ` +
+                    `when there is actually a change to make, or close it by hand if the ticket needs no code at all.`,
+                },
+                { kind: "beads.set_status", id: issueId, status: "deferred", ifStatus: "in_progress" },
+                warn(
+                  `Nothing to commit for ${issueId}: ${event.reason} ` +
+                    `No commit, no handoff, no close — and ${issueId} is now deferred, so this run moves ` +
+                    `on to the next ticket instead of stopping here. To put it back: ` +
+                    `bd update ${issueId} --status open. Reason recorded under ${failureKey}.`,
+                ),
+              ],
+              { lastFailure: { stage: "commit", reason: event.reason } },
             ),
           );
         }

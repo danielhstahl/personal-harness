@@ -244,7 +244,9 @@ export function describeFinalizeFailure(outcome: FinalizeOutcome): string {
  * The machine's view of an outcome. Stages that landed emit their event; the
  * first stage that did not emits `finalize_failed`, which is the only event
  * that lets `.9` distinguish "commit is safe, handoff is not" from "nothing
- * happened".
+ * happened". A commit stage that found nothing at all to record emits
+ * `finalize_noop` instead: there is no half-written state to recover from and no
+ * retry that could change the answer, so it is not a failure.
  */
 export function toFinalizeEvents(outcome: FinalizeOutcome): OrchestratorEvent[] {
   switch (outcome.kind) {
@@ -268,6 +270,12 @@ export function toFinalizeEvents(outcome: FinalizeOutcome): OrchestratorEvent[] 
         { type: "finalize_failed", stage: "close", reason: outcome.message },
       ];
     case "nothing-to-commit":
+      // Nothing broke: the tree already matched what the work reported, so there
+      // is no diff to record and nothing to close. Sending this through
+      // `finalize_failed` made the interpreter end the whole run over a ticket
+      // that is simply already satisfied — or needs no code at all — and `retry`
+      // could only arrive at the same nothing. It gets its own event.
+      return [{ type: "finalize_noop", reason: nothingToCommitReason(outcome) }];
     case "unsafe-path":
     case "unrelated-staged":
     case "commit-failed":
@@ -280,6 +288,18 @@ export function toFinalizeEvents(outcome: FinalizeOutcome): OrchestratorEvent[] 
         },
       ];
   }
+}
+
+/**
+ * Why there was nothing to stage, with the per-path detail. "Identical to HEAD"
+ * and "was never in the tree" look the same from a distance and are different
+ * problems, so the difference is spelled out rather than flattened into one
+ * count.
+ */
+function nothingToCommitReason(outcome: FinalizeOutcome & { kind: "nothing-to-commit" }): string {
+  if (outcome.skipped.length === 0) return "no reported path produced anything to stage";
+  const detail = outcome.skipped.map((s) => `${s.path} (${s.reason})`).join("; ");
+  return `no reported path produced anything to stage — ${detail}`;
 }
 
 // ── rendering ───────────────────────────────────────────────────────────────

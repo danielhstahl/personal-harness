@@ -49,6 +49,14 @@
  *    `blocked` result naming the stage, the commit that exists and the bead
  *    that may still be open. No auto-retry of a write, because a write that
  *    failed once is a fact about the world, not a hiccup.
+ *    One case is not a failure: a commit stage that finds *nothing at all* to
+ *    commit, because the tree already matches what the work reported. Nothing
+ *    broke and a retry would land in the same nothing, so the bead is deferred
+ *    with its reason recorded and the run carries on to the next ticket (the
+ *    `finalize_noop` event). The bead is never closed on that basis — "no diff"
+ *    is not evidence that a ticket was done, only that this run had nothing to
+ *    add — and if it cannot be deferred the run stops rather than resume a bead
+ *    that can only repeat itself.
  *
  * Context does not carry. That is not this module's job to enforce so much as
  * its job to *not break*: each iteration's work goes through `AgentRunner`,
@@ -356,7 +364,26 @@ type Unit =
       readonly created: { index: number; id: string; title: string }[];
       readonly failed: { index: number; title: string; errorKind: string }[];
     }
-  | { readonly kind: "finalize"; readonly request: FinalizeRequest };
+  | {
+      readonly kind: "finalize";
+      readonly request: FinalizeRequest;
+      /**
+       * Receipts, because `already performed by the unit` is a claim the
+       * interpreter makes about work it did not do itself.
+       *
+       * `owned*` is what the unit took responsibility for — the handoff note and
+       * the close belong to the finalizer's ritual and the interpreter must never
+       * run them, least of all after the unit died on them, which is the blind
+       * retry `.8` rule 9 forbids. `landed*` is what actually reached the board,
+       * which decides how the effect is *reported*: performed, or attempted and
+       * failed. A no-op finalize owns neither list, so the reason note the machine
+       * then asks for is written for real instead of being quietly claimed.
+       */
+      ownedRememberKeys: string[];
+      landedRememberKeys: string[];
+      ownedCloseIds: string[];
+      landedCloseIds: string[];
+    };
 
 /**
  * Run one loop: board → idle → split → work → finalize → board → …
@@ -406,6 +433,17 @@ export async function runLoop(
   let failedIssue: string | null = null;
   let consecutiveFailures = 0;
   /**
+   * Set when a bead could not be moved out of the pick queue after a finalize that
+   * had nothing to commit.
+   *
+   * The whole reason that case continues instead of stopping is that the bead ends
+   * up `deferred` and so is invisible to the next board read. If the write that
+   * defers it fails, the bead stays `in_progress`, the next read resumes it, the
+   * work lands in the same nothing and the loop is a wheel with the brake cut. So
+   * that one failed write is a stop, with the bead named and the fix spelled out.
+   */
+  let parkFailed: { issueId: string; reason: string } | null = null;
+  /**
    * Set when the last worked bead ran out of the harness's room rather than out of
    * things to do. Kept apart from the failure streak on purpose: the streak says
    * "this bead keeps failing", which is a thing to retry once and stop on; this
@@ -444,6 +482,18 @@ export async function runLoop(
           `budget later. The bead is back on the board open, with what this attempt got to in its note ` +
           `(${failureKeyFor(unfitWork.issueId)}) — split it into pieces that fit one session, or raise ` +
           `the budget if the ticket really is this size, and run again.`,
+      };
+      return guardTripped;
+    }
+    if (parkFailed !== null) {
+      guardTripped = {
+        kind: "blocked",
+        reason:
+          `${parkFailed.issueId} had nothing to commit and could not be deferred (${parkFailed.reason}), ` +
+          `so it is still in_progress. Working it again lands in the same nothing — the tree already ` +
+          `matches what was reported. Decide by hand: bd update ${parkFailed.issueId} --status open to ` +
+          `give it real work first, or bd close ${parkFailed.issueId} if the ticket needs no code. ` +
+          `The reason is on the board under ${failureKeyFor(parkFailed.issueId)}.`,
       };
       return guardTripped;
     }
@@ -619,6 +669,12 @@ export async function runLoop(
         refusedClaimIssue = effect.id;
         return feed({ type: "claim_failed", id: effect.id, reason });
       }
+      if (effect.status === "deferred") {
+        // The no-op parking write. If it cannot land there is no way to keep the
+        // loop off this bead, so remember that and let the guard stop the run
+        // rather than resume a ticket that can only repeat itself.
+        parkFailed = { issueId: effect.id, reason };
+      }
       // A failed fire-and-forget write (e.g. re-opening after a failed run) has
       // no event that represents it. Say so: the board is not what we wanted.
       warn(`could not set ${effect.id} to ${effect.status}: ${reason}. The board was left as found.`);
@@ -669,20 +725,43 @@ export async function runLoop(
   }
 
   async function handleRemember(effect: RememberEffect): Promise<readonly Effect[]> {
-    if (unit !== null && unit.kind === "finalize") {
-      // The finalizer already attempted this write, with the commit hash in the
-      // note. Re-issuing it here would duplicate the memory — and if the unit
-      // failed at this stage, re-issuing is exactly the blind retry `.8` rule 9
-      // forbids.
-      if (effect.key !== handoffKeyFor(unit.request.issueId)) {
+    const finalizeUnit = unit !== null && unit.kind === "finalize" ? unit : null;
+    if (finalizeUnit !== null) {
+      const worked = finalizeUnit.request.issueId;
+      const handoffKey = handoffKeyFor(worked);
+      const failureKey = failureKeyFor(worked);
+      if (effect.key !== handoffKey && effect.key !== failureKey) {
         throw new LoopError(
           "unit-drift",
-          `the finalize unit was asked to remember ${unit.request.issueId} but the machine ` +
-            `reported key ${effect.key}; refusing to claim a write we did not make`,
+          `the finalize unit was working ${worked} but the machine reported key ${effect.key}; ` +
+            `it is neither the handoff note nor the failure note of that bead`,
         );
       }
-      effects.push({ kind: effect.kind, detail: `performed by finalize unit (${effect.key})` });
-      return [];
+      if (effect.key === handoffKey) {
+        // The handoff note belongs to the unit. Re-issuing it here would either
+        // duplicate the memory or blindly retry a write that just failed — both
+        // forbidden. It is claimed as performed when the unit's receipt says it
+        // landed, and reported as attempted-and-failed when it does not; the run
+        // result then names the dead stage.
+        if (!finalizeUnit.ownedRememberKeys.includes(effect.key)) {
+          throw new LoopError(
+            "unit-drift",
+            `the machine asked for the handoff ${effect.key} but the finalize unit for ${worked} ` +
+              `never took responsibility for it; refusing to claim a write we did not make`,
+          );
+        }
+        const landed = finalizeUnit.landedRememberKeys.includes(effect.key);
+        effects.push({
+          kind: effect.kind,
+          detail: landed
+            ? `performed by finalize unit (${effect.key})`
+            : `attempted by finalize unit (${effect.key}) and FAILED; the run stops on that stage`,
+        });
+        return [];
+      }
+      // The failure note behind `finalize_noop`. The unit made no commit and so
+      // wrote neither a handoff nor a close, but the reason still has to go down
+      // before the bead moves — and the unit is not the thing that writes it.
     }
     try {
       await ports.beads.remember(effect.text, effect.key);
@@ -701,7 +780,20 @@ export async function runLoop(
             `closing ${effect.id}`,
         );
       }
-      effects.push({ kind: effect.kind, detail: `performed by finalize unit (${effect.id})` });
+      if (!unit.ownedCloseIds.includes(effect.id)) {
+        throw new LoopError(
+          "unit-drift",
+          `the machine reported ${effect.id} closed but the finalize unit never attempted a close ` +
+            `for it; refusing to claim a bead closed that is still open`,
+        );
+      }
+      const landed = unit.landedCloseIds.includes(effect.id);
+      effects.push({
+        kind: effect.kind,
+        detail: landed
+          ? `performed by finalize unit (${effect.id})`
+          : `attempted by finalize unit (${effect.id}) and FAILED; the run stops on that stage`,
+      });
       return [];
     }
     try {
@@ -1034,12 +1126,35 @@ export async function runLoop(
     }
 
     const request = await buildFinalizeRequest(issueId, effect);
-    unit = { kind: "finalize", request };
+    const active: Extract<Unit, { kind: "finalize" }> = {
+      kind: "finalize",
+      request,
+      ownedRememberKeys: [],
+      landedRememberKeys: [],
+      ownedCloseIds: [],
+      landedCloseIds: [],
+    };
+    unit = active;
     try {
       const outcome = await ports.finalizer.finalize(request);
       lastFinalize = outcome;
       effects.push({ kind: "vcs.commit", detail: `unit:${outcome.kind}` });
       log("info", `finalize unit ended ${outcome.kind} for ${issueId}`);
+      // Which writes the unit took responsibility for, and which reached the
+      // board, per stage. A landed commit means the handoff was attempted; a
+      // landed handoff means the close was. A no-op commit owns nothing, which is
+      // exactly why its reason note has to be written by the interpreter instead
+      // of claimed as already done.
+      const handoffAttempted =
+        outcome.kind === "finalized" ||
+        outcome.kind === "handoff-failed" ||
+        outcome.kind === "close-failed";
+      const handoffLanded = outcome.kind === "finalized" || outcome.kind === "close-failed";
+      const closeAttempted = outcome.kind === "finalized" || outcome.kind === "close-failed";
+      if (handoffAttempted) active.ownedRememberKeys.push(outcome.handoffKey);
+      if (closeAttempted) active.ownedCloseIds.push(outcome.issueId);
+      if (handoffLanded) active.landedRememberKeys.push(outcome.handoffKey);
+      if (outcome.kind === "finalized") active.landedCloseIds.push(outcome.issueId);
 
       if (outcome.kind === "planned") {
         dryPlan.lines = outcome.planText;
@@ -1047,7 +1162,7 @@ export async function runLoop(
         return [];
       }
       if (outcome.kind === "finalized") closedIssueIds.push(outcome.issueId);
-      if (outcome.kind !== "finalized") {
+      if (outcome.kind !== "finalized" && outcome.kind !== "nothing-to-commit") {
         // A failed stage is the run's last word: it names what exists on disk
         // and what is still open, which is exactly what a human needs. Do not
         // go looking for more work after a half-finished handoff.
@@ -1059,9 +1174,12 @@ export async function runLoop(
       const deferred: Effect[] = [];
       for (const finalizeEvent of toFinalizeEvents(outcome)) {
         for (const producedEffect of feed(finalizeEvent)) {
-          // `remember`/`close` were already done by the unit, with the commit hash
-          // in the note. `dispatch` performs the drift check against what the
-          // unit actually did before it lets either pass as performed.
+          // `remember`/`close` are the unit's own writes, made with the commit
+          // hash in the note. The unit claims them from its receipts rather than
+          // letting them run a second time, and says so honestly when the receipt
+          // shows the write died. Any other note the machine asks for here — the
+          // "why this bead was deferred" note behind a no-op — is not the unit's
+          // and is written for real.
           if (
             producedEffect.kind === "beads.remember" ||
             producedEffect.kind === "beads.close_issue"

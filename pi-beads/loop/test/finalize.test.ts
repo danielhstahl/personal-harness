@@ -922,6 +922,53 @@ test("rule 5: nothing reported means no commit, no memory, no close", async () =
   }
 });
 
+test(
+  "a tree that already matches what was reported is a no-op event, naming each path",
+  async () => {
+    const sandbox = makeSandbox();
+    const order: string[] = [];
+    const calls = emptyCalls();
+    try {
+      sandbox.write("src/landed.ts", "export const landed = 1;\n");
+      sandbox.git("add", "--", "src/landed.ts");
+      sandbox.git("commit", "-q", "-m", "someone else landed this");
+      const commits = sandbox.commitCount();
+
+      const finalizer = createFinalizer({
+        vcs: realWriter(sandbox),
+        beads: fakeBoard(order, { calls }),
+      });
+
+      const outcome = await finalizer.finalize(
+        request({ changedFiles: ["src/landed.ts", "src/never-existed.ts"] }),
+      );
+
+      assert.equal(outcome.kind, "nothing-to-commit");
+      assert.equal(sandbox.commitCount(), commits, "no commit for a tree with nothing to stage");
+      assert.equal(order.filter((entry) => entry !== "plan").length, 0, "no write was attempted");
+
+      const events = toFinalizeEvents(outcome);
+      assert.equal(events.length, 1);
+      const [event] = events;
+      assert.equal(
+        event?.type,
+        "finalize_noop",
+        "not finalize_failed: nothing broke, and a retry would land in the same nothing",
+      );
+      if (event?.type !== "finalize_noop") return;
+      assert.match(event.reason, /src\/landed\.ts .*identical to HEAD/u);
+      assert.match(event.reason, /src\/never-existed\.ts .*not in the working tree/u);
+      assert.equal(
+        describeFinalizeFailure(outcome).includes("no commit, no memory, no close"),
+        true,
+        "the honest one-line description still says what did NOT happen",
+      );
+    } finally {
+      sandbox.dispose();
+    }
+  },
+);
+
 test("rule 3 strict: an unrelated staged path blocks the commit outright", async () => {
   const sandbox = makeSandbox();
   const order: string[] = [];
