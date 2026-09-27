@@ -31,7 +31,7 @@ import { readEnv, runFromEnv } from "../src/main.ts";
 import { createAgentRunner } from "../src/agent.ts";
 import { createHttpTransport, createNtfyPublisher, resolveNtfyTarget } from "../src/ntfy.ts";
 import { createNotifier } from "../src/notify.ts";
-import { startFakeNtfy } from "./ntfy-server.ts";
+import { publishedJson, startFakeNtfy } from "./ntfy-server.ts";
 import { BdError } from "../src/beads.ts";
 import { createFinalizer } from "../src/finalize.ts";
 import { normaliseDependencies } from "../src/beads.ts";
@@ -438,24 +438,34 @@ test("the whole chain: a closed bead publishes to a real HTTP server, id in the 
     assert.equal(server.requests.length, 2, "two beads closed, two publishes arrived");
 
     const first = server.requests[0];
+    const firstJson = publishedJson(first);
     assert.equal(first?.method, "POST");
-    assert.equal(first?.path, "/loop-notices");
-    assert.equal(first?.headers.title, "[pi-beads] tst.2 completed: Added the colour mode to the parser.");
-    assert.equal(first?.headers.priority, "high");
-    assert.equal(first?.headers.tags, "+1");
-    assert.match(first?.body ?? "", /bd show tst\.2/u);
-    assert.match(first?.body ?? "", /bd recall loop:handoff:tst\.2/u);
-    assert.match(first?.body ?? "", /src\/colour\.ts/u);
+    assert.equal(first?.path, "/", "a JSON publish goes to the server root, not the topic URL");
+    assert.equal(
+      first?.topic,
+      "loop-notices",
+      "and the topic arrived in the body, which is where ntfy reads it from",
+    );
+    assert.equal(
+      firstJson.title,
+      "[pi-beads] tst.2 completed: Added the colour mode to the parser.",
+    );
+    assert.equal(firstJson.priority, 4, "the name becomes the number the JSON field is typed as");
+    assert.deepEqual(firstJson.tags, ["+1"]);
+    assert.match(String(firstJson.message), /bd show tst\.2/u);
+    assert.match(String(firstJson.message), /bd recall loop:handoff:tst\.2/u);
+    assert.match(String(firstJson.message), /src\/colour\.ts/u);
 
     const second = server.requests[1];
-    assert.match(String(second?.headers.title ?? ""), /^\[pi-beads\] tst\.3 completed:/u);
+    const secondJson = publishedJson(second);
+    assert.match(String(secondJson.title), /^\[pi-beads\] tst\.3 completed:/u);
 
     // The commit hash in the notice is the one git actually made.
     const log = h.repo.git("log", "--pretty=%H %s");
     const commitForSecond = log.split("\n").find((line) => line.includes("tst.3"))?.split(" ")[0];
     assert.ok(commitForSecond);
     assert.ok(
-      (second?.body ?? "").includes(commitForSecond.slice(0, 12)),
+      String(secondJson.message).includes(commitForSecond.slice(0, 12)),
       "the notice carries the real hash for the bead it is about",
     );
   } finally {

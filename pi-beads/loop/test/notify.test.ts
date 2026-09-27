@@ -15,7 +15,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { buildApp } from "../src/app.ts";
-import type { NtfyDelivery, NtfyMessage, NtfyPublisher } from "../src/ntfy.ts";
+import {
+  createHttpTransport,
+  createNtfyPublisher,
+  resolveNtfyTarget,
+  type NtfyDelivery,
+  type NtfyMessage,
+  type NtfyPublisher,
+} from "../src/ntfy.ts";
 import { LoopError } from "../src/loop.ts";
 import { readEnv } from "../src/main.ts";
 import {
@@ -30,6 +37,7 @@ import {
   oneLine,
   type BeadCompletion,
 } from "../src/notify.ts";
+import { publishedJson, startFakeNtfy } from "./ntfy-server.ts";
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -65,6 +73,7 @@ function recordingPublisher(deliveries: readonly ("delivered" | "failed" | "skip
   const publisher: NtfyPublisher = {
     enabled: true,
     destination: "http://ntfy.test/loop",
+    publishUrl: "http://ntfy.test/",
     transport: "recorder",
     async publish(message: NtfyMessage): Promise<NtfyDelivery> {
       published.push(message);
@@ -308,6 +317,7 @@ test("one success clears the failure streak", async () => {
   const publisher: NtfyPublisher = {
     enabled: true,
     destination: "http://ntfy.test/loop",
+    publishUrl: "http://ntfy.test/",
     transport: "stub",
     async publish(): Promise<NtfyDelivery> {
       const kind = outcomes[index] ?? "delivered";
@@ -435,6 +445,65 @@ test("a nonsense priority is refused, and the five names and 1-5 are not", () =>
     assert.equal(app.ports.notify?.enabled, true, `priority "${ok}" should have been accepted`);
   }
 });
+
+test("a topic ntfy would reject, or a token no header could carry, is refused here first", () => {
+  for (const setting of [
+    { topic: "has a space" },
+    { topic: "with.dots" },
+    { topic: "loop", token: "line1\nline2" },
+    { topic: "loop", token: "tok-\u{1F512}-en" },
+  ] as const) {
+    assert.throws(
+      () => buildApp({ cwd: "/tmp", notify: { enabled: true, ...setting } }),
+      (error: unknown) => LoopError.is(error) && error.code === "notify-config",
+      `${JSON.stringify(setting)} should have been refused at startup`,
+    );
+  }
+});
+
+// ── the two halves together ────────────────────────────────────────────────
+
+test(
+  "REGRESSION: a notice the agent actually worded gets all the way to the server",
+  async () => {
+    // notify.ts writes prose; ntfy.ts used to put that prose in a `Title:`
+    // header, where an em dash, a curly quote, a `✓`, CJK or an emoji is
+    // illegal — Node answered with
+    // `Invalid character in header content ["Title"]` and the notice never
+    // left the process. The pairing of the two modules is exactly where that
+    // lived, so it is where the test lives.
+    const server = await startFakeNtfy();
+    const notifier = createNotifier({
+      publisher: createNtfyPublisher({
+        target: resolveNtfyTarget({ url: server.base, topic: "loop" }),
+        transport: createHttpTransport(),
+      }),
+      context: CONTEXT,
+      priority: "high",
+      tags: ["+1"],
+    });
+    const summary =
+      "Fixed the parser — “fast” now ✓ (日本語 handled, \u{1F389} shipped)";
+    try {
+      const delivery = await notifier.notifyCompletion(completion({ summary }));
+      assert.equal(
+        delivery.kind,
+        "delivered",
+        `"${summary}" must not be a delivery failure: ${JSON.stringify(delivery)}`,
+      );
+      const sent = publishedJson(server.requests[0]);
+      assert.equal(String(sent.message).includes(summary), true, "the summary arrives verbatim");
+      const title = String(sent.title);
+      for (const ch of ["—", "“", "”", "✓", "日", "\u{1F389}"]) {
+        assert.ok(title.includes(ch), `the title lost ${JSON.stringify(ch)}`);
+      }
+      assert.ok(!title.includes("\\u"), "nothing was escaped away into ASCII");
+      assert.equal(sent.priority, 4, "the name the config used became the number the field wants");
+    } finally {
+      await server.close();
+    }
+  },
+);
 
 test("with no topic the loop still builds, and knows it will tell nobody", () => {
   const app = buildApp({ cwd: "/tmp" });

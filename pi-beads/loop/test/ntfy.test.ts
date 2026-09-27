@@ -17,21 +17,27 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  NTFY_MAX_JSON_BODY_BYTES,
   NTFY_MAX_MESSAGE_BYTES,
   NTFY_MAX_TITLE_LENGTH,
+  NTFY_TOPIC_PATTERN,
   classifyResponse,
   createHttpTransport,
   createNtfyPublisher,
   createNullPublisher,
+  fitJsonBytes,
+  isHeaderSafe,
   localHostname,
-  ntfyHeaders,
+  ntfyPriorityNumber,
+  ntfyPublishBody,
+  ntfyPublishPayload,
   resolveNtfyTarget,
+  transportHeaders,
   truncateToBytes,
-  type NtfyMessage,
   type NtfyRequestOptions,
   type NtfyTransport,
 } from "../src/ntfy.ts";
-import { startFakeNtfy } from "./ntfy-server.ts";
+import { publishedJson, startFakeNtfy } from "./ntfy-server.ts";
 
 // ── the target: where a notice goes ─────────────────────────────────────────
 
@@ -40,12 +46,18 @@ test("a bare topic is joined onto the server, whose default is the hosted one", 
   assert.equal(target.base, "https://ntfy.sh");
   assert.equal(target.topic, "my-loop");
   assert.equal(target.destination, "https://ntfy.sh/my-loop");
+  assert.equal(
+    target.publishUrl,
+    "https://ntfy.sh/",
+    "the request goes to the root; the topic travels in the body",
+  );
 });
 
 test("a self-hosted server is one variable, not a different configuration", () => {
   const target = resolveNtfyTarget({ url: "http://192.168.1.20:8080", topic: "loop" });
   assert.equal(target.destination, "http://192.168.1.20:8080/loop");
   assert.equal(target.base, "http://192.168.1.20:8080");
+  assert.equal(target.publishUrl, "http://192.168.1.20:8080/");
 });
 
 test("a reverse-proxied base keeps its path prefix", () => {
@@ -55,12 +67,41 @@ test("a reverse-proxied base keeps its path prefix", () => {
     "https://example.test/ntfy/loop",
     "nginx-served ntfy lives under a prefix, and the topic belongs under it too",
   );
+  assert.equal(
+    target.publishUrl,
+    "https://example.test/ntfy/",
+    "and the JSON publish is POSTed at the prefix, which is the root of the ntfy behind it",
+  );
 });
 
 test("a full URL as the topic is taken as given, the way the web UI hands it over", () => {
   const target = resolveNtfyTarget({ topic: "https://ntfy.sh/abc123-notify" });
   assert.equal(target.destination, "https://ntfy.sh/abc123-notify");
   assert.equal(target.topic, "abc123-notify");
+  assert.equal(target.publishUrl, "https://ntfy.sh/");
+});
+
+test("a full URL with a proxy prefix keeps the prefix and takes the last segment as the topic", () => {
+  const target = resolveNtfyTarget({ topic: "https://example.test/ntfy/loop" });
+  assert.equal(target.topic, "loop");
+  assert.equal(target.publishUrl, "https://example.test/ntfy/");
+  assert.equal(target.destination, "https://example.test/ntfy/loop");
+});
+
+test("a topic ntfy would reject is refused here instead, with the rule in the message", () => {
+  for (const topic of ["has space", "sl/ash", "über", "", "a".repeat(65)]) {
+    if (topic === "") continue; // handled by the empty-topic case below
+    assert.throws(
+      () => resolveNtfyTarget({ topic, url: "http://localhost:9" }),
+      /not a valid ntfy topic name/u,
+      `"${topic}" should not have made it to the wire`,
+    );
+  }
+  assert.ok(NTFY_TOPIC_PATTERN.test("loop-notices-1_2"), "the shape this repo uses is legal");
+  assert.ok(
+    !NTFY_TOPIC_PATTERN.test("loop.notices"),
+    "and a dot is not legal — ntfy's own topicRegex says so, and this one mirrors it",
+  );
 });
 
 test("unusable targets are refused at build time, each with its own reason", () => {
@@ -83,37 +124,111 @@ test("unusable targets are refused at build time, each with its own reason", () 
   }
 });
 
-// ── headers ─────────────────────────────────────────────────────────────────
+// ── the publish envelope: the notice, as ntfy reads it ────────────────────────
 
-test("the ntfy headers are built from the message, and unset fields stay unset", () => {
-  const headers = ntfyHeaders({
+test("the whole notice travels as JSON, and unset fields stay unset", () => {
+  const payload = ntfyPublishPayload(
+    { title: "[pi-beads] tst.42 completed: the parser change", body: "body text" },
+    "loop",
+  );
+  assert.deepEqual(payload, {
+    topic: "loop",
     title: "[pi-beads] tst.42 completed: the parser change",
-    body: "body",
-    priority: "high",
-    tags: ["+1", "beads"],
-    click: "https://example.test/bead/42",
+    message: "body text",
   });
-  assert.equal(headers.Title, "[pi-beads] tst.42 completed: the parser change");
-  assert.equal(headers.Priority, "high");
-  assert.equal(headers.Tags, "+1,beads");
-  assert.equal(headers.Click, "https://example.test/bead/42");
-  assert.equal(headers.Authorization, undefined, "no token configured means no Authorization header");
-  assert.equal(headers["Content-Type"], "text/plain; charset=utf-8");
 });
 
-test("a header value cannot smuggle a second header in with a line break", () => {
-  const headers = ntfyHeaders({
-    title: "one\r\nX-Evil: yes\ntwo",
-    body: "b",
-    priority: "3\nX-More: nope",
-    tags: ["ok\r\nInjected: true"],
-  });
-  assert.equal(headers.Title, "one X-Evil: yes two");
-  assert.equal(headers.Priority, "3 X-More: nope");
-  assert.equal(headers.Tags, "ok Injected: true");
-  for (const value of Object.values(headers)) {
-    assert.ok(!/[\r\n]/u.test(value), `header value kept a line break: ${JSON.stringify(value)}`);
-  }
+test("the body is a publish document: topic, message, and the presentation as fields", () => {
+  const wire = ntfyPublishBody(
+    {
+      title: "[pi-beads] tst.42 completed: the parser change",
+      body: "line one\nline two",
+      priority: "high",
+      tags: ["+1", "beads"],
+      click: "https://example.test/bead/42",
+    },
+    "loop",
+  );
+  const parsed = JSON.parse(wire) as Record<string, unknown>;
+  assert.equal(parsed.topic, "loop", "ntfy takes the topic out of the body, not the URL");
+  assert.equal(parsed.message, "line one\nline two", "the body is the message, newlines and all");
+  assert.equal(
+    parsed.priority,
+    4,
+    "the name the header API took has to become the number the JSON field is typed as",
+  );
+  assert.deepEqual(parsed.tags, ["+1", "beads"], "a list, not the comma-joined header form");
+  assert.equal(parsed.click, "https://example.test/bead/42");
+});
+
+test("every priority spelling becomes an integer, because ntfy's field is an int", () => {
+  assert.equal(ntfyPriorityNumber("min"), 1);
+  assert.equal(ntfyPriorityNumber("low"), 2);
+  assert.equal(ntfyPriorityNumber("default"), 3);
+  assert.equal(ntfyPriorityNumber("high"), 4);
+  assert.equal(ntfyPriorityNumber("URGENT"), 5);
+  assert.equal(ntfyPriorityNumber(" 3 "), 3);
+  assert.throws(() => ntfyPriorityNumber("urgentish"), /not an ntfy priority/u);
+  assert.throws(() => ntfyPriorityNumber("9"), /not an ntfy priority/u);
+});
+
+test("nothing the work wrote goes in a header — the header set is three constants and a token", () => {
+  const headers = transportHeaders({ token: "s3cret" });
+  assert.deepEqual(
+    Object.keys(headers).sort(),
+    ["Authorization", "Content-Type", "User-Agent"],
+    "Title/Priority/Tags/Click are fields in the body now, not headers",
+  );
+  assert.equal(headers["Content-Type"], "application/json");
+  assert.equal(transportHeaders().Authorization, undefined, "no token configured means no header");
+  assert.ok(isHeaderSafe("pi-beads-loop"), "the defaults are header-safe");
+  assert.ok(!isHeaderSafe("bell\u0007"), "control characters are not");
+  assert.ok(!isHeaderSafe("— em dash —"), "and neither is anything outside ASCII");
+});
+
+test(
+  "REGRESSION: a title outside Latin-1 publishes instead of dying at the header layer",
+  async () => {
+    // What this is a test for: the title is an agent-written sentence, and
+    // Node refuses a character a header cannot carry with
+    // `Invalid character in header content ["Title"]`. Under the header-only
+    // wire format that meant a bead whose summary happened to contain an em
+    // dash, a curly quote, a tick or any CJK could not be announced, while a
+    // plain-ASCII summary of the same shape announced fine — a failure in the
+    // *content*, which is the worst place to put one.
+    const titles = [
+      "[pi-beads] tst.42 completed: rewrote the parser — faster, mostly",
+      "[pi-beads] tst.42 completed: ✓ all green",
+      "[pi-beads] tst.42 completed: 日本語のタイトル",
+      "[pi-beads] tst.42 completed: shipped it \u{1F389}",
+      "[pi-beads] tst.42 completed: a \u2018curly quoted\u2019 summary",
+    ];
+    const server = await startFakeNtfy();
+    try {
+      const publisher = createNtfyPublisher({
+        target: resolveNtfyTarget({ url: server.base, topic: "loop" }),
+        transport: createHttpTransport(),
+      });
+      for (const title of titles) {
+        const delivery = await publisher.publish({ title, body: `body for ${title}` });
+        assert.equal(delivery.kind, "delivered", `"${title}" was not delivered: ${JSON.stringify(delivery)}`);
+        assert.equal(
+          publishedJson(server.requests[server.requests.length - 1]).title,
+          title,
+          "arrives verbatim, not escaped, not dropped, not refused",
+        );
+      }
+    } finally {
+      await server.close();
+    }
+  },
+);
+
+test("a line break in the title is flattened: two lines is a broken list entry", () => {
+  const payload = ntfyPublishPayload({ title: "one\r\nX-Evil: yes\ntwo", body: "b" }, "loop");
+  assert.equal(payload.title, "one X-Evil: yes two");
+  const wire = ntfyPublishBody({ title: "a\nb", body: "c\nd" }, "loop");
+  assert.ok(!/[\r\n]/u.test(wire), "every newline in the request body is JSON-escaped");
 });
 
 test("the token lands in the header and nowhere else", async () => {
@@ -137,6 +252,32 @@ test("the token lands in the header and nowhere else", async () => {
   assert.ok(!body.includes("super-secret-token"), "the secret stays out of the message body");
 });
 
+test(
+  "a token that cannot be a header value is named as a config error, not ERR_INVALID_CHAR",
+  async () => {
+    const logged: string[] = [];
+    const publisher = createNtfyPublisher({
+      target: resolveNtfyTarget({ url: "http://localhost:9999", topic: "t" }),
+      transport: stubTransport(),
+      token: "bear\u{1F512}er",
+      logger: (line) => logged.push(line),
+    });
+    const delivery = await publisher.publish({ title: "t", body: "b" });
+    assert.equal(delivery.kind, "failed");
+    const reason = delivery.kind === "failed" ? delivery.reason : "";
+    assert.match(reason, /cannot be sent in an HTTP header/u, `reason was: ${reason}`);
+    assert.match(reason, /LOOP_NTFY_TOKEN/u, "and it names the setting to fix");
+    assert.equal(
+      delivery.kind === "failed" ? delivery.retryable : true,
+      false,
+      "asking again will not fix a typo, so do not pretend it might",
+    );
+    for (const line of logged) {
+      assert.ok(!line.includes("bear\u{1F512}er"), `the token leaked into a log line: ${line}`);
+    }
+  },
+);
+
 // ── the limits ──────────────────────────────────────────────────────────────
 
 test("a body over the byte limit is cut on a character boundary and marked", () => {
@@ -154,7 +295,39 @@ test("a body that already fits is returned untouched", () => {
 
 test("the default limits are ntfy's documented ones", () => {
   assert.equal(NTFY_MAX_MESSAGE_BYTES, 4096);
+  assert.equal(NTFY_MAX_JSON_BODY_BYTES, 8192, "ntfy reads a JSON publish with 2x the message limit");
   assert.equal(NTFY_MAX_TITLE_LENGTH, 200);
+});
+
+test("escaping is paid for: a body that fits as text may not fit as JSON", () => {
+  // 4000 newlines is 4000 bytes of message and 8002 bytes of JSON (8000 for
+  // the escapes, two for the quotes around the field).
+  const newlines = "\n".repeat(4000);
+  assert.equal(Buffer.byteLength(newlines, "utf8"), 4000);
+  assert.equal(Buffer.byteLength(JSON.stringify(newlines), "utf8"), 8002);
+  const cut = fitJsonBytes(newlines, 5000);
+  assert.ok(Buffer.byteLength(JSON.stringify(cut), "utf8") <= 5000);
+  assert.match(cut, /… \(truncated\)$/u, "and the cut is marked");
+  assert.equal(fitJsonBytes("short", 5000), "short", "one that fits is returned untouched");
+});
+
+test("a notice whose JSON form is too big for the server is clamped, not rejected", async () => {
+  // A body made of nothing but quotes: 4096 bytes of message, 8192 bytes once
+  // every one of them is escaped, and the envelope has to fit on top of that.
+  const hostile = '"'.repeat(4096);
+  const publisher = createNtfyPublisher({
+    target: resolveNtfyTarget({ url: "http://localhost:9", topic: "t" }),
+    transport: stubTransport(),
+  });
+  const delivery = await publisher.publish({ title: "t", body: hostile });
+  assert.equal(delivery.kind, "delivered");
+  const sent = lastSent();
+  assert.ok(
+    Buffer.byteLength(sent.body, "utf8") <= NTFY_MAX_JSON_BODY_BYTES,
+    `the whole document was ${Buffer.byteLength(sent.body, "utf8")} bytes`,
+  );
+  const message = String((JSON.parse(sent.body) as Record<string, unknown>).message);
+  assert.match(message, /… \(truncated\)$/u, "and the reader is told, not left counting quotes");
 });
 
 test("a title too long for a phone is clipped without losing the leading id", async () => {
@@ -170,16 +343,24 @@ test("a title too long for a phone is clipped without losing the leading id", as
   assert.ok(sent.title.startsWith("[p] tst.42"), "the searchable part survives the clip");
 });
 
-// A transport that records the last message it was handed.
-let lastMessage: NtfyMessage = { title: "", body: "" };
-function lastSent(): NtfyMessage {
-  return lastMessage;
+// A transport that records the last request it was handed, with the publish
+// envelope read back out of it.
+let lastRequest: NtfyRequestOptions = { headers: {}, body: "", timeoutMs: 0 };
+function lastSent(): { title: string; body: string; url: string } {
+  const parsed = JSON.parse(lastRequest.body) as { title?: string };
+  return {
+    title: typeof parsed.title === "string" ? parsed.title : "",
+    body: lastRequest.body,
+    url: lastUrl,
+  };
 }
+let lastUrl = "";
 function stubTransport(): NtfyTransport {
   return {
     name: "stub",
-    async publish(_url: string, options: NtfyRequestOptions) {
-      lastMessage = { title: options.headers.Title ?? "", body: options.body };
+    async publish(url: string, options: NtfyRequestOptions) {
+      lastRequest = options;
+      lastUrl = url;
       return { statusCode: 200, body: '{"id":"stub"}' };
     },
   };
@@ -200,7 +381,7 @@ test("only 4xx-but-not-429 is a clean no", () => {
 
 // ── the real transport, against a real server ───────────────────────────────
 
-test("a good publish: POST to the topic, JSON ack read back", async () => {
+test("a good publish: POST the envelope to the server root, JSON ack read back", async () => {
   const server = await startFakeNtfy();
   try {
     const publisher = createNtfyPublisher({
@@ -220,8 +401,45 @@ test("a good publish: POST to the topic, JSON ack read back", async () => {
     );
     assert.equal(server.requests.length, 1);
     assert.equal(server.requests[0]?.method, "POST");
-    assert.equal(server.requests[0]?.path, "/loop");
-    assert.equal(server.requests[0]?.headers.title, "[pi-beads] tst.7 completed: fixed it");
+    assert.equal(
+      server.requests[0]?.path,
+      "/",
+      "ntfy routes a JSON publish on the root path; the topic is not in the URL",
+    );
+    assert.equal(
+      server.requests[0]?.topic,
+      "loop",
+      "and the server got the topic out of the body, which is where it looked",
+    );
+    assert.equal(server.requests[0]?.headers["content-type"], "application/json");
+    const sent = publishedJson(server.requests[0]);
+    assert.equal(sent.title, "[pi-beads] tst.7 completed: fixed it");
+    assert.equal(sent.priority, 3, "the numeric form the field is typed as");
+    assert.match(String(sent.message), /the details/u);
+    // The report still names the topic URL rather than the request URL, because
+    // that is the thing a human recognises as "where the notices go".
+    assert.equal(
+      delivery.kind === "delivered" ? delivery.destination : "",
+      `${server.base}/loop`,
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("a JSON publish aimed at the topic URL is refused, the way ntfy refuses it", async () => {
+  // The fake is stricter than the real server on purpose: ntfy would accept
+  // `POST /loop` with a JSON body and turn the whole document into the text of
+  // the notification. A client that did that delivers garbage, so the test that
+  // it never happens is worth more than the test that garbage looks like.
+  const server = await startFakeNtfy();
+  try {
+    const response = await fetch(`${server.base}/loop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ topic: "loop", message: "would have arrived as JSON text" }),
+    });
+    assert.equal(response.status, 400);
   } finally {
     await server.close();
   }

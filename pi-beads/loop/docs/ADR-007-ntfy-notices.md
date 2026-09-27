@@ -6,10 +6,10 @@
   machine asks for, the ordering, the failure containment, the give-up streak —
   stands unchanged.
 - **Modules:** `src/ntfy.ts` (the publish transport: target resolution,
-  headers, byte limits, HTTP), `src/notify.ts` (the wording, re-shaped for a
-  phone), `src/orchestrator.ts` (`notify.publish`, renamed from `notify.email`),
-  `src/loop.ts` (the handler), `src/app.ts` / `src/main.ts` (composition and
-  the `LOOP_NTFY_*` knobs)
+  the JSON publish envelope, byte limits, HTTP), `src/notify.ts` (the wording,
+  re-shaped for a phone), `src/orchestrator.ts` (`notify.publish`, renamed from
+  `notify.email`), `src/loop.ts` (the handler), `src/app.ts` / `src/main.ts`
+  (composition and the `LOOP_NTFY_*` knobs)
 
 ## Context
 
@@ -33,12 +33,14 @@ The actual requirement was never "email". It was: **something finished, I'm not
 looking at the terminal, tell me.** ntfy is that, with a topic URL:
 
 ```
-POST https://ntfy.sh/<topic>          (or http://192.168.1.20:8080/<topic>)
-Title: [pi-beads] tst.42 completed: Added colour handling to the tokenizer…
-Priority: high
+POST https://ntfy.sh/                  (or http://192.168.1.20:8080/)
+Content-Type: application/json
 
-tst.42 — Add the colour mode to the parser
-…
+{"topic":"loop",
+ "title":"[pi-beads] tst.42 completed: Added colour handling to the tokenizer…",
+ "priority":4,
+ "tags":["+1"],
+ "message":"tst.42 — Add the colour mode to the parser\n…"}
 ```
 
 No handshake, no session, no sender identity, no relay policy — and the same
@@ -58,7 +60,13 @@ It takes either a bare topic name (`loop-notices`) or a complete URL
 UI hands you and the first is what you'd write in a dotenv file. A bare topic is
 joined onto `LOOP_NTFY_URL`, which defaults to `https://ntfy.sh`. A base with a
 path prefix (`https://example.test/ntfy`) is kept — that's a reverse-proxied
-ntfy, and the topic lives under the prefix.
+ntfy, and the publish goes to the prefix, which is the root of the ntfy behind
+it.
+
+The topic name itself is checked against ntfy's own rule (`^[-_A-Za-z0-9]{1,64}$`,
+and note that a dot is not in it), because a topic outside that rule is a
+guaranteed `400` on every single notice, and a guaranteed failure is worth
+hearing once, in the terminal the typo was typed in.
 
 `LOOP_NTFY_URL` alone is *not* the switch. A server with nowhere to publish is a
 relay that will never be exercised, and `enabled: false` with a reason beats a
@@ -126,10 +134,17 @@ notification is found by its title long after it arrives.
 ### 5. ntfy's limits are honoured, not discovered
 
 ntfy's defaults are `limit-message-bytes: 4096` and
-`limit-message-title-length: 200`. The body is truncated at the byte limit on a
+`limit-message-title-length: 200`. The message is truncated at the byte limit on a
 character boundary and marked `… (truncated)`; the title is clipped in a way that
 keeps the leading `[prefix] bead.id`. Cutting to fit beats a `413`, and marking
 the cut beats a notice that silently reads as shorter than the run.
+
+The JSON body has a second ceiling that the header form did not have to think
+about: `transformBodyJSON` reads the document with `MessageSizeLimit*2`, so the
+whole envelope — escaping included — has to fit 8 KiB while the message inside it
+fits 4 KiB. A message of 4 KiB made of quotes is 8 KiB of JSON before the topic
+and the title are added, so the message is clamped twice: to its own limit, then
+to whatever the document limit leaves. Both clamps say so.
 
 ### 6. The give-up streak carries over, unchanged
 
@@ -186,3 +201,104 @@ costs nothing when the body already says `bd show tst.42`.
 `LOOP_NOTIFY_EMAIL` in a deployed environment silently doing nothing would be
 exactly the kind of ghost this codebase keeps having to exorcise, so the answer
 is that unset is unset and the transcript says so.
+
+## Amendment: the notice moved out of the headers and into the body
+
+- **Status:** Accepted. Amends §1 and §5 above; the ordering, the containment,
+  the give-up streak and the wording all stand exactly as decided.
+- **Trigger:** a real run, a real closed bead, and this transcript line:
+
+  ```
+  Could not publish the completion notice for workspace-a05: Invalid character
+  in header content ["Title"]. The bead is closed either way — nothing about the
+  work changed.
+  ```
+
+### What happened
+
+`Title:` is a header, and a header is a control-character-free, Latin-1-sort-of
+thing. Node refuses anything above U+00FF at the socket layer
+(`ERR_INVALID_CHAR`) before a byte of the request leaves the process. The title
+of this notice is
+
+```
+[pi-beads] <bead id> completed: <the summary the agent reported>
+```
+
+and that summary is prose written by a model. An em dash, a curly quote, a `✓`
+it typed because the tests pass, a term copied out of a file in another language:
+any one of them in a sentence about the work and the notice cannot be sent —
+while the very same notice with a plainer summary sails through.
+
+That is a shape of bug worth writing down, because everything about it
+misleads:
+
+- **It looks intermittent.** Half the beads announce themselves and half do
+  not, and which half is decided by the *vocabulary* used to describe the
+  work. Nothing about the run predicts it.
+- **It looks like the server's fault.** It arrives in the delivery report,
+  alongside "ntfy replied 503" and "connection refused", so the natural
+  place to look is the server. No request was ever sent.
+- **It cannot be reviewed away.** Nothing in the diff of the ticket that
+  triggers it is wrong. The trigger is a word.
+
+The containment decided in §2 did its job — the bead stayed closed, the run
+kept going, the failure was legible — which is why this was a notice problem
+and not an incident. But a notice that quietly does not fire for some tickets
+is a notice nobody can trust, and "we will tell you about the finished work"
+does not come with a character-set exclusion list.
+
+### The fix
+
+Say the same thing somewhere that is not a header. ntfy accepts the whole
+publish as a JSON request body (its documented "Publish as JSON" form, made
+for integrations that cannot set headers at all); we were using the older
+form out of habit:
+
+```
+POST <server>/              ← the root, not <server>/<topic>
+Content-Type: application/json
+Authorization: Bearer …     ← the one thing that has to stay a header
+
+{"topic":"loop","message":"…","title":"…","priority":4,"tags":["+1"]}
+```
+
+Everything the run wrote — title, message, tags, click URL — is now UTF-8 in a
+JSON string, where anything the run produced is legal. What is left in a header
+is `Content-Type`, `User-Agent` and the bearer token: three constants and one
+operator-supplied secret, none of it agent-authored.
+
+The two formats are equivalent where it matters. ntfy's own `transformBodyJSON`
+decodes the envelope and sets the very same `X-Title` / `X-Priority` /
+`X-Tags` / `X-Click` headers server-side, then calls the same publish handler.
+Nothing was traded away for the robustness: headers were always one way of
+spelling that envelope, and the worse-spelled way.
+
+### Four things the JSON form made us check instead of assume
+
+1. **The URL is the root, not the topic.** ntfy routes a JSON publish on
+   `r.URL.Path == "/"`. `POST /mytopic` with a JSON body is not the same
+   request said differently — that route takes its topic out of the *path*
+   and makes the entire JSON document the text of the notification, which
+   "delivers" and reads like a stack trace. So `NtfyTarget` now carries
+   `destination` (the `host/topic` string a human recognises, still what the
+   delivery report names) and `publishUrl` (where the request actually goes)
+   as two fields rather than one string pressed into both jobs.
+2. **`priority` is an `int`.** `high` is fine in a header and a `400` in a
+   JSON body, because `publishMessage.Priority` is an `int` in Go. Names are
+   translated on the way in (`min`→1 … `urgent`→5), and a value that is
+   neither is refused rather than shipped.
+3. **`tags` is an array of strings**, not the comma-joined string the header
+   took.
+4. **The document has its own ceiling**, 2× the message limit, and escaping
+   spends it. Hence the second clamp in §5.
+
+### And one rule it made explicit
+
+Nothing the work wrote may sit in a header. That is enforced rather than
+remembered: the one remaining operator-supplied header value, the token, is
+checked at startup (`notify-config`, exit 2 — a token with a stray newline is
+an operator error, reported where it was typed) and checked again inside the
+publisher, where all it can become is a `failed` delivery that names
+`LOOP_NTFY_TOKEN` instead of an `ERR_INVALID_CHAR` that names nothing a person
+can act on.
