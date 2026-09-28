@@ -1968,6 +1968,9 @@ function outcomeFixtureFor(kind: (typeof WORK_OUTCOME_KINDS)[number]): WorkOutco
     elapsedMs: 1,
     contextNotes: [],
     verdictToolCalls: 0,
+    // Nothing was killed in these fixtures: a verdict-shaped outcome always
+    // carries the list, even when the list is empty.
+    toolTimeouts: [],
   };
   switch (kind) {
     case "done":

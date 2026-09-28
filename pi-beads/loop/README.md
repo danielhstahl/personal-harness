@@ -271,7 +271,7 @@ pushing layers 1..7 of 9
   forever".
 - **A killed call does not end the run.** It comes back as a tool result carrying
   `details.timedOut: true`, plus a `tool_timeout` runner event, painted as
-  `bash killed after 02:00 of a 02:00 per-call cap (loop-7) — tool "bash" hit its
+  `bash timed out after 02:00 at the 02:00 LOOP_TOOL_TIMEOUT_MS cap (loop-7) — tool "bash" hit its
   per-call cap and was killed; the run goes on`, and the model goes
   on with the budget it has left. Contrast `timeout`, which *is* the run ending.
   The wrapper returns that result rather than throwing it because throwing is how
@@ -279,6 +279,36 @@ pushing layers 1..7 of 9
   is the one field that separates "the harness capped this" from "the tool
   failed by itself", which is the difference between work worth retrying and work
   that is not.
+- **On the board it is its own state, not a red `✗`.** `ToolStatus` has four
+  values — `pending`, `ok`, `error`, `timeout` — and a killed call settles on the
+  fourth: the warning glyph, in the theme's warning colour, with the cap it ran
+  into.
+
+  ```
+  ⚠ bash $ npm ci · timed out after 02:00
+  ```
+
+  That is the difference between an operator going to debug code that works and
+  an operator going to look at the cap. The status is decided in one place,
+  `settledToolStatus(result, isError)`, which reads the kill off the **result**
+  rather than the error flag for the reason just given; a killed call then closes
+  the pending-call bookkeeping exactly like one that returned normally, so the
+  spinner and the fast refresh beat stop with it.
+- **The next session is told, and the run is still what it was.** The kill is
+  folded into the run's transcript and into the bead's handoff note, naming the
+  tool and the knob that killed it:
+
+  ```
+  Tool timeouts: tool "bash" was killed at the LOOP_TOOL_TIMEOUT_MS=120000 cap
+  (2m0s); it had been out for 2m0s with 1024 char(s) of partial output; killed,
+  not failed: it never ran to completion, so assume nothing it was meant to do
+  was done
+  ```
+
+  while the run's outcome kind stays exactly what the verdict was — `done` if the
+  model said `done`. A killed `npm ci` does not reopen a finished bead; it stops
+  the next attempt from running the same command blind. Only the run-level budget
+  or the context wall ends a run, and neither of those is what this knob is for.
 - **The hung child really dies.** The wrapper owns the `AbortController` it hands
   down and forwards the session's own abort into it, so pi's `killProcessTree`
   fires at the cap — and Ctrl-C / `session.abort()` still reach the child

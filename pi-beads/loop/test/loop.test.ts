@@ -26,6 +26,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+
 import { buildApp, idleStatusFrom, perTurnIdle } from "../src/app.ts";
 import { readEnv, runFromEnv } from "../src/main.ts";
 import { createAgentRunner } from "../src/agent.ts";
@@ -34,6 +37,7 @@ import { createNotifier } from "../src/notify.ts";
 import { publishedJson, startFakeNtfy } from "./ntfy-server.ts";
 import { BdError } from "../src/beads.ts";
 import { createFinalizer } from "../src/finalize.ts";
+import { TOOL_TIMEOUT_ENV } from "../src/tool-timeouts.ts";
 import { normaliseDependencies } from "../src/beads.ts";
 import { HANDLED_EFFECT_KINDS, LoopError, runLoop } from "../src/loop.ts";
 import type { LoopLogEntry, LoopPorts } from "../src/loop.ts";
@@ -114,6 +118,10 @@ interface HarnessOptions {
   timeoutMs?: number;
   abortGraceMs?: number;
   wrapUpMs?: number;
+  /** Per-tool-call cap (`LOOP_TOOL_TIMEOUT_MS`) for the runner this harness builds. */
+  toolTimeoutMs?: number;
+  /** Extra tools the runner hands every session, alongside the report tool. */
+  extraTools?: ToolDefinition[];
   retryUnfitWork?: boolean;
   /** The completion notifier to wire in. Absent means the loop has none. */
   notifier?: import("../src/notify.ts").Notifier;
@@ -150,6 +158,8 @@ function harness(options: HarnessOptions = {}): Harness {
     timeoutMs: options.timeoutMs,
     abortGraceMs: options.abortGraceMs,
     wrapUpMs: options.wrapUpMs,
+    toolTimeoutMs: options.toolTimeoutMs,
+    extraTools: options.extraTools,
   });
   const splitter = createSplitter({ agent: splitPort, beads: board }, {});
   const finalizer = createFinalizer(
@@ -898,6 +908,109 @@ test("a run that lands on request is a verdict, so it may be tried again", async
     assert.ok(
       !/[Nn]ot running it again/u.test(result.reason ?? ""),
       `an off-ramped run is not unfit work: ${result.reason ?? ""}`,
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+// ── a tool call killed at the per-tool cap (ADR-010 §6) ───────────────────
+
+/**
+ * A tool whose `execute` never comes back — the wedged `docker push`, made
+ * testable. `entered` tells a test "the cap fired while the tool was still out"
+ * from "the tool was never called at all".
+ */
+function wedgedTool(name = "wedged"): { tool: ToolDefinition; entered: () => boolean } {
+  let entered = false;
+  const tool = {
+    name,
+    label: name,
+    description: "A tool that never returns.",
+    parameters: Type.Object({}),
+    execute: () => {
+      entered = true;
+      return new Promise<never>(() => {});
+    },
+  } as unknown as ToolDefinition;
+  return { tool, entered: () => entered };
+}
+
+test("a tool call killed at the cap is recorded in the run and in the handoff, and is not a timed-out run", async () => {
+  // The contrast with the two tests above is the point of this one. Those show
+  // the *run* running out of the harness's room, which ends it. This is one
+  // call running out of room, which does not: the wrapper handed the model a
+  // result, the model reported normally, the bead closed normally. What the
+  // kill changes is only what the next session is told.
+  const board = createScriptBoard();
+  board.seed({ id: "tst.9", title: "One bead, one wedged command", status: "open", priority: 1 });
+  const wedged = wedgedTool("wedged");
+  const h = harness({
+    board,
+    scripts: [
+      {
+        tools: [
+          { name: "wedged", params: {} },
+          {
+            name: "report_done",
+            params: doneParams({ summary: "Worked around the killed command and landed the change." }),
+          },
+        ],
+      },
+    ],
+    idleTexts: [],
+    toolTimeoutMs: 20,
+    extraTools: [wedged.tool],
+  });
+  h.repo.write("src/thing.ts", "export const thing = 1;\n");
+  try {
+    const result = await h.run();
+
+    assert.equal(wedged.entered(), true, "the tool really was called");
+    assert.equal(result.kind, "done", `clean stop expected: ${JSON.stringify(result.reason)}`);
+    assert.equal(board.statusOf("tst.9"), "closed", "the bead closed on its own verdict");
+
+    // The outcome the machine saw was the verdict, never `timeout`.
+    const runDetails = result.transcript.effects
+      .filter((entry) => entry.kind === "agent.run")
+      .map((entry) => entry.detail);
+    assert.ok(runDetails.length > 0, "work ran");
+    assert.ok(
+      runDetails.some((detail) => /tst\.9:done$/u.test(detail)),
+      `the run must report its verdict, not a kill: ${runDetails.join(" | ")}`,
+    );
+    assert.ok(
+      !runDetails.some((detail) => /timeout/u.test(detail)),
+      `a killed call must not reach the machine as a timed-out run: ${runDetails.join(" | ")}`,
+    );
+    assert.ok(
+      !result.transcript.transitions.some((entry) => entry.event === "work_failed"),
+      "a killed call must not reach the machine as a failed run",
+    );
+
+    // Recorded in the run's own transcript, with the knob named…
+    const notes = result.transcript.notes.join("\n");
+    assert.match(
+      notes,
+      new RegExp(`tool "wedged" was killed at the ${TOOL_TIMEOUT_ENV}=20 cap`, "u"),
+      notes,
+    );
+    // …said out loud to whoever is watching…
+    assert.ok(
+      h.ui.warned.some(
+        (line) => /wedged/u.test(line) && line.includes(TOOL_TIMEOUT_ENV),
+      ),
+      `nothing was said to the human: ${h.ui.warned.join(" | ")}`,
+    );
+    // …and in the note the next session reads cold.
+    const handoff = board.memories.get(handoffKeyFor("tst.9")) ?? "";
+    assert.match(handoff, /Tool timeouts:/u, handoff);
+    assert.match(handoff, /"wedged"/u, handoff);
+    assert.match(handoff, new RegExp(`${TOOL_TIMEOUT_ENV}=20`, "u"), handoff);
+    assert.match(
+      handoff,
+      /Summary: Worked around the killed command/u,
+      "the kill rides along with the verdict; it does not replace it",
     );
   } finally {
     h.dispose();

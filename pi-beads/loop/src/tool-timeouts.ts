@@ -162,6 +162,120 @@ export function timedOutToolResult(info: ToolTimeoutInfo): AgentToolResult<ToolT
 }
 
 /**
+ * The knob every killed call was capped by.
+ *
+ * Named in everything this module says out loud — the bead note, the handoff, the
+ * loop's transcript — because "a tool was killed at 120000ms" is only actionable
+ * once the reader knows *which* knob to go turn.
+ */
+export const TOOL_TIMEOUT_ENV = "LOOP_TOOL_TIMEOUT_MS";
+
+/**
+ * A killed call, in the shape a **run** keeps.
+ *
+ * {@link ToolTimeoutInfo} is the wrapper's live view, with the partial output in
+ * it. This is what survives: a run accumulates one of these per kill and hands
+ * them to the outcome, so the note written an hour later can still say which
+ * tool died and at what limit. `elapsedMs` and `partialChars` are kept because
+ * the difference between "killed with no output" and "killed after three pages
+ * of build log" is the difference between a hung command and a slow one.
+ */
+export interface ToolTimeoutRecord {
+  readonly tool: string;
+  readonly timeoutMs: number;
+  readonly elapsedMs: number;
+  readonly partialChars: number;
+}
+
+/** The wrapper's info, downgraded to what a note needs. */
+export function toolTimeoutRecord(info: ToolTimeoutInfo): ToolTimeoutRecord {
+  return {
+    tool: info.toolName,
+    timeoutMs: info.timeoutMs,
+    elapsedMs: info.elapsedMs,
+    partialChars: info.partialOutput.length,
+  };
+}
+
+/**
+ * `120000` → `2m0s`, `45_000` → `45s`, `900` → `900ms`.
+ *
+ * Notes are read in a terminal or a `bd` note, not in a debugger: `2m0s` is
+ * scannable where `120000` makes the reader do arithmetic.
+ */
+export function formatTimeoutLimit(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "an unknown limit";
+  if (ms < 1_000) return `${Math.round(ms)}ms`;
+  const total = Math.floor(ms / 1_000);
+  const seconds = total % 60;
+  const minutes = Math.floor(total / 60) % 60;
+  const hours = Math.floor(total / 3_600);
+  if (hours > 0) return `${hours}h${minutes}m${seconds}s`;
+  if (minutes > 0) return `${minutes}m${seconds}s`;
+  return `${seconds}s`;
+}
+
+/** One grouped kill: N calls of one tool at one cap. */
+interface KillGroup {
+  readonly tool: string;
+  readonly timeoutMs: number;
+  count: number;
+  lastElapsedMs: number;
+  partialChars: number;
+}
+
+/**
+ * The one wording for "a tool call in this run was killed", for everything that
+ * outlives the run: the loop's transcript, the bead's handoff note.
+ *
+ * Kill counts are folded per tool+cap so a run that killed `bash` four times
+ * produces one line, not four, in a note a human has to read. The line names
+ * the tool, the knob, the limit and what had been streamed — the four things
+ * needed to decide whether to raise the cap, split the command, or leave it.
+ *
+ * Returns nothing for nothing: the caller appends these to a note, and an empty
+ * list must add no noise.
+ */
+export function toolTimeoutNotes(
+  records: readonly ToolTimeoutRecord[] | undefined,
+): string[] {
+  if (records === undefined || records.length === 0) return [];
+  const groups: KillGroup[] = [];
+  for (const record of records) {
+    const found = groups.find(
+      (group) => group.tool === record.tool && group.timeoutMs === record.timeoutMs,
+    );
+    if (found !== undefined) {
+      found.count += 1;
+      found.lastElapsedMs = record.elapsedMs;
+      found.partialChars += record.partialChars;
+      continue;
+    }
+    groups.push({
+      tool: record.tool,
+      timeoutMs: record.timeoutMs,
+      count: 1,
+      lastElapsedMs: record.elapsedMs,
+      partialChars: record.partialChars,
+    });
+  }
+  return groups.map((group) => {
+    const parts = [
+      `tool "${group.tool}" was killed at the ${TOOL_TIMEOUT_ENV}=${group.timeoutMs} ` +
+        `cap (${formatTimeoutLimit(group.timeoutMs)})`,
+      group.count > 1
+        ? `${group.count} "${group.tool}" call(s) hit that cap this run`
+        : null,
+      `it had been out for ${formatTimeoutLimit(group.lastElapsedMs)} with ` +
+        `${group.partialChars} char(s) of partial output`,
+      "killed, not failed: it never ran to completion, so assume nothing it was " +
+        "meant to do was done",
+    ];
+    return parts.filter((part): part is string => part !== null).join("; ");
+  });
+}
+
+/**
  * "Did this tool result come from a killed call?" — the one definition.
  *
  * Needed outside the wrapper because the wrapper *returns* rather than throws
@@ -171,10 +285,48 @@ export function timedOutToolResult(info: ToolTimeoutInfo): AgentToolResult<ToolT
  * transcript read back, where there is no class left to compare against.
  */
 export function isTimedOutToolResult(result: unknown): boolean {
-  if (typeof result !== "object" || result === null) return false;
+  return readTimedOutResult(result) !== null;
+}
+
+/** What a killed result says about the kill. Any field may be missing. */
+export interface TimedOutResultInfo {
+  readonly tool: string | undefined;
+  readonly timeoutMs: number | undefined;
+  readonly elapsedMs: number | undefined;
+  readonly partialChars: number | undefined;
+}
+
+/**
+ * Read a killed result's own record of what was killed, or `null` when this is
+ * not one.
+ *
+ * The renderer needs the *cap*, not just the fact: `timed out after 2m0s` is
+ * the line that tells an operator which knob to turn, and the only place that
+ * number lives once the wrapper has returned is the result object itself.
+ */
+export function readTimedOutResult(result: unknown): TimedOutResultInfo | null {
+  if (typeof result !== "object" || result === null) return null;
   const details = (result as { details?: unknown }).details;
-  if (typeof details !== "object" || details === null) return false;
-  return (details as { timedOut?: unknown }).timedOut === true;
+  if (typeof details !== "object" || details === null) return null;
+  const record = details as {
+    timedOut?: unknown;
+    tool?: unknown;
+    toolName?: unknown;
+    timeoutMs?: unknown;
+    elapsedMs?: unknown;
+    partialChars?: unknown;
+  };
+  if (record.timedOut !== true) return null;
+  const number = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  const text = (value: unknown): string | undefined =>
+    typeof value === "string" && value !== "" ? value : undefined;
+  return {
+    tool: text(record.toolName) ?? text(record.tool),
+    timeoutMs: number(record.timeoutMs),
+    elapsedMs: number(record.elapsedMs),
+    partialChars: number(record.partialChars),
+  };
 }
 
 /** A running cap: the promise that fires it, and the way to stop it. */

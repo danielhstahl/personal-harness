@@ -66,6 +66,7 @@ import {
   validateFinalizeRequest,
   type FinalizeRequest,
 } from "../src/finalize.ts";
+import { TOOL_TIMEOUT_ENV, toolTimeoutNotes } from "../src/tool-timeouts.ts";
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -632,6 +633,88 @@ test("a note with no next steps says so instead of trailing off", () => {
   const req = request({ nextSteps: [], decisions: [] });
   const note = renderHandoff(req, "abc", ["src/a.ts"], handoffKeyFor("loop-1"));
   assert.match(note, /Next: \(none recorded\)/);
+});
+
+test("a run that had a tool call killed carries it into the handoff, knob and all", () => {
+  const note = renderHandoff(
+    request({
+      toolTimeouts: toolTimeoutNotes([
+        { tool: "bash", timeoutMs: 120_000, elapsedMs: 120_412, partialChars: 1_024 },
+      ]),
+    }),
+    "abc",
+    ["src/a.ts"],
+    handoffKeyFor("loop-1"),
+  );
+  const line = note.split("\n").find((entry) => entry.startsWith("Tool timeouts:")) ?? "";
+  assert.ok(line !== "", `the handoff must carry the kill:\n${note}`);
+  assert.match(line, /"bash"/u, "the tool that died is named");
+  assert.match(
+    line,
+    new RegExp(`${TOOL_TIMEOUT_ENV}=120000`, "u"),
+    "and the knob that killed it, with the value that was set",
+  );
+  assert.match(line, /\(2m0s\)/u, "the limit is readable, not only raw milliseconds");
+  assert.match(line, /never ran to completion/u, "and what that means for the reader");
+  // The kill is not the verdict: the summary is still what the run achieved.
+  assert.match(note, /^Summary: Added the finalize ritual.*$/mu);
+
+  // Field order: with the other facts about the run, and before `Next`.
+  const fields = note.split("\n").map((entry) => entry.split(":")[0] ?? "");
+  assert.ok(
+    fields.indexOf("Tool timeouts") > fields.indexOf("Changed") &&
+      fields.indexOf("Tool timeouts") < fields.indexOf("Next"),
+    `field order came out as: ${fields.join(", ")}`,
+  );
+});
+
+test("a run with no killed call grows no timeout line", () => {
+  for (const req of [request(), request({ toolTimeouts: [] })]) {
+    const note = renderHandoff(req, "abc", ["src/a.ts"], handoffKeyFor("loop-1"));
+    assert.ok(!note.includes("Tool timeouts"), `a quiet run grew a warning:\n${note}`);
+    assert.ok(!note.includes(TOOL_TIMEOUT_ENV), "the knob is not mentioned either");
+  }
+});
+
+test("toolTimeouts is validated like the request's other string lists", () => {
+  assert.equal(validateFinalizeRequest(request({ toolTimeouts: ["one line"] })).length, 0);
+  assert.ok(
+    validateFinalizeRequest({ ...request(), toolTimeouts: "killed" as never }).some((problem) =>
+      /`toolTimeouts`/u.test(problem),
+    ),
+    "a bare string is refused, not rendered as one giant line",
+  );
+  assert.ok(
+    validateFinalizeRequest({ ...request(), toolTimeouts: [42] as never }).some((problem) =>
+      /`toolTimeouts\[0\]`/u.test(problem),
+    ),
+    "and so is a non-string entry",
+  );
+});
+
+test("the memory a killed run actually writes names the tool and the cap", async () => {
+  const order: string[] = [];
+  const calls = emptyCalls();
+  const finalizer = createFinalizer(
+    { vcs: fakeVcs(order, { calls: emptyVcsCalls() }), beads: fakeBoard(order, { calls }) },
+    {},
+  );
+
+  const outcome = await finalizer.finalize(
+    request({
+      toolTimeouts: toolTimeoutNotes([
+        { tool: "bash", timeoutMs: 120_000, elapsedMs: 120_412, partialChars: 0 },
+      ]),
+    }),
+  );
+
+  assert.equal(outcome.kind, "finalized", describeFinalizeFailure(outcome));
+  const remembered = calls.remembered[0]?.text ?? "";
+  assert.match(remembered, /Tool timeouts:/u, "the kill reached the board");
+  assert.match(remembered, /"bash"/u);
+  assert.match(remembered, new RegExp(`${TOOL_TIMEOUT_ENV}=120000`, "u"));
+  // It is still a handoff, and still says the bead was finished.
+  assert.match(remembered, /Finalized loop-1/u);
 });
 
 // ── rule 12: the dry run prints the truth ───────────────────────────────────

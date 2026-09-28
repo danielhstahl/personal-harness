@@ -1,19 +1,22 @@
 #!/bin/bash
 set -e
 
-TAG="v0.2.5"
+TAG="v0.2.6"
 
 # sanitize PWD into something safe for docker names, and make it unique
 # even if two dirs share a basename
 SLUG="$(basename "$PWD")-$(echo -n "$PWD" | shasum -a 256 | cut -c1-8)"
 VOLUME="beads-data-$SLUG"
 docker volume create $VOLUME  >/dev/null
+# make issue names shorter and reflect pwd
+BASENAME=$(basename "$PWD")
 # make sure .beads exists before anything else touches the volume
 docker run --rm \
   -v $VOLUME:/home/appuser/.beads \
   --entrypoint bd \
   ghcr.io/danielhstahl/pi-beads:$TAG \
-  init --quiet --stealth || echo "already initialized"
+  init --quiet --stealth --prefix "${BASENAME:0:2}" || echo "already initialized"
+
 
 GIT_USER_NAME="$(git config user.name || true)"
 GIT_USER_NAME="${GIT_USER_NAME:-$USER}"

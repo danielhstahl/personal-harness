@@ -59,8 +59,10 @@ import {
   formatElapsed,
   formatTokenPair,
   joinFooter,
+  settledToolStatus,
   type WorkPresenter,
 } from "../src/render.ts";
+import { TOOL_TIMEOUT_ENV, timedOutToolResult } from "../src/tool-timeouts.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const sourceOf = (name: string): string =>
@@ -480,6 +482,7 @@ describe("rule 0: the presenter owns one output region and spawns nothing", () =
       elapsedMs: 1,
       contextNotes: [],
       verdictToolCalls: 1,
+      toolTimeouts: [],
       verdict: {
         done: true,
         summary: "did it",
@@ -566,6 +569,7 @@ function outcomeDone(): WorkOutcome {
     elapsedMs: 1,
     contextNotes: [],
     verdictToolCalls: 1,
+    toolTimeouts: [],
     verdict: { done: true, summary: "s", changedFiles: [], nextSteps: [] },
   };
 }
@@ -1569,6 +1573,213 @@ describe("rule 7: unknown and error-shaped events degrade honestly", () => {
       assert.doesNotThrow(() => h.presenter.feed(item as RunnerEvent));
     }
     h.presenter.flushSync();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// a killed tool call is its own state, never a generic error (ADR-010 §5, §6)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * What `LOOP_TOOL_TIMEOUT_MS=120000` leaves behind for a wedged `npm ci`: the
+ * wrapper's own result, built by the module that built the kill, so this test
+ * cannot quietly drift from the shape the harness actually produces.
+ */
+const KILLED_CI = timedOutToolResult({
+  toolName: "bash",
+  timeoutMs: 120_000,
+  elapsedMs: 120_412,
+  partialOutput: "npm ci: reifying node_modules",
+});
+
+describe("a tool call killed at the per-call cap reads as timed out, not as an error", () => {
+  const theme = createPresenterTheme();
+  const warningCode = openCode(theme.color("warning", "x"));
+  const errorCode = openCode(theme.color("error", "x"));
+
+  /** The rendered (escape-free) header line for the call whose summary is shown. */
+  const headerWith = (h: PresenterHarness, needle: string): string => {
+    const line = h
+      .plain()
+      .find((candidate) => candidate.includes(needle) && /^\s*\S/u.test(candidate));
+    assert.ok(line !== undefined, `no rendered line containing ${needle}`);
+    return line;
+  };
+
+  /** The styled line for a needle, so colour assertions read against the frame. */
+  const styledWith = (h: PresenterHarness, needle: string): string => {
+    const line = h
+      .frame()
+      .find((candidate) => stripTerminalSequences(candidate).includes(needle));
+    assert.ok(line !== undefined, `no styled line containing ${needle}`);
+    return line;
+  };
+
+  const killCall = (h: PresenterHarness): void => {
+    h.presenter.setContext({ issueId: "ws.7", phase: "work" });
+    h.presenter.feed(toolStart("c1", "bash", { command: "npm ci" }));
+    h.presenter.feed(toolEnd("c1", "bash", KILLED_CI, false));
+    h.presenter.flushSync();
+  };
+
+  it("settledToolStatus reads the kill out of the result, not the error flag", () => {
+    // The wrapper returns rather than throws, so `isError` is false here. A
+    // renderer that derived status from that flag alone would paint this `✓ ok`.
+    assert.equal(settledToolStatus(KILLED_CI, false), "timeout");
+    assert.equal(settledToolStatus(textResult("all good"), false), "ok");
+    assert.equal(settledToolStatus(textResult("exit 1"), true), "error");
+    // The kill is the more specific truth even when both are present.
+    assert.equal(settledToolStatus(KILLED_CI, true), "timeout");
+    // And a `timedOut` that is not exactly `true` is somebody else's field.
+    assert.equal(settledToolStatus({ details: { timedOut: false } }, true), "error");
+    assert.equal(settledToolStatus(undefined, false), "ok");
+    assert.equal(settledToolStatus("not even an object", true), "error");
+  });
+
+  it("the header says `timed out after <cap>` under a warning glyph", () => {
+    const h = presenterHarness();
+    killCall(h);
+    const line = headerWith(h, "npm ci");
+    assert.match(line, /^\s*⚠ bash/u, line);
+    assert.match(line, /timed out after 02:00/u, line);
+    assert.ok(!line.includes("\n"), "still exactly one line");
+    assert.doesNotMatch(line, /undefined|NaN/u, line);
+  });
+
+  it("never reads as ✓ ok, and never as the error ✗", () => {
+    const h = presenterHarness();
+    killCall(h);
+    const line = headerWith(h, "npm ci");
+    assert.doesNotMatch(line, /^\s*✓/u, "a killed call is not a passed one");
+    assert.doesNotMatch(line, /^\s*✗/u, "a killed call is not a failed one");
+  });
+
+  it("paints the kill with the theme's warning colour, not the error red", () => {
+    const h = presenterHarness();
+    killCall(h);
+    const styled = styledWith(h, "timed out after");
+    assert.ok(
+      styled.includes(warningCode),
+      `no warning colour in ${JSON.stringify(styled)}`,
+    );
+    assert.ok(
+      !styled.includes(errorCode),
+      `the error red leaked into a killed call: ${JSON.stringify(styled)}`,
+    );
+  });
+
+  it("a killed call and a failed call do not render alike", () => {
+    const h = presenterHarness();
+    h.presenter.setContext({ issueId: "ws.7", phase: "work" });
+    h.presenter.feed(toolStart("c1", "bash", { command: "npm ci" }));
+    h.presenter.feed(toolEnd("c1", "bash", KILLED_CI, false));
+    h.presenter.feed(toolStart("c2", "bash", { command: "exit 1" }));
+    h.presenter.feed(
+      toolEnd("c2", "bash", textResult("command failed: exit code 1"), true),
+    );
+    h.presenter.flushSync();
+
+    const killed = headerWith(h, "npm ci").trim();
+    const failed = headerWith(h, "exit 1").trim();
+    assert.equal(killed.charAt(0), "⚠", killed);
+    assert.equal(failed.charAt(0), "✗", failed);
+    assert.notEqual(killed, failed, "the two states must not collide");
+    // Colour, read off the styled frame — `plain()` has already stripped it.
+    const killedStyled = styledWith(h, "npm ci");
+    const failedStyled = styledWith(h, "exit 1");
+    assert.ok(
+      codeSet([killedStyled]).has(warningCode) &&
+        !codeSet([killedStyled]).has(errorCode),
+      `the killed header is not warning-only: ${JSON.stringify(killedStyled)}`,
+    );
+    assert.ok(
+      codeSet([failedStyled]).has(errorCode),
+      `the failed header lost its error colour: ${JSON.stringify(failedStyled)}`,
+    );
+  });
+
+  it("the kill keeps the wrapper's own explanation under the header", () => {
+    const h = presenterHarness({ collapsedPreviewLines: 3 });
+    killCall(h);
+    const body = h.plain().join("\n");
+    assert.match(
+      body,
+      /timed out after 120000ms and was killed/u,
+      "the model's own words are shown, not just the header",
+    );
+  });
+
+  it("a call that ends by timeout still closes the pending bookkeeping", () => {
+    const h = presenterHarness({ heartbeatMs: 500, spinnerMs: 120 });
+    h.presenter.setContext({ issueId: "ws.7", phase: "work" });
+    h.presenter.feed(toolStart("c1", "bash", { command: "npm ci" }));
+    h.presenter.flushSync();
+    assert.equal(h.presenter.stats().animating, true, "the call is outstanding");
+
+    h.presenter.feed(toolEnd("c1", "bash", KILLED_CI, false));
+    h.presenter.flushSync();
+    assert.equal(
+      h.presenter.stats().animating,
+      false,
+      "a killed call is a settled call: pendingCalls was decremented",
+    );
+
+    // The fast beat has to go back to the slow one. A timeout path that skipped
+    // `refreshCadence()` keeps the spinner timer alive for a call that is over.
+    const before = h.presenter.stats().paints;
+    for (let step = 0; step < 4; step += 1) {
+      h.time.advance(1_000);
+      h.time.fire();
+      h.time.fire();
+    }
+    const painted = h.presenter.stats().paints - before;
+    assert.ok(
+      painted <= 5,
+      `${painted} frames in four settled seconds: the fast beat outlived the kill`,
+    );
+    assert.doesNotMatch(h.plain().join("\n"), /[⠁-⣿]/u, "no spinner after the fact");
+  });
+
+  it("the plain path says the same thing with no escapes at all", () => {
+    const h = presenterHarness({ tty: false });
+    killCall(h);
+    const text = h.plain().join("\n");
+    assert.match(text, /bash .*timed out after 02:00/u, text);
+    assert.equal(codesIn(text).length, 0, "colour is a live-surface thing only");
+  });
+
+  it("the tool_timeout runner event names the tool, the cap and the knob", () => {
+    const h = presenterHarness();
+    h.presenter.setContext({ issueId: "ws.7eg", phase: "work" });
+    h.presenter.feed({
+      type: "tool_timeout",
+      elapsedMs: 120_412,
+      budgetMs: 120_000,
+      detail: "tool \"bash\" hit its per-call cap and was killed; the run goes on",
+      raw: { toolName: "bash", timeoutMs: 120_000 },
+    });
+    h.presenter.flushSync();
+
+    const line = stripTerminalSequences(styledWith(h, "timed out"));
+    assert.match(line, /bash timed out after 02:00/u, line);
+    assert.match(line, new RegExp(TOOL_TIMEOUT_ENV, "u"), "the knob is named");
+    assert.match(line, /ws\.7eg/u, "the bead it happened on is named");
+    const styled = styledWith(h, "timed out");
+    assert.ok(styled.includes(warningCode), "warning-themed, not a failure");
+    assert.ok(!styled.includes(errorCode), "a killed call is not a red line");
+  });
+
+  it("a killed call renders as itself next to a run that went on working", () => {
+    // The event ordering an operator actually sees: the kill, then prose. If the
+    // kill ended the run there would be nothing after it.
+    const h = presenterHarness();
+    killCall(h);
+    h.presenter.feed(assistantEvent("message_update", "Fine, I will build it piecemeal."));
+    h.presenter.flushSync();
+    const lines = h.plain();
+    const killed = lines.findIndex((l) => l.includes("timed out after"));
+    const prose = lines.findIndex((l) => l.includes("piecemeal"));
+    assert.ok(killed >= 0 && prose > killed, `kill at ${killed}, prose at ${prose}`);
   });
 });
 

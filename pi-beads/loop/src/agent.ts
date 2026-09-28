@@ -60,8 +60,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import { withToolTimeout, withToolTimeouts } from "./tool-timeouts.ts";
-import type { AnyToolDefinition, ToolTimeoutInfo } from "./tool-timeouts.ts";
+import { toolTimeoutRecord, withToolTimeout, withToolTimeouts } from "./tool-timeouts.ts";
+import type {
+  AnyToolDefinition,
+  ToolTimeoutInfo,
+  ToolTimeoutRecord,
+} from "./tool-timeouts.ts";
 import type { BdClient, Issue, NewIssueSpec } from "./beads.ts";
 import { BdError, normaliseDependencies } from "./beads.ts";
 import { failureKeyFor, handoffKeyFor } from "./orchestrator.ts";
@@ -452,6 +456,17 @@ export interface WorkOutcomeBase {
   readonly contextNotes: readonly string[];
   /** How many times `report_done` was called. More than one is worth seeing. */
   readonly verdictToolCalls: number;
+  /**
+   * Tool calls this run killed at the per-call cap, one record per kill.
+   *
+   * Deliberately *not* a kind. A killed call costs the model one tool result and
+   * nothing else: the run keeps its verdict, because "`npm ci` got cut off" says
+   * nothing about whether the ticket was finished. What it does say belongs where
+   * the next session will read it — the handoff note — so it is carried as data
+   * on the outcome and folded in by `src/loop.ts` rather than being made into a
+   * failure the machine would retry. ADR-010 §6.
+   */
+  readonly toolTimeouts: readonly ToolTimeoutRecord[];
 }
 
 export type WorkOutcome =
@@ -700,7 +715,11 @@ export class AgentError extends Error {
  * found in a transcript or a caught unknown.
  */
 export { isToolTimeoutError, ToolTimeoutError } from "./tool-timeouts.ts";
-export type { ToolTimeoutDetails, ToolTimeoutInfo } from "./tool-timeouts.ts";
+export type {
+  ToolTimeoutDetails,
+  ToolTimeoutInfo,
+  ToolTimeoutRecord,
+} from "./tool-timeouts.ts";
 
 // ── session abstraction ─────────────────────────────────────────────────────
 
@@ -1673,6 +1692,12 @@ export interface RunEvidence<T> {
   /** Proposals made after the accepted one. Never applied, always reported. */
   readonly duplicates: readonly T[];
   readonly verdictToolCalls: number;
+  /**
+   * Every call this session cut off, in the order it died. Collected by the same
+   * hook that emits the `tool_timeout` event, so the live surface and the note
+   * written afterwards cannot disagree about how many there were.
+   */
+  readonly toolTimeouts: readonly ToolTimeoutRecord[];
 }
 
 export const REPORT_DONE_PARAMS = Type.Object({
@@ -2109,6 +2134,9 @@ async function openAndRun<T>(
      */
     let sessionId: string | undefined;
 
+    /** Every call this session had killed, newest last. See {@link RunEvidence}. */
+    const toolTimeouts: ToolTimeoutRecord[] = [];
+
     /**
      * The one place a killed call is reported. Both wrap sites — this one, for
      * the tools handed to the session, and {@link cappedBuiltinTools} inside
@@ -2120,6 +2148,9 @@ async function openAndRun<T>(
      * working; contrast the run-level `timeout` below, which aborts.
      */
     const onToolTimeout = (info: ToolTimeoutInfo): void => {
+      // Recorded for the outcome as well as emitted: the event is what the
+      // operator sees now, the record is what the next session reads later.
+      toolTimeouts.push(toolTimeoutRecord(info));
       emit({
         type: "tool_timeout",
         sessionId,
@@ -2373,6 +2404,7 @@ async function openAndRun<T>(
         accepted: capture.accepted,
         duplicates: capture.duplicates,
         verdictToolCalls: capture.accepted.length,
+        toolTimeouts: [...toolTimeouts],
       };
     } finally {
       capture.onAccepted = undefined;
@@ -2440,7 +2472,10 @@ async function openAndRun<T>(
 
   function baseFields(
     issueId: string,
-    evidence: Pick<RunEvidence<unknown>, "sessionId" | "sessionFile" | "assistantText"> | null,
+    evidence: Pick<
+      RunEvidence<unknown>,
+      "sessionId" | "sessionFile" | "assistantText" | "toolTimeouts"
+    > | null,
     started: number,
     contextNotes: readonly string[],
     verdictToolCalls: number,
@@ -2454,6 +2489,10 @@ async function openAndRun<T>(
       elapsedMs: Math.max(0, now() - started),
       contextNotes,
       verdictToolCalls,
+      // No evidence at all means no call could have been killed: a session that
+      // never opened never ran a tool. Stated as the empty list rather than
+      // `undefined`, so every reader downstream has one shape to loop over.
+      toolTimeouts: evidence?.toolTimeouts ?? [],
     };
   }
 
