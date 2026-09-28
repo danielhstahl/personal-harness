@@ -73,6 +73,7 @@ import { BdError, selectWorkable } from "./beads.ts";
 import type { BdClient, Issue } from "./beads.ts";
 import type { AgentRunner, WorkOutcome } from "./agent.ts";
 import { describeFailure, toWorkEvent } from "./agent.ts";
+import { TOOL_TIMEOUT_ENV, toolTimeoutNotes } from "./tool-timeouts.ts";
 import type { FinalizeOutcome, FinalizeRequest } from "./finalize.ts";
 import { describeFinalizeFailure, toFinalizeEvents } from "./finalize.ts";
 import type { IdleOutcome } from "./idle.ts";
@@ -973,6 +974,27 @@ export async function runLoop(
           : null;
     }
     effects.push({ kind: effect.kind, detail: `${effect.issueId}:${outcome.kind}` });
+    // A tool call killed at the per-call cap is recorded here — in the run's own
+    // transcript, and then in the handoff note by `buildFinalizeRequest` — and
+    // changes nothing above. The wrapper handed the model a result instead of
+    // throwing, the model kept working, so the outcome kind stays whatever the
+    // verdict was. Making a killed `npm ci` a `timeout` would reopen a bead that
+    // finished, for a reason that has nothing to do with the work; only the
+    // run-level budget or the context window ends a run. ADR-010 §6.
+    const killed = toolTimeoutNotes(outcome.toolTimeouts);
+    for (const note of killed) {
+      notes.push(note);
+      log("info", note);
+    }
+    if (killed.length > 0) {
+      const tools = [...new Set(outcome.toolTimeouts.map((record) => record.tool))];
+      warn(
+        `${effect.issueId}: ${outcome.toolTimeouts.length} tool call(s) ` +
+          `(${tools.join(", ")}) were killed at the ${TOOL_TIMEOUT_ENV} cap. The run ` +
+          `carried on from them and ended ${outcome.kind}: the verdict is the ` +
+          "model's, not the killed call's, and the handoff note names what died.",
+      );
+    }
     log("info", `work on ${effect.issueId} ended ${outcome.kind} (${outcome.elapsedMs}ms)`);
     return feed(toWorkEvent(outcome));
   }
@@ -1191,12 +1213,23 @@ export async function runLoop(
     const summary = verdict?.summary ?? stripIssuePrefix(effect.message, issueId);
     const changedFiles =
       verdict !== null && verdict.changedFiles.length > 0 ? verdict.changedFiles : effect.paths;
+    // Killed tool calls ride along into the handoff, keyed off the run that
+    // actually ran them: the note is the only thing the next session is
+    // guaranteed to read, and "a call to `bash` was cut off at 2m0s here" is
+    // the difference between resuming intelligently and re-running the same
+    // command that never returns. Only this issue's own run counts — attaching
+    // another bead's kill to this note would be a fabricated fact.
+    const killed =
+      lastWork !== null && lastWork.issueId === issueId
+        ? toolTimeoutNotes(lastWork.toolTimeouts)
+        : [];
     const request: FinalizeRequest = {
       issueId,
       title: issue?.title ?? state.activeIssueTitle ?? issueId,
       summary,
       changedFiles,
       nextSteps: verdict?.nextSteps ?? [],
+      toolTimeouts: killed,
     };
     if (verdict === null) {
       notes.push("finalize: no verdict in hand; the commit effect's own message was used");

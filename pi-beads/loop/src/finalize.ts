@@ -83,6 +83,20 @@ export interface FinalizeRequest {
   readonly changedFiles: readonly string[];
   readonly nextSteps?: readonly string[];
   readonly decisions?: readonly string[];
+  /**
+   * One already-worded line per tool call this run had killed at the per-call
+   * cap, as produced by `toolTimeoutNotes()` in `src/tool-timeouts.ts`.
+   *
+   * It lives in the handoff rather than in the summary because the two have
+   * different readers: the summary is what this run claims to have achieved,
+   * and a killed `npm ci` says nothing about that. What the *next* session
+   * needs to know is that a tool died here, at what limit, and that its effects
+   * should be assumed absent — otherwise the next attempt re-runs the command
+   * that never returns and pays for it with a whole session. Written only when
+   * something was actually killed; a run with no kill gets no line, because a
+   * note that reports a non-existent problem is worse than one that is quiet.
+   */
+  readonly toolTimeouts?: readonly string[];
 }
 
 export interface FinalizerPorts {
@@ -350,6 +364,14 @@ export function renderHandoff(
   if (decisions.length > 0) {
     lines.push(`Decisions: ${decisions.join(" | ")}`);
   }
+  // A killed tool call, named with the knob that killed it. Placed before `Next`
+  // so the "what to do next" line stays last but one, and so a reader who stops
+  // reading at the first warning-shaped line has still been told that something
+  // in this run did not finish.
+  const timeouts = (request.toolTimeouts ?? []).map((t) => t.trim()).filter((t) => t !== "");
+  if (timeouts.length > 0) {
+    lines.push(`Tool timeouts: ${timeouts.join(" | ")}`);
+  }
   const next = (request.nextSteps ?? []).map((s) => s.trim()).filter((s) => s !== "");
   lines.push(`Next: ${next.length === 0 ? "(none recorded)" : next.map((s, i) => `${i + 1}) ${s}`).join(" ")}`);
   lines.push(`Handoff key: ${handoffKey}`);
@@ -406,7 +428,7 @@ export function validateFinalizeRequest(request: Partial<FinalizeRequest> | null
       }
     });
   }
-  for (const field of ["nextSteps", "decisions"] as const) {
+  for (const field of ["nextSteps", "decisions", "toolTimeouts"] as const) {
     const value = request[field];
     if (value !== undefined && !Array.isArray(value)) {
       problems.push(`\`${field}\` must be an array of strings when present`);

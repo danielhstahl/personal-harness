@@ -30,12 +30,14 @@ import {
   describeFailure,
   extractLastFencedJson,
   isDone,
+  isToolTimeoutError,
   lastAssistantText,
   parseThinkingLevel,
   resolveModelForRun,
   resolveThinkingLevelForRun,
   toWorkEvent,
   toolInventoryGap,
+  ToolTimeoutError,
   formatTimeoutNote,
   validateSplitPayload,
   validateVerdict,
@@ -58,6 +60,15 @@ import type {
 } from "../src/agent.ts";
 import { BdError } from "../src/beads.ts";
 import { RepoError } from "../src/repo.ts";
+import {
+  isTimedOutToolResult,
+  isToolTimeoutWrapped,
+  withToolTimeout,
+  withToolTimeouts,
+} from "../src/tool-timeouts.ts";
+import type { ToolTimeoutDetails, ToolTimeoutInfo } from "../src/tool-timeouts.ts";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import type { RepoReaderLike } from "../src/agent.ts";
 import { measureContextBudget } from "../src/context.ts";
 import type { BdClient, Issue, NewIssueSpec } from "../src/beads.ts";
@@ -454,6 +465,10 @@ function runnerHarness(
     issue?: Issue | null;
     memories?: Record<string, string>;
     timeoutMs?: number;
+    /** Per-tool-call cap. Unset means the runner caps nothing, as shipped. */
+    toolTimeoutMs?: number;
+    /** Tools added to every session the runner opens. */
+    extraTools?: readonly ToolDefinition[];
     abortGraceMs?: number;
     wrapUpMs?: number;
     noRepo?: boolean;
@@ -493,6 +508,8 @@ function runnerHarness(
     sessionFactory: factory,
     repo,
     timeoutMs: options.timeoutMs ?? 60_000,
+    toolTimeoutMs: options.toolTimeoutMs,
+    extraTools: options.extraTools,
     abortGraceMs: options.abortGraceMs ?? 50,
     wrapUpMs: options.wrapUpMs,
     workThinkingLevel: options.workThinkingLevel,
@@ -1951,6 +1968,9 @@ function outcomeFixtureFor(kind: (typeof WORK_OUTCOME_KINDS)[number]): WorkOutco
     elapsedMs: 1,
     contextNotes: [],
     verdictToolCalls: 0,
+    // Nothing was killed in these fixtures: a verdict-shaped outcome always
+    // carries the list, even when the list is empty.
+    toolTimeouts: [],
   };
   switch (kind) {
     case "done":
@@ -2154,6 +2174,337 @@ test("nothing in agent.ts assigns a thinking level literal", () => {
     "a hard-coded level makes every ticket run at whatever this file says, with " +
       "nothing in the config able to overrule it",
   );
+});
+
+// ── the per-tool-call cap (ADR-010) ───────────────────────────────────────
+
+/**
+ * A tool whose `execute` never settles — the wedged child of the parent report,
+ * made testable. `entered` is what lets a test tell "the cap fired while the tool
+ * was still out" from "the tool was never called at all".
+ */
+function wedgedToolDefinition(
+  name = "wedged",
+  onEnter?: () => void,
+): { tool: ToolDefinition; entered: () => boolean } {
+  let entered = false;
+  const tool = {
+    name,
+    label: name,
+    description: "A tool that never returns.",
+    parameters: Type.Object({}),
+    execute: () => {
+      entered = true;
+      onEnter?.();
+      return new Promise<never>(() => {});
+    },
+  } as unknown as ToolDefinition;
+  return { tool, entered: () => entered };
+}
+
+/** A tool that answers immediately, to show the cap does not slow anything. */
+function quickToolDefinition(text = "PONG"): ToolDefinition {
+  return {
+    name: "quick",
+    label: "quick",
+    description: "Answers at once.",
+    parameters: Type.Object({}),
+    execute: async () => ({
+      content: [{ type: "text", text }],
+      details: { answered: true },
+    }),
+  } as unknown as ToolDefinition;
+}
+
+/** The text of the first content block of a tool result. */
+const firstText = (result: unknown): string => {
+  const content = (result as { content?: unknown }).content;
+  const part = Array.isArray(content) ? content[0] : undefined;
+  return typeof (part as { text?: unknown })?.text === "string"
+    ? (part as { text: string }).text
+    : "";
+};
+
+test("a call that never settles comes back as a killed call: a returned result, not a hang", async () => {
+  const fake = { t: 1_000 };
+  let fire: () => void = () => {};
+  const timeouts: ToolTimeoutInfo[] = [];
+  const wedged = wedgedToolDefinition("wedged");
+
+  const capped = withToolTimeout(wedged.tool, 1_000, {
+    now: () => fake.t,
+    deadline: () => ({
+      expired: new Promise<void>((resolve) => {
+        fire = () => {
+          fake.t += 1_000;
+          resolve();
+        };
+      }),
+      cancel: () => {},
+    }),
+    onTimeout: (info) => {
+      timeouts.push(info);
+    },
+  });
+
+  setTimeout(() => fire(), 0);
+  const result = await capped.execute(
+    "tc-wedged",
+    {},
+    new AbortController().signal,
+    () => {},
+    {} as never,
+  );
+
+  assert.equal(wedged.entered(), true, "the wrapped tool really ran");
+  assert.equal(isTimedOutToolResult(result), true);
+  const details = result.details as ToolTimeoutDetails;
+  assert.equal(details.timedOut, true);
+  assert.equal(details.toolName, "wedged");
+  assert.equal(details.timeoutMs, 1_000);
+  assert.equal(details.elapsedMs, 1_000, "elapsed is read off the injected clock");
+  assert.match(
+    firstText(result),
+    /^tool "wedged" timed out after 1000ms and was killed — it did not run to completion/u,
+    "the model-visible text names the tool, the cap and the fact it was killed",
+  );
+  assert.equal(timeouts.length, 1);
+  assert.equal(timeouts[0]?.toolName, "wedged");
+  assert.equal(isToolTimeoutWrapped(capped), true);
+});
+
+test("ToolTimeoutError carries the sentence the model is meant to read", () => {
+  const error = new ToolTimeoutError("bash", 120_000, 120_004);
+  assert.equal(
+    error.message,
+    'tool "bash" timed out after 120000ms and was killed — it did not run to completion',
+  );
+  assert.equal(ToolTimeoutError.is(error), true);
+  assert.equal(isToolTimeoutError(error), true, "re-exported beside isAgentError");
+  assert.equal(ToolTimeoutError.is(new Error("nope")), false);
+  assert.equal(isToolTimeoutError(undefined), false);
+});
+
+test("the wrapper owns the controller, and re-fires it when the session aborts", async () => {
+  let seen: AbortSignal | undefined;
+  const listener = {
+    name: "listener",
+    label: "listener",
+    description: "Reports the signal it was handed.",
+    parameters: Type.Object({}),
+    execute: async (_id: string, _params: unknown, signal?: AbortSignal) => {
+      seen = signal;
+      // What pi's own tools do: kill the child and reject when the signal fires.
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, 5_000);
+        signal?.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(timer);
+            reject(new Error("aborted"));
+          },
+          { once: true },
+        );
+      });
+      return { content: [{ type: "text", text: "finished" }], details: {} };
+    },
+  } as unknown as ToolDefinition;
+
+  const inbound = new AbortController();
+  // A cap that never fires: only the inbound abort can act, which is what Ctrl-C
+  // and `session.abort()` have to be able to do through the wrapper.
+  const capped = withToolTimeout(listener, 60_000, {
+    deadline: () => ({ expired: new Promise<void>(() => {}), cancel: () => {} }),
+  });
+
+  const running = capped.execute("tc-listener", {}, inbound.signal, () => {}, {} as never);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.ok(seen, "the inner tool was called");
+  assert.notEqual(seen, inbound.signal, "the wrapper substitutes its own controller");
+  assert.equal(seen?.aborted, false, "not aborted yet");
+
+  inbound.abort();
+  await assert.rejects(running, /aborted/u);
+  assert.equal(seen?.aborted, true, "the inbound abort reached the substituted controller");
+});
+
+test("a call that answers inside the cap is untouched by it", async () => {
+  const timeouts: ToolTimeoutInfo[] = [];
+  const capped = withToolTimeout(quickToolDefinition(), 10_000, {
+    onTimeout: (info) => {
+      timeouts.push(info);
+    },
+  });
+  const result = await capped.execute(
+    "tc-quick",
+    {},
+    new AbortController().signal,
+    () => {},
+    {} as never,
+  );
+  assert.equal(firstText(result), "PONG");
+  assert.deepEqual(result.details, { answered: true });
+  assert.equal(isTimedOutToolResult(result), false);
+  assert.equal(timeouts.length, 0, "nothing was reported for a call that finished");
+});
+
+test("what a killed call had already streamed is kept, not thrown away", async () => {
+  const streamed = "first-line\nsecond-line\n";
+  const updates: unknown[] = [];
+  const tool = {
+    name: "streamer",
+    label: "streamer",
+    description: "Streams, then wedges.",
+    parameters: Type.Object({}),
+    execute: async (
+      _id: string,
+      _params: unknown,
+      _signal: AbortSignal | undefined,
+      onUpdate: ((partial: unknown) => void) | undefined,
+    ) => {
+      onUpdate?.({ content: [{ type: "text", text: "first-line\n" }], details: {} });
+      onUpdate?.({ content: [{ type: "text", text: "second-line\n" }], details: {} });
+      return new Promise<never>(() => {});
+    },
+  } as unknown as ToolDefinition;
+
+  let fire: () => void = () => {};
+  const capped = withToolTimeout(tool, 500, {
+    deadline: () => ({
+      expired: new Promise<void>((resolve) => {
+        fire = resolve;
+      }),
+      cancel: () => {},
+    }),
+  });
+
+  setTimeout(() => fire(), 0);
+  const result = await capped.execute(
+    "tc-streamer",
+    {},
+    new AbortController().signal,
+    (partial) => updates.push(partial),
+    {} as never,
+  );
+
+  const details = result.details as ToolTimeoutDetails;
+  assert.equal(details.timedOut, true);
+  assert.equal(details.partialChars, streamed.length);
+  assert.match(firstText(result), /Partial output before the kill:\nfirst-line\nsecond-line/u);
+  assert.equal(updates.length, 2, "the tee forwards; it does not swallow the stream");
+});
+
+test("no cap means the definition is handed through untouched", () => {
+  const quick = quickToolDefinition();
+  assert.equal(withToolTimeout(quick, undefined), quick);
+  assert.equal(withToolTimeout(quick, 0), quick, "a zero cap is no cap, not an instant one");
+  assert.equal(withToolTimeout(quick, Number.NaN), quick);
+  const list = [quick];
+  assert.equal(withToolTimeouts(list, undefined), list, "and the list is not even copied");
+  assert.equal(isToolTimeoutWrapped(quick), false);
+});
+
+test("wrapping twice keeps the first wrapper, so the first site keeps the event sink", () => {
+  const seen: ToolTimeoutInfo[] = [];
+  const first = withToolTimeout(quickToolDefinition(), 1_000, {
+    onTimeout: (info) => {
+      seen.push(info);
+    },
+  });
+  const second = withToolTimeout(first, 5_000, {});
+  assert.equal(second, first, "a second wrap site does not re-wrap and swap the cap");
+});
+
+test("a wedged tool call is cut off at the per-tool cap and the run keeps going", async () => {
+  // The parent report, end to end: a call that never returns must cost that
+  // call, not the iteration. The run is still expected to finish normally,
+  // because the model got a *result* and went on to report.
+  const wedged = wedgedToolDefinition("wedged", () => clock.advance(20));
+  const h = runnerHarness(
+    [{ tools: [{ name: "wedged", params: {} }, { name: "report_done", params: DONE_PARAMS }] }],
+    { toolTimeoutMs: 20, extraTools: [wedged.tool] },
+  );
+
+  const outcome = await h.runner.run("loop-42");
+
+  const killed = h.events.filter((event) => event.type === "tool_timeout");
+  assert.equal(killed.length, 1, `expected one tool_timeout event, got: ${JSON.stringify(killed)}`);
+  assert.equal(killed[0]?.kind, "work");
+  assert.equal(killed[0]?.sessionId, h.sessions[0]?.sessionId);
+  assert.equal(killed[0]?.budgetMs, 20, "the event carries the cap it ran into");
+  assert.equal(killed[0]?.elapsedMs, 20, "and the run's own clock, not the surface's");
+  assert.match(killed[0]?.detail ?? "", /"wedged"/u);
+  assert.match(killed[0]?.detail ?? "", /the run goes on/u);
+
+  assert.equal(
+    h.events.some((event) => event.type === "timeout"),
+    false,
+    "a killed call must not come back as a timed-out run",
+  );
+  assert.equal(h.sessions[0]?.toolErrors.length, 0, "the kill was a result, not a thrown tool error");
+  assert.equal(outcome.kind, "done", "the model got its timeout result and still reported");
+  assert.equal(wedged.entered(), true);
+});
+
+test("every tool handed to the session is capped — the report tool and the extras alike", async () => {
+  const wedged = wedgedToolDefinition("wedged");
+  const h = runnerHarness(
+    [{ tools: [{ name: "report_done", params: DONE_PARAMS }] }],
+    { toolTimeoutMs: 1_000, extraTools: [wedged.tool] },
+  );
+  await h.runner.run("loop-42");
+
+  const spec = h.specs[0];
+  assert.ok(spec, "the factory saw a spec");
+  assert.equal(spec.customTools.length, 2, "report tool + extra");
+  for (const tool of spec.customTools) {
+    assert.ok(isToolTimeoutWrapped(tool), `${tool.name} reached the session uncapped`);
+  }
+  assert.equal(spec.toolTimeoutMs, 1_000, "the cap is in the spec, for the built-in shadows");
+  assert.equal(typeof spec.onToolTimeout, "function", "and so is where it reports to");
+});
+
+test("with no cap configured, the tools reach the session exactly as written", async () => {
+  const h = runnerHarness([{ tools: [{ name: "report_done", params: DONE_PARAMS }] }]);
+  const outcome = await h.runner.run("loop-42");
+  assert.equal(outcome.kind, "done", "the ordinary path still works, uncapped");
+  const spec = h.specs[0];
+  assert.ok(spec);
+  assert.equal(spec.toolTimeoutMs, undefined);
+  for (const tool of spec.customTools) {
+    assert.equal(isToolTimeoutWrapped(tool), false, "no cap means no wrapper at all");
+  }
+});
+
+test("a cap at or above the run budget is said out loud instead of silently never firing", async () => {
+  const h = runnerHarness([{ tools: [{ name: "report_done", params: DONE_PARAMS }] }], {
+    timeoutMs: 1_000,
+    toolTimeoutMs: 5_000,
+  });
+  await h.runner.run("loop-42");
+  const notes = h.events
+    .filter((event) => event.type === "context_note")
+    .map((event) => event.detail ?? "");
+  assert.equal(notes.length, 1, `expected one ordering note, got: ${notes.join(" | ")}`);
+  assert.match(notes[0] ?? "", /per-tool cap .* at or above the run budget/u);
+  assert.match(notes[0] ?? "", /LOOP_TOOL_TIMEOUT_MS/u);
+});
+
+test("the cap is applied where the session's tools are assembled, not tool by tool", () => {
+  const source = stripComments(readFileSync(join(SRC_DIR, "agent.ts"), "utf8"));
+  // The runner's side: the whole list handed to the factory goes through the cap.
+  assert.match(source, /withToolTimeouts\(\s*sessionTools,/u);
+  assert.match(source, /customTools:\s*cappedTools/u);
+  // The factory's side: the built-ins are shadowed by capped copies of pi's own
+  // definitions (ADR-010 §1), which is the only way to cap a tool this harness
+  // does not own.
+  assert.match(source, /cappedBuiltinTools\(spec, settingsManager\)/u);
+  assert.match(source, /createBashToolDefinition/u);
+  assert.match(source, /createReadToolDefinition/u);
+  assert.match(source, /createEditToolDefinition/u);
+  assert.match(source, /createWriteToolDefinition/u);
+  // The event exists on the union the presenter reads.
+  assert.match(source, /\| "tool_timeout"/u);
 });
 
 // ── test utilities ──────────────────────────────────────────────────────────

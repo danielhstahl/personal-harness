@@ -53,6 +53,13 @@ import {
 
 import { formatToolArgs, formatToolResult, indentContent } from "./format.ts";
 import {
+  formatTimeoutLimit,
+  isTimedOutToolResult,
+  readTimedOutResult,
+  TOOL_TIMEOUT_ENV,
+} from "./tool-timeouts.ts";
+import type { TimedOutResultInfo } from "./tool-timeouts.ts";
+import {
   KanbanComponent,
   type KanbanMode,
   type KanbanSource,
@@ -271,7 +278,39 @@ export function formatTokenPair(
 
 export type BlockKind = "notice" | "assistant" | "tool" | "event";
 export type NoticeLevel = "info" | "warn" | "error";
-export type ToolStatus = "pending" | "ok" | "error";
+
+/**
+ * Where a tool call stands.
+ *
+ * `timeout` is a separate state rather than a flavour of `error` because the two
+ * readings are opposite: `error` says the tool tried and reported failure, so
+ * the work is wrong or the tool is broken; `timeout` says the harness cut a
+ * call off at `LOOP_TOOL_TIMEOUT_MS` and the run carried on. Painting the
+ * second with the first's red sends an operator to debug code that works, when
+ * the actual question is whether the cap is too low — and ADR-010 §6 is
+ * explicit that a killed call is not a failed run.
+ */
+export type ToolStatus = "pending" | "ok" | "error" | "timeout";
+
+/** A call that has come back — `pending` is not one of these. */
+export type SettledToolStatus = Exclude<ToolStatus, "pending">;
+
+/**
+ * The one place a finished call's status is decided.
+ *
+ * The kill is read out of the *result*, not the error flag: the wrapper returns
+ * rather than throws, because throwing is how pi sets `isError` and the throw
+ * path discards `details` — the one field that separates "the harness capped
+ * this" from "the tool failed by itself" (ADR-010 §5). Checked first, so a
+ * result that somehow carries both is reported as the more specific truth.
+ */
+export function settledToolStatus(
+  result: unknown,
+  isError: boolean,
+): SettledToolStatus {
+  if (isTimedOutToolResult(result)) return "timeout";
+  return isError ? "error" : "ok";
+}
 
 /** One line the loop said (`say` / `warn`), themed by level. */
 class NoticeBlock implements Component {
@@ -371,6 +410,18 @@ export interface ToolPulse {
 const PENDING_GLYPH = "…";
 
 /**
+ * The glyph for a call that was killed at the per-call cap.
+ *
+ * Not `✗`. That mark means "the tool reported failure", and a killed call did
+ * not fail — the harness stopped it, which is a thing the operator can tune
+ * (`LOOP_TOOL_TIMEOUT_MS`) and the model can work around. The warning triangle
+ * is the glyph this harness already uses for "attention, not failure" on the
+ * board (`src/kanban.ts`), and it is painted in the theme's warning colour
+ * rather than the error red for exactly that reason.
+ */
+const TIMEOUT_GLYPH = "⚠";
+
+/**
  * One second per turn of the spinner, at the default 120ms cadence. Exported
  * because "what the pending glyph can be" is a fact about the surface that
  * tests and any other reader should be able to ask for rather than guess.
@@ -449,10 +500,10 @@ class ToolBlock implements Component {
     this.hasResult = true;
   }
 
-  finish(result: unknown, isError: boolean): void {
+  finish(result: unknown, status: SettledToolStatus): void {
     this.result = result;
     this.hasResult = true;
-    this.status = isError ? "error" : "ok";
+    this.status = status;
   }
 
   /** The one-line summary. Single line by construction, whatever the tool said. */
@@ -484,6 +535,7 @@ class ToolBlock implements Component {
   }
 
   private glyph(): string {
+    if (this.status === "timeout") return TIMEOUT_GLYPH;
     if (this.status === "error") return "✗";
     if (this.status === "ok") return "✓";
     const pulse = this.pulseNow();
@@ -511,9 +563,47 @@ class ToolBlock implements Component {
     return text === "" ? "" : this.theme.color("muted", text);
   }
 
+  /** The killed call's own record of the cap; `null` for every other status. */
+  private timeoutInfo(): TimedOutResultInfo | null {
+    if (this.status !== "timeout") return null;
+    return readTimedOutResult(this.result);
+  }
+
+  /**
+   * ` · timed out after 2m0s`, undecorated, or "" unless this call was killed.
+   *
+   * The **cap** is the number on purpose, not the elapsed. The line is making a
+   * specific claim — "this call ran into `LOOP_TOOL_TIMEOUT_MS`" — and the
+   * elapsed figure overshoots the cap by whatever the scheduler jittered, which
+   * would have the header reporting a limit nobody configured. Falls back to
+   * elapsed, then to the bare phrase, when the result carries no cap.
+   *
+   * Formatted with `formatTimeoutLimit()`, the same function that words the cap
+   * in the bead's handoff note (`Tool timeouts: … (2m0s)`). One format for one
+   * number: an operator who saw `2m0s` on the live board and then reads `2m0s`
+   * in the note is looking at the same knob, not wondering whether the two
+   * numbers mean different things. `formatElapsed()` — the `mm:ss` clock the
+   * pending suffix uses — is for time counted *up*; a configured limit is a
+   * duration, and reads as one here.
+   */
+  timedOutPlain(): string {
+    const info = this.timeoutInfo();
+    if (info === null) return "";
+    const limit = info.timeoutMs ?? info.elapsedMs;
+    if (limit === undefined) return " · timed out";
+    return ` · timed out after ${formatTimeoutLimit(limit)}`;
+  }
+
+  private timedOut(): string {
+    const text = this.timedOutPlain();
+    return text === "" ? "" : this.theme.color("warning", text);
+  }
+
   /** Header line only — exposed so the one-line rule is directly testable. */
   headerPlain(): string {
-    return `${this.glyph()} ${this.name} ${this.summary()}${this.pendingTimePlain()}`;
+    return `${this.glyph()} ${this.name} ${this.summary()}${this.pendingTimePlain()}${
+      this.timedOutPlain()
+    }`;
   }
 
   /** Nothing is cached between frames: every render is a fresh string build. */
@@ -523,7 +613,13 @@ class ToolBlock implements Component {
 
   render(width: number): string[] {
     const glyphRole: PresenterRole =
-      this.status === "error" ? "error" : this.status === "ok" ? "success" : "muted";
+      this.status === "timeout"
+        ? "warning"
+        : this.status === "error"
+          ? "error"
+          : this.status === "ok"
+            ? "success"
+            : "muted";
     const header = [
       " ",
       this.theme.color(glyphRole, this.glyph()),
@@ -532,6 +628,7 @@ class ToolBlock implements Component {
       " ",
       this.theme.color("muted", this.summary()),
       this.pendingTime(),
+      this.timedOut(),
     ].join("");
 
     const lines = [truncateToWidth(header, width, "…")];
@@ -1329,6 +1426,42 @@ class Presenter implements WorkPresenter {
         );
         return;
       }
+      case "tool_timeout": {
+        // A call cut off, not a run cut off. The run is still going — which is
+        // the whole difference between this event and `timeout` below, and the
+        // reason it is a warning on its own line rather than a failure.
+        //
+        // The knob is named here on purpose: this is the line an operator acts
+        // on, and "it timed out" without the name sends them looking for a
+        // setting in the wrong file.
+        const raw = asRecord(event.raw);
+        const name = typeof raw?.toolName === "string" ? raw.toolName : "tool call";
+        const detail = event.detail === undefined ? "" : ` — ${oneLine(event.detail)}`;
+        // The cap is the fact the line exists to report; the elapsed is its
+        // witness. In a real kill the two round to the same string — the call
+        // ran to the cap and was cut — so printing both says one thing twice.
+        // The elapsed earns its words when it *differs*: an elapsed well off the
+        // cap means the kill itself was late, which is a different bug from a
+        // call that was slow, and is worth seeing. And when no cap came through
+        // at all it is the only number there is.
+        const cap =
+          event.budgetMs === undefined ? undefined : formatTimeoutLimit(event.budgetMs);
+        const spent = event.elapsedMs ?? this.elapsedMs();
+        const spentText = spent === undefined ? undefined : formatTimeoutLimit(spent);
+        const when =
+          spentText === undefined || spentText === cap ? "" : ` after ${spentText}`;
+        this.notice(
+          "warn",
+          `${name} timed out${when} ${
+            cap === undefined
+              ? `at the ${TOOL_TIMEOUT_ENV} cap`
+              : `at the ${cap} ${TOOL_TIMEOUT_ENV} cap`
+          }${
+            this.fields.issueId === undefined ? "" : ` (${this.fields.issueId})`
+          }${detail}`,
+        );
+        return;
+      }
       case "wrap_up": {
         const detail = event.detail === undefined ? "" : ` — ${oneLine(event.detail)}`;
         this.notice(
@@ -1443,7 +1576,14 @@ class Presenter implements WorkPresenter {
             : null;
         if (block === null) return;
         const wasPending = block.toolStatus === "pending";
-        block.finish(record?.result, record?.isError === true);
+        // A killed call must not render as `✓ ok`, and must not render as a red
+        // failure either: `settledToolStatus` reads the wrapper's own flag out
+        // of the result so the header can say *which* of the two happened.
+        // ADR-010 §5.
+        block.finish(
+          record?.result,
+          settledToolStatus(record?.result, record?.isError === true),
+        );
         if (wasPending) {
           // The call reported back: stop animating it, and stop paying for the
           // fast beat. The bookkeeping is deleted rather than zeroed so a long

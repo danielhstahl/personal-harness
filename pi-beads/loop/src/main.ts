@@ -143,6 +143,36 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
   };
 
   /**
+   * The per-tool-call cap, refused rather than dropped.
+   *
+   * `number()` cannot serve here, for the reason {@link maxFailuresSetting} gives:
+   * it returns `undefined` for what it cannot parse, and a timeout that took is
+   * indistinguishable from one that did not. There is no worse failure mode in
+   * this whole knob — the complaint that motivated it is a run that waits forever,
+   * so an operator who set `LOOP_TOOL_TIMEOUT_MS="120s"` (a string `Number` will
+   * not read) and got no cap has to be told at startup, in the same breath, with
+   * the vocabulary accepted. Unset is the only way to ask for no cap.
+   *
+   * A *safe* integer in milliseconds, at least 1: `1e21` parses as a whole
+   * number that is not the whole number anybody meant, and a cap past
+   * `Number.MAX_SAFE_INTEGER` is a cap that will never be reached by clock
+   * arithmetic.
+   */
+  const toolTimeoutSetting = (): number | undefined => {
+    const raw = source.LOOP_TOOL_TIMEOUT_MS;
+    if (raw === undefined || raw.trim() === "") return undefined;
+    const parsed = Number(raw);
+    if (!Number.isSafeInteger(parsed) || parsed < 1) {
+      throw new LoopError(
+        "tool-timeout-config",
+        `LOOP_TOOL_TIMEOUT_MS must be a whole number of milliseconds, at least 1, not "${raw.trim()}" ` +
+          "(unset means no per-tool cap; e.g. 120000 for two minutes)",
+      );
+    }
+    return parsed;
+  };
+
+  /**
    * Our declared understanding of the server's `limit-message-bytes`.
    *
    * ntfy does not publish the number it is running, so a self-hosted server on
@@ -267,6 +297,12 @@ export function readEnv(source: Readonly<Record<string, string | undefined>> = p
     },
     modelRef: provider !== undefined && model !== undefined ? { provider, id: model } : undefined,
     workTimeoutMs: number("LOOP_WORK_TIMEOUT_MS"),
+    /**
+     * Per-tool-call cap, nested inside `workTimeoutMs`. Unset = no cap on an
+     * individual call, which is what a run without it has always been.
+     * Read strictly, not with `number()`: see {@link toolTimeoutSetting}.
+     */
+    toolTimeoutMs: toolTimeoutSetting(),
     /** When to tell a run to land and report. Unset = budget minus the lead. */
     wrapUpMs: number("LOOP_WRAP_UP_MS"),
     /** Opt back up: retry a run that ran out of time or context in place. */
