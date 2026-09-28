@@ -271,9 +271,13 @@ pushing layers 1..7 of 9
   forever".
 - **A killed call does not end the run.** It comes back as a tool result carrying
   `details.timedOut: true`, plus a `tool_timeout` runner event, painted as
-  `bash timed out after 02:00 at the 02:00 LOOP_TOOL_TIMEOUT_MS cap (loop-7) — tool "bash" hit its
+  `bash timed out at the 2m0s LOOP_TOOL_TIMEOUT_MS cap (loop-7) — tool "bash" hit its
   per-call cap and was killed; the run goes on`, and the model goes
   on with the budget it has left. Contrast `timeout`, which *is* the run ending.
+  The line states the cap once; it adds the elapsed (`after 3m5s`) only when
+  that number *drifts* from the cap, because a call that was cut five minutes
+  after a two-minute cap is a late kill, not a slow call, and the two faults
+  want different fixes.
   The wrapper returns that result rather than throwing it because throwing is how
   pi sets `isError` and the throw path discards `details` — and `details.timedOut`
   is the one field that separates "the harness capped this" from "the tool
@@ -285,8 +289,14 @@ pushing layers 1..7 of 9
   into.
 
   ```
-  ⚠ bash $ npm ci · timed out after 02:00
+  ⚠ bash $ npm ci · timed out after 2m0s
   ```
+
+  The limit is worded by `formatTimeoutLimit()` — the same function that writes
+  `(2m0s)` into the bead's handoff note — so the number an operator sees live
+  and the number they read back the next day are spelled identically. The
+  `mm:ss` clock used for a *pending* call counts time up; a configured cap is a
+  duration, and reads as one.
 
   That is the difference between an operator going to debug code that works and
   an operator going to look at the cap. The status is decided in one place,

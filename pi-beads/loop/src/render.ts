@@ -53,6 +53,7 @@ import {
 
 import { formatToolArgs, formatToolResult, indentContent } from "./format.ts";
 import {
+  formatTimeoutLimit,
   isTimedOutToolResult,
   readTimedOutResult,
   TOOL_TIMEOUT_ENV,
@@ -569,20 +570,28 @@ class ToolBlock implements Component {
   }
 
   /**
-   * ` · timed out after 02:00`, undecorated, or "" unless this call was killed.
+   * ` · timed out after 2m0s`, undecorated, or "" unless this call was killed.
    *
    * The **cap** is the number on purpose, not the elapsed. The line is making a
    * specific claim — "this call ran into `LOOP_TOOL_TIMEOUT_MS`" — and the
    * elapsed figure overshoots the cap by whatever the scheduler jittered, which
    * would have the header reporting a limit nobody configured. Falls back to
    * elapsed, then to the bare phrase, when the result carries no cap.
+   *
+   * Formatted with `formatTimeoutLimit()`, the same function that words the cap
+   * in the bead's handoff note (`Tool timeouts: … (2m0s)`). One format for one
+   * number: an operator who saw `2m0s` on the live board and then reads `2m0s`
+   * in the note is looking at the same knob, not wondering whether the two
+   * numbers mean different things. `formatElapsed()` — the `mm:ss` clock the
+   * pending suffix uses — is for time counted *up*; a configured limit is a
+   * duration, and reads as one here.
    */
   timedOutPlain(): string {
     const info = this.timeoutInfo();
     if (info === null) return "";
     const limit = info.timeoutMs ?? info.elapsedMs;
     if (limit === undefined) return " · timed out";
-    return ` · timed out after ${formatElapsed(limit)}`;
+    return ` · timed out after ${formatTimeoutLimit(limit)}`;
   }
 
   private timedOut(): string {
@@ -1428,14 +1437,26 @@ class Presenter implements WorkPresenter {
         const raw = asRecord(event.raw);
         const name = typeof raw?.toolName === "string" ? raw.toolName : "tool call";
         const detail = event.detail === undefined ? "" : ` — ${oneLine(event.detail)}`;
-        const elapsed = event.elapsedMs ?? this.elapsedMs();
+        // The cap is the fact the line exists to report; the elapsed is its
+        // witness. In a real kill the two round to the same string — the call
+        // ran to the cap and was cut — so printing both says one thing twice.
+        // The elapsed earns its words when it *differs*: an elapsed well off the
+        // cap means the kill itself was late, which is a different bug from a
+        // call that was slow, and is worth seeing. And when no cap came through
+        // at all it is the only number there is.
         const cap =
-          event.budgetMs === undefined
-            ? `at the ${TOOL_TIMEOUT_ENV} cap`
-            : `at the ${formatElapsed(event.budgetMs)} ${TOOL_TIMEOUT_ENV} cap`;
+          event.budgetMs === undefined ? undefined : formatTimeoutLimit(event.budgetMs);
+        const spent = event.elapsedMs ?? this.elapsedMs();
+        const spentText = spent === undefined ? undefined : formatTimeoutLimit(spent);
+        const when =
+          spentText === undefined || spentText === cap ? "" : ` after ${spentText}`;
         this.notice(
           "warn",
-          `${name} timed out after ${formatElapsed(elapsed)} ${cap}${
+          `${name} timed out${when} ${
+            cap === undefined
+              ? `at the ${TOOL_TIMEOUT_ENV} cap`
+              : `at the ${cap} ${TOOL_TIMEOUT_ENV} cap`
+          }${
             this.fields.issueId === undefined ? "" : ` (${this.fields.issueId})`
           }${detail}`,
         );

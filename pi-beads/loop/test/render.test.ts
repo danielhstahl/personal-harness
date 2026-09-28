@@ -60,9 +60,15 @@ import {
   formatTokenPair,
   joinFooter,
   settledToolStatus,
+  type SettledToolStatus,
+  type ToolStatus,
   type WorkPresenter,
 } from "../src/render.ts";
-import { TOOL_TIMEOUT_ENV, timedOutToolResult } from "../src/tool-timeouts.ts";
+import {
+  TOOL_TIMEOUT_ENV,
+  timedOutToolResult,
+  toolTimeoutNotes,
+} from "../src/tool-timeouts.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const sourceOf = (name: string): string =>
@@ -1636,14 +1642,51 @@ describe("a tool call killed at the per-call cap reads as timed out, not as an e
     assert.equal(settledToolStatus("not even an object", true), "error");
   });
 
+  it("ToolStatus carries `timeout` beside pending/ok/error, and nothing else", () => {
+    // A type-level check: `Record<SettledToolStatus, true>` fails to compile if
+    // a settled state is missing from this object, and the excess-property check
+    // fails if a fifth one turns up without being accounted for here. The state
+    // list cannot drift without `npm run typecheck` going red.
+    const settled: Record<SettledToolStatus, true> = {
+      ok: true,
+      error: true,
+      timeout: true,
+    };
+    const all: readonly ToolStatus[] = ["pending", "ok", "error", "timeout"];
+    const settledKeys = (Object.keys(settled) as SettledToolStatus[]).sort();
+    assert.deepEqual(settledKeys, ["error", "ok", "timeout"]);
+    assert.deepEqual([...all].sort(), ["error", "ok", "pending", "timeout"]);
+    assert.equal(new Set(all).size, 4, "four states, no duplicates");
+  });
+
   it("the header says `timed out after <cap>` under a warning glyph", () => {
     const h = presenterHarness();
     killCall(h);
     const line = headerWith(h, "npm ci");
     assert.match(line, /^\s*⚠ bash/u, line);
-    assert.match(line, /timed out after 02:00/u, line);
+    // `2m0s` — the way a duration is written in the bead note, not the `mm:ss`
+    // clock the pending suffix uses for time counted up.
+    assert.match(line, /timed out after 2m0s/u, line);
     assert.ok(!line.includes("\n"), "still exactly one line");
     assert.doesNotMatch(line, /undefined|NaN/u, line);
+  });
+
+  it("the cap on the board and the cap in the handoff note are the same string", () => {
+    // One number, one format. An operator reads the cap live, then reads it
+    // again in the note a day later; two spellings of the same cap invites a
+    // hunt for a second knob that does not exist.
+    const h = presenterHarness();
+    killCall(h);
+    const header = headerWith(h, "npm ci");
+    const [note] = toolTimeoutNotes([
+      { tool: "bash", timeoutMs: 120_000, elapsedMs: 120_412, partialChars: 25 },
+    ]);
+    const limit = /\(([^)]+)\)/u.exec(note ?? "")?.[1];
+    assert.ok(limit !== undefined, `no readable limit in: ${note}`);
+    assert.ok(
+      header.includes(`timed out after ${limit}`),
+      `header ${JSON.stringify(header)} vs note ${JSON.stringify(note)}`,
+    );
   });
 
   it("never reads as ✓ ok, and never as the error ✗", () => {
@@ -1744,7 +1787,7 @@ describe("a tool call killed at the per-call cap reads as timed out, not as an e
     const h = presenterHarness({ tty: false });
     killCall(h);
     const text = h.plain().join("\n");
-    assert.match(text, /bash .*timed out after 02:00/u, text);
+    assert.match(text, /bash .*timed out after 2m0s/u, text);
     assert.equal(codesIn(text).length, 0, "colour is a live-surface thing only");
   });
 
@@ -1761,12 +1804,55 @@ describe("a tool call killed at the per-call cap reads as timed out, not as an e
     h.presenter.flushSync();
 
     const line = stripTerminalSequences(styledWith(h, "timed out"));
-    assert.match(line, /bash timed out after 02:00/u, line);
+    assert.match(line, /bash timed out at the 2m0s LOOP_TOOL_TIMEOUT_MS cap/u, line);
     assert.match(line, new RegExp(TOOL_TIMEOUT_ENV, "u"), "the knob is named");
     assert.match(line, /ws\.7eg/u, "the bead it happened on is named");
     const styled = styledWith(h, "timed out");
     assert.ok(styled.includes(warningCode), "warning-themed, not a failure");
     assert.ok(!styled.includes(errorCode), "a killed call is not a red line");
+  });
+
+  it("the event states the cap once, and the elapsed only when it drifts", () => {
+    const h = presenterHarness();
+    h.presenter.setContext({ issueId: "ws.7eg", phase: "work" });
+    // The ordinary kill: elapsed and cap are the same number, rounded.
+    h.presenter.feed({
+      type: "tool_timeout",
+      elapsedMs: 120_412,
+      budgetMs: 120_000,
+      raw: { toolName: "bash" },
+    });
+    // A kill whose elapsed is minutes past the cap: the *kill* was late, a
+    // different fault than a slow call, and it has to stay visible.
+    h.presenter.feed({
+      type: "tool_timeout",
+      elapsedMs: 185_000,
+      budgetMs: 120_000,
+      raw: { toolName: "npm" },
+    });
+    // And a kill that reported no cap: the elapsed is all there is.
+    h.presenter.feed({
+      type: "tool_timeout",
+      elapsedMs: 45_300,
+      raw: { toolName: "grep" },
+    });
+    h.presenter.flushSync();
+    const text = h.plain().join("\n");
+    assert.match(
+      text,
+      /bash timed out at the 2m0s LOOP_TOOL_TIMEOUT_MS cap(?! after)/u,
+      text,
+    );
+    assert.match(
+      text,
+      /npm timed out after 3m5s at the 2m0s LOOP_TOOL_TIMEOUT_MS cap/u,
+      text,
+    );
+    assert.match(
+      text,
+      /grep timed out after 45s at the LOOP_TOOL_TIMEOUT_MS cap/u,
+      "no cap number, but still the elapsed and the knob",
+    );
   });
 
   it("a killed call renders as itself next to a run that went on working", () => {
