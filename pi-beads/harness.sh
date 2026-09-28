@@ -25,6 +25,7 @@ GIT_USER_EMAIL="$(git config user.email || true)"
 GIT_USER_EMAIL="${GIT_USER_EMAIL:-$USER@example.com}"
 # run the actual pi harness
 # put models.json in $HOME/.pi/agent
+# Tools timeout after 10 minutes
 docker run --rm -it \
   -v "$PWD:/workspace" \
   --add-host=host.docker.internal:host-gateway \
@@ -34,6 +35,7 @@ docker run --rm -it \
   -e GIT_USER_EMAIL="$GIT_USER_EMAIL" \
   -e LOOP_NTFY_URL="$NTFY_URL" \
   -e LOOP_NTFY_TOPIC="harness" \
+  -e LOOP_TOOL_TIMEOUT_MS=60000 \
   -e LOOP_KANBAN="board" \
   -e LOOP_MONITOR=0 \
   -e LOOP_AUDIT=0 \
