@@ -28,10 +28,16 @@ fn print_json_value_to_string(v: &Value) -> String {
     s
 }
 
+pub enum ChatState {
+    Stopped,
+    Chat,
+    Tool,
+}
+
 pub struct App {
     pub input: InputState,
     pub transcript: Transcript,
-    pub running: bool,
+    pub chat_state: ChatState,
     pub spinner: usize,
     pub width: u16,
     pub dirty: bool,
@@ -50,7 +56,7 @@ impl App {
             input,
             transcript,
             width,
-            running: false,
+            chat_state: ChatState::Stopped,
             dirty: true,
             should_quit: false,
             spinner: 0,
@@ -61,7 +67,7 @@ impl App {
     pub fn update(&mut self, msg: Msg) {
         match msg {
             Msg::Tick => {
-                if self.running {
+                if !matches!(self.chat_state, ChatState::Stopped) {
                     self.spinner = self.spinner.wrapping_add(1);
                     self.dirty = true;
                 }
@@ -106,10 +112,10 @@ impl App {
     fn on_agent(&mut self, ev: AgentEvent) {
         match ev {
             AgentEvent::AgentStart { .. } => {
-                self.running = true;
+                self.chat_state = ChatState::Chat;
             }
             AgentEvent::AgentEnd { error, .. } => {
-                self.running = false;
+                self.chat_state = ChatState::Stopped;
                 if let Some(err) = error {
                     self.transcript.push_done(MessageKind::Error, err);
                 }
@@ -118,7 +124,7 @@ impl App {
                 assistant_message_event,
                 ..
             } => {
-                //self.running = true;
+                self.chat_state = ChatState::Chat;
                 match assistant_message_event {
                     AssistantMessageEvent::TextDelta {
                         delta,
@@ -142,7 +148,7 @@ impl App {
                 tool_name,
                 args,
             } => {
-                //self.running = true;
+                self.chat_state = ChatState::Tool;
                 self.transcript.start_tool(
                     tool_call_id,
                     tool_name,
@@ -169,11 +175,11 @@ impl App {
                 );
             }
             AgentEvent::ProviderError { message, .. } => {
-                self.running = false;
+                self.chat_state = ChatState::Stopped;
                 self.transcript.push_done(MessageKind::Error, message);
             }
             AgentEvent::ExtensionError { error, .. } => {
-                self.running = false;
+                self.chat_state = ChatState::Stopped;
                 self.transcript.push_done(MessageKind::Error, error);
             }
             _ => {}

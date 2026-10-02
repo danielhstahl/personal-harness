@@ -32,6 +32,7 @@ use components::text_stream::LiveTextPreview;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
+use crate::app::ChatState;
 use crate::components::scrollback::Flusher;
 use crate::components::tool::LiveToolPreview;
 use crate::state::state::{Entry, Transcript};
@@ -149,7 +150,7 @@ fn view(app: &App, flusher: &Flusher, f: &mut Frame) {
     ])
     .areas(f.area());
 
-    if app.running {
+    if matches!(app.chat_state, ChatState::Chat) {
         f.render_widget(
             LiveTextPreview::new(app.spinner, &app.transcript, flusher),
             text_area,
@@ -160,13 +161,7 @@ fn view(app: &App, flusher: &Flusher, f: &mut Frame) {
     //    Layout::vertical([Constraint::Min(0), Constraint::Length(tools.len() as u16)])
     //        .areas(preview);
 
-    tracing::warn!(
-        open = tools.len(),
-        total = app.transcript.entries.len(),
-        "view"
-    );
     for (i, e) in tools.iter().enumerate() {
-        tracing::warn!("tool exists in render");
         let row = Rect {
             y: tool_area.y + i as u16,
             height: 1,
@@ -210,32 +205,3 @@ fn spawn_agent(mut cmd_rx: mpsc::Receiver<UiCommand>, tx: mpsc::UnboundedSender<
         }
     });
 }
-
-/*
-fn main() -> io::Result<()> {
-    let (out_tx, out_rx) = mpsc::channel::<String>();
-    let (prompt_tx, prompt_rx) = mpsc::channel::<String>();
-
-    // Worker thread owns the session, so it never has to cross threads.
-    thread::spawn(move || {
-        let mut session = block_on(create_agent_session(SessionOptions {
-            provider: Some("llamacpp".to_string()),
-            model: Some("halogen-qwen3.8-flash-next".to_string()),
-            api_key: Some(std::env::var("OPENAI_API_KEY").unwrap_or_default()),
-            no_session: true,
-            ..SessionOptions::default()
-        }))
-        .unwrap();
-        println!("created session");
-        while let Ok(text) = prompt_rx.recv() {
-            //println!("Received text {}", text);
-            let tx = out_tx.clone();
-            let _ = block_on(session.prompt(&text, move |event: AgentEvent| {
-                let _ = tx.send(format!("{event:?}"));
-            }));
-        }
-    });
-    let app = App::new(prompt_tx, 200);
-    ratatui::run(|terminal| app.run(terminal))
-}
-*/

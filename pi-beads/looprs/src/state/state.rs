@@ -60,12 +60,6 @@ impl Transcript {
         });
     }
 
-    /*pub fn finish_last(&mut self) {
-        if let Some(e) = self.entries.last_mut() {
-            e.done = true;
-        }
-    }*/
-
     //start of adding tools
     pub fn start_tool(&mut self, id: String, name: String, input: String) {
         self.finish_last();
