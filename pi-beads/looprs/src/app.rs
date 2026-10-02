@@ -3,6 +3,7 @@ use crate::state::state::{MessageKind, Transcript};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use pi::model::AssistantMessageEvent;
 use pi::sdk::{AgentEvent, ContentBlock};
+use serde_json::Value;
 
 use tokio::sync::mpsc;
 pub enum Msg {
@@ -17,13 +18,23 @@ pub enum UiCommand {
     Cancel,
 }
 
+fn print_json_value_to_string(v: &Value) -> String {
+    let mut s = "".to_string();
+    if let Some(map) = v.as_object() {
+        for (key, value) in map {
+            s += &format!("{}: {}", key, value);
+        }
+    }
+    s
+}
+
 pub struct App {
     pub input: InputState,
     pub transcript: Transcript,
-    //pub running: bool,
+    pub running: bool,
     pub spinner: usize,
     pub width: u16,
-    //pub dirty: bool,
+    pub dirty: bool,
     pub should_quit: bool,
     //out_rx: Receiver<String>, // agent -> UI
     cmd_tx: mpsc::Sender<UiCommand>, // UI -> agent
@@ -39,17 +50,10 @@ impl App {
             input,
             transcript,
             width,
+            running: false,
+            dirty: true,
             should_quit: false,
-            //answer: BlockStream::default(),
-            //thinking: BlockStream::default(),
-            //block_stream_type: BlockStreamType::Answer,
-            //running: false,
             spinner: 0,
-            //scrollback: vec![],
-            //active_tools: vec![],
-            //width,
-            //dirty: true,
-            //should_quit: false,
             cmd_tx,
         }
     }
@@ -57,23 +61,29 @@ impl App {
     pub fn update(&mut self, msg: Msg) {
         match msg {
             Msg::Tick => {
-                //if self.running {
-                self.spinner = self.spinner.wrapping_add(1);
-                //self.dirty = true;
-                // }
+                if self.running {
+                    self.spinner = self.spinner.wrapping_add(1);
+                    self.dirty = true;
+                }
             }
             Msg::Term(Event::Resize(w, _)) => {
                 self.width = w;
-                //self.dirty = true;
+                self.dirty = true;
             }
-            Msg::Term(Event::Key(k)) if k.kind == KeyEventKind::Press => self.on_key(k),
+            Msg::Term(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                self.dirty = true;
+                self.on_key(k);
+            }
             Msg::Term(_) => {}
-            Msg::Agent(ev) => self.on_agent(ev),
+            Msg::Agent(ev) => {
+                self.dirty = true;
+                self.on_agent(ev);
+            }
         }
     }
 
     fn on_key(&mut self, k: crossterm::event::KeyEvent) {
-        //self.dirty = true;
+        self.dirty = true;
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
             self.should_quit = true;
             return;
@@ -81,7 +91,7 @@ impl App {
 
         if let Some(action) = self.input.handle_key(k) {
             match action {
-                InputAction::Submit { text, mode } => {
+                InputAction::Submit { text, ../*mode*/ } => {
                     //todo, send different if in different mode
                     let _ = self.cmd_tx.try_send(UiCommand::UserMessage(text.clone()));
                     self.transcript.push_done(MessageKind::User, text);
@@ -91,36 +101,24 @@ impl App {
                 }
             }
         }
-
-        /*match k.code {
-            KeyCode::Enter if !self.running && !self.input.trim().is_empty() => {
-                let text = std::mem::take(&mut self.input);
-                let w = self.md_width() as usize;
-                let mut lines =
-                    md::wrap(vec![Span::raw(text.clone())], w, "❯ ".into(), "  ".into());
-                lines.push(Line::default());
-                self.scrollback.extend(lines);
-                self.running = true;
-                let _ = self.cmd_tx.try_send(UiCommand::UserMessage(text));
-            }
-            KeyCode::Esc if self.running => {
-                let _ = self.cmd_tx.try_send(UiCommand::Cancel);
-            }
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Char(c) => self.input.push(c),
-            _ => {}
-        }*/
     }
 
     fn on_agent(&mut self, ev: AgentEvent) {
-        //let w = self.md_width();
         match ev {
+            AgentEvent::AgentStart { .. } => {
+                self.running = true;
+            }
+            AgentEvent::AgentEnd { error, .. } => {
+                self.running = false;
+                if let Some(err) = error {
+                    self.transcript.push_done(MessageKind::Error, err);
+                }
+            }
             AgentEvent::MessageUpdate {
                 assistant_message_event,
                 ..
             } => {
+                //self.running = true;
                 match assistant_message_event {
                     AssistantMessageEvent::TextDelta {
                         delta,
@@ -144,8 +142,12 @@ impl App {
                 tool_name,
                 args,
             } => {
-                self.transcript
-                    .start_tool(tool_call_id, tool_name, args.to_string());
+                //self.running = true;
+                self.transcript.start_tool(
+                    tool_call_id,
+                    tool_name,
+                    print_json_value_to_string(&args),
+                );
             }
             AgentEvent::ToolExecutionEnd {
                 tool_call_id,
@@ -167,9 +169,11 @@ impl App {
                 );
             }
             AgentEvent::ProviderError { message, .. } => {
+                self.running = false;
                 self.transcript.push_done(MessageKind::Error, message);
             }
             AgentEvent::ExtensionError { error, .. } => {
+                self.running = false;
                 self.transcript.push_done(MessageKind::Error, error);
             }
             _ => {}

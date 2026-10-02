@@ -4035,6 +4035,7 @@ dependencies = [
  "pi_agent_rust",
  "pulldown-cmark",
  "ratatui",
+ "serde_json",
  "syntect",
  "tokio",
  "tokio-util",

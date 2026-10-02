@@ -1,8 +1,6 @@
 use crate::state::state::MessageKind;
-use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Widget};
-use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
 
 pub fn content_width(term_width: u16) -> u16 {
     term_width.saturating_sub(2).max(20)

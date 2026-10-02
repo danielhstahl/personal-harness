@@ -1,7 +1,7 @@
 //Visualize tool execution
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
@@ -9,19 +9,16 @@ use crate::state::state::{Entry, MessageKind};
 use crate::utils::utils::FRAMES;
 
 pub fn tool_line(e: &Entry, spinner: usize) -> Line<'static> {
-    let MessageKind::Tool { name, state, .. } = &e.kind else {
+    let MessageKind::Tool {
+        name, state, input, ..
+    } = &e.kind
+    else {
         return Line::default();
     };
-    let mut spans = vec![Span::styled(
-        format!("{} {name} ", state.icon(spinner)),
+    let spans = vec![Span::styled(
+        format!("{} {name} {input} ", state.icon(spinner)),
         Style::new().fg(state.color()),
     )];
-    if !e.text.is_empty() {
-        spans.push(Span::styled(
-            e.text.clone(),
-            Style::new().add_modifier(Modifier::DIM),
-        ));
-    }
     Line::from(spans)
 }
 
@@ -61,12 +58,5 @@ impl<'a> LiveToolPreview<'a> {
 impl<'a> Widget for LiveToolPreview<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         Paragraph::new(tool_line(self.entry, self.spinner)).render(area, buf);
-        /*let icon = self.mode.icon(self.spinner);
-        let tool_name = &self.tool_name;
-        Paragraph::new(Line::from(Span::styled(
-            format!("{icon} {tool_name} "),
-            Style::default().fg(self.mode.color()),
-        )))
-        .render(area, buf);*/
     }
 }

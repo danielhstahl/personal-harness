@@ -60,11 +60,11 @@ impl Transcript {
         });
     }
 
-    pub fn finish_last(&mut self) {
+    /*pub fn finish_last(&mut self) {
         if let Some(e) = self.entries.last_mut() {
             e.done = true;
         }
-    }
+    }*/
 
     //start of adding tools
     pub fn start_tool(&mut self, id: String, name: String, input: String) {
@@ -81,7 +81,7 @@ impl Transcript {
         });
     }
 
-    pub fn finish_tool(&mut self, id: String, summary: String, ok: bool) {
+    pub fn finish_tool(&mut self, id: String, summary: String, is_error: bool) {
         let found = self
             .entries
             .iter_mut()
@@ -89,10 +89,10 @@ impl Transcript {
             .find(|e| matches!(&e.kind, MessageKind::Tool { id: i, .. } if *i == id));
         if let Some(e) = found {
             if let MessageKind::Tool { state, .. } = &mut e.kind {
-                *state = if ok {
-                    ToolStateCategory::Success
-                } else {
+                *state = if is_error {
                     ToolStateCategory::Error
+                } else {
+                    ToolStateCategory::Success
                 };
             }
             e.text = summary;
@@ -106,11 +106,12 @@ impl Transcript {
             .filter(|e| matches!(e.kind, MessageKind::Tool { .. }) && !e.done)
     }
 
-    /*pub fn finish_last(&mut self) {
+    pub fn finish_last(&mut self) {
         // only streamed entries close implicitly; a running tool must not be closed
         // by whatever comes next (parallel tools, for example)
+        // tools are often run in parallel, so this is required
         if let Some(e) = self.entries.last_mut().filter(|e| e.kind.is_streamed()) {
             e.done = true;
         }
-    }*/
+    }
 }

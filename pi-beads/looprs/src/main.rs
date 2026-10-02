@@ -14,7 +14,6 @@ use futures::executor::block_on;
 use pi::sdk::{AgentEvent, SessionOptions, create_agent_session};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
@@ -22,7 +21,6 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
-//use unicode_width::UnicodeWidthStr;
 
 /// Inline viewports are fixed-height in stock ratatui. Live preview gets whatever is left
 /// after status (1) + input (3). To resize dynamically, recreate the Terminal (or fork the
@@ -39,7 +37,8 @@ use crate::components::tool::LiveToolPreview;
 use crate::state::state::{Entry, Transcript};
 
 fn init_logging() -> anyhow::Result<WorkerGuard> {
-    let dir = std::env::temp_dir(); // or a proper data dir, e.g. via the `dirs` crate
+    //let dir = std::env::temp_dir(); // or a proper data dir, e.g. via the `dirs` crate
+    let dir = std::env::current_dir().unwrap();
     let appender = tracing_appender::rolling::never(&dir, "looprs.log");
     let (writer, guard) = tracing_appender::non_blocking(appender);
 
@@ -102,7 +101,6 @@ async fn run(term: &mut Term) -> Result<()> {
 
     loop {
         tokio::select! {
-            //Some(Ok(ev)) = keys.next() => app.update(Msg::Term(ev)),
             Some(ev) = ev_rx.recv() => app.update(Msg::Agent(ev)),
             Some(Ok(ev)) = keys.next() => {
                 if let Event::Resize(w, h) = ev {
@@ -113,21 +111,18 @@ async fn run(term: &mut Term) -> Result<()> {
                     }
                     keys = EventStream::new();                // resume
                     app.width = w;
-                    //app.dirty = true;
                 } else {
                     app.update(Msg::Term(ev));
                 }
             }
             _ = tick.tick() => {
                 app.update(Msg::Tick); //spinner only atm
-                let lines = flusher.drain(&app.transcript, app.width);  // reads transcript, mutates flusher
-                insert_lines(term, lines)?;
-                term.draw(|f| view(&app, &flusher, f))?;
-                /*if app.dirty {
-                    flush_scrollback(term, &mut app)?;   // 1. commit finished lines above viewport
-                    term.draw(|f| view(&app, f))?;       // 2. redraw live region
+                if app.dirty {
+                    let lines = flusher.drain(&app.transcript, app.width);  // reads transcript, mutates flusher
+                    insert_lines(term, lines)?;
+                    term.draw(|f| view(&app, &flusher, f))?;
                     app.dirty = false;
-                }*/
+                }
             }
         }
         if app.should_quit {
@@ -137,41 +132,41 @@ async fn run(term: &mut Term) -> Result<()> {
     Ok(())
 }
 
-/// Push finalized lines into the terminal's native scrollback.
-/*fn flush_scrollback(term: &mut Term, app: &mut App) -> io::Result<()> {
-    if app.scrollback.is_empty() {
-        return Ok(());
-    }
-    let lines = std::mem::take(&mut app.scrollback);
-    for chunk in lines.chunks(64) {
-        let h = chunk.len() as u16;
-        // Lines are pre-wrapped, so no Wrap here (overlong lines are truncated, not re-wrapped).
-        term.insert_before(h, |buf| {
-            Paragraph::new(chunk.to_vec()).render(buf.area, buf);
-        })?;
-    }
-    Ok(())
-}*/
-
 /// Pure function of state (the tail preview re-parses only the open block).
 fn view(app: &App, flusher: &Flusher, f: &mut Frame) {
-    let [preview, status, input] = Layout::vertical([
+    /*let [preview, status, input] = Layout::vertical([
         Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(3),
+    ])
+    .areas(f.area());*/
+    let tools: Vec<&Entry> = app.transcript.open_tools().take(4).collect();
+    let [text_area, tool_area, _status, input] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(tools.len() as u16),
         Constraint::Length(1),
         Constraint::Length(3),
     ])
     .areas(f.area());
 
-    f.render_widget(
-        LiveTextPreview::new(app.spinner, &app.transcript, flusher),
-        preview,
-    );
-    let tools: Vec<&Entry> = app.transcript.open_tools().take(4).collect();
-    let [preview, tool_area] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(tools.len() as u16)])
-            .areas(preview);
+    if app.running {
+        f.render_widget(
+            LiveTextPreview::new(app.spinner, &app.transcript, flusher),
+            text_area,
+        );
+    }
 
+    //let [preview, tool_area] =
+    //    Layout::vertical([Constraint::Min(0), Constraint::Length(tools.len() as u16)])
+    //        .areas(preview);
+
+    tracing::warn!(
+        open = tools.len(),
+        total = app.transcript.entries.len(),
+        "view"
+    );
     for (i, e) in tools.iter().enumerate() {
+        tracing::warn!("tool exists in render");
         let row = Rect {
             y: tool_area.y + i as u16,
             height: 1,
@@ -179,43 +174,8 @@ fn view(app: &App, flusher: &Flusher, f: &mut Frame) {
         };
         f.render_widget(LiveToolPreview::new(e, app.spinner), row);
     }
-
-    // live preview: bottom-anchored slice of the not-yet-committed tail
-    /*let tail = app.live_tail();
-    let skip = tail.len().saturating_sub(preview.height as usize);
-    f.render_widget(Paragraph::new(tail[skip..].to_vec()), preview);*/
-
-    /*match app.block_stream_type {
-        BlockStreamType::Thinking => {
-            f.render_widget(LivePreview::new(&app.thinking, THINKING_STYLE), preview)
-        }
-        BlockStreamType::Answer => {
-            f.render_widget(LivePreview::new(&app.answer, Style::default()), preview)
-        }
-    };
-
-    // status line
-    let line = if app.running {
-        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let tools: Vec<_> = app.active_tools.iter().map(|(_, n)| n.as_str()).collect();
-        Line::from(vec![
-            Span::styled(FRAMES[app.spinner % FRAMES.len()], Style::new().cyan()),
-            Span::raw(format!(" working {}", tools.join(", "))),
-            Span::styled("  (esc to cancel)", Style::new().dark_gray()),
-        ])
-    } else {
-        Line::styled("ctrl-c to quit", Style::new().dark_gray())
-    };
-    f.render_widget(Paragraph::new(line), status);*/
-
     // input
     app.input.render(f, input);
-    /*f.render_widget(
-        text_input(app.input.as_str(), &TerminalType::Beeds),
-        //Paragraph::new(app.input.as_str()).block(Block::bordered().border_style(Color::DarkGray)),
-        input,
-    );
-    f.set_cursor_position((input.x + 1 + app.input.width() as u16, input.y + 1));*/
 }
 
 fn spawn_agent(mut cmd_rx: mpsc::Receiver<UiCommand>, tx: mpsc::UnboundedSender<AgentEvent>) {
@@ -241,7 +201,7 @@ fn spawn_agent(mut cmd_rx: mpsc::Receiver<UiCommand>, tx: mpsc::UnboundedSender<
                         })
                         .await;
                     match res {
-                        Ok(v) => tracing::debug!("Success"),
+                        Ok(_v) => tracing::debug!("Success"),
                         Err(e) => tracing::info!("This is err: {}", e),
                     };
                 }
