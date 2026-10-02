@@ -1,0 +1,281 @@
+#![recursion_limit = "256"]
+mod app;
+mod components;
+mod state;
+mod theme;
+mod utils;
+use anyhow::Result;
+use app::{App, Msg, UiCommand};
+use components::input::InputState;
+use crossterm::event::{Event, EventStream};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use futures::StreamExt;
+use futures::executor::block_on;
+use pi::sdk::{AgentEvent, SessionOptions, create_agent_session};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Paragraph, Widget};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use std::io::{self, Stdout};
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
+//use unicode_width::UnicodeWidthStr;
+
+/// Inline viewports are fixed-height in stock ratatui. Live preview gets whatever is left
+/// after status (1) + input (3). To resize dynamically, recreate the Terminal (or fork the
+/// terminal layer like Codex does).
+const VIEWPORT_H: u16 = 10;
+
+type Term = Terminal<CrosstermBackend<Stdout>>;
+use components::text_stream::LiveTextPreview;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::EnvFilter;
+
+use crate::components::scrollback::Flusher;
+use crate::components::tool::LiveToolPreview;
+use crate::state::state::{Entry, Transcript};
+
+fn init_logging() -> anyhow::Result<WorkerGuard> {
+    let dir = std::env::temp_dir(); // or a proper data dir, e.g. via the `dirs` crate
+    let appender = tracing_appender::rolling::never(&dir, "looprs.log");
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+
+    tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    Ok(guard)
+}
+
+fn insert_lines(term: &mut Term, lines: Vec<Line<'static>>) -> io::Result<()> {
+    for chunk in lines.chunks(64) {
+        //64 is arbitrary
+        let height = chunk.len() as u16;
+        term.insert_before(height, |buf| {
+            Paragraph::new(chunk.to_vec()).render(buf.area, buf);
+        })?;
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let _log_guard = init_logging()?; // keep alive until exit, or buffered logs are lost
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        prev(info);
+    }));
+
+    enable_raw_mode()?;
+    let mut term = Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(VIEWPORT_H),
+        },
+    )?;
+    let res = run(&mut term).await;
+    disable_raw_mode()?;
+    term.clear()?; // erase the live region; scrollback stays
+    println!();
+    res
+}
+
+async fn run(term: &mut Term) -> Result<()> {
+    let (cmd_tx, cmd_rx) = mpsc::channel(16);
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<AgentEvent>(); // bounded => backpressure on the agent
+    spawn_agent(cmd_rx, ev_tx);
+    let input_state = InputState::new();
+    let transcript = Transcript::new();
+    let mut app = App::new(cmd_tx, input_state, transcript, term.size()?.width);
+    let mut flusher = Flusher::new();
+    let mut keys = EventStream::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60 fps cap
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            //Some(Ok(ev)) = keys.next() => app.update(Msg::Term(ev)),
+            Some(ev) = ev_rx.recv() => app.update(Msg::Agent(ev)),
+            Some(Ok(ev)) = keys.next() => {
+                if let Event::Resize(w, h) = ev {
+                    drop(keys);                               // stop reading stdin
+                    if let Err(e) = term.resize(Rect::new(0, 0, w, h)) {
+                        // don't kill the session over a failed re-anchor
+                        tracing::warn!("resize failed: {e}");
+                    }
+                    keys = EventStream::new();                // resume
+                    app.width = w;
+                    //app.dirty = true;
+                } else {
+                    app.update(Msg::Term(ev));
+                }
+            }
+            _ = tick.tick() => {
+                app.update(Msg::Tick); //spinner only atm
+                let lines = flusher.drain(&app.transcript, app.width);  // reads transcript, mutates flusher
+                insert_lines(term, lines)?;
+                term.draw(|f| view(&app, &flusher, f))?;
+                /*if app.dirty {
+                    flush_scrollback(term, &mut app)?;   // 1. commit finished lines above viewport
+                    term.draw(|f| view(&app, f))?;       // 2. redraw live region
+                    app.dirty = false;
+                }*/
+            }
+        }
+        if app.should_quit {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Push finalized lines into the terminal's native scrollback.
+/*fn flush_scrollback(term: &mut Term, app: &mut App) -> io::Result<()> {
+    if app.scrollback.is_empty() {
+        return Ok(());
+    }
+    let lines = std::mem::take(&mut app.scrollback);
+    for chunk in lines.chunks(64) {
+        let h = chunk.len() as u16;
+        // Lines are pre-wrapped, so no Wrap here (overlong lines are truncated, not re-wrapped).
+        term.insert_before(h, |buf| {
+            Paragraph::new(chunk.to_vec()).render(buf.area, buf);
+        })?;
+    }
+    Ok(())
+}*/
+
+/// Pure function of state (the tail preview re-parses only the open block).
+fn view(app: &App, flusher: &Flusher, f: &mut Frame) {
+    let [preview, status, input] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(3),
+    ])
+    .areas(f.area());
+
+    f.render_widget(
+        LiveTextPreview::new(app.spinner, &app.transcript, flusher),
+        preview,
+    );
+    let tools: Vec<&Entry> = app.transcript.open_tools().take(4).collect();
+    let [preview, tool_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(tools.len() as u16)])
+            .areas(preview);
+
+    for (i, e) in tools.iter().enumerate() {
+        let row = Rect {
+            y: tool_area.y + i as u16,
+            height: 1,
+            ..tool_area
+        };
+        f.render_widget(LiveToolPreview::new(e, app.spinner), row);
+    }
+
+    // live preview: bottom-anchored slice of the not-yet-committed tail
+    /*let tail = app.live_tail();
+    let skip = tail.len().saturating_sub(preview.height as usize);
+    f.render_widget(Paragraph::new(tail[skip..].to_vec()), preview);*/
+
+    /*match app.block_stream_type {
+        BlockStreamType::Thinking => {
+            f.render_widget(LivePreview::new(&app.thinking, THINKING_STYLE), preview)
+        }
+        BlockStreamType::Answer => {
+            f.render_widget(LivePreview::new(&app.answer, Style::default()), preview)
+        }
+    };
+
+    // status line
+    let line = if app.running {
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let tools: Vec<_> = app.active_tools.iter().map(|(_, n)| n.as_str()).collect();
+        Line::from(vec![
+            Span::styled(FRAMES[app.spinner % FRAMES.len()], Style::new().cyan()),
+            Span::raw(format!(" working {}", tools.join(", "))),
+            Span::styled("  (esc to cancel)", Style::new().dark_gray()),
+        ])
+    } else {
+        Line::styled("ctrl-c to quit", Style::new().dark_gray())
+    };
+    f.render_widget(Paragraph::new(line), status);*/
+
+    // input
+    app.input.render(f, input);
+    /*f.render_widget(
+        text_input(app.input.as_str(), &TerminalType::Beeds),
+        //Paragraph::new(app.input.as_str()).block(Block::bordered().border_style(Color::DarkGray)),
+        input,
+    );
+    f.set_cursor_position((input.x + 1 + app.input.width() as u16, input.y + 1));*/
+}
+
+fn spawn_agent(mut cmd_rx: mpsc::Receiver<UiCommand>, tx: mpsc::UnboundedSender<AgentEvent>) {
+    tokio::spawn(async move {
+        let mut session = block_on(create_agent_session(SessionOptions {
+            provider: Some("llamacpp".to_string()),
+            model: Some("halogen-qwen3.8-flash-next".to_string()),
+            api_key: Some(std::env::var("OPENAI_API_KEY").unwrap_or_default()),
+            no_session: true,
+            ..SessionOptions::default()
+        }))
+        .unwrap();
+        while let Some(input) = cmd_rx.recv().await {
+            match input {
+                UiCommand::UserMessage(text) => {
+                    let txc = tx.clone();
+                    let res = session
+                        .prompt(&text, move |event: AgentEvent| {
+                            if txc.send(event).is_err() {
+                                // receiver dropped: UI is gone
+                                tracing::info!("Error in sending event to backend");
+                            }
+                        })
+                        .await;
+                    match res {
+                        Ok(v) => tracing::debug!("Success"),
+                        Err(e) => tracing::info!("This is err: {}", e),
+                    };
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+/*
+fn main() -> io::Result<()> {
+    let (out_tx, out_rx) = mpsc::channel::<String>();
+    let (prompt_tx, prompt_rx) = mpsc::channel::<String>();
+
+    // Worker thread owns the session, so it never has to cross threads.
+    thread::spawn(move || {
+        let mut session = block_on(create_agent_session(SessionOptions {
+            provider: Some("llamacpp".to_string()),
+            model: Some("halogen-qwen3.8-flash-next".to_string()),
+            api_key: Some(std::env::var("OPENAI_API_KEY").unwrap_or_default()),
+            no_session: true,
+            ..SessionOptions::default()
+        }))
+        .unwrap();
+        println!("created session");
+        while let Ok(text) = prompt_rx.recv() {
+            //println!("Received text {}", text);
+            let tx = out_tx.clone();
+            let _ = block_on(session.prompt(&text, move |event: AgentEvent| {
+                let _ = tx.send(format!("{event:?}"));
+            }));
+        }
+    });
+    let app = App::new(prompt_tx, 200);
+    ratatui::run(|terminal| app.run(terminal))
+}
+*/
