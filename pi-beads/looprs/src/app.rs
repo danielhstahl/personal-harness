@@ -311,8 +311,9 @@ impl App {
                             let _ = self.cmd_tx.try_send(UiCommand::UserMessage(text.clone()));
                         }
                         TerminalType::Bash => {
-                            //todo
-                            //let _ = self.cmd_tx.try_send(UiCommand::UserMessage(text.clone()));
+                            // Not implemented yet (looprs-553). The shell itself is a real pty,
+                            // not a piped `bash -i`, and Ctrl-C is forwarded to it rather than
+                            // quitting looprs -- see docs/adr/0001-bash-terminal-state-pty.md.
                         }
                     }
                     self.transcript.push_done(MessageKind::User, text);

@@ -1,0 +1,79 @@
+^D=== Option A - pipes (bash -i) ===
+bash bin: /bin/bash
+
+--- timeline ([ms since spawn], every line the child emitted) ---
+[     7ms] bash: no job control in this shell
+[     8ms] 
+[     8ms] The default interactive shell is now zsh.
+[     8ms] To update your account to use zsh, please run `chsh -s /bin/zsh`.
+[     8ms] For more details, please visit https://support.apple.com/kb/HT208050.
+[     8ms] <ESC>[?1034hbash-3.2$ for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+[     8ms] >   echo "PROBE o$i-stdout"
+[     8ms] >   echo "PROBE e$i-stderr" >&2
+[     8ms] > done
+[     8ms] PROBE o1-stdout
+[     8ms] PROBE o2-stdout
+[     8ms] PROBE o3-stdout
+[     8ms] PROBE o4-stdout
+[     8ms] PROBE o5-stdout
+[     8ms] PROBE o6-stdout
+[     8ms] PROBE o7-stdout
+[     8ms] PROBE o8-stdout
+[     8ms] PROBE o9-stdout
+[     8ms] PROBE o10-stdout
+[     8ms] PROBE o11-stdout
+[     8ms] PROBE o12-stdout
+[     8ms] PROBE e1-stderr
+[     8ms] PROBE e2-stderr
+[     8ms] PROBE e3-stderr
+[     8ms] PROBE e4-stderr
+[     8ms] PROBE e5-stderr
+[     8ms] PROBE e6-stderr
+[     8ms] PROBE e7-stderr
+[     8ms] PROBE e8-stderr
+[     8ms] PROBE e9-stderr
+[     8ms] PROBE e10-stderr
+[     8ms] PROBE e11-stderr
+[     8ms] PROBE e12-stderr
+[     8ms] bash-3.2$ echo "PROBE done"
+[     8ms] bash-3.2$ PROBE done
+
+--- PROBE results ---
+PROBE o1-stdout
+PROBE o2-stdout
+PROBE o3-stdout
+PROBE o4-stdout
+PROBE o5-stdout
+PROBE o6-stdout
+PROBE o7-stdout
+PROBE o8-stdout
+PROBE o9-stdout
+PROBE o10-stdout
+PROBE o11-stdout
+PROBE o12-stdout
+PROBE e1-stderr
+PROBE e2-stderr
+PROBE e3-stderr
+PROBE e4-stderr
+PROBE e5-stderr
+PROBE e6-stderr
+PROBE e7-stderr
+PROBE e8-stderr
+PROBE e9-stderr
+PROBE e10-stderr
+PROBE e11-stderr
+PROBE e12-stderr
+
+--- marker checks (against the raw byte stream) ---
+alt-screen entered (ESC[?1049h / ESC[?47h)           no 
+vim painted typed text on its screen                 no 
+vim 'not to a terminal' warning                      no 
+vim 'Error reading input' fatal                      no 
+bash 'no job control in this shell'                  YES
+Ctrl-C echoed as ^C by a line discipline             no 
+macOS 'default interactive shell is now zsh' noise   YES
+bash prompt seen in stream (PS1)                     YES
+colored/ANSI escapes present (count)                 YES
+Ctrl-C gap                                           not observed
+stdout/stderr merged in program order                NO
+      observed: o1-stdout o2-stdout o3-stdout o4-stdout o5-stdout o6-stdout o7-stdout o8-stdout o9-stdout o10-stdout o11-stdout o12-stdout e1-stderr e2-stderr e3-stderr e4-stderr e5-stderr e6-stderr e7-stderr e8-stderr e9-stderr e10-stderr e11-stderr e12-stderr

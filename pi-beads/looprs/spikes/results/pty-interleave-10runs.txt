@@ -1,0 +1,1 @@
+  10 stdout/stderr merged in program order                YES

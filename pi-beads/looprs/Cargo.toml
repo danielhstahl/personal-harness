@@ -17,3 +17,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 serde_json = "1.0.151"
 serde = { version = "1.0.229", features = ["derive"] }
+
+[dev-dependencies]
+# Used by examples/spike_bash.rs (ADR-0001 spike). looprs-553 moves this to
+# [dependencies] when the Bash terminal state actually lands; until then it would
+# trip cargo's unused_dependencies lint on the test target.
+portable-pty = "0.9.0"
+
+[lints.cargo]
+unused_dependencies = "allow"
