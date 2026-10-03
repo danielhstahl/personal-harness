@@ -25,6 +25,7 @@ pub enum Msg {
 }
 
 ///add more (eg change terminal)
+#[derive(Debug)]
 pub enum UiCommand {
     UserMessage(String),
     UserBeadMessage(String),
@@ -220,7 +221,6 @@ pub struct App {
     pub dirty: bool,
     pub should_quit: bool,
     pub need_input: bool,
-    //out_rx: Receiver<String>, // agent -> UI
     cmd_tx: mpsc::Sender<UiCommand>, // UI -> agent
 }
 impl App {
@@ -284,10 +284,22 @@ impl App {
 
         if let Some(action) = self.input.handle_key(k) {
             match action {
-                InputAction::Submit { text, ../*mode*/ } => {
+                InputAction::Submit { text, mode } => {
                     self.chat_state = ChatState::Chat;
-                    //todo, send different if in different mode
-                    let _ = self.cmd_tx.try_send(UiCommand::UserMessage(text.clone()));
+                    match mode {
+                        TerminalType::Beeds => {
+                            let _ = self
+                                .cmd_tx
+                                .try_send(UiCommand::UserBeadMessage(text.clone()));
+                        }
+                        TerminalType::Pi => {
+                            let _ = self.cmd_tx.try_send(UiCommand::UserMessage(text.clone()));
+                        }
+                        TerminalType::Bash => {
+                            //todo
+                            //let _ = self.cmd_tx.try_send(UiCommand::UserMessage(text.clone()));
+                        }
+                    }
                     self.transcript.push_done(MessageKind::User, text);
                 }
                 InputAction::Cancel => {
@@ -371,9 +383,9 @@ fn bd_ready(ev_tx: UnboundedSender<Msg>) -> Result<Option<PiRpc>> {
     if let Some(bead) = beads.first() {
         let args = vec![];
         let (pi, mut ev_rx) = PiRpc::spawn(&args)?;
-        //let tx = ev_tx.clone();
         tokio::spawn(async move {
             while let Some(v) = ev_rx.recv().await {
+                tracing::debug!("Receiving information {}", v);
                 if let Some(ev) = parse(&v) {
                     if ev_tx.send(Msg::Agent(ev)).is_err() {
                         break;
@@ -408,9 +420,11 @@ impl BeadsLoop {
         self.bead_step = s.clone(); // keep the field private
         let _ = self.ev_tx.send(Msg::BeadStep(s));
     }
+    //listens for input from cmd OR for a trigger
     pub fn listen_input(mut self, mut cmd_rx: Receiver<UiCommand>) {
         tokio::spawn(async move {
             while let Some(input) = cmd_rx.recv().await {
+                tracing::debug!("Recieved input on cmd_rx: {:?}", input);
                 match input {
                     UiCommand::UserBeadMessage(text) => {
                         let res = self.launch_create_tickets(&text).await;
@@ -451,8 +465,8 @@ impl BeadsLoop {
         }
         Ok(())
     }
-    //hmmm...how do I make a state machine when the lifetime is managed by the main loop?
     async fn launch_create_tickets(&mut self, instructions: &str) -> Result<()> {
+        tracing::debug!("Launched tickets with these instructions: {}", instructions);
         let args = vec!["--tools", "read,bash"];
         let (pi, mut ev_rx) = PiRpc::spawn(&args)?;
         self.set_step(BeadStep::CreateTickets);
@@ -467,10 +481,8 @@ impl BeadsLoop {
                 }
             }
         });
-        //Ok(Some(pi))
-
         let prompt = generate_prompt(PLANNER, instructions);
-        let res = pi.prompt(&prompt).await?;
+        let _res = pi.prompt(&prompt).await?;
         self.pi_rx = Some(pi);
 
         Ok(())

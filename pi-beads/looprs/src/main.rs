@@ -19,6 +19,7 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
+use tracing::Level;
 
 /// Inline viewports are fixed-height in stock ratatui. Live preview gets whatever is left
 /// after status (1) + input (3). To resize dynamically, recreate the Terminal (or fork the
@@ -45,6 +46,7 @@ fn init_logging() -> anyhow::Result<WorkerGuard> {
     tracing_subscriber::fmt()
         .with_writer(writer)
         .with_ansi(false)
+        .with_max_level(Level::DEBUG)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
@@ -88,16 +90,19 @@ async fn main() -> Result<()> {
 }
 
 async fn run(term: &mut Term) -> Result<()> {
-    let (cmd_tx, cmd_rx) = mpsc::channel(16);
+    // all terminal UI events and events originating outside the app
+    // come from cmd_tx and are received on cmd_rx
+    let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>(16);
+    // any app state changes come from app_tx and are recived from app_rx
     let (app_tx, mut app_rx) = mpsc::unbounded_channel::<Msg>();
-    //let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<PiEvent>(); // bounded => backpressure on the agent
-    //let args = vec![];
-    //let (pi, mut ev_rx) = PiRpc::spawn(&args)?;
-    //spawn_agent(cmd_rx, pi);
+    // beads_loop will produce events that trigger updates to app state
     let bead_loop = BeadsLoop::new(app_tx)?;
+    // bead_loop listens for new commands from the terminal on cmd_rx,
+    // but only those that pertain to bead_loop
     bead_loop.listen_input(cmd_rx);
     let input_state = InputState::new();
     let transcript = Transcript::new();
+
     let mut app = App::new(cmd_tx, input_state, transcript, term.size()?.width);
     let mut flusher = Flusher::new();
     let mut keys = EventStream::new();
@@ -106,6 +111,7 @@ async fn run(term: &mut Term) -> Result<()> {
 
     loop {
         tokio::select! {
+            //app_rx receives events that require state updates
             Some(ev) = app_rx.recv() => app.update(ev),
             Some(Ok(ev)) = keys.next() => {
                 if let Event::Resize(w, h) = ev {
