@@ -6,22 +6,29 @@
 //! *types* land in `Unknown`, so additive protocol changes are harmless. Renamed/removed fields
 //! show up as parse errors; log them loudly (see `parse`).
 
-use crate::components::input::{InputAction, InputState};
+use crate::components::input::{InputAction, InputState, TerminalType};
+use crate::services::bd::get_ready_beads;
+use crate::services::pi::PiRpc;
+use crate::services::prompts::{PLANNER, WORKER, generate_prompt};
 use crate::state::state::{MessageKind, Transcript};
+use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, Receiver, UnboundedReceiver, UnboundedSender};
 
 pub enum Msg {
     Term(Event),
-    Agent(Option<PiEvent>),
+    Agent(PiEvent),
+    BeadStep(BeadStep),
     Tick,
 }
 
 ///add more (eg change terminal)
 pub enum UiCommand {
     UserMessage(String),
+    UserBeadMessage(String),
+    BeadsNext,
     Cancel,
 }
 
@@ -35,6 +42,7 @@ fn print_json_value_to_string(v: &Value) -> String {
     s
 }
 
+//UI only
 pub enum ChatState {
     Stopped,
     Chat,
@@ -211,6 +219,7 @@ pub struct App {
     pub width: u16,
     pub dirty: bool,
     pub should_quit: bool,
+    pub need_input: bool,
     //out_rx: Receiver<String>, // agent -> UI
     cmd_tx: mpsc::Sender<UiCommand>, // UI -> agent
 }
@@ -225,6 +234,7 @@ impl App {
             input,
             transcript,
             width,
+            need_input: true,
             chat_state: ChatState::Stopped,
             dirty: true,
             should_quit: false,
@@ -252,8 +262,14 @@ impl App {
             Msg::Term(_) => {}
             Msg::Agent(ev) => {
                 self.dirty = true;
-                if let Some(ev) = ev {
-                    self.on_pi(ev);
+                self.on_pi(ev);
+            }
+            Msg::BeadStep(bead) => {
+                self.dirty = true;
+                match bead {
+                    BeadStep::AwaitInput => self.need_input = true,
+                    BeadStep::CreateTickets => self.need_input = false,
+                    BeadStep::WorkTickets => self.need_input = false,
                 }
             }
         }
@@ -315,86 +331,161 @@ impl App {
                 result,
                 is_error,
             } => t.finish_tool(tool_call_id, result.text(), is_error),
-            PiEvent::AgentSettled => self.chat_state = ChatState::Stopped,
+            PiEvent::AgentSettled => {
+                self.chat_state = ChatState::Stopped;
+                if matches!(self.input.mode, TerminalType::Beeds) {
+                    //no await
+                    //self.bd_loop.next();
+                    let _ = self.cmd_tx.send(UiCommand::BeadsNext);
+                };
+            }
             // AutoRetryStart / CompactionStart: show a status note if you want one
             _ => {}
         }
     }
+}
 
-    /*fn on_agent(&mut self, ev: AgentEvent) {
-        match ev {
-            AgentEvent::AgentStart { .. } => {
-                self.chat_state = ChatState::Chat;
-            }
-            AgentEvent::AgentEnd { error, .. } => {
-                self.chat_state = ChatState::Stopped;
-                if let Some(err) = error {
-                    self.transcript.push_done(MessageKind::Error, err);
+pub enum PiStep {
+    AwaitInput,
+    DoingWork,
+}
+
+pub struct PiLoop {
+    pi_rx: Option<(PiRpc, UnboundedReceiver<Value>)>,
+    pi_step: PiStep,
+}
+#[derive(Clone)]
+pub enum BeadStep {
+    AwaitInput,
+    CreateTickets,
+    WorkTickets,
+}
+pub struct BeadsLoop {
+    pi_rx: Option<PiRpc>,
+    ev_tx: UnboundedSender<Msg>,
+    pub bead_step: BeadStep,
+}
+
+fn bd_ready(ev_tx: UnboundedSender<Msg>) -> Result<Option<PiRpc>> {
+    let beads = get_ready_beads()?;
+    if let Some(bead) = beads.first() {
+        let args = vec![];
+        let (pi, mut ev_rx) = PiRpc::spawn(&args)?;
+        //let tx = ev_tx.clone();
+        tokio::spawn(async move {
+            while let Some(v) = ev_rx.recv().await {
+                if let Some(ev) = parse(&v) {
+                    if ev_tx.send(Msg::Agent(ev)).is_err() {
+                        break;
+                    }
                 }
             }
-            AgentEvent::MessageUpdate {
-                assistant_message_event,
-                ..
-            } => {
-                self.chat_state = ChatState::Chat;
-                match assistant_message_event {
-                    AssistantMessageEvent::TextDelta {
-                        delta,
-                        content_index: _,
-                        partial: _,
-                    } => {
-                        self.transcript.push_delta(MessageKind::Answer, &delta);
+        });
+        Ok(Some(pi))
+    } else {
+        Ok(None)
+    }
+}
+
+//stateful with the invocation of bd ready
+impl BeadsLoop {
+    pub fn new(ev_tx: UnboundedSender<Msg>) -> Result<Self> {
+        if let Some(pi) = bd_ready(ev_tx.clone())? {
+            Ok(Self {
+                pi_rx: Some(pi),
+                ev_tx,
+                bead_step: BeadStep::WorkTickets,
+            })
+        } else {
+            Ok(Self {
+                pi_rx: None,
+                ev_tx,
+                bead_step: BeadStep::AwaitInput,
+            })
+        }
+    }
+    fn set_step(&mut self, s: BeadStep) {
+        self.bead_step = s.clone(); // keep the field private
+        let _ = self.ev_tx.send(Msg::BeadStep(s));
+    }
+    /*pub fn get_rx(&mut self) -> Option<&mut UnboundedReceiver<Value>> {
+        self.pi_rx.as_mut().map(|(_, rx)| rx)
+    }*/
+    pub fn listen_input(mut self, mut cmd_rx: Receiver<UiCommand>) {
+        tokio::spawn(async move {
+            while let Some(input) = cmd_rx.recv().await {
+                match input {
+                    UiCommand::UserBeadMessage(text) => {
+                        let res = self.launch_create_tickets(&text).await;
+                        match res {
+                            Ok(_v) => tracing::debug!("Success"),
+                            Err(e) => tracing::error!("This is err: {}", e),
+                        };
                     }
-                    AssistantMessageEvent::ThinkingDelta {
-                        delta,
-                        content_index: _,
-                        partial: _,
-                    } => {
-                        self.transcript.push_delta(MessageKind::Thinking, &delta);
+                    UiCommand::BeadsNext => {
+                        let res = self.next().await;
+                        match res {
+                            Ok(_v) => tracing::debug!("Success"),
+                            Err(e) => tracing::error!("This is err: {}", e),
+                        };
                     }
                     _ => {}
-                };
+                }
             }
-            AgentEvent::ToolExecutionStart {
-                tool_call_id,
-                tool_name,
-                args,
-            } => {
-                self.chat_state = ChatState::Tool;
-                self.transcript.start_tool(
-                    tool_call_id,
-                    tool_name,
-                    print_json_value_to_string(&args),
-                );
-            }
-            AgentEvent::ToolExecutionEnd {
-                tool_call_id,
-                result,
-                is_error,
-                ..
-            } => {
-                self.transcript.finish_tool(
-                    tool_call_id,
-                    result
-                        .content
-                        .into_iter()
-                        .filter_map(|c| match c {
-                            ContentBlock::Text(t) => Some(t.text),
-                            _ => None,
-                        })
-                        .collect(),
-                    is_error,
-                );
-            }
-            AgentEvent::ProviderError { message, .. } => {
-                self.chat_state = ChatState::Stopped;
-                self.transcript.push_done(MessageKind::Error, message);
-            }
-            AgentEvent::ExtensionError { error, .. } => {
-                self.chat_state = ChatState::Stopped;
-                self.transcript.push_done(MessageKind::Error, error);
-            }
-            _ => {}
+        });
+    }
+    pub async fn close(&mut self) -> Result<()> {
+        if let Some(mut old_pi) = self.pi_rx.take() {
+            old_pi.kill().await?;
+            //old_rx.close();
         }
-    }*/
+        Ok(())
+    }
+    pub async fn next(&mut self) -> Result<()> {
+        self.close().await?;
+        if let Some(pi) = bd_ready(self.ev_tx.clone())? {
+            let res = pi.prompt(&WORKER).await?; //consider passing bead id into context so worker doesn't have to run `bd ready`
+            self.pi_rx = Some(pi);
+            self.bead_step = BeadStep::WorkTickets;
+        } else {
+            self.bead_step = BeadStep::AwaitInput;
+        }
+        Ok(())
+    }
+    //hmmm...how do I make a state machine when the lifetime is managed by the main loop?
+    async fn launch_create_tickets(&mut self, instructions: &str) -> Result<()> {
+        let args = vec!["--tools", "read,bash"];
+        //let (pi, ev_rx) = PiRpc::spawn(&args)?;
+
+        let (pi, mut ev_rx) = PiRpc::spawn(&args)?;
+        self.bead_step = BeadStep::CreateTickets;
+        let tx = self.ev_tx.clone();
+        tokio::spawn(async move {
+            while let Some(v) = ev_rx.recv().await {
+                if let Some(ev) = parse(&v) {
+                    if tx.send(Msg::Agent(ev)).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        //Ok(Some(pi))
+
+        let prompt = generate_prompt(PLANNER, instructions);
+        let res = pi.prompt(&prompt).await?;
+        self.pi_rx = Some(pi);
+
+        Ok(())
+    }
+}
+
+impl PiLoop {
+    pub fn new() -> Result<Self> {
+        let args = vec![];
+        let (pi, ev_rx) = PiRpc::spawn(&args)?;
+        Ok(Self {
+            pi_rx: Some((pi, ev_rx)),
+            pi_step: PiStep::AwaitInput,
+        })
+    }
 }

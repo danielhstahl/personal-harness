@@ -6,3 +6,4 @@ looprs.log
 *.db
 .beads-credential-key
 .beads/proxieddb/
+.beads

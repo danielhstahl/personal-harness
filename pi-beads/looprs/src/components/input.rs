@@ -43,7 +43,7 @@ pub enum InputAction {
 
 pub struct InputState {
     text: String,
-    mode: TerminalType,
+    pub mode: TerminalType,
 }
 
 impl InputState {

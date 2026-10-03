@@ -30,7 +30,7 @@ use components::text_stream::LiveTextPreview;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
-use crate::app::{ChatState, parse};
+use crate::app::{BeadStep, BeadsLoop, ChatState, parse};
 use crate::components::scrollback::Flusher;
 use crate::components::tool::LiveToolPreview;
 use crate::services::pi::PiRpc;
@@ -89,10 +89,13 @@ async fn main() -> Result<()> {
 
 async fn run(term: &mut Term) -> Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
+    let (app_tx, mut app_rx) = mpsc::unbounded_channel::<Msg>();
     //let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<PiEvent>(); // bounded => backpressure on the agent
-    let args = vec![];
-    let (pi, mut ev_rx) = PiRpc::spawn(&args)?;
-    spawn_agent(cmd_rx, pi);
+    //let args = vec![];
+    //let (pi, mut ev_rx) = PiRpc::spawn(&args)?;
+    //spawn_agent(cmd_rx, pi);
+    let bead_loop = BeadsLoop::new(app_tx)?;
+    bead_loop.listen_input(cmd_rx);
     let input_state = InputState::new();
     let transcript = Transcript::new();
     let mut app = App::new(cmd_tx, input_state, transcript, term.size()?.width);
@@ -103,7 +106,7 @@ async fn run(term: &mut Term) -> Result<()> {
 
     loop {
         tokio::select! {
-            Some(ev) = ev_rx.recv() => app.update(Msg::Agent(parse(&ev))),
+            Some(ev) = app_rx.recv() => app.update(ev),
             Some(Ok(ev)) = keys.next() => {
                 if let Event::Resize(w, h) = ev {
                     drop(keys);                               // stop reading stdin
@@ -122,7 +125,7 @@ async fn run(term: &mut Term) -> Result<()> {
                 if app.dirty {
                     let lines = flusher.drain(&app.transcript, app.width);  // reads transcript, mutates flusher
                     insert_lines(term, lines)?;
-                    term.draw(|f| view(&app, &flusher, f))?;
+                    term.draw(|f| view(&app,  &flusher, f))?;
                     app.dirty = false;
                 }
             }
@@ -171,9 +174,11 @@ fn view(app: &App, flusher: &Flusher, f: &mut Frame) {
         f.render_widget(LiveToolPreview::new(e, app.spinner), row);
     }
     // input
-    app.input.render(f, input);
+    if app.need_input {
+        app.input.render(f, input)
+    }
 }
-
+/*
 fn spawn_agent(mut cmd_rx: mpsc::Receiver<UiCommand>, pi: PiRpc) {
     tokio::spawn(async move {
         while let Some(input) = cmd_rx.recv().await {
@@ -189,4 +194,4 @@ fn spawn_agent(mut cmd_rx: mpsc::Receiver<UiCommand>, pi: PiRpc) {
             }
         }
     });
-}
+}*/

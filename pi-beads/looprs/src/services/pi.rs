@@ -119,4 +119,8 @@ impl PiRpc {
     pub fn abort(&self) -> Result<()> {
         self.send(json!({ "type": "abort" }))
     }
+    pub async fn kill(&mut self) -> Result<()> {
+        self._child.kill().await?;
+        Ok(())
+    }
 }
