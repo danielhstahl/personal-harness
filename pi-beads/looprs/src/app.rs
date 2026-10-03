@@ -363,7 +363,7 @@ pub enum BeadStep {
 pub struct BeadsLoop {
     pi_rx: Option<PiRpc>,
     ev_tx: UnboundedSender<Msg>,
-    pub bead_step: BeadStep,
+    bead_step: BeadStep,
 }
 
 fn bd_ready(ev_tx: UnboundedSender<Msg>) -> Result<Option<PiRpc>> {
@@ -408,9 +408,6 @@ impl BeadsLoop {
         self.bead_step = s.clone(); // keep the field private
         let _ = self.ev_tx.send(Msg::BeadStep(s));
     }
-    /*pub fn get_rx(&mut self) -> Option<&mut UnboundedReceiver<Value>> {
-        self.pi_rx.as_mut().map(|(_, rx)| rx)
-    }*/
     pub fn listen_input(mut self, mut cmd_rx: Receiver<UiCommand>) {
         tokio::spawn(async move {
             while let Some(input) = cmd_rx.recv().await {
@@ -446,22 +443,23 @@ impl BeadsLoop {
         if let Some(pi) = bd_ready(self.ev_tx.clone())? {
             let res = pi.prompt(&WORKER).await?; //consider passing bead id into context so worker doesn't have to run `bd ready`
             self.pi_rx = Some(pi);
-            self.bead_step = BeadStep::WorkTickets;
+            self.set_step(BeadStep::WorkTickets);
+            //self.bead_step = BeadStep::WorkTickets;
         } else {
-            self.bead_step = BeadStep::AwaitInput;
+            self.set_step(BeadStep::AwaitInput);
+            //self.bead_step = BeadStep::AwaitInput;
         }
         Ok(())
     }
     //hmmm...how do I make a state machine when the lifetime is managed by the main loop?
     async fn launch_create_tickets(&mut self, instructions: &str) -> Result<()> {
         let args = vec!["--tools", "read,bash"];
-        //let (pi, ev_rx) = PiRpc::spawn(&args)?;
-
         let (pi, mut ev_rx) = PiRpc::spawn(&args)?;
-        self.bead_step = BeadStep::CreateTickets;
+        self.set_step(BeadStep::CreateTickets);
         let tx = self.ev_tx.clone();
         tokio::spawn(async move {
             while let Some(v) = ev_rx.recv().await {
+                tracing::debug!("Receiving information {}", v);
                 if let Some(ev) = parse(&v) {
                     if tx.send(Msg::Agent(ev)).is_err() {
                         break;
