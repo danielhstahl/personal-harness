@@ -1,6 +1,6 @@
-#![recursion_limit = "256"]
 mod app;
 mod components;
+mod services;
 mod state;
 mod theme;
 mod utils;
@@ -10,8 +10,6 @@ use components::input::InputState;
 use crossterm::event::{Event, EventStream};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
-use futures::executor::block_on;
-use pi::sdk::{AgentEvent, SessionOptions, create_agent_session};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
@@ -32,9 +30,10 @@ use components::text_stream::LiveTextPreview;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
-use crate::app::ChatState;
+use crate::app::{ChatState, parse};
 use crate::components::scrollback::Flusher;
 use crate::components::tool::LiveToolPreview;
+use crate::services::pi::PiRpc;
 use crate::state::state::{Entry, Transcript};
 
 fn init_logging() -> anyhow::Result<WorkerGuard> {
@@ -90,8 +89,10 @@ async fn main() -> Result<()> {
 
 async fn run(term: &mut Term) -> Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
-    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<AgentEvent>(); // bounded => backpressure on the agent
-    spawn_agent(cmd_rx, ev_tx);
+    //let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<PiEvent>(); // bounded => backpressure on the agent
+    let args = vec![];
+    let (pi, mut ev_rx) = PiRpc::spawn(&args)?;
+    spawn_agent(cmd_rx, pi);
     let input_state = InputState::new();
     let transcript = Transcript::new();
     let mut app = App::new(cmd_tx, input_state, transcript, term.size()?.width);
@@ -102,7 +103,7 @@ async fn run(term: &mut Term) -> Result<()> {
 
     loop {
         tokio::select! {
-            Some(ev) = ev_rx.recv() => app.update(Msg::Agent(ev)),
+            Some(ev) = ev_rx.recv() => app.update(Msg::Agent(parse(&ev))),
             Some(Ok(ev)) = keys.next() => {
                 if let Event::Resize(w, h) = ev {
                     drop(keys);                               // stop reading stdin
@@ -173,28 +174,12 @@ fn view(app: &App, flusher: &Flusher, f: &mut Frame) {
     app.input.render(f, input);
 }
 
-fn spawn_agent(mut cmd_rx: mpsc::Receiver<UiCommand>, tx: mpsc::UnboundedSender<AgentEvent>) {
+fn spawn_agent(mut cmd_rx: mpsc::Receiver<UiCommand>, pi: PiRpc) {
     tokio::spawn(async move {
-        let mut session = block_on(create_agent_session(SessionOptions {
-            provider: Some("llamacpp".to_string()),
-            model: Some("halogen-qwen3.8-flash-next".to_string()),
-            api_key: Some(std::env::var("OPENAI_API_KEY").unwrap_or_default()),
-            no_session: true,
-            ..SessionOptions::default()
-        }))
-        .unwrap();
         while let Some(input) = cmd_rx.recv().await {
             match input {
                 UiCommand::UserMessage(text) => {
-                    let txc = tx.clone();
-                    let res = session
-                        .prompt(&text, move |event: AgentEvent| {
-                            if txc.send(event).is_err() {
-                                // receiver dropped: UI is gone
-                                tracing::info!("Error in sending event to backend");
-                            }
-                        })
-                        .await;
+                    let res = pi.prompt(&text).await;
                     match res {
                         Ok(_v) => tracing::debug!("Success"),
                         Err(e) => tracing::info!("This is err: {}", e),
