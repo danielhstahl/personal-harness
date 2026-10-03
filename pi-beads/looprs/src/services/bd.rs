@@ -1,19 +1,6 @@
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
-use std::process::Command;
-use std::{
-    collections::HashMap,
-    process::Stdio,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::Child,
-    sync::{mpsc, oneshot},
-};
+use std::process::{Command, Stdio};
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BeadStatus {
@@ -49,6 +36,15 @@ pub struct Bead {
     issue_type: BeadIssueType,
 }
 
+impl Bead {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct BdReady {
@@ -56,14 +52,25 @@ pub struct BdReady {
     schema_version: usize,
 }
 
-pub fn get_ready_beads() -> Result<Vec<Bead>> {
-    let child = Command::new("bd")
+/// `bd ready --json`, against an explicit binary (the TUI passes `bd`, tests pass a fake).
+pub fn ready_beads_with(bin: &str) -> Result<Vec<Bead>> {
+    let child = Command::new(bin)
         .args(["ready", "--json"])
         .env("BD_JSON_ENVELOPE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()?;
+    if !child.status.success() {
+        return Err(anyhow!(
+            "{bin} ready failed with exit status {}",
+            child
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string())
+        ));
+    }
     let result: BdReady = serde_json::from_slice(&child.stdout)?;
 
     Ok(result.data)

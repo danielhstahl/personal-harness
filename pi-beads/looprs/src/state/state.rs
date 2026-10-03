@@ -11,6 +11,8 @@ pub enum MessageKind {
         input: String,
         state: ToolStateCategory,
     },
+    /// Loop/harness status lines ("working looprs-1", "board empty, awaiting input").
+    System,
     Error,
 }
 impl MessageKind {

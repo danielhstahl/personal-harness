@@ -22,7 +22,21 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
-type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>;
+/// Commands awaiting a correlated response, plus the "pi is gone" flag.
+/// Both live behind one mutex so that `fail_all` and `register` cannot interleave:
+/// a request either sees `exited` and fails immediately, or is registered and is
+/// guaranteed to be drained by the reader task when it notices EOF.
+/// Without that, a child that dies during startup could leave `request()` parked forever.
+#[derive(Default)]
+struct PendingState {
+    txs: HashMap<String, oneshot::Sender<Value>>,
+    exited: bool,
+}
+type Pending = Arc<Mutex<PendingState>>;
+
+fn error_response(id: &str, msg: &str) -> Value {
+    json!({ "type": "response", "id": id, "success": false, "error": msg })
+}
 
 pub struct PiRpc {
     _child: Child, // kill_on_drop: pi dies with the TUI
@@ -32,10 +46,19 @@ pub struct PiRpc {
 }
 
 impl PiRpc {
-    /// Spawns pi and returns the client plus a stream of every non-response message (agent events,
-    /// extension UI requests, ...). Events stay as `Value` so protocol additions never break parsing;
+    /// Spawns `pi` and returns the client plus a stream of every non-response
+    /// message (agent events, extension UI requests, ...). Events stay as `Value` so protocol
+    /// additions never break parsing;
     pub fn spawn(extra_args: &[&str]) -> Result<(Self, mpsc::UnboundedReceiver<Value>)> {
-        let mut child = Command::new("pi")
+        Self::spawn_with("pi", extra_args)
+    }
+
+    /// Same as [`PiRpc::spawn`] but with an explicit executable (fakes in tests).
+    pub fn spawn_with(
+        bin: &str,
+        extra_args: &[&str],
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>)> {
+        let mut child = Command::new(bin)
             .args(["--mode", "rpc"])
             .args(extra_args)
             .stdin(Stdio::piped())
@@ -61,6 +84,7 @@ impl PiRpc {
         let pending: Pending = Arc::default();
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let p = pending.clone();
+        let bin_owned = bin.to_string();
         tokio::spawn(async move {
             // tokio's `lines()` splits on '\n' only, which is what pi's framing requires
             // (JS readline also splits on U+2028/2029 and would corrupt messages).
@@ -71,7 +95,7 @@ impl PiRpc {
                 };
                 if v["type"] == "response" {
                     if let Some(id) = v["id"].as_str() {
-                        if let Some(tx) = p.lock().unwrap().remove(id) {
+                        if let Some(tx) = p.lock().unwrap().txs.remove(id) {
                             let _ = tx.send(v);
                             continue;
                         }
@@ -81,7 +105,20 @@ impl PiRpc {
                     break;
                 }
             }
-            // stdout closed => pi exited; dropping ev_tx lets the UI see the stream end
+            // stdout closed => pi exited. Nobody is going to answer outstanding commands,
+            // so answer them ourselves; callers get an error instead of hanging forever.
+            let drained: Vec<(String, oneshot::Sender<Value>)> = {
+                let mut st = p.lock().unwrap();
+                st.exited = true;
+                st.txs.drain().collect()
+            };
+            for (id, tx) in drained {
+                let _ = tx.send(error_response(
+                    &id,
+                    &format!("{bin_owned} exited before responding"),
+                ));
+            }
+            // dropping ev_tx lets the UI see the stream end
         });
 
         Ok((
@@ -102,18 +139,43 @@ impl PiRpc {
     }
 
     /// Send with a correlation id and await the matching `response`.
+    /// Returns Err when pi reports `success: false`, when the child is already gone,
+    /// or if the response never comes because the stream ended.
     pub async fn request(&self, mut cmd: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         cmd["id"] = json!(id);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        {
+            // Register (or refuse) while holding the lock so the EOF drain can't miss us.
+            let mut st = self.pending.lock().unwrap();
+            if st.exited {
+                return Err(anyhow!("pi process has already exited"));
+            }
+            st.txs.insert(id.clone(), tx);
+        }
         self.out_tx.send(cmd.to_string())?;
-        Ok(rx.await?)
+        let resp = rx
+            .await
+            .map_err(|_| anyhow!("response {id} cancelled before it was answered"))?;
+        if resp["success"].as_bool() != Some(true) {
+            let msg = resp["error"].as_str().unwrap_or("unknown error");
+            return Err(anyhow!("pi rpc error: {msg}"));
+        }
+        Ok(resp)
     }
 
-    pub async fn prompt(&self, message: &str) -> Result<Value> {
-        self.request(json!({ "type": "prompt", "message": message }))
-            .await
+    /// Send a prompt and return its disposition: `"started"` means a run is coming (wait for
+    /// `agent_settled`), `"handled"` means pi took the prompt but started no run, so no
+    /// `agent_settled` will ever arrive. Defaults to `"started"` if the field is missing,
+    /// because stalling on a phantom run is easier to spot than dropping a real one.
+    pub async fn prompt(&self, message: &str) -> Result<String> {
+        let resp = self
+            .request(json!({ "type": "prompt", "message": message }))
+            .await?;
+        Ok(resp["data"]["disposition"]
+            .as_str()
+            .unwrap_or("started")
+            .to_string())
     }
 
     pub fn abort(&self) -> Result<()> {

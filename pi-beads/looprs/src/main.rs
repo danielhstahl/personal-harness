@@ -2,6 +2,8 @@ mod app;
 mod components;
 mod services;
 mod state;
+#[cfg(test)]
+mod testing;
 mod theme;
 mod utils;
 use anyhow::Result;
@@ -19,7 +21,6 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
-use tracing::Level;
 
 /// Inline viewports are fixed-height in stock ratatui. Live preview gets whatever is left
 /// after status (1) + input (3). To resize dynamically, recreate the Terminal (or fork the
@@ -31,10 +32,9 @@ use components::text_stream::LiveTextPreview;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
-use crate::app::{BeadStep, BeadsLoop, ChatState, parse};
+use crate::app::{BeadsLoop, BeadsLoopConfig, ChatState};
 use crate::components::scrollback::Flusher;
 use crate::components::tool::LiveToolPreview;
-use crate::services::pi::PiRpc;
 use crate::state::state::{Entry, Transcript};
 
 fn init_logging() -> anyhow::Result<WorkerGuard> {
@@ -46,9 +46,9 @@ fn init_logging() -> anyhow::Result<WorkerGuard> {
     tracing_subscriber::fmt()
         .with_writer(writer)
         .with_ansi(false)
-        .with_max_level(Level::DEBUG)
+        //.with_max_level(Level::DEBUG)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
         )
         .init();
 
@@ -95,15 +95,26 @@ async fn run(term: &mut Term) -> Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>(16);
     // any app state changes come from app_tx and are recived from app_rx
     let (app_tx, mut app_rx) = mpsc::unbounded_channel::<Msg>();
-    // beads_loop will produce events that trigger updates to app state
-    let bead_loop = BeadsLoop::new(app_tx)?;
+    // beads_loop drives the beads-backed terminal state: it owns its pi child and
+    // reports state changes into the UI through app_tx.
+    let mut bead_loop = BeadsLoop::new(app_tx, BeadsLoopConfig::default());
+    let input_state = InputState::new();
+    let transcript = Transcript::new();
+    // Self-start: if the board already has ready beads this spawns *and prompts* a worker,
+    // otherwise it parks. Running this before the App is built means the input box opens
+    // in the correct state instead of flickering.
+    bead_loop.next().await;
+    let need_input = bead_loop.is_awaiting_input();
+    let mut app = App::new(
+        cmd_tx,
+        input_state,
+        need_input,
+        transcript,
+        term.size()?.width,
+    );
     // bead_loop listens for new commands from the terminal on cmd_rx,
     // but only those that pertain to bead_loop
     bead_loop.listen_input(cmd_rx);
-    let input_state = InputState::new();
-    let transcript = Transcript::new();
-
-    let mut app = App::new(cmd_tx, input_state, transcript, term.size()?.width);
     let mut flusher = Flusher::new();
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60 fps cap

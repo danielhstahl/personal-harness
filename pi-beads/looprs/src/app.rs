@@ -7,11 +7,11 @@
 //! show up as parse errors; log them loudly (see `parse`).
 
 use crate::components::input::{InputAction, InputState, TerminalType};
-use crate::services::bd::get_ready_beads;
+use crate::services::bd::{Bead, ready_beads_with};
 use crate::services::pi::PiRpc;
 use crate::services::prompts::{PLANNER, WORKER, generate_prompt};
 use crate::state::state::{MessageKind, Transcript};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use serde::Deserialize;
 use serde_json::Value;
@@ -21,6 +21,10 @@ pub enum Msg {
     Term(Event),
     Agent(PiEvent),
     BeadStep(BeadStep),
+    /// A loop-level failure the human needs to see (spawn failure, `bd` failure, ...).
+    Error(String),
+    /// A loop-level status line ("working looprs-1", "board empty, awaiting input").
+    System(String),
     Tick,
 }
 
@@ -227,6 +231,7 @@ impl App {
     pub fn new(
         cmd_tx: mpsc::Sender<UiCommand>,
         input: InputState,
+        need_input: bool,
         transcript: Transcript,
         width: u16,
     ) -> Self {
@@ -234,7 +239,7 @@ impl App {
             input,
             transcript,
             width,
-            need_input: true,
+            need_input,
             chat_state: ChatState::Stopped,
             dirty: true,
             should_quit: false,
@@ -271,6 +276,16 @@ impl App {
                     BeadStep::CreateTickets => self.need_input = false,
                     BeadStep::WorkTickets => self.need_input = false,
                 }
+            }
+            Msg::Error(text) => {
+                self.dirty = true;
+                self.chat_state = ChatState::Chat; // make sure the line is on screen
+                self.transcript.push_done(MessageKind::Error, text);
+            }
+            Msg::System(text) => {
+                self.dirty = true;
+                self.chat_state = ChatState::Chat;
+                self.transcript.push_done(MessageKind::System, text);
             }
         }
     }
@@ -373,53 +388,144 @@ pub enum BeadStep {
     WorkTickets,
 }
 pub struct BeadsLoop {
+    /// The pi session currently driven by the loop. `None` whenever the loop is parked.
     pi_rx: Option<PiRpc>,
     ev_tx: UnboundedSender<Msg>,
+    cfg: BeadsLoopConfig,
     bead_step: BeadStep,
 }
 
-fn bd_ready(ev_tx: UnboundedSender<Msg>) -> Result<Option<PiRpc>> {
-    let beads = get_ready_beads()?;
-    if let Some(bead) = beads.first() {
-        let args = vec![];
-        let (pi, mut ev_rx) = PiRpc::spawn(&args)?;
-        tokio::spawn(async move {
-            while let Some(v) = ev_rx.recv().await {
-                tracing::debug!("Receiving information {}", v);
-                if let Some(ev) = parse(&v) {
-                    if ev_tx.send(Msg::Agent(ev)).is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-        Ok(Some(pi))
-    } else {
-        Ok(None)
+/// Which executables drive the beads loop. Injectable so tests can run fake `pi` / `bd`
+/// binaries and assert exactly what got spawned and what was sent to it.
+#[derive(Clone, Debug)]
+pub struct BeadsLoopConfig {
+    pub pi_bin: String,
+    pub bd_bin: String,
+}
+
+impl Default for BeadsLoopConfig {
+    fn default() -> Self {
+        // Env overrides exist for wrapper scripts (a shimmed `pi`, a remote `bd`).
+        Self {
+            pi_bin: std::env::var("LOOPRS_PI_BIN").unwrap_or_else(|_| "pi".to_string()),
+            bd_bin: std::env::var("LOOPRS_BD_BIN").unwrap_or_else(|_| "bd".to_string()),
+        }
     }
 }
 
-//stateful with the invocation of bd ready
+/// What a worker pass did.
+enum WorkerPass {
+    /// Nothing ready: no child was spawned, the loop should park.
+    Idle,
+    /// A worker was spawned *and prompted*.
+    Working,
+}
+
 impl BeadsLoop {
-    pub fn new(ev_tx: UnboundedSender<Msg>) -> Result<Self> {
-        if let Some(pi) = bd_ready(ev_tx.clone())? {
-            Ok(Self {
-                pi_rx: Some(pi),
-                ev_tx,
-                bead_step: BeadStep::WorkTickets,
-            })
-        } else {
-            Ok(Self {
-                pi_rx: None,
-                ev_tx,
-                bead_step: BeadStep::AwaitInput,
-            })
+    /// Builds the loop without touching any process: it starts parked in
+    /// `AwaitInput`. Work only begins when [`BeadsLoop::next`] is called, so a
+    /// constructed-but-unstarted loop can never be holding an idle, unprompted
+    /// pi child (the bug this replaces: `new()` used to spawn a session nobody
+    /// ever prompted, and nothing else would ever prompt it).
+    pub fn new(ev_tx: UnboundedSender<Msg>, cfg: BeadsLoopConfig) -> Self {
+        Self {
+            pi_rx: None,
+            ev_tx,
+            cfg,
+            bead_step: BeadStep::AwaitInput,
         }
     }
+
     fn set_step(&mut self, s: BeadStep) {
         self.bead_step = s.clone(); // keep the field private
         let _ = self.ev_tx.send(Msg::BeadStep(s));
     }
+
+    pub fn get_step(&self) -> &BeadStep {
+        &self.bead_step
+    }
+
+    pub fn is_awaiting_input(&self) -> bool {
+        matches!(self.bead_step, BeadStep::AwaitInput)
+    }
+
+    /// Tear down the current session, then work the next ready bead or park.
+    ///
+    /// Infallible by design: a failing `bd`, a `pi` that will not start, or a prompt
+    /// that never gets answered is reported to the transcript and the loop parks in
+    /// `AwaitInput` for a human. Nothing here retries on a timer, so a broken board
+    /// cannot turn into a respawn storm.
+    pub async fn next(&mut self) {
+        self.close().await;
+        match self.work_next_bead().await {
+            Ok(WorkerPass::Working) => {}
+            Ok(WorkerPass::Idle) => {
+                tracing::debug!("board empty, awaiting input");
+                self.report_system("beads: board empty, awaiting input".to_string());
+                self.set_step(BeadStep::AwaitInput);
+            }
+            Err(e) => {
+                tracing::error!("beads worker pass failed: {e:#}");
+                self.report_error(format!("beads: {e:#}"));
+                self.set_step(BeadStep::AwaitInput);
+            }
+        }
+    }
+
+    /// The one code path that owns "spawn a worker for the current ready bead":
+    /// spawn, wire up event forwarding, and prompt. Callers never see a pi child
+    /// that is alive but unprompted.
+    async fn work_next_bead(&mut self) -> Result<WorkerPass> {
+        let beads = ready_beads_with(&self.cfg.bd_bin)?;
+        let Some(bead) = beads.first() else {
+            return Ok(WorkerPass::Idle);
+        };
+        tracing::info!(bead = %bead.id(), "starting worker pass");
+
+        // The session is built against locals: if any step below fails, `pi` drops here
+        // and kill_on_drop reaps it, so a failed pass cannot leave an orphan behind.
+        let (pi, ev_rx) = PiRpc::spawn_with(&self.cfg.pi_bin, &[])?;
+        self.forward_pi_events(ev_rx);
+        let disposition = pi.prompt(&worker_prompt(bead)).await?;
+        if disposition == "handled" {
+            // pi took the prompt but started no run, so no `agent_settled` will ever
+            // arrive to advance the loop. Do not hold an idle session open.
+            drop(pi);
+            return Err(anyhow!(
+                "worker prompt for {} was handled without starting a run",
+                bead.id()
+            ));
+        }
+
+        self.pi_rx = Some(pi);
+        self.report_system(format!("beads: working {}", bead.id()));
+        self.set_step(BeadStep::WorkTickets);
+        Ok(WorkerPass::Working)
+    }
+
+    /// Pipe a pi event stream into the UI until the child's stdout closes.
+    fn forward_pi_events(&self, mut ev_rx: mpsc::UnboundedReceiver<Value>) {
+        let tx = self.ev_tx.clone();
+        tokio::spawn(async move {
+            while let Some(v) = ev_rx.recv().await {
+                tracing::debug!("Receiving information {}", v);
+                if let Some(ev) = parse(&v)
+                    && tx.send(Msg::Agent(ev)).is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+
+    fn report_error(&self, text: String) {
+        let _ = self.ev_tx.send(Msg::Error(text));
+    }
+
+    fn report_system(&self, text: String) {
+        let _ = self.ev_tx.send(Msg::System(text));
+    }
+
     //listens for input from cmd OR for a trigger
     pub fn listen_input(mut self, mut cmd_rx: Receiver<UiCommand>) {
         tokio::spawn(async move {
@@ -427,66 +533,53 @@ impl BeadsLoop {
                 tracing::debug!("Recieved input on cmd_rx: {:?}", input);
                 match input {
                     UiCommand::UserBeadMessage(text) => {
-                        let res = self.launch_create_tickets(&text).await;
-                        match res {
-                            Ok(_v) => tracing::debug!("Success"),
-                            Err(e) => tracing::error!("This is err: {}", e),
-                        };
+                        if let Err(e) = self.launch_create_tickets(&text).await {
+                            tracing::error!("planner pass failed: {e:#}");
+                            self.report_error(format!("planner: {e:#}"));
+                            self.set_step(BeadStep::AwaitInput);
+                        }
                     }
-                    UiCommand::BeadsNext => {
-                        let res = self.next().await;
-                        match res {
-                            Ok(_v) => tracing::debug!("Success"),
-                            Err(e) => tracing::error!("This is err: {}", e),
-                        };
-                    }
+                    UiCommand::BeadsNext => self.next().await,
                     _ => {}
                 }
             }
         });
     }
-    pub async fn close(&mut self) -> Result<()> {
+
+    pub async fn close(&mut self) {
         if let Some(mut old_pi) = self.pi_rx.take() {
-            old_pi.kill().await?;
-            //old_rx.close();
+            let _ = old_pi.kill().await;
         }
-        Ok(())
     }
-    pub async fn next(&mut self) -> Result<()> {
-        self.close().await?;
-        if let Some(pi) = bd_ready(self.ev_tx.clone())? {
-            let res = pi.prompt(&WORKER).await?; //consider passing bead id into context so worker doesn't have to run `bd ready`
-            self.pi_rx = Some(pi);
-            self.set_step(BeadStep::WorkTickets);
-            //self.bead_step = BeadStep::WorkTickets;
-        } else {
-            self.set_step(BeadStep::AwaitInput);
-            //self.bead_step = BeadStep::AwaitInput;
-        }
-        Ok(())
-    }
+
     async fn launch_create_tickets(&mut self, instructions: &str) -> Result<()> {
         tracing::debug!("Launched tickets with these instructions: {}", instructions);
+        self.close().await;
         let args = vec!["--tools", "read,bash"];
-        let (pi, mut ev_rx) = PiRpc::spawn(&args)?;
+        let (pi, ev_rx) = PiRpc::spawn_with(&self.cfg.pi_bin, &args)?;
         self.set_step(BeadStep::CreateTickets);
-        let tx = self.ev_tx.clone();
-        tokio::spawn(async move {
-            while let Some(v) = ev_rx.recv().await {
-                tracing::debug!("Receiving information {}", v);
-                if let Some(ev) = parse(&v) {
-                    if tx.send(Msg::Agent(ev)).is_err() {
-                        break;
-                    }
-                }
-            }
-        });
+        self.forward_pi_events(ev_rx);
         let prompt = generate_prompt(PLANNER, instructions);
-        let _res = pi.prompt(&prompt).await?;
+        let disposition = pi.prompt(&prompt).await?;
+        if disposition == "handled" {
+            drop(pi);
+            return Err(anyhow!(
+                "planner prompt was handled without starting a run; no tickets were requested"
+            ));
+        }
         self.pi_rx = Some(pi);
 
         Ok(())
     }
+}
+
+/// The worker prompt, with the target bead named so the worker does not have to
+/// re-run `bd ready` to find out what it is supposed to be doing.
+fn worker_prompt(bead: &Bead) -> String {
+    generate_prompt(
+        WORKER,
+        &format!("Claim and work ticket {} ({}).", bead.id(), bead.title()),
+    )
 }
 
 impl PiLoop {
@@ -497,5 +590,225 @@ impl PiLoop {
             pi_rx: Some((pi, ev_rx)),
             pi_step: PiStep::AwaitInput,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{BdFake, EMPTY_BOARD, Fakes, ONE_BEADED_BOARD, PiFake, process_alive};
+    use tokio::time::{Duration, timeout};
+
+    const SECOND_BOARD: &str = r#"{
+  "data": [
+    {"id": "looprs-99", "title": "the next ticket", "status": "open", "issue_type": "task"}
+  ],
+  "schema_version": 1
+}"#;
+
+    /// Generous, but bounded: a hang is a failure of this ticket, and a bounded test
+    /// reports it instead of wedging the suite.
+    const NO_HANG: Duration = Duration::from_secs(10);
+
+    fn loop_with(fakes: &Fakes) -> (BeadsLoop, UnboundedReceiver<Msg>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let cfg = BeadsLoopConfig {
+            pi_bin: fakes.pi_bin().to_string(),
+            bd_bin: fakes.bd_bin().to_string(),
+        };
+        (BeadsLoop::new(tx, cfg), rx)
+    }
+
+    /// Snapshot of what the loop told the UI, as stable strings.
+    fn drain(rx: &mut UnboundedReceiver<Msg>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            out.push(match m {
+                Msg::BeadStep(BeadStep::AwaitInput) => "step:await".into(),
+                Msg::BeadStep(BeadStep::CreateTickets) => "step:plan".into(),
+                Msg::BeadStep(BeadStep::WorkTickets) => "step:work".into(),
+                Msg::Error(t) => format!("error: {t}"),
+                Msg::System(t) => format!("system: {t}"),
+                Msg::Agent(_) => "agent".into(),
+                Msg::Term(_) | Msg::Tick => "ui".into(),
+            });
+        }
+        out
+    }
+
+    fn has_error(msgs: &[String]) -> bool {
+        msgs.iter().any(|m| m.starts_with("error: "))
+    }
+
+    /// A constructed loop must not have touched any process. The old code spawned a
+    /// pi child inside new() and never prompted it.
+    #[tokio::test]
+    async fn constructing_a_loop_spawns_nothing() {
+        let fakes = Fakes::new("ctor", PiFake::Started, BdFake::Ok, ONE_BEADED_BOARD);
+        let (l, mut rx) = loop_with(&fakes);
+
+        assert!(l.is_awaiting_input(), "a new loop starts parked");
+        assert_eq!(fakes.pi_spawns(), 0, "new() must not spawn a pi child");
+        assert_eq!(fakes.bd_calls(), 0, "new() must not even query the board");
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    /// The bug: with a non-empty board, launching looprs sat forever with a live,
+    /// idle pi child. Driving the loop must start real work with no human input.
+    #[tokio::test]
+    async fn a_non_empty_board_self_starts_a_prompted_worker() {
+        let fakes = Fakes::new("self-start", PiFake::Started, BdFake::Ok, ONE_BEADED_BOARD);
+        let (mut l, mut rx) = loop_with(&fakes);
+
+        assert!(
+            timeout(NO_HANG, l.next()).await.is_ok(),
+            "next() hung instead of starting a worker"
+        );
+
+        assert_eq!(fakes.pi_spawns(), 1, "exactly one worker spawned");
+        let prompts = fakes.pi_prompts();
+        assert_eq!(prompts.len(), 1, "the worker was prompted, not left idle");
+        assert!(
+            prompts[0].contains("technical software engineer"),
+            "worker prompt missing: {}",
+            prompts[0]
+        );
+        assert!(
+            prompts[0].contains("looprs-26r"),
+            "worker was not told which bead to work: {}",
+            prompts[0]
+        );
+        // Invariant for the whole run: no child exists that was never prompted.
+        assert_eq!(fakes.pi_spawns(), fakes.pi_prompts().len());
+        assert!(matches!(l.get_step(), BeadStep::WorkTickets));
+        assert!(!l.is_awaiting_input());
+        assert!(drain(&mut rx).contains(&"step:work".to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_empty_board_parks_without_spawning() {
+        let fakes = Fakes::new("empty", PiFake::Started, BdFake::Ok, EMPTY_BOARD);
+        let (mut l, mut rx) = loop_with(&fakes);
+
+        assert!(timeout(NO_HANG, l.next()).await.is_ok());
+
+        assert_eq!(fakes.pi_spawns(), 0, "empty board must not spawn anything");
+        assert!(l.is_awaiting_input());
+        let msgs = drain(&mut rx);
+        assert!(msgs.contains(&"step:await".to_string()), "{msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m.contains("board empty")),
+            "parking should say why: {msgs:?}"
+        );
+    }
+
+    /// Switching passes must reap the previous session: no orphan pi children, and no
+    /// unprompted child in the gap between sessions.
+    #[tokio::test]
+    async fn driving_the_loop_reaps_the_previous_worker() {
+        let fakes = Fakes::new("reap", PiFake::Started, BdFake::Ok, ONE_BEADED_BOARD);
+        let (mut l, _rx) = loop_with(&fakes);
+
+        timeout(NO_HANG, l.next()).await.unwrap();
+        let first = fakes.pi_pids()[0];
+        assert!(process_alive(first), "worker should be running");
+
+        // A second pass onto a different ticket: the old child goes away, the new one works.
+        fakes.set_board(SECOND_BOARD);
+        timeout(NO_HANG, l.next()).await.unwrap();
+        assert!(
+            !process_alive(first),
+            "pid {first} survived the pass boundary: orphaned child"
+        );
+        let second = fakes.pi_pids()[1];
+        assert_ne!(first, second);
+        assert!(process_alive(second), "second worker should be running");
+
+        // Draining the board parks the loop and reaps the live worker.
+        fakes.set_board(EMPTY_BOARD);
+        timeout(NO_HANG, l.next()).await.unwrap();
+        assert!(!process_alive(second), "parked loop left a child running");
+        assert_eq!(fakes.pi_spawns(), 2);
+        assert_eq!(fakes.pi_prompts().len(), 2, "every child got a prompt");
+        assert!(l.is_awaiting_input());
+        assert!(l.pi_rx.is_none(), "parked loop must not hold a session");
+    }
+
+    /// pi dying during startup must surface as a transcript error and park the loop,
+    /// never as a hang or a panic in main.
+    #[tokio::test]
+    async fn a_pi_that_dies_during_startup_is_reported() {
+        let fakes = Fakes::new(
+            "dead-pi",
+            PiFake::DiesImmediately,
+            BdFake::Ok,
+            ONE_BEADED_BOARD,
+        );
+        let (mut l, mut rx) = loop_with(&fakes);
+
+        assert!(
+            timeout(NO_HANG, l.next()).await.is_ok(),
+            "next() hung on a pi that died instead of reporting"
+        );
+
+        let msgs = drain(&mut rx);
+        assert!(has_error(&msgs), "death should be reported: {msgs:?}");
+        assert!(
+            !msgs.contains(&"step:work".to_string()),
+            "a dead worker must not claim to be working: {msgs:?}"
+        );
+        assert!(l.is_awaiting_input());
+        assert!(l.pi_rx.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failing_bd_is_reported_and_parks() {
+        let fakes = Fakes::new("bad-bd", PiFake::Started, BdFake::Fails, EMPTY_BOARD);
+        let (mut l, mut rx) = loop_with(&fakes);
+
+        assert!(timeout(NO_HANG, l.next()).await.is_ok());
+
+        let msgs = drain(&mut rx);
+        assert!(
+            has_error(&msgs),
+            "`bd ready` failure should surface: {msgs:?}"
+        );
+        assert_eq!(fakes.pi_spawns(), 0, "no worker without a board read");
+        assert!(l.is_awaiting_input());
+    }
+
+    #[tokio::test]
+    async fn a_refused_prompt_is_reported_and_keeps_no_session() {
+        let fakes = Fakes::new("refused", PiFake::Rejects, BdFake::Ok, ONE_BEADED_BOARD);
+        let (mut l, mut rx) = loop_with(&fakes);
+
+        assert!(timeout(NO_HANG, l.next()).await.is_ok());
+
+        assert!(has_error(&drain(&mut rx)));
+        assert!(l.is_awaiting_input());
+        assert!(l.pi_rx.is_none());
+    }
+
+    /// `disposition: "handled"` means pi took the prompt but started no run, so no
+    /// `agent_settled` will ever arrive to advance the loop. Holding that session
+    /// open would be the same idle-child trap this ticket is about.
+    #[tokio::test]
+    async fn a_handled_prompt_does_not_leave_an_idle_worker() {
+        let fakes = Fakes::new("handled", PiFake::Handled, BdFake::Ok, ONE_BEADED_BOARD);
+        let (mut l, mut rx) = loop_with(&fakes);
+
+        assert!(timeout(NO_HANG, l.next()).await.is_ok());
+
+        let msgs = drain(&mut rx);
+        assert!(
+            msgs.iter()
+                .any(|m| m.starts_with("error: ") && m.contains("handled")),
+            "{msgs:?}"
+        );
+        assert!(l.is_awaiting_input());
+        assert!(
+            l.pi_rx.is_none(),
+            "handled session must be dropped, not kept"
+        );
     }
 }

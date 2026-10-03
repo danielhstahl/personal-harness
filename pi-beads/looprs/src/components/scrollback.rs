@@ -21,6 +21,7 @@ fn render_simple(e: &Entry, w: u16) -> Vec<Line<'static>> {
             format!("error: {}", e.text),
             Style::new().red(),
         )],
+        MessageKind::System => vec![Line::styled(format!("• {}", e.text), Style::new().yellow())],
         _ => unreachable!("streamed kinds use drain_stream"),
     };
     lines.push(Line::default()); // blank line after each entry
