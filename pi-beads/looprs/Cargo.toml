@@ -1,0 +1,19 @@
+[package]
+name = "looprs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+crossterm = { version= "0.29.0", features = ["event-stream"] }
+futures = "0.3.34"
+pulldown-cmark = "0.13.4"
+ratatui = { version="0.30.2", features = ["scrolling-regions"]}
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] } # pure-Rust regex
+tokio = { version = "1", features = ["full"] }
+unicode-width = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+serde_json = "1.0.151"
+serde = { version = "1.0.229", features = ["derive"] }
