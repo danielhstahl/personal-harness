@@ -67,6 +67,10 @@ pub fn wrap(id: SessionId, ev: SessionEvent) -> Msg {
             chunk,
         },
         SessionEvent::BeadStep(step) => Msg::BeadStep { session: id, step },
+        SessionEvent::Status(status) => Msg::SessionStatus {
+            session: id,
+            status,
+        },
         SessionEvent::ActiveBead { bead } => Msg::ActiveBead { session: id, bead },
         SessionEvent::System(text) => Msg::System {
             session: Some(id),
@@ -151,10 +155,12 @@ impl Router {
 
     /// Which mode is on screen.
     ///
-    /// The router keeps this to itself while routing, so the binary has no caller;
-    /// it is the assertion surface for "Tab actually moved the address" (and the
-    /// status row, looprs-guh, wants the same answer).
-    #[allow(dead_code)] // consumers: router tests; looprs-guh (mode in the status row)
+    /// The router keeps this to itself while routing, so the binary has no caller:
+    /// the row reads `App::active`, which the switch path sets from the same
+    /// keystroke that moved this one, and the tests assert against the router's own
+    /// answer. Two copies of one fact, but every one of them written by the same
+    /// `switch_to`, which is what keeps them from drifting.
+    #[allow(dead_code)] // consumers: router tests ("Tab actually moved the address")
     pub fn active_mode(&self) -> TerminalType {
         self.active
     }
@@ -176,8 +182,17 @@ impl Router {
         self.sessions.get(&mode).map(|m| m.id)
     }
 
-    /// For the status row: which modes have a live child right now (looprs-guh).
-    #[allow(dead_code)] // consumers: router tests; looprs-guh (the row is not wired yet)
+    /// Which modes have a live child right now.
+    ///
+    /// The status row does **not** call this. It could not: the row is drawn from
+    /// `App`, and `App` must not reach into the Router, which is on another task
+    /// and may be inside a spawn (ADR-0002 Q4 — the draw loop never blocks on a
+    /// session). The same answer gets to the row the other way instead, as
+    /// [`SessionEvent::Status`] edges mirrored into each `SessionView`, which is
+    /// also why the row cannot be a frame behind the session by more than one
+    /// edge. This is the pull-shaped version of that answer, which the lifecycle
+    /// tests want and the binary has no safe use for.
+    #[allow(dead_code)] // consumers: router tests (pull-shaped liveness; the row is push-shaped)
     pub fn live_modes(&self) -> Vec<TerminalType> {
         let mut live: Vec<TerminalType> = self
             .sessions
@@ -578,6 +593,9 @@ mod tests {
                 Msg::Agent { session, .. } => format!("agent@{session}"),
                 Msg::BashOutput { session, .. } => format!("bash@{session}"),
                 Msg::BeadStep { session, step } => format!("step@{session} {step:?}"),
+                Msg::SessionStatus { session, status } => {
+                    format!("status@{session} {status:?}")
+                }
                 Msg::ActiveBead { session, bead } => format!(
                     "active_bead@{session} {}",
                     bead.map(|b| b.id).unwrap_or_else(|| "-".into())

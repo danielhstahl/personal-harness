@@ -17,7 +17,7 @@ use ratatui::text::Line;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 pub use crate::session::BeadStep;
@@ -37,6 +37,16 @@ const QUIT_RETRY: Duration = Duration::from_secs(1);
 /// `0` is not just a spare number: the Router's generations start at 1, so a
 /// harness placeholder can never collide with a real session's identity.
 pub const HARNESS_GENERATION: u64 = 0;
+
+/// The status row's animation pace: one spinner step every 125ms, i.e. 8fps.
+///
+/// The frame ticks at ~60fps, and painting a braille spinner at that rate spends
+/// seven frames in eight on nothing — while a background `sleep 100` keeps the
+/// whole pane redrawing for a row that only changes once a second. 8fps is the
+/// rate a spinner still reads as spinning. This is not a second timer: the tick
+/// that already exists is decimated, which is what the ticket's "driven off the
+/// existing ~60fps tick, no extra timers" asks for.
+const ROW_ANIM: Duration = Duration::from_millis(125);
 
 /// Everything that can change the UI.
 ///
@@ -68,11 +78,14 @@ pub enum Msg {
         session: SessionId,
         /// Kept because the envelope has to be able to say *which* pipe a byte came
         /// from even though today's only producer (a pty) cannot tell them apart.
-        /// Consumed by looprs-guh, which wants stderr lines marked as such in the
-        /// status row; until then the transcript deliberately prints one merged
-        /// stream, because inventing a split the backend cannot back up is worse
-        /// than not having one.
-        #[allow(dead_code)] // consumer: looprs-guh (status row marks stderr distinctly)
+        /// looprs-guh's row does **not** mark stderr, and cannot: the pty hands
+        /// one merged stream, and `ByteStream::Merged` is what honestly says so.
+        /// Marking a stream the backend cannot attribute would be inventing a
+        /// distinction that does not exist — worse than not having one. Kept
+        /// because the day a split (non-pty) backend lands, this is the field that
+        /// makes the row able to say which pipe a line came from.
+        // wire-format record; would surface as: "stderr" on the row, if a split backend ever lands
+        #[allow(dead_code)]
         stream: ByteStream,
         chunk: String,
     },
@@ -80,6 +93,19 @@ pub enum Msg {
     BeadStep {
         session: SessionId,
         step: BeadStep,
+    },
+    /// A session's liveness changed (looprs-guh). Mirrored, never acted on: the
+    /// status row answers from it, and the only consequence here is the one
+    /// `SessionView::set_status` already encodes — a dead session hands the input
+    /// box back.
+    ///
+    /// This is not `App::chat_state`, and the two must not be conflated: `chat`
+    /// says *the live region has text arriving*, this says *a child exists and what
+    /// it is doing*. A bash shell running `sleep 10` is the second and not the
+    /// first, which is exactly why the row needs its own edge.
+    SessionStatus {
+        session: SessionId,
+        status: SessionStatus,
     },
     /// The ticket the beads loop holds right now, `None` when it holds none
     /// (looprs-w7q). Rendered, never re-derived — see
@@ -198,6 +224,20 @@ fn print_json_value_to_string(v: &Value) -> String {
 ///
 /// Where a field is parsed but **nothing renders it yet**, it carries its own
 /// `#[allow(dead_code)]` with the reason it stays (looprs-6ol's warning-gate rule:
+///
+/// **What looprs-guh (the status row) took from this enum: nothing.** That is the
+/// honest label, not an oversight. The row is one line and its `Show` list is
+/// mode / loop step / bead / liveness / last error / key hints. Thinking deltas,
+/// compaction phases, pi's own retry ladder and the per-content-block indices are
+/// none of those, and pushing them in would cost the row the things that are. What
+/// the user gets instead is that a long pause is no longer *unattributed*: the
+/// row says the run is live and how long it has been going, which is the question
+/// those variants are usually standing in for.
+///
+/// They stay for the reason they were written down at all: this enum is the
+/// harness's record of pi's RPC wire format, and a field captured here is a field
+/// a later ticket cannot silently misread as absent. Each allow names the
+/// surfacing that field is waiting for; none of them has a reader today.
 /// a dead-code allow is allowed only when it is individually justified, never
 /// blanket). The reason is almost always the same one and it is a real one: this
 /// enum *is* the harness's record of pi's RPC wire format, and a field that is
@@ -221,7 +261,8 @@ pub enum PiEvent {
         /// built from the authoritative `message_end` record. Parsed so that
         /// "a message started" stays a distinguishable event from "a message
         /// arrived" once the live region needs it (looprs-guh's streaming cursor).
-        #[allow(dead_code)] // consumer: looprs-guh (live region wants start-of-message)
+        // wire-format record; would surface as: live region wants start-of-message
+        #[allow(dead_code)]
         message: WireMessage,
     },
     MessageUpdate {
@@ -242,7 +283,7 @@ pub enum PiEvent {
     ///   instead of being appended (looprs-guh's live tool preview);
     /// * `partial_result` — the streamed output itself, same content the end record
     ///   carries, so nothing is lost by not printing it here.
-    #[allow(dead_code)] // consumer: looprs-guh (in-place tool card repaint)
+    #[allow(dead_code)] // wire-format record; would surface as: in-place tool card repaint)
     ToolExecutionUpdate {
         tool_call_id: String,
         partial_result: ToolOutput,
@@ -256,7 +297,8 @@ pub enum PiEvent {
     /// and every one of the four fields is something the user needs to know is
     /// happening rather than watching a frozen transcript (looprs-guh: "is it
     /// working or is it hung?").
-    #[allow(dead_code)] // consumer: looprs-guh (retry shown as a status, not silence)
+    // wire-format record; would surface as: retry shown as a status, not silence
+    #[allow(dead_code)]
     AutoRetryStart {
         attempt: u32,
         max_attempts: u32,
@@ -266,7 +308,8 @@ pub enum PiEvent {
     /// As [`PiEvent::AutoRetryStart`]: the outcome of pi's own retry ladder. The
     /// transcript currently treats a successful retry as invisible, which is fine
     /// for a run that recovers and terrible for one that does not — hence kept.
-    #[allow(dead_code)] // consumer: looprs-guh (retry outcome, esp. `final_error`)
+    #[allow(dead_code)]
+    // wire-format record; would surface as: retry outcome, esp. `final_error`)
     AutoRetryEnd {
         success: bool,
         #[serde(default)]
@@ -275,13 +318,14 @@ pub enum PiEvent {
     /// Context compaction began. Until the UI can say "compacting…" (looprs-guh)
     /// this arrives as an unexplained pause, which is the bug class the ticket is
     /// about — so the reason is parsed and kept, not dropped.
-    #[allow(dead_code)] // consumer: looprs-guh ("compacting: <reason>")
+    #[allow(dead_code)] // wire-format record; would surface as: "compacting: <reason>")
     CompactionStart {
         reason: String,
     },
     /// Compaction finished, was aborted, or failed. `aborted`/`error_message` are
     /// the two things a user must not have to guess about.
-    #[allow(dead_code)] // consumer: looprs-guh (aborted/failed compaction is loud)
+    #[allow(dead_code)]
+    // wire-format record; would surface as: aborted/failed compaction is loud)
     CompactionEnd {
         #[serde(default)]
         aborted: bool,
@@ -291,7 +335,8 @@ pub enum PiEvent {
     /// An extension in the pi child raised. Not the harness's fault, but it is the
     /// harness's screen, so the path and the message are recorded now that the
     /// status row exists to put them in (looprs-guh).
-    #[allow(dead_code)] // consumer: looprs-guh (extension errors are surfaced, not swallowed)
+    // wire-format record; would surface as: extension errors are surfaced, not swallowed
+    #[allow(dead_code)]
     ExtensionError {
         extension_path: String,
         error: String,
@@ -324,37 +369,39 @@ pub enum AssistantEvent {
     Start,
     /// Block N began. Nothing draws a per-block cursor yet (looprs-guh's live
     /// region), so the index is unread.
-    #[allow(dead_code)] // consumer: looprs-guh (per-block live region)
+    #[allow(dead_code)] // wire-format record; would surface as: per-block live region)
     TextStart {
         content_index: usize,
     },
     /// The visible stream: this delta is what gets printed. The index beside it is
     /// unread for the same one-block-per-message reason as above.
     TextDelta {
-        #[allow(dead_code)] // consumer: looprs-guh (which block this delta belongs to)
+        // wire-format record; would surface as: which block this delta belongs to
+        #[allow(dead_code)]
         content_index: usize,
         delta: String,
     },
     /// `content` is read (the authoritative block text, tee'd by the beads
     /// planner's "last words"); the index still isn't.
     TextEnd {
-        #[allow(dead_code)] // consumer: looprs-guh (which block ended)
+        #[allow(dead_code)] // wire-format record; would surface as: which block ended)
         content_index: usize,
         content: String,
     },
     /// Thinking is parsed and deliberately not shown. Both fields unread today:
     /// the transcript prints answers, not reasoning. Kept because "pi is thinking"
     /// is the single most useful thing a status row can say while a run is open.
-    #[allow(dead_code)] // consumer: looprs-guh ("thinking…" while a run is open)
+    #[allow(dead_code)]
+    // wire-format record; would surface as: "thinking…" while a run is open)
     ThinkingStart {
         content_index: usize,
     },
-    #[allow(dead_code)] // consumer: looprs-guh (thinking stream, if ever surfaced)
+    #[allow(dead_code)] // wire-format record; would surface as: thinking stream, if ever surfaced)
     ThinkingDelta {
         content_index: usize,
         delta: String,
     },
-    #[allow(dead_code)] // consumer: looprs-guh (the finished thinking block)
+    #[allow(dead_code)] // wire-format record; would surface as: the finished thinking block)
     ThinkingEnd {
         content_index: usize,
         content: String,
@@ -364,7 +411,8 @@ pub enum AssistantEvent {
     /// identity; this variant is the assistant-side view of it, and is kept so the
     /// two can be correlated when the live region (looprs-guh) renders calls as
     /// they are minted rather than when they run.
-    #[allow(dead_code)] // consumer: looprs-guh (tool call as the model writes it)
+    #[allow(dead_code)]
+    // wire-format record; would surface as: tool call as the model writes it)
     ToolcallStart {
         content_index: usize,
         id: String,
@@ -372,26 +420,29 @@ pub enum AssistantEvent {
     },
     /// Partial argument JSON. Printing half-written JSON is worse than printing
     /// nothing until the call lands, so it is parsed, unread, and available.
-    #[allow(dead_code)] // consumer: looprs-guh (streaming args, once renderable)
+    #[allow(dead_code)]
+    // wire-format record; would surface as: streaming args, once renderable)
     ToolcallDelta {
         content_index: usize,
         delta: String,
     }, // serialized (partial) argument JSON
-    #[allow(dead_code)] // consumer: looprs-guh (the completed call object)
+    #[allow(dead_code)] // wire-format record; would surface as: the completed call object)
     ToolcallEnd {
         content_index: usize,
         tool_call: Value,
     },
     /// Why the assistant stopped (stop / end_turn / length / …). Unread today; a
     /// run that ended for `length` looks exactly like one that finished, which is
-    /// precisely the distinction looprs-guh exists to make.
-    #[allow(dead_code)] // consumer: looprs-guh ("ended early: <reason>")
+    /// the kind of thing the status row (looprs-guh) is for. Not read yet: that
+    /// row reports the *session's* state, and a stop reason belongs to the turn.
+    #[allow(dead_code)] // wire-format record; the row reads session errors, not stop reasons
     Done {
         reason: String,
     },
-    /// The assistant-side error. Surfacing is the status row's job (looprs-guh);
-    /// until that row exists the harness deliberately does not half-report it.
-    #[allow(dead_code)] // consumer: looprs-guh (assistant errors are shown, not hidden)
+    /// The assistant-side error. Distinct from the session error the row carries:
+    /// this one is about a turn, that one is about the child. Reported in the
+    /// transcript, where the context for reading it lives.
+    #[allow(dead_code)] // wire-format record; the transcript shows this, not the status row
     Error {
         reason: String,
     },
@@ -475,6 +526,20 @@ pub struct App {
     /// the same dance `main.rs` already does for a window resize, for the same
     /// reason.
     pub reanchor: bool,
+    /// The row's wall clock, advanced only by `Msg::Tick` (see [`Self::on_tick`]).
+    ///
+    /// Held here rather than read at draw time so the render path reads no clock, as
+    /// the frame's purity contract requires — and so a test can hand the row any
+    /// age it wants without waiting for one.
+    clock: Instant,
+    /// When the row last animated, and the frame of the spinner it shows.
+    ///
+    /// Separate from [`Self::spinner`] because that one belongs to the live text
+    /// preview and only turns while text is streaming; the row has to animate for a
+    /// session that is busy with no text at all (a shell command, a beads pass
+    /// between deltas), and must not make the preview look like it started again.
+    row_phase: Instant,
+    row_spinner: usize,
     cmd_tx: mpsc::Sender<UiCommand>, // UI -> Router
 }
 
@@ -489,6 +554,7 @@ impl App {
         // seen from two sides, and a mismatch here would route keystrokes to a mode
         // the user is not looking at.
         input.mode = active;
+        let now = Instant::now();
         Self {
             input,
             views: HashMap::new(),
@@ -499,6 +565,9 @@ impl App {
             spinner: 0,
             screen: None,
             reanchor: false,
+            clock: now,
+            row_phase: now,
+            row_spinner: 0,
             cmd_tx,
         }
     }
@@ -519,6 +588,9 @@ impl App {
             v.seal();
             v.session = id;
             v.status = SessionStatus::NotStarted;
+            // ...and is not halfway through a run whose age the row would carry
+            // over from a process that no longer exists.
+            v.run_started = None;
             // A new incarnation of a mode is not holding the previous one's
             // ticket. Leaving a stale claim on the row would have the UI naming a
             // bead no live process owns.
@@ -527,11 +599,9 @@ impl App {
         v
     }
 
-    /// A specific mode's view. Nothing renders through this today — the frame draws
-    /// the active one — but it is how looprs-guh shows "beads is still working
-    /// while you chat", which the warm-child policy makes load-bearing rather than
-    /// cosmetic.
-    #[allow(dead_code)] // consumer: looprs-guh's status row
+    /// A specific mode's view — and the way the status row sees the modes it is
+    /// **not** showing, which is the whole reason ADR-0002 keeps them warm and
+    /// invisible (looprs-guh).
     pub fn view(&self, mode: TerminalType) -> Option<&SessionView> {
         self.views.get(&mode)
     }
@@ -585,6 +655,110 @@ impl App {
             .unwrap_or(0)
     }
 
+    /// The status row for this frame (looprs-guh).
+    ///
+    /// `App`'s job here is to *gather*, not to decide: every fact comes off a view
+    /// mirror a session published, and the layout, the truncation and the priority
+    /// order all live in [`components::status`](crate::components::status), which
+    /// is a pure function of what it is handed. Nothing here asks a session,
+    /// a `bd`, or the clock.
+    pub fn status_line(&self, width: u16) -> Line<'static> {
+        crate::components::status::Status {
+            active: self.sess(self.active),
+            background: self.busy_background(),
+            warm: self.warm_modes(),
+            dropped_bytes: self
+                .view(self.active)
+                .map(SessionView::dropped_bytes)
+                .unwrap_or(0),
+            spinner: self.row_spinner,
+        }
+        .line(width)
+    }
+
+    /// One mode's row input, read off its view.
+    ///
+    /// A mode with no view at all is `NotStarted` rather than absent: "never
+    /// entered" is a state the row renders (`○ Beeds · not started`), not a hole
+    /// in it.
+    fn sess(&self, mode: TerminalType) -> crate::components::status::Sess<'_> {
+        let Some(v) = self.view(mode) else {
+            return crate::components::status::Sess {
+                mode,
+                status: SessionStatus::NotStarted,
+                step: None,
+                bead: None,
+                elapsed: None,
+                error: None,
+            };
+        };
+        crate::components::status::Sess {
+            mode: v.session.mode,
+            status: v.status,
+            step: v.step,
+            bead: v.active_bead.as_ref(),
+            elapsed: v.run_elapsed(self.clock),
+            error: v.last_error.as_deref(),
+        }
+    }
+
+    /// The modes that are not on screen and are **busy** — the sentence ADR-0002
+    /// says this row exists to make visible: "beads is still working while I am
+    /// chatting in Pi".
+    fn busy_background(&self) -> Vec<crate::components::status::Sess<'_>> {
+        TerminalType::ALL
+            .iter()
+            .filter(|m| **m != self.active)
+            .map(|m| self.sess(*m))
+            .filter(|s| s.busy())
+            .collect()
+    }
+
+    /// The modes with a warm child: alive, idle, resident, and invisible without
+    /// this. Costs memory and nothing else, so it is one segment rather than one
+    /// per mode — the honest content is "a process is being kept for you".
+    fn warm_modes(&self) -> Vec<TerminalType> {
+        TerminalType::ALL
+            .iter()
+            .filter(|m| **m != self.active)
+            .filter(|m| {
+                self.view(**m)
+                    .is_some_and(|v| v.status.is_alive() && !v.status.is_busy())
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Is **any** session busy, on screen or not?
+    fn any_busy(&self) -> bool {
+        self.views.values().any(|v| v.status.is_busy())
+    }
+
+    /// Advance the row's clock and animation from the frame tick, and say nothing
+    /// back — the effect is on `dirty`.
+    ///
+    /// The row carries two time-shaped things: a run's age, to the second, and a
+    /// spinner while anything is busy. Neither needs 60fps, and repainting the pane
+    /// sixty times a second for a row that changes eight of them is the difference
+    /// between "animated" and "the whole UI is doing something". When nothing is
+    /// busy the row is static and no repaint is requested at all, which is what
+    /// keeps an idle app from redrawing forever.
+    ///
+    /// Public and taking `now` as an argument so a test can advance the clock
+    /// without sleeping.
+    pub fn on_tick(&mut self, now: Instant) {
+        self.clock = now;
+        if !self.any_busy() {
+            return;
+        }
+        if now.saturating_duration_since(self.row_phase) < ROW_ANIM {
+            return;
+        }
+        self.row_phase = now;
+        self.row_spinner = self.row_spinner.wrapping_add(1);
+        self.dirty = true;
+    }
+
     /// Echo the user's own line into the mode it was typed into.
     ///
     /// It targets the view that *exists* for that mode rather than a synthetic
@@ -618,6 +792,7 @@ impl App {
                     self.spinner = self.spinner.wrapping_add(1);
                     self.dirty = true;
                 }
+                self.on_tick(Instant::now());
             }
             Msg::Term(Event::Resize(w, _)) => {
                 self.width = w;
@@ -656,6 +831,15 @@ impl App {
                 self.dirty = true;
                 self.view_mut(session).set_step(step);
             }
+            Msg::SessionStatus { session, status } => {
+                // Mirrored, and nothing else. The row reads `status`; no decision
+                // here may be made on the basis of it, which is the same rule
+                // `BeadStep` and `ActiveBead` live by: the session owns the state,
+                // the UI renders it.
+                self.dirty = true;
+                let now = self.clock;
+                self.view_mut(session).set_status(status, now);
+            }
             Msg::ActiveBead { session, bead } => {
                 // A mirror of the loop's claim, recorded rather than interpreted:
                 // the status row (looprs-guh) reads this field, and nothing here
@@ -675,9 +859,10 @@ impl App {
                     self.screen = None;
                     self.reanchor = true;
                 }
+                let now = self.clock;
                 let view = self.view_mut(session);
                 view.seal();
-                view.set_status(SessionStatus::Dead);
+                view.set_status(SessionStatus::Dead, now);
                 view.push_note(MessageKind::System, format!("{session} ended ({reason:?})"));
             }
             Msg::ScreenHeld { session, active } => {
@@ -1781,5 +1966,276 @@ mod tests {
             "a generation that never held the screen cannot release it"
         );
         assert!(!app.reanchor);
+    }
+
+    // ─────────────────────── the status row (looprs-guh) ───────────────────────
+    //
+    // `App`'s half of the row: gather the mirrors, no more. The layout, the
+    // truncation and the priority ladder are tested in `components::status`; what
+    // is tested here is that the right thing reaches the row at all — which is the
+    // half that can go wrong while every individual piece still looks correct.
+
+    fn row(app: &App, w: u16) -> String {
+        app.status_line(w).to_string()
+    }
+
+    /// ADR-0002's whole reason for this row, end to end through the envelope: the
+    /// beads loop is running, the user is looking at Pi, and the row says so.
+    #[test]
+    fn the_row_names_a_busy_mode_you_are_not_looking_at() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        app.update(Msg::BeadStep {
+            session: beads_id(),
+            step: BeadStep::WorkTickets,
+        });
+        app.update(Msg::ActiveBead {
+            session: beads_id(),
+            bead: Some(ActiveBead {
+                id: "looprs-guh".into(),
+                title: "Status row is allocated but empty".into(),
+            }),
+        });
+        app.update(Msg::SessionStatus {
+            session: beads_id(),
+            status: SessionStatus::Running,
+        });
+        let txt = row(&app, 100);
+        assert!(txt.contains("Pi"), "{txt:?}");
+        assert!(txt.contains("bg: Beeds working"), "{txt:?}");
+        assert!(txt.contains("looprs-guh"), "{txt:?}");
+        assert!(
+            !txt.contains("warm: Beeds"),
+            "a running mode is not a warm one: {txt:?}"
+        );
+    }
+
+    /// The same mirrors are per-session, not global (ADR-0002 Q2 / Q5). A beads
+    /// edge must not make the Pi pane look busy, and vice versa.
+    #[test]
+    fn a_status_edge_lands_in_its_own_view_and_not_in_the_active_one() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        app.update(Msg::SessionStatus {
+            session: beads_id(),
+            status: SessionStatus::Running,
+        });
+        assert_eq!(
+            app.view(TerminalType::Beeds).unwrap().status,
+            SessionStatus::Running
+        );
+        assert_eq!(
+            app.view(TerminalType::Pi).map(|v| v.status),
+            None,
+            "a beads edge must not have created or touched the Pi view's liveness"
+        );
+
+        // Now the Pi view exists, and it is idle while beads runs.
+        app.update(Msg::SessionStatus {
+            session: pi_id(),
+            status: SessionStatus::Idle,
+        });
+        let txt = row(&app, 60);
+        assert!(txt.contains("Pi") && txt.contains("idle"), "{txt:?}");
+        assert_eq!(
+            app.view(TerminalType::Pi).unwrap().status,
+            SessionStatus::Idle
+        );
+        assert_eq!(
+            app.view(TerminalType::Beeds).unwrap().status,
+            SessionStatus::Running,
+            "and beads is still running, unchanged by the Pi edge"
+        );
+    }
+
+    /// A warm child (alive, idle, resident) is the cost ADR-0002 takes on for
+    /// instant mode switches. It shows up on the row, and only for modes that are
+    /// actually alive.
+    #[test]
+    fn warm_children_are_named_only_for_modes_with_a_live_child() {
+        let (mut app, _rx) = app_with(TerminalType::Beeds);
+        assert!(
+            !row(&app, 100).contains("warm"),
+            "nothing is alive yet: {:?}",
+            row(&app, 100)
+        );
+        app.update(Msg::SessionStatus {
+            session: pi_id(),
+            status: SessionStatus::Idle,
+        });
+        assert!(row(&app, 100).contains("warm: Pi"), "{}", row(&app, 100));
+
+        // Dead is not warm: the child is gone, and claiming otherwise would hide
+        // the one thing the user would want to know.
+        app.update(Msg::SessionStatus {
+            session: pi_id(),
+            status: SessionStatus::Dead,
+        });
+        assert!(
+            !row(&app, 100).contains("warm"),
+            "a dead child is not a warm one: {}",
+            row(&app, 100)
+        );
+    }
+
+    /// The active mode is never listed as background or warm. The row answers
+    /// "what is *this* pane doing", and the other lists are about the other panes.
+    #[test]
+    fn the_active_mode_is_never_listed_against_itself() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        app.update(Msg::SessionStatus {
+            session: pi_id(),
+            status: SessionStatus::Idle,
+        });
+        let txt = row(&app, 100);
+        assert!(!txt.contains("bg: Pi"), "{txt:?}");
+        assert!(!txt.contains("warm: Pi"), "{txt:?}");
+    }
+
+    /// The row is a pure function of state, and the state includes *when* it was
+    /// sampled. Advancing the app's clock advances the age the row shows; nothing
+    /// in the render path reads a clock of its own.
+    #[test]
+    fn the_run_age_comes_from_the_app_clock_not_from_a_read_of_the_wall() {
+        let (mut app, _rx) = app_with(TerminalType::Bash);
+        let t0 = Instant::now();
+        app.on_tick(t0);
+        app.update(Msg::SessionStatus {
+            session: bash_id(),
+            status: SessionStatus::Running,
+        });
+        assert!(row(&app, 100).contains("0s"), "{}", row(&app, 100));
+
+        app.on_tick(t0 + Duration::from_secs(45));
+        let txt = row(&app, 100);
+        assert!(txt.contains("45s"), "{txt:?}");
+
+        app.on_tick(t0 + Duration::from_secs(3600));
+        assert!(row(&app, 100).contains("1h00m"), "{}", row(&app, 100));
+    }
+
+    /// The age is *this run's*, not this session's: a second run restarts it.
+    #[test]
+    fn a_second_run_starts_a_new_clock() {
+        let (mut app, _rx) = app_with(TerminalType::Bash);
+        let t0 = Instant::now();
+        app.on_tick(t0);
+        app.update(Msg::SessionStatus {
+            session: bash_id(),
+            status: SessionStatus::Running,
+        });
+        app.on_tick(t0 + Duration::from_secs(100));
+        assert!(row(&app, 100).contains("1m40s"), "{}", row(&app, 100));
+
+        app.update(Msg::SessionStatus {
+            session: bash_id(),
+            status: SessionStatus::Idle,
+        });
+        // The idle row has no age at all...
+        assert!(
+            !row(&app, 100).contains("1m40s"),
+            "an idle session must not keep showing the last run's age: {}",
+            row(&app, 100)
+        );
+        // ...and the next run starts from zero, not from the old one.
+        app.update(Msg::SessionStatus {
+            session: bash_id(),
+            status: SessionStatus::Running,
+        });
+        app.on_tick(t0 + Duration::from_secs(105));
+        let txt = row(&app, 100);
+        assert!(txt.contains("5s"), "{txt:?}");
+    }
+
+    /// A new generation of a mode is a different process. Its row must not carry
+    /// the previous one's age or its claim.
+    #[test]
+    fn a_new_generation_carries_no_age_and_no_claim() {
+        let (mut app, _rx) = app_with(TerminalType::Beeds);
+        let t0 = Instant::now();
+        app.on_tick(t0);
+        app.update(Msg::ActiveBead {
+            session: beads_id(),
+            bead: Some(ActiveBead {
+                id: "looprs-old".into(),
+                title: "old".into(),
+            }),
+        });
+        app.update(Msg::SessionStatus {
+            session: beads_id(),
+            status: SessionStatus::Running,
+        });
+        app.on_tick(t0 + Duration::from_secs(60));
+        assert!(row(&app, 100).contains("looprs-old"));
+
+        let newer = SessionId::new(TerminalType::Beeds, 2);
+        app.view_mut(newer);
+        let txt = row(&app, 100);
+        assert!(!txt.contains("looprs-old"), "{txt:?}");
+        assert!(!txt.contains("1m00s"), "stale run age survived: {txt:?}");
+    }
+
+    /// `on_tick` decides when the row repaints. With nothing busy it must not mark
+    /// the app dirty, or an idle app redraws at 60fps for no reason at all; with
+    /// something busy it repaints at the row's own pace.
+    #[test]
+    fn an_idle_app_is_not_repainted_by_the_row_and_a_busy_one_is_repainted_at_eight_fps() {
+        let (mut app, _rx) = app_with(TerminalType::Bash);
+        let t0 = Instant::now();
+
+        app.dirty = false;
+        app.on_tick(t0 + Duration::from_millis(16));
+        assert!(
+            !app.dirty,
+            "nothing is busy; the row must not ask for a frame"
+        );
+
+        app.update(Msg::SessionStatus {
+            session: bash_id(),
+            status: SessionStatus::Running,
+        });
+        app.dirty = false;
+        // Under the animation interval: nothing to show yet that changed.
+        app.on_tick(t0 + Duration::from_millis(60));
+        assert!(!app.dirty, "still inside the same animation frame");
+        // Past it: the spinner moved, so the row needs painting.
+        app.on_tick(t0 + Duration::from_millis(200));
+        assert!(
+            app.dirty,
+            "the spinner advanced and the row was not repainted"
+        );
+    }
+
+    /// A mode with no view at all still gets a row. `App` is created before any
+    /// session exists, and the very first frame is exactly the frame where "what is
+    /// happening?" has no answer but the honest one.
+    #[test]
+    fn a_fresh_app_with_no_sessions_at_all_renders_a_sane_row() {
+        let (tx, _rx) = mpsc::channel::<UiCommand>(1);
+        let app = App::new(tx, InputState::new(), TerminalType::Beeds, 40);
+        let txt = row(&app, 40);
+        assert!(txt.contains("Beeds"), "{txt:?}");
+        assert!(txt.contains("not started"), "{txt:?}");
+        assert!(!txt.contains('{') && !txt.contains('}'), "{txt:?}");
+    }
+
+    /// The last error must not need scrolling to see — that is the ticket. It also
+    /// has to stay put when the mode is switched away from and back.
+    #[test]
+    fn the_last_error_shows_in_its_own_mode_and_does_not_follow_the_user_around() {
+        let (mut app, _rx) = app_with(TerminalType::Beeds);
+        app.update(Msg::Error {
+            session: Some(beads_id()),
+            text: "bd: database is locked".into(),
+        });
+        let txt = row(&app, 100);
+        assert!(txt.contains("✗"), "{txt:?}");
+        assert!(txt.contains("database is locked"), "{txt:?}");
+
+        // The Pi pane's row is not showing the beads pane's failure.
+        let other = App {
+            active: TerminalType::Pi,
+            ..app
+        };
+        let txt = row(&other, 100);
+        assert!(!txt.contains("database is locked"), "{txt:?}");
     }
 }

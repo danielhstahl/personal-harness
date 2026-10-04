@@ -18,6 +18,8 @@
 //! be able to hide the Pi input box, and a Pi answer must not be able to pause the
 //! beads loop.
 
+use std::time::{Duration, Instant};
+
 use ratatui::text::Line;
 
 use super::SessionId;
@@ -77,6 +79,14 @@ pub struct SessionView {
     flusher: Flusher,
     /// Liveness mirror of the owning session, for the status row (looprs-guh).
     pub status: SessionStatus,
+    /// When the **current run** started, for `run_elapsed`.
+    ///
+    /// Set on the way *into* a busy state and cleared on the way out, which makes
+    /// it "this run", not "this session": a session that goes idle and busy again
+    /// starts a new clock rather than inheriting an age hours old. The instant is
+    /// handed in rather than read here so the view stays a set of functions of
+    /// state that a test can drive without waiting for anything.
+    pub run_started: Option<Instant>,
     /// Most recent error, kept so the status row can show it without digging
     /// through scrollback (looprs-guh).
     pub last_error: Option<String>,
@@ -121,6 +131,7 @@ impl SessionView {
             transcript: Transcript::new(),
             flusher: Flusher::new(),
             status: SessionStatus::NotStarted,
+            run_started: None,
             last_error: None,
             chat: ChatState::Stopped,
             awaiting_user: true,
@@ -198,12 +209,42 @@ impl SessionView {
 
     /// Mirror of the owning session's liveness, plus the input gating that follows
     /// from it: a session with no child must not leave the input box hidden.
-    pub fn set_status(&mut self, status: SessionStatus) {
+    ///
+    /// Also the one place the run clock is wound: entering a busy state starts it if
+    /// it is not already running, leaving one stops it. Idempotent in both
+    /// directions, so a session that publishes `Running` twice (a mirror refresh,
+    /// a duplicate edge) does not restart the age the row is showing.
+    pub fn set_status(&mut self, status: SessionStatus, now: Instant) {
+        let was_busy = self.status.is_busy();
         self.status = status;
+        if status.is_busy() {
+            if !was_busy {
+                self.run_started = Some(now);
+            }
+        } else {
+            self.run_started = None;
+        }
         if !status.is_alive() {
             self.awaiting_user = true;
             self.chat = ChatState::Stopped;
         }
+    }
+
+    /// How long this session's current run has been going, measured at `now`.
+    ///
+    /// `None` unless a run is live: "idle for 4 minutes" is not a thing the row
+    /// should imply, and an age that keeps counting after the run ended is worse
+    /// than no age at all. `now` comes from the caller's tick, never from here, so
+    /// the render path reads no clock.
+    pub fn run_elapsed(&self, now: Instant) -> Option<Duration> {
+        if !self.status.is_busy() {
+            return None;
+        }
+        Some(
+            self.run_started
+                .map(|s| now.saturating_duration_since(s))
+                .unwrap_or_default(),
+        )
     }
 
     /// The beads machine moved: record the step (status row) and gate input on it.
@@ -218,10 +259,9 @@ impl SessionView {
 
     /// How many bytes of this view's output were dropped by the cap (status row).
     ///
-    /// The counter is what makes an eviction honest rather than invisible; nothing
-    /// draws it until the status row exists (looprs-guh), and the tests assert both
-    /// the count and the message that quotes it.
-    #[allow(dead_code)] // consumers: view tests; looprs-guh ("N bytes dropped")
+    /// The counter is what makes an eviction honest rather than invisible; the row
+    /// shows it as `~N dropped` (looprs-guh) and the tests here assert both the
+    /// count and the message that quotes it.
     pub fn dropped_bytes(&self) -> usize {
         self.dropped
     }
@@ -392,7 +432,7 @@ mod tests {
         v.awaiting_user = false;
         v.chat = ChatState::Chat;
 
-        v.set_status(SessionStatus::Dead);
+        v.set_status(SessionStatus::Dead, Instant::now());
         assert!(
             v.awaiting_user,
             "a dead session cannot answer, so ask the human"
@@ -402,7 +442,7 @@ mod tests {
         // ...while a live-but-idle session keeps whatever gating it had.
         let mut w = view(TerminalType::Bash);
         w.awaiting_user = false;
-        w.set_status(SessionStatus::Idle);
+        w.set_status(SessionStatus::Idle, Instant::now());
         assert!(!w.awaiting_user);
     }
 

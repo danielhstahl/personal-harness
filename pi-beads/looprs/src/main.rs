@@ -437,7 +437,7 @@ fn view(app: &App, f: &mut Frame, preview: &[Line<'static>]) {
                 .collect()
         })
         .unwrap_or_default();
-    let [text_area, tool_area, _status, input] =
+    let [text_area, tool_area, status_area, input] =
         viewport::frame_areas(f.area(), tools.len() as u16);
 
     // What the live region shows is a property of the session on screen, not of any
@@ -454,8 +454,139 @@ fn view(app: &App, f: &mut Frame, preview: &[Line<'static>]) {
         };
         f.render_widget(LiveToolPreview::new(e, app.spinner), row);
     }
+
+    // The status row (looprs-guh): the row `frame_areas` has been reserving and
+    // nothing drew into. Drawn unconditionally — every state, including "no view,
+    // no session, no idea", has an answer worth showing, and a row that is only
+    // drawn when there is something to report is a row that is missing exactly when
+    // it is needed. `status_line` has already cut itself to this area's width, so
+    // there is nothing here to wrap and no reason for the row to reflow anything.
+    f.render_widget(
+        Paragraph::new(app.status_line(status_area.width)),
+        status_area,
+    );
+
     // input
     if app.need_input() {
         app.input.render(f, input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{BeadStep, SessionId, SessionStatus};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::CellWidth;
+
+    /// Read the backend's screen back as trimmed rows of text.
+    fn rows(b: &TestBackend) -> Vec<String> {
+        let w = b.buffer().area.width.max(1) as usize;
+        b.buffer()
+            .content
+            .chunks(w)
+            .map(|row| {
+                let mut s = String::new();
+                let mut skip = 0usize;
+                for c in row {
+                    if skip > 0 {
+                        skip -= 1;
+                        continue;
+                    }
+                    s.push_str(c.symbol());
+                    skip = c.cell_width().saturating_sub(1) as usize;
+                }
+                s.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    fn app(mode: TerminalType, need_input: bool) -> App {
+        let (tx, _rx) = mpsc::channel::<UiCommand>(4);
+        let mut app = App::new(tx, InputState::new(), mode, 60);
+        if !need_input {
+            app.view_mut(SessionId::new(mode, 1)).awaiting_user = false;
+        }
+        app
+    }
+
+    fn paint(app: &App, h: u16) -> Vec<String> {
+        let backend = TestBackend::new(60, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| view(app, f, &[])).unwrap();
+        rows(term.backend())
+    }
+
+    /// The bug was a row that `frame_areas` reserved and `view` left empty. So:
+    /// paint the whole frame and read the band back off the screen. Nothing else
+    /// on the row matters if there is nothing **on** the row.
+    #[test]
+    fn the_status_row_is_painted_into_the_band_the_layout_reserved_for_it() {
+        let app = app(TerminalType::Beeds, true);
+        let [_, _, status, _] = viewport::frame_areas(Rect::new(0, 0, 60, 12), 0);
+        let screen = paint(&app, 12);
+        let row = &screen[status.y as usize];
+        assert_eq!(status.height, 1);
+        assert!(
+            row.contains("Beeds") && row.contains("not started"),
+            "the reserved row came back empty: {screen:?}"
+        );
+    }
+
+    /// The row is there when there is no input box to share the frame with. A
+    /// beads pass that has taken the keyboard away is exactly when the row is
+    /// load-bearing, and a row that only paints alongside the box would be dark.
+    #[test]
+    fn the_status_row_is_painted_even_with_no_input_box() {
+        let mut app = app(TerminalType::Beeds, false);
+        app.update(Msg::BeadStep {
+            session: SessionId::new(TerminalType::Beeds, 1),
+            step: BeadStep::WorkTickets,
+        });
+        app.update(Msg::SessionStatus {
+            session: SessionId::new(TerminalType::Beeds, 1),
+            status: SessionStatus::Running,
+        });
+        let [_, _, status, input] = viewport::frame_areas(Rect::new(0, 0, 60, 12), 0);
+        let screen = paint(&app, 12);
+        assert!(screen[status.y as usize].contains("working"), "{screen:?}");
+        // …and the box really is gone, so the row is not being confused with it.
+        let box_rows = &screen[input.y as usize..input.bottom() as usize];
+        assert!(
+            box_rows.iter().all(|r| r.trim().is_empty()),
+            "the input box was drawn when it should not have been: {screen:?}"
+        );
+    }
+
+    /// A row per frame, and one row only: it must never spill into the live text
+    /// above it or the input below it. That is a reflow, and the ticket forbids it.
+    #[test]
+    fn the_status_row_stays_on_its_own_line_at_any_terminal_height() {
+        let mut app = app(TerminalType::Bash, true);
+        app.update(Msg::Error {
+            session: Some(SessionId::new(TerminalType::Bash, 1)),
+            text: "spawn failed: bash not found on PATH".into(),
+        });
+        for h in 5u16..=20 {
+            let [_, _, status, _] = viewport::frame_areas(Rect::new(0, 0, 60, h), 0);
+            let screen = paint(&app, h);
+            let band = &screen[status.y as usize];
+            assert!(band.contains("Bash"), "h={h}: {screen:?}");
+            assert!(band.contains("✗"), "h={h}: {screen:?}");
+            // Nothing of the row leaked into the neighbouring bands.
+            if (status.y as usize) > 0 {
+                assert!(
+                    !screen[status.y as usize - 1].contains("spawn failed"),
+                    "h={h}: leaked upward: {screen:?}"
+                );
+            }
+            if status.bottom() < h {
+                assert!(
+                    !screen[status.bottom() as usize].contains("spawn failed"),
+                    "h={h}: leaked downward: {screen:?}"
+                );
+            }
+        }
     }
 }

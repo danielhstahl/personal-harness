@@ -18,6 +18,7 @@ evidence, so a future reader can re-run it instead of re-arguing.
 | `spikes/cancel_e2e.py` | looprs-5g7 acceptance: Esc in all three modes inside the real TUI — latency to the acknowledgement and to the completion word, the silent-idle rows, and "a cancelled beads pass did not start another bead". `pi`/`bd` are fakes the script writes, so it costs no model call. |
 | `spikes/viewport_e2e.py` | looprs-afw acceptance: the live region's *shape* in a real pty. A long streamed answer has to reach more than the ten rows `const VIEWPORT_H: u16 = 10` allowed, grow into them as the text arrives, and survive a window resize taken mid-stream. Run against the pre-afw binary as a control it fails both counts (`spikes/results/viewport-e2e-before-afw.log`), which is the point. |
 | `spikes/shutdown_e2e.py` | looprs-ecr acceptance: the exit path. Three scenarios — quit mid-stream in Pi, quit with a busy Bash shell, quit against a child that ignores stdin EOF **and** SIGTERM — judged on the bytes the pty got and on the process table: the live tail must land **above** the erase line (a repaint cannot do that, so the check cannot be satisfied by a race), the run must end with one erase and one newline, the tty must be cooked again, no `ESC[6n` may be issued on the exit path, and no child may survive. Against the pre-ecr binary: **23/26**, and the three failures are the ticket (`spikes/results/shutdown-e2e-before-ecr.log`). |
+| `spikes/status_e2e.py` | looprs-guh acceptance: the one-row status band, in a real pty, driven off the real state machines — an empty board, a `bd` that fails outright, a beads pass Tabbed away from mid-run (ADR-0002's "the load-bearing case"), a `sleep` holding a shell busy, and a resize to the 40-column floor taken mid-run. Costs no model call (`pi` is `fake_pi_slow.py`, `bd` is a bash fake the script writes). **20/20**; against the pre-looprs-guh binary, 0 of the 13 row-specific checks fire (`spikes/results/status-e2e-control.log`) — which is what makes the passing run mean something. See *"Why the spike reads the wire and not the screen"* in `docs/testing.md` before editing the needles. |
 | `spikes/fake_pi_slow.py` | The `pi` that spike needs: one assistant message held **open** while a paragraph dribbles out. `tests/fixtures/fake_pi_chat.py` emits `text_delta` and `message_end` back to back, so its reply is flushed before a frame can be drawn over it and there is no live tail to measure. |
 | `spikes/results/` | Committed raw output of the runs quoted in the ADR. |
 
@@ -40,6 +41,12 @@ python3 spikes/vim_fullscreen.py  | tee spikes/results/vim-fullscreen.log
 python3 spikes/cancel_e2e.py      | tee spikes/results/cancel-e2e.log
 python3 spikes/viewport_e2e.py    | tee spikes/results/viewport-e2e.log
 python3 spikes/shutdown_e2e.py    | tee spikes/results/shutdown-e2e.log
+python3 spikes/status_e2e.py      | tee spikes/results/status-e2e.log
+
+# …and the status spike against the pre-looprs-guh binary, as a control (the same
+# worktree recipe as above; `--control` inverts the verdict and names any needle
+# that fired without a status row to fire on):
+#   LOOPRS_BIN=/tmp/ctl-target/debug/looprs python3 spikes/status_e2e.py --control
 
 # …and the same shutdown spike against the pre-looprs-ecr binary, as a control
 # (build that revision into its own target dir first, so this one stays usable):

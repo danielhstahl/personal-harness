@@ -185,6 +185,75 @@ lives once instead of being re-implied at six call sites.
   one gate in front of "start a pass", all 16 rows, exactly one yes
 - `session::beads::tests::each_flag_closes_the_pass_gate_by_itself`
 
+### Status row (looprs-guh)
+
+**What it proves:** the one-row band `frame_areas` reserves is filled, is a pure
+function of app state, and follows the *real* state machines — not just in the
+model, but as painted in a real pty.
+
+| Layer | Where | What it pins |
+| --- | --- | --- |
+| the row builder | `components::status::tests` | the verb table (`the_verb_table_says_what_every_state_means`), the drop ladder (`the_widest_segment_goes_first_and_the_mode_last`), no overflow at any width (`the_row_never_overflows_its_width_at_any_width`), the 40-column floor with an error (`at_forty_columns_with_an_error_the_work_and_the_failure_survive`), a truncation that keeps its `✗` (`a_shortened_error_keeps_its_marker`) |
+| the paint | `main::tests` (ratatui `TestBackend`) | `the_status_row_is_painted_into_the_band_the_layout_reserved_for_it`, `…_even_with_no_input_box`, `the_status_row_stays_on_its_own_line_at_any_terminal_height` (heights 5–20) |
+| the plumbing | `app::tests` | `a_status_edge_lands_in_its_own_view_and_not_in_the_active_one`, `the_run_age_comes_from_the_app_clock_not_from_a_read_of_the_wall`, `an_idle_app_is_not_repainted_by_the_row_and_a_busy_one_is_repainted_at_eight_fps`, `the_last_error_shows_in_its_own_mode_and_does_not_follow_the_user_around` |
+| the real pty | `spikes/status_e2e.py` | 20 checks, 6 scenarios, and a control run that fires on 0 of the 13 row-specific ones |
+
+Run it:
+
+```sh
+cargo build
+python3 spikes/status_e2e.py | tee spikes/results/status-e2e.log
+
+# the control: same spike against the pre-looprs-guh binary
+git worktree add --detach /tmp/looprs-ctl HEAD
+(cd /tmp/looprs-ctl/pi-beads/looprs && cargo build --target-dir /tmp/ctl-target)
+LOOPRS_BIN=/tmp/ctl-target/debug/looprs python3 spikes/status_e2e.py --control \
+    | tee spikes/results/status-e2e-control.log
+```
+
+| Scenario | State under test | Row expected |
+| --- | --- | --- |
+| S1 empty board | loop waiting on a human | `awaiting input · Tab switch · ^C quit`, nothing flushed to the alt screen |
+| S2 `bd` down | loop parked by a failing CLI | `paused · ✗ …` on the **row**, not only in scrollback |
+| S3 beads working, Tab away | a paid-for pass, then focus moved (ADR-0002) | `working · <bead-id>`, then `bg: Beeds working · <id> <elapsed>` with Pi focused; never `bg: Pi` |
+| S4 shell liveness | `sleep 6` start → finish | `running · … · Esc cancel`, then `idle`; a mode merely Tabbed through is not claimed warm |
+| S5 40 columns, mid-run | resize while busy | app alive, row still painted and still the running row |
+| S6 40 columns + long error | the truncation worst case | `paused · ✗` still reaches the band |
+
+**Why the spike reads the wire and not the screen.** Three ways of checking a row
+over a pty were tried and each produced confident nonsense:
+
+1. *Grep the capture for the whole row.* `ratatui` renders by **diff** — a frame
+   rewrites only the cells that changed, so the frame after an empty board wrote
+   `●` at column 1 and `awaiting input · Tab switch ·` at column 11 and nothing
+   in between.
+2. *Concatenate recent output and grep.* Diff rendering plus column shifts mean the
+   stream's order is not the screen's order: `Esc cancel` reached the wire as
+   `Esc can` + `el`, the shared `c` cell left unwritten because the previous
+   frame already had a `c` there (it was in `switch`). A needle can therefore be
+   **on screen and unread**. `Driver::full_paint()` — nudge two columns out and
+   back — makes the redraw non-partial and is used wherever a check needs a
+   specific string.
+3. *A cell-grid emulator with scroll regions.* Coherent for a while, then the
+   `ESC[6n` answers the harness must feed the app drift the emulator's cursor, and
+   the replay starts reading rows that were never on screen. Kept in the script
+   only for the human-readable dump.
+
+What the spike checks instead is **row-only vocabulary in a fresh window**: words
+that exist nowhere else in the program's output (`Esc cancel`, `bg: `, `warm: `,
+`paused · ✗`). The transcript is deliberately different at exactly those points —
+it says "the loop is parked", the row says `paused`; it says "beads: working
+looprs-…", the row says `bg: Beeds working`. That is what makes the match mean
+the row, and it is why the control matters: run against the pre-feature binary,
+**0 of 13** row-specific checks fire. The control caught two needles of mine that
+were passing on transcript prose rather than on the row.
+
+**What the spike deliberately does not claim:** line width, reflow, and the drop
+order. A terminal's line model cannot be recovered from this byte stream, for the
+reason above. Those live in `status.rs`'s width tests and `main.rs`'s
+`TestBackend` tests, where every cell can be checked exactly.
+
+
 ---
 
 ## Why "pure" matters here, once

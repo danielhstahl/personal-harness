@@ -58,12 +58,11 @@ pub enum TerminalType {
 impl TerminalType {
     /// All modes, in Tab order.
     ///
-    /// Nothing in the shipped binary enumerates the modes (it cycles them with
-    /// [`TerminalType::next`]), so this reads as dead there; it is the one place the
-    /// order is written down, and the tests that would otherwise hard-code
-    /// "Beeds, Pi, Bash" in nine spots walk it. The status row (looprs-guh) needs
-    /// the same table to print every mode, not just the live one.
-    #[allow(dead_code)] // consumers: the mode-table tests; looprs-guh enumerates modes
+    /// The one place the order is written down. The status row (looprs-guh) walks
+    /// it rather than only reporting the mode on screen — which is the point of the
+    /// row: the modes you are *not* looking at are the ones that need reporting —
+    /// and the mode-table tests walk it instead of hard-coding "Beeds, Pi, Bash" in
+    /// nine spots.
     pub const ALL: [TerminalType; 3] = [TerminalType::Beeds, TerminalType::Pi, TerminalType::Bash];
 
     pub fn label(self) -> &'static str {
@@ -201,10 +200,10 @@ pub enum SessionStatus {
 impl SessionStatus {
     /// "Do not let the user start another thing right now."
     ///
-    /// The bin does not call it yet — the App's input box currently gates on the
-    /// active *view* rather than the session's liveness — but it is the predicate
-    /// the router tests against, and the one looprs-guh's busy indicator reads.
-    #[allow(dead_code)] // consumers: router tests; looprs-guh (busy indicator)
+    /// The bin's input gating still runs off the active *view*'s `awaiting_user`
+    /// rather than off liveness, but the status row asks this question of every
+    /// mode, on screen or not, to decide what is doing work and what is merely
+    /// warm (looprs-guh: `Sess::busy`, `Status::background`).
     pub fn is_busy(self) -> bool {
         matches!(self, Self::Running | Self::Aborting)
     }
@@ -245,6 +244,19 @@ pub enum SessionEvent {
     BashOutput { stream: ByteStream, chunk: String },
     /// The beads machine moved. Only BeadsSession ever sends this.
     BeadStep(BeadStep),
+    /// This session's liveness, published on every change (looprs-guh).
+    ///
+    /// Pushed rather than polled because nobody upstream of the session task *can*
+    /// poll it cheaply: the `Router` owns the `Box<dyn Session>` and lives on
+    /// another task, and `App` is on the draw loop, which must not block on
+    /// anything (ADR-0002 Q4). A pushed edge is the same shape as every other
+    /// fact a session reports, and it is what lets the status row answer "is
+    /// there a child behind this mode, and is it busy?" without a round trip.
+    ///
+    /// Published only on change, by [`publish_liveness`], from the one place each
+    /// session task finishes handling a command — so "the row and the session
+    /// agree" does not depend on remembering to say it at every mutation.
+    Status(SessionStatus),
     /// The ticket the beads loop currently holds a claim on, `None` when it holds
     /// none. Only BeadsSession ever sends this.
     ///
@@ -278,6 +290,29 @@ pub enum SessionEvent {
     ScreenHeld { active: bool },
     /// Lifecycle edge: the child is gone and no further events will follow.
     Exited { reason: ExitReason },
+}
+
+/// Publish a session's liveness if it changed since the last publish.
+///
+/// A free function rather than three copies because the rule is identical in every
+/// session and a drift between them is the status row lying about a mode. Each
+/// session task calls it once, at the end of the turn in which it handled a
+/// command, next to the mirror write that `Session::status()` already reads — so
+/// the push cannot be forgotten at an individual mutation site, and a session that
+/// changes liveness without handling a command is not a session this harness has.
+///
+/// `last` advances whether or not the send succeeds: a failed send means the UI is
+/// gone, and there is nobody left to bring up to date.
+pub fn publish_liveness(
+    last: &mut SessionStatus,
+    now: SessionStatus,
+    tx: &mpsc::UnboundedSender<SessionEvent>,
+) {
+    if *last == now {
+        return;
+    }
+    *last = now;
+    let _ = tx.send(SessionEvent::Status(now));
 }
 
 /// The beads loop's own state, owned by the beads *session*, never by the UI.

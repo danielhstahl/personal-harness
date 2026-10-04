@@ -42,7 +42,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::screen::{Piece, ScreenWatch};
 use crate::session::{
     ByteStream, ExitReason, Session, SessionConfig, SessionEvent, SessionId, SessionStatus,
-    Spawned, cancel,
+    Spawned, cancel, publish_liveness,
 };
 
 /// `DC1` — starts the exit marker. A control character no program emits by
@@ -942,6 +942,10 @@ impl BashSession {
             last_exit: None,
         };
 
+        // The liveness this session has already told the UI about, so
+        // `publish_liveness` fires on changes rather than on every turn of the loop.
+        let mut published = SessionStatus::NotStarted;
+
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
@@ -956,7 +960,9 @@ impl BashSession {
                         // Publish the mirror before the ack, so a test that waits
                         // on the seam then reads `status()` sees the state as of
                         // that ack rather than one command stale.
-                        *task_status.lock().unwrap() = task.status();
+                        let s = task.status();
+                        *task_status.lock().unwrap() = s;
+                        publish_liveness(&mut published, s, &ev_tx);
                         let _ = tx.send(());
                     }
                     BashCmd::Shutdown => {
@@ -968,7 +974,9 @@ impl BashSession {
                         break;
                     }
                 }
-                *task_status.lock().unwrap() = task.status();
+                let s = task.status();
+                *task_status.lock().unwrap() = s;
+                publish_liveness(&mut published, s, &ev_tx);
             }
             // The mailbox is closed. Dropping the task drops the shell, whose `Drop`
             // kills the child: no bash outlives this session.

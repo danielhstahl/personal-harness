@@ -101,8 +101,9 @@ use crate::services::pi::PiRpc;
 use crate::services::prompts::{PLANNER, WORKER, generate_prompt};
 use crate::session::{
     ActiveBead, BeadStep, ExitReason, Session, SessionConfig, SessionEvent, SessionId,
-    SessionStatus, Spawned, cancel,
+    SessionStatus, Spawned, cancel, publish_liveness,
 };
+
 use serde_json::Value;
 
 /// Commands to the task that owns the [`BeadsCmd`] mailbox.
@@ -565,7 +566,7 @@ pub struct BeadsSession {
     /// `status` is. Nothing outside the task may write it, which keeps the loop's
     /// state single-owner while still letting the status row (looprs-guh) say *which*
     /// pass is running — and letting a test settle against a serial it did not make up.
-    #[allow(dead_code)] // read via BeadsSession::in_flight (looprs-guh + tests)
+    #[allow(dead_code)] // read via BeadsSession::in_flight
     in_flight: Arc<StdMutex<Option<u64>>>,
 }
 
@@ -603,6 +604,10 @@ impl BeadsSession {
             abort_attempt: 0,
             stall_reported: false,
         };
+
+        // The liveness this session has already told the UI about, so
+        // `publish_liveness` fires on changes rather than on every turn of the loop.
+        let mut published = SessionStatus::NotStarted;
 
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
@@ -645,7 +650,9 @@ impl BeadsSession {
                         // stale — and on a multi-threaded runtime the ack wakes
                         // the waiter before this task necessarily gets to the
                         // end-of-iteration mirror below.
-                        *task_status.lock().unwrap() = task.status();
+                        let s = task.status();
+                        *task_status.lock().unwrap() = s;
+                        publish_liveness(&mut published, s, &ev_tx);
                         *task_in_flight.lock().unwrap() = task.inner.worker_serial();
                         let _ = tx.send(());
                     }
@@ -659,7 +666,9 @@ impl BeadsSession {
                         break;
                     }
                 }
-                *task_status.lock().unwrap() = task.status();
+                let s = task.status();
+                *task_status.lock().unwrap() = s;
+                publish_liveness(&mut published, s, &ev_tx);
                 *task_in_flight.lock().unwrap() = task.inner.worker_serial();
             }
             // The task ends here and `ev_tx` drops with it, so the router's pump
@@ -680,7 +689,12 @@ impl BeadsSession {
     /// The pass this session has in flight right now, `None` when nothing is
     /// running. A snapshot taken from outside the task, so it is only as fresh as
     /// the last command the task finished — see [`Self::quiesce`].
-    #[allow(dead_code)] // consumers: beads::tests; looprs-guh (which pass is running)
+    ///
+    /// The status row does not read it: the row's "which bead" comes from
+    /// [`SessionEvent::ActiveBead`], which the loop publishes at the two moments
+    /// that matter rather than being polled out of the loop by a draw loop that
+    /// must not block on one.
+    #[allow(dead_code)] // consumers: beads::tests (which pass is running, without a sleep)
     pub fn in_flight(&self) -> Option<u64> {
         *self.in_flight.lock().unwrap()
     }
@@ -1619,6 +1633,7 @@ mod tests {
             SessionEvent::Agent(_) => "agent".into(),
             SessionEvent::Exited { .. } => "session-down".into(),
             SessionEvent::BashOutput { .. } => "bash".into(),
+            SessionEvent::Status(s) => format!("status:{s:?}"),
             // Only Bash mode ever takes a screen over; a beads session saying it did
             // would be a bug worth seeing in the test output.
             SessionEvent::ScreenHeld { active } => format!("screen:{active}"),

@@ -1,25 +1,16 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
-use ratatui::style::Color;
 
 use ratatui::Frame;
 use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
+use crate::theme::styles::mode_color;
+
 /// The terminal states are a session-layer identity (ADR-0002), not a property of
 /// this widget. The input box only cycles and labels them, so the type is imported
 /// and re-exported here rather than owned here.
 pub use crate::session::TerminalType;
-
-impl TerminalType {
-    fn color(self) -> Color {
-        match self {
-            Self::Bash => Color::Blue,
-            Self::Beeds => Color::DarkGray,
-            Self::Pi => Color::Yellow,
-        }
-    }
-}
 
 pub enum InputAction {
     Submit {
@@ -97,7 +88,7 @@ impl InputState {
     pub fn render(&self, f: &mut Frame, area: Rect) {
         let block = Block::bordered()
             .title(self.mode.label())
-            .border_style(self.mode.color());
+            .border_style(mode_color(self.mode));
         f.render_widget(Paragraph::new(self.text.as_str()).block(block), area);
         f.set_cursor_position((area.x + 1 + self.text.width() as u16, area.y + 1));
     }

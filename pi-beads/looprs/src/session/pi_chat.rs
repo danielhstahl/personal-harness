@@ -39,6 +39,7 @@ use crate::app::{PiEvent, parse};
 use crate::services::pi::{PiRpc, disposition_of, queued_text, succeeded};
 use crate::session::{
     ExitReason, Session, SessionConfig, SessionEvent, SessionId, SessionStatus, Spawned, cancel,
+    publish_liveness,
 };
 
 /// How long an orderly `close stdin -> pi disposes itself` gets before we SIGKILL.
@@ -573,6 +574,10 @@ impl PiChatSession {
             stall_reported: false,
         };
 
+        // The liveness this session has already told the UI about, so
+        // `publish_liveness` fires on changes rather than on every turn of the loop.
+        let mut published = SessionStatus::NotStarted;
+
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
@@ -590,7 +595,9 @@ impl PiChatSession {
                         // end-of-iteration mirror below is not enough: on a
                         // multi-threaded runtime the ack can wake the waiter
                         // first.)
-                        *task_status.lock().unwrap() = chat.status();
+                        let s = chat.status();
+                        *task_status.lock().unwrap() = s;
+                        publish_liveness(&mut published, s, &ev_tx);
                         let _ = tx.send(());
                     }
                     PiCmd::Shutdown => {
@@ -601,7 +608,9 @@ impl PiChatSession {
                         break;
                     }
                 }
-                *task_status.lock().unwrap() = chat.status();
+                let s = chat.status();
+                *task_status.lock().unwrap() = s;
+                publish_liveness(&mut published, s, &ev_tx);
             }
             // The mailbox is closed: the Router replaced us, or the app is gone.
             // Dropping the chat drops the child, and `kill_on_drop` makes good on
@@ -727,6 +736,7 @@ mod tests {
             SessionEvent::RestoreInput { text } => format!("restore: {text}"),
             SessionEvent::Exited { reason } => format!("down {reason:?}"),
             SessionEvent::BeadStep(s) => format!("step {s:?}"),
+            SessionEvent::Status(s) => format!("status {s:?}"),
             // A pi chat session never holds a bead; if this shows up in this file's
             // test output, the event came from somewhere it should not have.
             SessionEvent::ActiveBead { bead } => {
