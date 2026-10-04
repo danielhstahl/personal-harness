@@ -424,3 +424,41 @@ the settle under test is a real `agent_settled` off a real child process rather
 than a hand-built event. Incidentally: both sessions' `quiesce()` now publish their
 status mirror *before* acking, so "waited on the seam, then read the status" means
 what it says on a multi-threaded runtime.
+
+## Amendments made while implementing looprs-ecr (the exit path)
+
+This ADR said what a session owes on quit (`shutdown()` → close stdin → grace → SIGKILL) and left
+the **order of the exit itself** to looprs-ecr. It landed as six steps in `run()`, and three of
+them are amendments to what this file said or implied.
+
+1. **`UiCommand::Quit` exists, and dropping the channel is only the fallback.** Q4's topology has
+   the App holding `cmd_tx`, so "close the channel" was the natural exit signal — the Router
+   treats it as exactly that, still. But closing it closes the *reader* too, and the sessions do
+   most of their talking after being told to leave: the tail of a streamed answer, and the
+   `SessionEvent::Exited` that Q2 promises and that `SessionView::seal()` depends on. A quit that
+   drops the App loses all of it in the pane. So the UI now *sends* `Quit`, keeps the App alive,
+   and drains `app_rx` until every sender is gone — bounded, so a child that will not stop
+   talking cannot hold the screen.
+
+2. **The run loop holds no `app_tx` at all.** Q4's diagram shows the App as the source of `Msg`,
+   and it is, via the Router's clones. A copy left in `run()` is a sender that never dies, which
+   silently turns "drain until the senders are gone" into "drain until the timeout". Measured:
+   every quit cost 2.5s of frozen screen for nothing; with the stray sender dropped the same quit
+   takes 0.33s. The invariant worth keeping is *n senders, and every one of them is a task that
+   can finish*.
+
+3. **`shutdown_all` shares one deadline across the set and `abort()`s past it.** The grace per
+   session was three grace periods laid end to end — paid in full, in series, by the worst run
+   there is. One shared deadline makes the worst case the same as the single-session case. And
+   past the deadline the pump is cut rather than abandoned: an abandoned pump keeps its `app_tx`
+   clone (see point 2, again) and its receiver on the session's stream, so "abandon" would have
+   quietly unbounded the thing it was bounding.
+
+Also worth writing down, because it is the part that bites anyone who touches this next: **the exit
+path must never ask the terminal a question.** `Terminal::clear()` opens with a cursor query
+(`ESC[6n`), and at exit the async key stream's reader thread is still parked on the same stdin
+and eats the answer — which is how every run of this app used to end, in `Error: The cursor
+position could not be read within a normal duration`, exit code 1, with the live pane still
+painted. The clear is done from the anchor `LiveView` publishes instead, which is also why
+`insert_before` has to move that anchor with the pane: erase from the row the pane occupied
+*before* the last insert and the erase deletes the lines that insert just wrote.

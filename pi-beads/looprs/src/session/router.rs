@@ -324,6 +324,14 @@ impl Router {
                 }
                 Ok(())
             }
+            UiCommand::Quit => {
+                // `run` intercepts this before it ever gets here and stops
+                // serving, so reaching this arm means `handle` was driven
+                // directly. The teardown itself is `shutdown_all`'s job; a single
+                // command has nothing to add, and growing a second route to the
+                // same teardown is the drift this ticket is about.
+                Ok(())
+            }
         }
     }
 
@@ -377,13 +385,23 @@ impl Router {
 
     /// Teardown for app exit (ADR-0002 Q3, "on quit").
     ///
-    /// Bounded and ordered: `shutdown()` each session (close stdin first so pi can
-    /// dispose its runtime), then bound-wait for the `Exited` each one owes us, then
-    /// stop waiting past the grace period rather than hanging on a wedged child.
-    /// The sessions stay alive for the duration of the wait — dropping one early is
-    /// how a child gets orphaned.
+    /// `shutdown()` every session **first**, so all three children are closing at
+    /// once (close the child's stdin so it can dispose its runtime, per the
+    /// trait), and then wait for the `Exited` each one owes us on **one deadline
+    /// shared by the whole set**. A grace period per session is three grace
+    /// periods laid end to end, and the run that pays for all of them is the worst
+    /// possible one: three wedged children, and nobody can quit for six seconds.
+    ///
+    /// The sessions stay alive for the duration of the wait — dropping one early
+    /// is how a child gets orphaned — and past the deadline their pumps are
+    /// **cut**, not abandoned. An abandoned pump keeps its `app_tx` clone alive,
+    /// which keeps the UI's exit drain waiting on a task that is never going to
+    /// finish; `abort()` is what makes "bounded" true all the way up the chain.
     pub async fn shutdown_all(&mut self, grace: Duration) -> Result<()> {
-        let mut leaving: Vec<(SessionId, Box<dyn Session>, JoinHandle<()>)> = Vec::new();
+        // Retiring and waiting are separate lists because the sessions must outlive
+        // the waiting while the pumps are being reaped.
+        let mut retiring: Vec<Box<dyn Session>> = Vec::new();
+        let mut pumps: Vec<(SessionId, JoinHandle<()>)> = Vec::new();
         for (_, m) in self.sessions.drain() {
             let Managed {
                 id,
@@ -393,25 +411,40 @@ impl Router {
             if let Err(e) = session.shutdown() {
                 tracing::warn!("{id} shutdown failed: {e:#}");
             }
-            leaving.push((id, session, pump));
+            retiring.push(session);
+            pumps.push((id, pump));
         }
-        for (id, _session, pump) in leaving {
-            if timeout(grace, pump).await.is_err() {
-                // Past the grace period we stop waiting. The pump's session has
-                // been told to die; turning that into a SIGKILL is looprs-ecr's
-                // job, hanging the exit on it is not.
-                tracing::warn!(
-                    "{id} did not report its exit within {grace:?}; abandoning its pump"
-                );
+
+        let deadline = tokio::time::Instant::now() + grace;
+        for (id, mut pump) in pumps {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if timeout(left, &mut pump).await.is_err() {
+                // Past the deadline we stop waiting. The session has been told to
+                // die and its own `Drop` below is the net under that; what must
+                // not happen is its pump still holding a route to a UI that has
+                // moved on to clearing the screen.
+                tracing::warn!("{id} did not report its exit within {grace:?}; cutting its pump");
+                pump.abort();
             }
         }
+        // Dropped here, at the end: every session's `Drop` is the last net under
+        // its child, and it wants to fall after the waiting rather than during it.
+        drop(retiring);
         Ok(())
     }
 
-    /// The Router task body: serve commands until the UI closes the channel, then
-    /// take every session with us.
+    /// The Router task body: serve commands until the UI closes the channel or
+    /// says goodnight, then take every session with us.
     pub async fn run(mut self, mut cmd_rx: mpsc::Receiver<UiCommand>) -> Result<()> {
         while let Some(cmd) = cmd_rx.recv().await {
+            if matches!(cmd, UiCommand::Quit) {
+                // Stop serving. The sessions are on their way out, and a command
+                // queued behind this one has nowhere to go — the UI that typed it
+                // has already left. Whatever is still queued is dropped with the
+                // receiver, which is the honest end of it.
+                tracing::debug!("router: quit received, shutting every session down");
+                break;
+            }
             if let Err(e) = self.handle(cmd).await {
                 let _ = self.app_tx.send(Msg::Error {
                     session: None,
@@ -1218,6 +1251,122 @@ mod tests {
         assert!(res.is_ok(), "shutdown hung on a silent session");
         assert!(started.elapsed() < Duration::from_millis(900));
         assert!(silent.was_called("shutdown"));
+    }
+
+    /// ...and the bound is **one** grace period, not one per session. Three wedged
+    /// children laid end to end would be three grace periods of staring at a
+    /// screen that has already been told to leave, and the worst run is the one
+    /// that pays for all of them.
+    #[tokio::test]
+    async fn wedged_sessions_share_one_grace_period() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
+        let wedged = FakeBackend::new().with_silent_exit();
+        let mut router = Router::with_factory(TerminalType::Beeds, tx, wedged.factory());
+        router.boot().await.unwrap();
+        router.switch_to(TerminalType::Pi).await.unwrap();
+        router.switch_to(TerminalType::Bash).await.unwrap();
+        assert_eq!(router.sessions.len(), 3, "three live sessions to retire");
+
+        let grace = Duration::from_millis(250);
+        let started = std::time::Instant::now();
+        router.shutdown_all(grace).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < grace * 2,
+            "three wedged sessions took {elapsed:?} — the grace is being paid per session"
+        );
+        assert!(
+            elapsed >= grace,
+            "and it really did wait the grace rather than giving up early: {elapsed:?}"
+        );
+        assert_eq!(wedged.calls("shutdown"), 3, "all three were asked first");
+    }
+
+    /// Past the deadline a pump is **cut**, not abandoned. An abandoned pump keeps
+    /// its `app_tx` clone alive and its receiver on the session's event stream,
+    /// which means the exit drain waits on a task that is never going to finish,
+    /// and "bounded wait" was a figure of speech. The session's own `Drop` is what
+    /// kills the child; the pump just has to stop being a route to the UI.
+    #[tokio::test]
+    async fn a_wedged_sessions_pump_is_cut_rather_than_left_running() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
+        let wedged = FakeBackend::new().with_silent_exit();
+        let mut router = Router::with_factory(TerminalType::Pi, tx, wedged.factory());
+        router.boot().await.unwrap();
+        let id = router.session(TerminalType::Pi).unwrap().id;
+
+        // Reachable before: the pump is holding the receiver.
+        assert!(
+            wedged
+                .events(id)
+                .send(SessionEvent::System("while we are still talking".into()))
+                .is_ok(),
+            "the pump should still be reading"
+        );
+
+        router
+            .shutdown_all(Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        // The abort lands when the runtime next polls the task, so give it a few
+        // chances rather than asserting on a single instant.
+        for _ in 0..40 {
+            if wedged
+                .events(id)
+                .send(SessionEvent::System("after".into()))
+                .is_err()
+            {
+                return; // receiver gone: the pump is dead, and so is its route
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("a wedged session's pump kept a route to the UI after the grace period");
+    }
+
+    /// `UiCommand::Quit` is the UI's way of saying "I am leaving, and I am still
+    /// here to read what you say on the way out". The old signal — dropping the
+    /// command channel — shut the sessions down *and* closed the reader with them,
+    /// which is where the tail of a streamed answer went.
+    #[tokio::test]
+    async fn a_quit_command_shuts_the_sessions_down_without_closing_the_channel() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>(16);
+        let (app_tx, mut app_rx) = mpsc::unbounded_channel::<Msg>();
+        let backend = FakeBackend::new();
+        let mut router = Router::with_factory(TerminalType::Beeds, app_tx, backend.factory());
+        router.boot().await.unwrap();
+        let task = tokio::spawn(router.run(cmd_rx));
+
+        cmd_tx.send(UiCommand::Quit).await.unwrap();
+        // A command queued behind the quit is not honored: the UI that typed it
+        // has already left, and a session brought up to serve it is a session
+        // nobody is looking at.
+        cmd_tx
+            .send(UiCommand::Submit {
+                mode: TerminalType::Beeds,
+                text: "too late".into(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            timeout(Duration::from_secs(5), task).await.is_ok(),
+            "the router should leave on Quit alone, with the channel still open"
+        );
+        assert!(backend.was_called("shutdown"), "every session was told");
+        assert_eq!(
+            backend.calls("send_text"),
+            0,
+            "nothing behind the quit was served: {:?}",
+            backend.log()
+        );
+        // The UI's receiver is still its own and still readable, which is the
+        // whole reason this is a command instead of a `drop`.
+        assert!(
+            !drain(&mut app_rx).iter().any(|m| m.starts_with("error")),
+            "a normal quit is not an error"
+        );
     }
 
     /// `run()` serves commands until the UI hangs up, then leaves cleanly — the

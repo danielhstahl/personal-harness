@@ -17,9 +17,19 @@ use ratatui::text::Line;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub use crate::session::BeadStep;
+
+/// How long the exit path waits for room in the command queue to deliver `Quit`.
+///
+/// Bounded because *nothing* on this path may wait on a child process. The Router
+/// keeps that promise everywhere else (`handle` queues and returns), so a full
+/// queue here drains in microseconds and the timeout only ever fires if the
+/// Router is wedged by a bug — in which case leaving is the right answer, not
+/// hanging the exit on it.
+const QUIT_RETRY: Duration = Duration::from_secs(1);
 
 /// The `generation` a harness-level message uses when it has to create a view for
 /// a mode that has no session yet (`"could not open Bash: …"`).
@@ -158,6 +168,17 @@ pub enum UiCommand {
     /// this the child wraps for a terminal that does not exist and every table it
     /// prints is wrong forever, in the transcript as well as on screen.
     Resize { rows: u16, cols: u16 },
+    /// The app is leaving; take every session down with it (ADR-0002 Q3, "on
+    /// quit").
+    ///
+    /// A command rather than "just drop the `App`", which is how the exit used to
+    /// be signalled. Dropping does work — the Router shuts everything down when
+    /// the channel closes — but it also throws away the only thing that can *read*
+    /// what the sessions say on the way out: the last lines of a streamed answer,
+    /// and the `SessionDown` that seals each transcript. The exit path sends this,
+    /// then stays alive to drain those messages into the scrollback before the
+    /// live pane is erased.
+    Quit,
 }
 
 fn print_json_value_to_string(v: &Value) -> String {
@@ -721,6 +742,36 @@ impl App {
         let _ = self.cmd_tx.try_send(UiCommand::Resize { rows, cols });
     }
 
+    /// Tell the Router to shut every session down (exit step 2).
+    ///
+    /// A command and not a `drop`: the caller has work left to do with this App
+    /// afterwards — reading the messages the sessions emit as they go — and
+    /// dropping takes the reader with it.
+    ///
+    /// Best-effort with one bounded retry. A *full* queue is a wait on the queue
+    /// and nothing else: `Router::handle` never awaits a child, so it drains in
+    /// microseconds. A *closed* channel means the Router is already gone, which
+    /// is not something to retry or to complain about.
+    pub async fn request_shutdown(&self) {
+        match self.cmd_tx.try_send(UiCommand::Quit) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!("the router is already gone; nothing left to shut down");
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if tokio::time::timeout(QUIT_RETRY, self.cmd_tx.send(UiCommand::Quit))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "the quit command never reached the router; \
+                         the sessions go with the process"
+                    );
+                }
+            }
+        }
+    }
+
     /// Hand text back to the input box (Esc's queued-message restore).
     ///
     /// Two guards, both about not losing what the user has:
@@ -1169,6 +1220,27 @@ mod tests {
             other => panic!("expected Submit, got {other:?}"),
         }
         assert!(text_of(&app, TerminalType::Pi).contains("hi"));
+    }
+
+    /// The exit signal is a command on the same channel as every other one, not a
+    /// `drop` of that channel — so the App that sent it is still alive and still
+    /// holding the reader the exit drain needs. Asserting the round trip is what
+    /// pins that choice down; the alternative (dropping `App`) looks the same from
+    /// here and loses the tail of the answer.
+    #[tokio::test]
+    async fn asking_for_shutdown_puts_quit_on_the_command_channel() {
+        let (mut app, mut rx) = app_with(TerminalType::Pi);
+        app.request_shutdown().await;
+        assert!(
+            matches!(rx.recv().await.unwrap(), UiCommand::Quit),
+            "the exit instruction reached the router"
+        );
+        // …and the App is still a working reader afterwards.
+        app.update(Msg::SessionDown {
+            session: pi_id(),
+            reason: ExitReason::Shutdown,
+        });
+        assert!(text_of(&app, TerminalType::Pi).contains("ended"));
     }
 
     /// **A local echo does not steal the view's session identity.** It matters

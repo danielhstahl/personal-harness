@@ -1,0 +1,46 @@
+[  0.00s] === quit mid-stream: the answer is on screen, then the app is gone ===
+[  0.00s] spawned target/debug/looprs (pid 34021) in a 44x100 pty
+[  0.01s]   pump saw ESC[6n cursor query
+[  1.51s] PASS  the app boots and is alive
+[  2.31s]   pump saw ESC[6n cursor query
+[  2.53s]   pump saw ESC[6n cursor query
+[  2.75s]   pump saw ESC[6n cursor query
+[  3.00s]   pump saw ESC[6n cursor query
+[  3.20s]   pump saw ESC[6n cursor query
+[  3.43s]   pump saw ESC[6n cursor query
+[  3.67s]   pump saw ESC[6n cursor query
+[  3.89s]   pump saw ESC[6n cursor query
+[  4.12s]   pump saw ESC[6n cursor query
+[  4.34s]   pump saw ESC[6n cursor query
+[  4.44s] PASS  the answer is streaming into the live region
+[  4.77s] PASS  the app exits on Ctrl-Q
+[  4.77s] PASS  exit code is 0
+[  4.77s] PASS  no cursor query on the exit path
+[  4.77s] PASS  no 'cursor position could not be read' anywhere in the run
+[  4.77s] PASS  the live pane is erased on the way out
+[  4.78s] PASS  nothing on screen was lost: the live tail was flushed ABOVE the erase line
+[  4.78s] PASS  exactly one closing newline after the erase (no doubled prompt)
+[  4.78s] PASS  the tty is cooked again after exit
+[  4.82s] PASS  no bash from the generated rcfile survived
+[  4.87s] PASS  no fake pi survived the app
+[  4.87s] exited 0.33s after the quit key, code 0
+[  4.87s] === quit with a Bash child running: the shell goes with the app ===
+[  4.88s]   pump saw ESC[6n cursor query
+[  8.69s] PASS  the shell is up and busy
+[ 11.11s] PASS  the app exits on Ctrl-Q with a busy shell
+[ 11.11s] PASS  exit code is 0
+[ 11.11s] PASS  the exit stayed inside the budget
+[ 11.16s] PASS  no shell from our rcfile outlived the app
+[ 11.18s] PASS  no stray `sleep 30` from that shell
+[ 11.18s] PASS  the tty is cooked again after exit
+[ 11.18s] PASS  no 'could not be read' error at the end of the run
+[ 11.18s] === a child that will not stop: the budget has to be the answer ===
+[ 11.19s]   pump saw ESC[6n cursor query
+[ 14.36s] PASS  the wedged child is up
+[ 16.71s] PASS  the app exits even with a child that ignores everything
+[ 16.71s] PASS  exit code is 0
+[ 16.71s] PASS  the exit stayed inside the 8.0s budget
+[ 16.78s] PASS  the wedged child was killed, not left behind
+[ 16.78s] PASS  the tty is cooked again after exit
+[ 16.78s] exited 2.35s after the quit key against a child that ignored SIGTERM
+[ 16.78s] 26/26 checks passed

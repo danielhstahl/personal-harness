@@ -4,6 +4,7 @@ mod screen;
 mod services;
 mod session;
 mod state;
+mod teardown;
 #[cfg(test)]
 mod testing;
 mod theme;
@@ -13,7 +14,7 @@ use anyhow::Result;
 use app::{App, Msg, UiCommand};
 use components::input::InputState;
 use crossterm::event::{Event, EventStream};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::enable_raw_mode;
 use futures::StreamExt;
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
@@ -21,6 +22,7 @@ use ratatui::layout::{Rect, Size};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 use std::io::{self, Stdout};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -33,6 +35,7 @@ use tracing_subscriber::EnvFilter;
 use crate::session::router::{Router, SHUTDOWN_GRACE};
 use crate::session::{ChatState, SessionConfig, SessionStatus, TerminalType};
 use crate::state::transcript::Entry;
+use crate::teardown::{LiveAnchor, Teardown, install_panic_hook};
 
 fn init_logging() -> anyhow::Result<WorkerGuard> {
     //let dir = std::env::temp_dir(); // or a proper data dir, e.g. via the `dirs` crate
@@ -69,32 +72,51 @@ fn insert_lines(
 #[tokio::main]
 async fn main() -> Result<()> {
     let _log_guard = init_logging()?; // keep alive until exit, or buffered logs are lost
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        prev(info);
-    }));
 
     enable_raw_mode()?;
+    // The teardown is built *before* the live view, and the hook goes in before
+    // anything that can fail in raw mode. `LiveView::new` constructs a `Terminal`,
+    // which queries the cursor and can error; a panic or an `?` in that window is
+    // exactly what a terminal-left-in-raw-mode story is made of, so the way back
+    // exists before the thing that can break does.
+    //
+    // The anchor is handed in rather than read out afterwards for the same reason:
+    // it is the one fact the exit path needs about the screen, and it is published
+    // by the live view from the first frame onward (see `viewport` /
+    // `teardown::LiveAnchor`).
+    let anchor = LiveAnchor::new();
+    let exit = Arc::new(Teardown::new(anchor.clone()));
+    install_panic_hook(exit.clone());
+
     let initial = TerminalType::Beeds;
     // The live region opens at the height the policy wants for an empty stream —
     // its chrome plus one row — instead of the constant 10 it used to be. From
     // here on the frame decides the shape; see `viewport`.
     let rows = crossterm::terminal::size().map(|(_, r)| r).unwrap_or(24);
     let boot_h = viewport::desired_height(initial, rows, 0, 0);
-    let mut live = viewport::LiveView::new(CrosstermBackend::new(io::stdout()), boot_h, |_| {
-        Ok(CrosstermBackend::new(io::stdout()))
-    })?;
-    let res = run(&mut live, initial).await;
-    disable_raw_mode()?;
-    live.clear()?; // erase the live region; scrollback stays
-    println!();
+    let mut live = viewport::LiveView::with_anchor(
+        CrosstermBackend::new(io::stdout()),
+        boot_h,
+        |_| Ok(CrosstermBackend::new(io::stdout())),
+        anchor,
+    )?;
+    let res = run(&mut live, initial, &exit).await;
+    // The run loop restores the terminal itself, on its own exit path. This is the
+    // net under every way of getting here that skipped it — an early `?` out of
+    // `run`, most of which are terminal-write failures, which is precisely when
+    // the terminal most needs taking back. `restore` is idempotent, so this is a
+    // no-op when the loop already did the job, and the "exactly once" holds for
+    // the two of them together rather than for each of them separately.
+    exit.restore();
+    // `res` is returned rather than swallowed: a run that failed is worth an exit
+    // code, and the terminal is already safe by the time we get here to say so.
     res
 }
 
 async fn run(
     live: &mut viewport::LiveView<CrosstermBackend<Stdout>>,
     initial: TerminalType,
+    exit: &Teardown,
 ) -> Result<()> {
     // all terminal UI events and events originating outside the app
     // come from cmd_tx and are received on cmd_rx
@@ -107,6 +129,13 @@ async fn run(
     // `BeadsLoop::new(...)` hand-wired here, with a Tab being a border-color change
     // — is what looprs-05j replaces.
     let mut router = Router::new(initial, SessionConfig::default(), app_tx.clone());
+    // The run loop keeps **no** sender of its own. This is not tidiness: the exit
+    // drain ends when `app_rx` closes, and `app_rx` closes when the last sender
+    // is gone. A copy held here is a sender that never goes away, so the drain
+    // would sit out its whole timeout on every single quit — a 2.5s freeze on a
+    // screen that has nothing left to receive — and "the sessions said their
+    // piece" would stop being a fact the exit can observe.
+    drop(app_tx);
     // Bring up the mode we open in *before* the App exists: the beads loop's first
     // pass runs now, so the input box opens in the right state instead of
     // flickering once the BeadStep message lands.
@@ -140,7 +169,7 @@ async fn run(
 
     // Sole owner of the sessions from here on: nothing after this point may touch a
     // backend except by sending the Router a command.
-    let router_task = tokio::spawn(router.run(cmd_rx));
+    let mut router_task = tokio::spawn(router.run(cmd_rx));
 
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60 fps cap
@@ -290,15 +319,107 @@ async fn run(
         }
     }
 
-    // Dropping the App closes `cmd_tx`, which is the Router's cue to shut every
-    // session down. Await it: the children are reaped on that path, and quitting
-    // before it finishes is how a session outlives the TUI.
-    drop(app);
-    let grace = SHUTDOWN_GRACE + Duration::from_secs(1);
-    if tokio::time::timeout(grace, router_task).await.is_err() {
-        tracing::warn!("router did not finish shutting its sessions down within {grace:?}");
+    // ── exit ─────────────────────────────────────────────────────────────────
+    //
+    // Six steps, in this order, because every one of them is here to stop a
+    // specific way of losing something (looprs-ecr). The shared `exit` object is
+    // the same one the panic hook holds, so steps (4) and (5) cannot drift from
+    // what a crash does — see `crate::teardown`.
+    //
+    //   1. stop accepting input
+    //   2. tell every session to shut down
+    //   3. drain what they say into the scrollback, bounded
+    //   4. clear the live pane            ┐
+    //   5. raw mode off, one newline     ┘ `exit.restore()`, exactly once
+    //   6. bound-wait on the session tasks
+    //
+    // (1) The key stream goes first because it is the one thing in this function
+    // that can steal a terminal reply. Its reader thread is parked on the same
+    // stdin everything else reads, and any escape-sequence answer it takes is a
+    // two-second timeout somewhere else. Nothing below queries the cursor — that
+    // rule is what makes this list safe — but stopping the reader costs nothing
+    // and it makes the rule independent of whoever adds the next line here.
+    drop(keys);
+    drop(tick);
+
+    // (2) A command, not a `drop(app)`. Closing the channel does shut the
+    // sessions down, but it also closes the only reader of what they say next:
+    // the tail of a streamed answer that was still in the live preview region,
+    // and the `SessionDown` that seals each transcript. Losing that is the
+    // headline bug this ticket was filed for.
+    app.request_shutdown().await;
+
+    // (3) Bounded, because "until they are done talking" is not a bound: a child
+    // that streams forever is a `yes | cat` away from an app that never exits.
+    // Everything that was on screen goes out *before* the wait, so a quit
+    // mid-stream is safe in scrollback immediately and does not sit on the
+    // sessions' goodwill.
+    let drain_budget = SHUTDOWN_GRACE + Duration::from_millis(500);
+    if tokio::time::timeout(drain_budget, drain_sessions(&mut app, live, &mut app_rx))
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "sessions were still talking after {drain_budget:?}; leaving them where they are"
+        );
+    }
+
+    // (4) + (5) The pane goes, raw mode comes off, the line closes. No cursor
+    // query anywhere in it: it erases from the anchor the live view has been
+    // publishing, which `insert_before` above follows downward as it pushes.
+    exit.restore();
+
+    // (6) The router task is the task that waited on every pump, so joining it
+    // joins the shutdown. It has already bounded itself at `SHUTDOWN_GRACE` with
+    // `abort()` past that; this is the net under the whole thing, and past *this*
+    // the task is cut rather than waited on, because the user has already pressed
+    // the key that said "leave".
+    let join_budget = Duration::from_secs(1);
+    if tokio::time::timeout(join_budget, &mut router_task)
+        .await
+        .is_err()
+    {
+        tracing::warn!("router task did not finish within {join_budget:?}; cutting it");
+        router_task.abort();
     }
     Ok(())
+}
+
+/// The exit drain: everything the sessions say on the way out, written above the
+/// live pane before the pane disappears (looprs-ecr step 3).
+///
+/// Note the order inside the loop — **flush, then wait**. Flushing only after a
+/// message arrives would mean the text already on screen when the user pressed
+/// Ctrl-Q has to wait for the sessions to finish before it is safe, and a quit
+/// during a long silence would then be a quit with nothing drained at all. Flushing
+/// first means "what was on screen is in the scrollback" is true within one
+/// iteration of this loop, whatever the children decide to do afterwards.
+///
+/// Only the active view is drained. A hidden view's backlog is not on the screen,
+/// so nothing about it is "lost" by the exit — and dumping a session the user
+/// walked away from into their scrollback at the worst possible moment, one
+/// message at a time, is its own kind of noise. It is dropped with the view.
+async fn drain_sessions(
+    app: &mut App,
+    live: &mut viewport::LiveView<CrosstermBackend<Stdout>>,
+    rx: &mut mpsc::UnboundedReceiver<Msg>,
+) {
+    loop {
+        let lines = app.flush_active(app.width);
+        if !lines.is_empty() && insert_lines(live, lines).is_err() {
+            // The screen stopped accepting output. There is no point trying to
+            // drain anything further, and no point taking the app down over it
+            // either: the restore that follows is what matters now.
+            tracing::warn!("the final flush never reached the screen; leaving the rest undrained");
+            return;
+        }
+        match rx.recv().await {
+            Some(msg) => app.update(msg),
+            // Every sender is gone: each session got its parting word out, or had
+            // its pump cut after the grace period. Either way this is the end.
+            None => return,
+        }
+    }
 }
 
 /// Pure function of state (the tail preview re-parses only the open block).

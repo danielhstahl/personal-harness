@@ -108,6 +108,7 @@ use ratatui::layout::{Position, Rect, Size};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 use crate::session::TerminalType;
+use crate::teardown::LiveAnchor;
 
 /// The status row. `Constraint::Length(1)` in [`frame_areas`], and the same number
 /// in the height policy — the two must be one constant or the frame grows a row of
@@ -230,10 +231,18 @@ type Respawn<B> = dyn FnMut(&B) -> Result<B, <B as Backend>::Error>;
 /// and any event that can move the viewport without our knowledge — a window
 /// resize, a full-screen hand-back — clears it rather than leaving a guess
 /// standing.
+///
+/// The anchor is a [`LiveAnchor`] rather than a plain `Option<u16>` because the
+/// exit path has to read it too, and cannot ask the `Terminal`: ratatui's own
+/// `clear()` finds the row by *querying the cursor*, which is the one thing that
+/// must never happen at exit (see [`crate::teardown`). Publishing it from here —
+/// every writer of the anchor goes through this type — is what makes the exit
+/// path's idea of "where the pane is" and this type's idea of the same fact one
+/// fact, not two that can drift.
 pub struct LiveView<B: Backend> {
     term: Terminal<B>,
     height: u16,
-    top: Option<u16>,
+    top: LiveAnchor,
     /// The real window this view was last reshaped for. The frame loop compares
     /// the actual size against it every tick, because a `SIGWINCH` that lands
     /// while the key stream is stopped is never delivered at all — see
@@ -254,11 +263,28 @@ fn deferred<E: std::fmt::Display>(e: E) -> E {
 }
 
 impl<B: Backend> LiveView<B> {
-    /// Wrap a fresh `Terminal` whose inline viewport is `height` rows.
+    /// Wrap a fresh `Terminal` whose inline viewport is `height` rows, over an
+    /// anchor nobody else holds.
+    #[allow(dead_code)] // test seam: the app needs `with_anchor`, so the exit path shares the anchor; the mechanics tests have no exit path
     pub fn new(
         backend: B,
         height: u16,
         respawn: impl FnMut(&B) -> Result<B, B::Error> + 'static,
+    ) -> Result<Self, B::Error> {
+        Self::with_anchor(backend, height, respawn, LiveAnchor::new())
+    }
+
+    /// As [`Self::new`], over an anchor somebody else already holds.
+    ///
+    /// The app uses this so `main` can hand the *same* anchor to the panic hook
+    /// before the run loop has drawn a single frame: the window between
+    /// `enable_raw_mode()` and the first draw is exactly the window a panic in
+    /// `LiveView::new` would land in, and the terminal still has to come back.
+    pub fn with_anchor(
+        backend: B,
+        height: u16,
+        respawn: impl FnMut(&B) -> Result<B, B::Error> + 'static,
+        anchor: LiveAnchor,
     ) -> Result<Self, B::Error> {
         let term = Terminal::with_options(
             backend,
@@ -271,9 +297,17 @@ impl<B: Backend> LiveView<B> {
             term,
             height,
             // Unknown until the first frame reports where it landed.
-            top: None,
+            top: anchor,
             respawn: Box::new(respawn),
         })
+    }
+
+    /// The handle the exit path reads. Clones point at the same row this view keeps
+    /// updating, which is the point of it — there is no second copy of the truth
+    /// to fall out of agreement with the pane.
+    #[allow(dead_code)] // test seam: `main` supplies the anchor to `with_anchor` rather than reading it back; the anchor tests below assert it
+    pub fn anchor(&self) -> LiveAnchor {
+        self.top.clone()
     }
 
     /// Has the live region already been reshaped for a window of this size?
@@ -294,7 +328,7 @@ impl<B: Backend> LiveView<B> {
     /// Where the live region starts on the real screen, once a frame has said so.
     #[allow(dead_code)] // test seam: anchoring is only observable from the outside
     pub fn top(&self) -> Option<u16> {
-        self.top
+        self.top.get()
     }
 
     /// Rows of the real terminal.
@@ -319,7 +353,7 @@ impl<B: Backend> LiveView<B> {
             drawn = f.area();
             render(f);
         })?;
-        self.top = Some(drawn.top());
+        self.top.set(Some(drawn.top()));
         Ok(())
     }
 
@@ -328,17 +362,60 @@ impl<B: Backend> LiveView<B> {
     /// This moves the viewport down; the record of where it went comes from the
     /// frame that is drawn immediately afterwards, which is why the run loop's
     /// order is `fit` -> `insert` -> `draw` and not some other order.
+    /// Insert finalized lines above the live region, and follow the pane down.
+    ///
+    /// ratatui moves the viewport as part of the insert but does not report the new
+    /// row back, so the anchor would otherwise be one operation stale — and the
+    /// exit path erases *from* that row. Erasing from the row the pane occupied
+    /// *before* the last insert would wipe the lines that insert just wrote. Hence
+    /// this function is the only way in, and it moves the anchor with the pane.
     pub fn insert_before(
         &mut self,
         height: u16,
         draw_fn: impl FnOnce(&mut ratatui::buffer::Buffer),
     ) -> Result<(), B::Error> {
-        self.term.insert_before(height, draw_fn)
+        self.term.insert_before(height, draw_fn)?;
+        self.follow_the_pane_down(height);
+        Ok(())
+    }
+
+    /// Update the published anchor after `height` rows went in above the pane.
+    ///
+    /// The pane moves down by the rows that fitted below it; whatever did not fit
+    /// went out through the top and is already in scrollback. So:
+    ///
+    /// ```text
+    /// new_top = clamp(top + height, top, screen_height - pane_height)
+    /// ```
+    ///
+    /// The upper bound is what makes the arithmetic agree with all three of
+    /// ratatui's cases: room below (it scrolls the region down and the pane moves
+    /// the full amount), no room below (the bound holds it at the last row that
+    /// keeps the whole pane on screen), and a pane that already fills the screen
+    /// (the bound *is* the current row, so it never moves). The lower bound of
+    /// `top` covers a terminal that reported a size smaller than the pane; the pane
+    /// cannot travel backwards, and neither does the record of it.
+    ///
+    /// An unknown anchor is left unknown rather than guessed at. This is the row the
+    /// exit path clears from, and a wrong one here is an erase across rows that
+    /// were never ours.
+    fn follow_the_pane_down(&self, height: u16) {
+        let Some(top) = self.top.get() else { return };
+        // If the size cannot be read, assume it did not get in the way: overshoot
+        // leaves the top of the pane on screen, which is untidy. Underguessing
+        // erases output the user just got. Those are not equally bad.
+        let floor = self
+            .rows()
+            .unwrap_or(u16::MAX)
+            .saturating_sub(self.height)
+            .max(top);
+        let moved = top.saturating_add(height).min(floor).max(top);
+        self.top.set(Some(moved));
     }
 
     /// The real window changed shape. The viewport moved; we do not know where to.
     pub fn resize_window(&mut self, area: Rect) -> Result<(), B::Error> {
-        self.top = None;
+        self.top.set(None);
         self.window = Some(area.as_size());
         self.term.resize(area)
     }
@@ -347,7 +424,7 @@ impl<B: Backend> LiveView<B> {
     /// frame reports where the viewport actually is again — the row we recorded
     /// before the takeover describes a screen that no longer exists.
     pub fn anchor_lost(&mut self) {
-        self.top = None;
+        self.top.set(None);
     }
 
     /// Would [`Self::fit`] have to rebuild the `Terminal` for this height?
@@ -358,7 +435,7 @@ impl<B: Backend> LiveView<B> {
     /// clamped to the screen and changes nothing, which costs a restarted key
     /// stream and no more.
     pub fn needs_fit(&self, want: u16) -> bool {
-        self.top.is_some() && want != self.height
+        self.top.get().is_some() && want != self.height
     }
 
     /// Bring the live region to `want` rows.
@@ -376,7 +453,7 @@ impl<B: Backend> LiveView<B> {
         if want == 0 || want == self.height {
             return Ok(false);
         }
-        let Some(top) = self.top else {
+        let Some(top) = self.top.get() else {
             tracing::debug!("viewport fit to {want} deferred: anchor unknown");
             return Ok(false);
         };
@@ -417,7 +494,7 @@ impl<B: Backend> LiveView<B> {
         .map_err(deferred)?;
         self.height = want;
         // Where it actually landed is reported by the next frame.
-        self.top = Some(top);
+        self.top.set(Some(top));
 
         // Remember the real window this shape was built for. A freshly built
         // inline `Terminal` already records the backend's size as its own known
@@ -428,10 +505,13 @@ impl<B: Backend> LiveView<B> {
         Ok(true)
     }
 
-    /// Erase the live region (app shutdown: the scrollback stays, the pane goes).
-    pub fn clear(&mut self) -> Result<(), B::Error> {
-        self.term.clear()
-    }
+    // No `clear()` here, on purpose. `Terminal::clear()` is the obvious call for
+    // "erase the live region at exit" and it is a trap: it starts by asking the
+    // terminal where the cursor is (`ESC[6n`), and at exit the async key stream's
+    // reader thread is still parked on the same stdin and eats the answer — the
+    // `"cursor position could not be read"` death this whole ticket is about. The
+    // erase is done by [`crate::teardown`], from the anchor published here, with
+    // no query in front of it.
 }
 
 #[cfg(test)]
@@ -900,6 +980,81 @@ mod tests {
         assert!(!live.fit(20).unwrap());
         live.draw(paint_live).unwrap();
         assert!(live.top().is_some());
+    }
+
+    /// The anchor is not only for rebuilding — it is the row the **exit** path
+    /// erases from. So it has to follow the pane down every time
+    /// `insert_before` pushes it, or the final erase lands on the rows the last
+    /// insert just wrote and deletes the answer instead of the pane. (This is
+    /// looprs-ecr's half of the story: `teardown::restore_bytes` trusts this row
+    /// with the user's scrollback.)
+    #[test]
+    fn the_anchor_follows_the_pane_down_when_rows_are_inserted() {
+        let mut live = view_at(10, 8, 10);
+        live.draw(paint_live).unwrap();
+        assert_eq!(live.top(), Some(10));
+
+        insert(&mut live, 3);
+        assert_eq!(
+            live.top(),
+            Some(13),
+            "there was room below: the pane moved the whole way"
+        );
+
+        // More rows than fit under the pane: the pane stops at the last row that
+        // keeps all eight of its rows on screen, and everything past the top of
+        // the screen went into scrollback — it is not the pane's to move.
+        insert(&mut live, 40);
+        assert_eq!(
+            live.top(),
+            Some(H - 8),
+            "capped where the whole pane still fits, not at 53"
+        );
+
+        // A zero-row insert moves nothing, and must not move the record either.
+        insert(&mut live, 0);
+        assert_eq!(live.top(), Some(H - 8));
+    }
+
+    /// A pane that already fills the screen cannot move down at all; the rows go
+    /// straight out through the top. The anchor has to stay put rather than claim
+    /// the pane travelled.
+    #[test]
+    fn a_pane_that_fills_the_screen_does_not_move_when_rows_are_inserted() {
+        let mut live = view_at(0, H, 0);
+        live.draw(paint_live).unwrap();
+        assert_eq!(live.top(), Some(0));
+        insert(&mut live, 6);
+        assert_eq!(
+            live.top(),
+            Some(0),
+            "nowhere to go, and the record knows it"
+        );
+    }
+
+    /// And an unknown anchor stays unknown. The exit path reads "unknown" as
+    /// "erase nothing", which is the safe answer; inventing a row here would turn
+    /// a shutdown into an erase across rows that were never ours.
+    #[test]
+    fn inserting_with_no_anchor_does_not_invent_one() {
+        let mut live = view_at(10, 8, 10);
+        assert_eq!(live.top(), None, "nothing has been drawn yet");
+        insert(&mut live, 4);
+        assert_eq!(live.top(), None);
+
+        // Once a frame reports the row, the inserts can follow it.
+        live.draw(paint_live).unwrap();
+        let anchored = live.top().expect("the frame reported a row");
+        insert(&mut live, 2);
+        assert_eq!(
+            live.top(),
+            Some(anchored + 2),
+            "the record moved with the pane from the row the frame reported"
+        );
+    }
+
+    fn insert(live: &mut LiveView<TestBackend>, rows: u16) {
+        live.insert_before(rows, |_buf| {}).unwrap();
     }
 
     /// The whole run loop's frame order — `fit` -> `insert_before` -> `draw` —

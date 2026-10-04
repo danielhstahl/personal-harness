@@ -17,6 +17,7 @@ evidence, so a future reader can re-run it instead of re-arguing.
 | `spikes/fullscreen_e2e.py` | looprs-4hv acceptance: vim + less + a program that repaints in place, each against a bare-pty control. |
 | `spikes/cancel_e2e.py` | looprs-5g7 acceptance: Esc in all three modes inside the real TUI — latency to the acknowledgement and to the completion word, the silent-idle rows, and "a cancelled beads pass did not start another bead". `pi`/`bd` are fakes the script writes, so it costs no model call. |
 | `spikes/viewport_e2e.py` | looprs-afw acceptance: the live region's *shape* in a real pty. A long streamed answer has to reach more than the ten rows `const VIEWPORT_H: u16 = 10` allowed, grow into them as the text arrives, and survive a window resize taken mid-stream. Run against the pre-afw binary as a control it fails both counts (`spikes/results/viewport-e2e-before-afw.log`), which is the point. |
+| `spikes/shutdown_e2e.py` | looprs-ecr acceptance: the exit path. Three scenarios — quit mid-stream in Pi, quit with a busy Bash shell, quit against a child that ignores stdin EOF **and** SIGTERM — judged on the bytes the pty got and on the process table: the live tail must land **above** the erase line (a repaint cannot do that, so the check cannot be satisfied by a race), the run must end with one erase and one newline, the tty must be cooked again, no `ESC[6n` may be issued on the exit path, and no child may survive. Against the pre-ecr binary: **23/26**, and the three failures are the ticket (`spikes/results/shutdown-e2e-before-ecr.log`). |
 | `spikes/fake_pi_slow.py` | The `pi` that spike needs: one assistant message held **open** while a paragraph dribbles out. `tests/fixtures/fake_pi_chat.py` emits `text_delta` and `message_end` back to back, so its reply is flushed before a frame can be drawn over it and there is no live tail to measure. |
 | `spikes/results/` | Committed raw output of the runs quoted in the ADR. |
 
@@ -38,11 +39,13 @@ python3 spikes/fullscreen_e2e.py  | tee spikes/results/fullscreen-e2e.log
 python3 spikes/vim_fullscreen.py  | tee spikes/results/vim-fullscreen.log
 python3 spikes/cancel_e2e.py      | tee spikes/results/cancel-e2e.log
 python3 spikes/viewport_e2e.py    | tee spikes/results/viewport-e2e.log
+python3 spikes/shutdown_e2e.py    | tee spikes/results/shutdown-e2e.log
 
-# …and the same viewport spike against the pre-looprs-afw binary, as a control
+# …and the same shutdown spike against the pre-looprs-ecr binary, as a control
 # (build that revision into its own target dir first, so this one stays usable):
-#   git stash && cargo build --target-dir /tmp/base-target && git stash pop
-#   LOOPRS_BIN=/tmp/base-target/debug/looprs python3 spikes/viewport_e2e.py
+#   git worktree add --detach /tmp/looprs-prefix HEAD
+#   cd /tmp/looprs-prefix/pi-beads/looprs && cargo build --target-dir /tmp/base-target
+#   LOOPRS_BIN=/tmp/base-target/debug/looprs python3 spikes/shutdown_e2e.py
 ```
 
 **Why the full-screen spikes run a control.** "Did the user see it?" is not answered
