@@ -759,6 +759,18 @@ impl Session for FakeSession {
         Ok(())
     }
 
+    /// Recorded so a test can assert the real window size reached the sessions
+    /// that were up at the time — and, just as importantly, that no session was
+    /// brought up merely because a window got dragged.
+    fn resize(&mut self, rows: u16, cols: u16) -> anyhow::Result<()> {
+        self.backend.inner.lock().unwrap().log.push(format!(
+            "resize {} #{} {rows}x{cols}",
+            self.id.mode.label(),
+            self.id.generation
+        ));
+        Ok(())
+    }
+
     fn status(&self) -> SessionStatus {
         self.backend
             .inner

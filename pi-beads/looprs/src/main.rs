@@ -122,6 +122,12 @@ async fn run(term: &mut Term) -> Result<()> {
     if let Some((id, awaiting)) = seed {
         app.view_mut(id).awaiting_user = awaiting;
     }
+    // Tell the sessions the size they are being shown at before anyone runs a
+    // command. A Bash shell spawned later still inherits this: `BashTask::resize`
+    // records the size even with no shell up yet, and uses it for the pty it
+    // eventually opens.
+    let sz = term.size()?;
+    app.forward_resize(sz.height, sz.width);
 
     // Sole owner of the sessions from here on: nothing after this point may touch a
     // backend except by sending the Router a command.
@@ -144,6 +150,10 @@ async fn run(term: &mut Term) -> Result<()> {
                     }
                     keys = EventStream::new();                // resume
                     app.width = w;
+                    // …and the children get it too. A pty sized 80x24 while the
+                    // window is 180x50 wraps every program's output for a terminal
+                    // that is not there (ADR-0001 rule 6).
+                    app.forward_resize(h, w);
                 } else {
                     app.update(Msg::Term(ev));
                 }

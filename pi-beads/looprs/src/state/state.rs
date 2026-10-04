@@ -13,11 +13,27 @@ pub enum MessageKind {
     },
     /// Loop/harness status lines ("working looprs-1", "board empty, awaiting input").
     System,
+    /// Raw shell output from the Bash terminal state.
+    ///
+    /// ADR-0001 rule 1: **no markdown, no theme reinterpretation, no re-wrap.**
+    /// The child wrapped its own lines for a width it knows; running this through
+    /// the markdown renderer would corrupt tables, progress bars and box-drawing.
+    Bash,
     Error,
 }
 impl MessageKind {
+    /// Appended incrementally and closed implicitly (by a different kind arriving,
+    /// or by `finish_last`).
     pub fn is_streamed(&self) -> bool {
-        matches!(self, MessageKind::Thinking | MessageKind::Answer)
+        matches!(
+            self,
+            MessageKind::Thinking | MessageKind::Answer | MessageKind::Bash
+        )
+    }
+
+    /// Streamed **and** rendered verbatim: never a markdown or wrap pass over it.
+    pub fn is_raw(&self) -> bool {
+        matches!(self, MessageKind::Bash)
     }
 }
 

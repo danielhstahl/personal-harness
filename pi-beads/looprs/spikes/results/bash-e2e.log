@@ -1,0 +1,111 @@
+# Bash terminal state (looprs-553) — end-to-end runs against the REAL TUI in a real PTY
+# date: 2026-10-04T13:13:30Z
+# command: python3 spikes/bash_e2e.py, 5 consecutive runs, fresh process each time
+# env: TERM=xterm-256color, LOOPRS_BD_BIN=/bin/echo, LOOPRS_PI_BIN=/usr/bin/false
+# (fake bd/pi so no real agent runs; the Bash mode under test needs neither)
+
+----- run 1 -----
+PASS  Tab reaches the Bash mode
+PASS  the shell opens at the real window size (stty, not the 24x80 default)
+PASS  echo hi -> the shell's echo puts the typed line on screen (reads like a shell)
+PASS  …and the command line itself is echoed as typed
+PASS  echo hi -> exit 0 is shown
+PASS  cd /tmp is accepted
+PASS  pwd, a LATER command, reports the earlier cd (persistence)
+PASS  …and it is a real /tmp path, not a cwd we invented
+PASS  false -> visibly exit 1
+PASS  ls of a missing path -> stderr reaches the transcript
+PASS  Ctrl-C interrupts the running command
+PASS  Ctrl-C acted in 0.06s (not the 30s the command wanted)
+PASS  Ctrl-C did not quit looprs
+PASS  the shell survives Ctrl-C and still runs commands
+PASS  exit -> a visible notice
+PASS  exit -> looprs is still up
+PASS  after exit, the next command brings a shell back
+PASS  the replacement is announced (nothing appears out of nowhere)
+PASS  Ctrl-Q quits looprs
+PASS  no orphaned bash child left behind
+----- run 2 -----
+PASS  Tab reaches the Bash mode
+PASS  the shell opens at the real window size (stty, not the 24x80 default)
+PASS  echo hi -> the shell's echo puts the typed line on screen (reads like a shell)
+PASS  …and the command line itself is echoed as typed
+PASS  echo hi -> exit 0 is shown
+PASS  cd /tmp is accepted
+PASS  pwd, a LATER command, reports the earlier cd (persistence)
+PASS  …and it is a real /tmp path, not a cwd we invented
+PASS  false -> visibly exit 1
+PASS  ls of a missing path -> stderr reaches the transcript
+PASS  Ctrl-C interrupts the running command
+PASS  Ctrl-C acted in 0.06s (not the 30s the command wanted)
+PASS  Ctrl-C did not quit looprs
+PASS  the shell survives Ctrl-C and still runs commands
+PASS  exit -> a visible notice
+PASS  exit -> looprs is still up
+PASS  after exit, the next command brings a shell back
+PASS  the replacement is announced (nothing appears out of nowhere)
+PASS  Ctrl-Q quits looprs
+PASS  no orphaned bash child left behind
+----- run 3 -----
+PASS  Tab reaches the Bash mode
+PASS  the shell opens at the real window size (stty, not the 24x80 default)
+PASS  echo hi -> the shell's echo puts the typed line on screen (reads like a shell)
+PASS  …and the command line itself is echoed as typed
+PASS  echo hi -> exit 0 is shown
+PASS  cd /tmp is accepted
+PASS  pwd, a LATER command, reports the earlier cd (persistence)
+PASS  …and it is a real /tmp path, not a cwd we invented
+PASS  false -> visibly exit 1
+PASS  ls of a missing path -> stderr reaches the transcript
+PASS  Ctrl-C interrupts the running command
+PASS  Ctrl-C acted in 0.06s (not the 30s the command wanted)
+PASS  Ctrl-C did not quit looprs
+PASS  the shell survives Ctrl-C and still runs commands
+PASS  exit -> a visible notice
+PASS  exit -> looprs is still up
+PASS  after exit, the next command brings a shell back
+PASS  the replacement is announced (nothing appears out of nowhere)
+PASS  Ctrl-Q quits looprs
+PASS  no orphaned bash child left behind
+----- run 4 -----
+PASS  Tab reaches the Bash mode
+PASS  the shell opens at the real window size (stty, not the 24x80 default)
+PASS  echo hi -> the shell's echo puts the typed line on screen (reads like a shell)
+PASS  …and the command line itself is echoed as typed
+PASS  echo hi -> exit 0 is shown
+PASS  cd /tmp is accepted
+PASS  pwd, a LATER command, reports the earlier cd (persistence)
+PASS  …and it is a real /tmp path, not a cwd we invented
+PASS  false -> visibly exit 1
+PASS  ls of a missing path -> stderr reaches the transcript
+PASS  Ctrl-C interrupts the running command
+PASS  Ctrl-C acted in 0.06s (not the 30s the command wanted)
+PASS  Ctrl-C did not quit looprs
+PASS  the shell survives Ctrl-C and still runs commands
+PASS  exit -> a visible notice
+PASS  exit -> looprs is still up
+PASS  after exit, the next command brings a shell back
+PASS  the replacement is announced (nothing appears out of nowhere)
+PASS  Ctrl-Q quits looprs
+PASS  no orphaned bash child left behind
+----- run 5 -----
+PASS  Tab reaches the Bash mode
+PASS  the shell opens at the real window size (stty, not the 24x80 default)
+PASS  echo hi -> the shell's echo puts the typed line on screen (reads like a shell)
+PASS  …and the command line itself is echoed as typed
+PASS  echo hi -> exit 0 is shown
+PASS  cd /tmp is accepted
+PASS  pwd, a LATER command, reports the earlier cd (persistence)
+PASS  …and it is a real /tmp path, not a cwd we invented
+PASS  false -> visibly exit 1
+PASS  ls of a missing path -> stderr reaches the transcript
+PASS  Ctrl-C interrupts the running command
+PASS  Ctrl-C acted in 0.06s (not the 30s the command wanted)
+PASS  Ctrl-C did not quit looprs
+PASS  the shell survives Ctrl-C and still runs commands
+PASS  exit -> a visible notice
+PASS  exit -> looprs is still up
+PASS  after exit, the next command brings a shell back
+PASS  the replacement is announced (nothing appears out of nowhere)
+PASS  Ctrl-Q quits looprs
+PASS  no orphaned bash child left behind

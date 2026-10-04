@@ -106,6 +106,13 @@ pub struct Router {
     app_tx: mpsc::UnboundedSender<Msg>,
     active: TerminalType,
     sessions: HashMap<TerminalType, Managed>,
+    /// The last size we were told, kept so that a session created *after* the last
+    /// resize still gets it. Without this the size is shouted once into an empty
+    /// room: Bash is spawned lazily, so the startup resize and every resize before
+    /// the first command land nowhere, and the shell opens at the library default
+    /// and wraps its output at 80 columns inside a 132-column window forever
+    /// (measured: `stty size` said `24 80` in a 40x132 pty).
+    last_size: Option<(u16, u16)>,
     /// Generation source. Every spawn takes one; nothing else may invent ids.
     next_gen: u64,
 }
@@ -132,6 +139,7 @@ impl Router {
             app_tx,
             active,
             sessions: HashMap::new(),
+            last_size: None,
             next_gen: 1,
         }
     }
@@ -255,6 +263,27 @@ impl Router {
                     }
                 }
             }
+            UiCommand::Resize { rows, cols } => {
+                // Recorded first, so a session born later still gets it.
+                if rows > 0 && cols > 0 {
+                    self.last_size = Some((rows, cols));
+                }
+                // Every live session gets the real size, not just the active one:
+                // a shell running while the user looks at another mode wraps its
+                // output once, wrongly, and that wrong wrap is what lands in the
+                // transcript permanently (ADR-0001 rule 6).
+                //
+                // `values_mut` over what exists, never `ensure` — dragging a
+                // window must not spawn a child. A failed delivery is a session on
+                // its way out; the log is the right weight for that.
+                for m in self.sessions.values_mut() {
+                    let id = m.id;
+                    if let Err(e) = m.session.resize(rows, cols) {
+                        tracing::warn!("{id} resize to {rows}x{cols} not delivered: {e:#}");
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -361,10 +390,12 @@ impl Router {
     /// retired first and the new generation gets a fresh id — which is what makes a
     /// stale event distinguishable rather than merely unlikely.
     fn ensure(&mut self, mode: TerminalType) -> Result<SessionId> {
+        let mut replaced: Option<SessionId> = None;
         if let Some(m) = self.sessions.get(&mode) {
             if !matches!(m.session.status(), SessionStatus::Dead) {
                 return Ok(m.id);
             }
+            replaced = Some(m.id);
             // Retire the dead generation. The pump is cut first: after this point
             // that incarnation has no path to the UI at all. Any trailing
             // `SessionDown` it does not get to send is covered by the App's
@@ -391,6 +422,31 @@ impl Router {
                 pump,
             },
         );
+        // A session born after the last resize would otherwise open at the default
+        // size and stay there: the resize it needed was broadcast before it existed.
+        if let Some((rows, cols)) = self.last_size {
+            if let Err(e) = self
+                .sessions
+                .get_mut(&mode)
+                .expect("just inserted")
+                .session
+                .resize(rows, cols)
+            {
+                tracing::warn!("{id} initial size {rows}x{cols} not applied: {e:#}");
+            }
+        }
+        // A replacement is said out loud, and it is said here, because nobody else
+        // can. The new session does not know it is a replacement (it never had a
+        // child), and the old one is already off the air. Without this the user gets
+        // the dying session's last words and then a stranger's banner, with nothing
+        // in between to say they are the same pane — which reads as a crash rather
+        // than a restart. (looprs-553: "restart it with a visible notice".)
+        if let Some(old) = replaced {
+            let _ = self.app_tx.send(Msg::System {
+                session: Some(id),
+                text: format!("{old} was gone; started {id} in its place"),
+            });
+        }
         Ok(id)
     }
 
@@ -962,6 +1018,114 @@ mod tests {
         let err = router.ensure(TerminalType::Pi).unwrap_err();
         assert!(err.to_string().contains("factory produced"), "{err}");
         assert!(router.sessions.is_empty(), "a liar is not registered");
+    }
+
+    /// **A dead session being replaced is visible.** A new generation spawns with no
+    /// memory of being a replacement, and the old one is already off the air, so
+    /// without an explicit word the user sees the old session's last line and then a
+    /// stranger's banner — a crash, not a restart.
+    #[tokio::test]
+    async fn replacing_a_dead_generation_is_announced() {
+        let (mut router, mut rx, backend) = router_with(TerminalType::Bash);
+        let old = router.ensure(TerminalType::Bash).unwrap();
+        drain(&mut rx);
+        backend.set_status(old, SessionStatus::Dead);
+
+        let new = router.ensure(TerminalType::Bash).unwrap();
+        assert_ne!(old, new, "a replacement is a new generation");
+        let msgs = drain(&mut rx);
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("was gone") && m.contains("in its place")),
+            "the replacement was silent: {msgs:?}"
+        );
+    }
+
+    // ---------------------------- resize ----------------------------
+
+    /// **ADR-0001 rule 6: the child gets the real window.** A shell wraps its own
+    /// output for the width it was given, once, at the moment it wrote it — so a
+    /// resize that never reaches the pty is wrong permanently, in the transcript as
+    /// well as on screen. Every live session gets it, not just the visible one.
+    #[tokio::test]
+    async fn a_resize_reaches_every_live_session() {
+        let (mut router, _rx, backend) = router_with(TerminalType::Beeds);
+        router.boot().await.unwrap();
+        router.ensure(TerminalType::Bash).unwrap();
+        backend.clear_log();
+
+        router
+            .handle(UiCommand::Resize {
+                rows: 50,
+                cols: 180,
+            })
+            .await
+            .unwrap();
+
+        let log = backend.log();
+        for mode in [TerminalType::Beeds, TerminalType::Bash] {
+            let want = format!("resize {} ", mode.label());
+            assert!(
+                log.iter()
+                    .any(|c| c.starts_with(&want) && c.ends_with("50x180")),
+                "{mode:?} was not resized: {log:?}"
+            );
+        }
+    }
+
+    /// Dragging a window is not a reason to start a child. `handle` would happily
+    /// `ensure` its way to a session on every resize event; that is a process
+    /// spawn per pixel-drag, in the one mode where a spawn costs a shell.
+    #[tokio::test]
+    async fn a_resize_never_spawns_anything() {
+        let (mut router, _rx, backend) = router_with(TerminalType::Beeds);
+        backend.clear_log();
+
+        router
+            .handle(UiCommand::Resize {
+                rows: 40,
+                cols: 120,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            backend.log().is_empty(),
+            "a resize touched something it had not already: {:?}",
+            backend.log()
+        );
+    }
+
+    /// But a resize must not be *lost*, either. Bash spawns lazily, so the startup
+    /// broadcast happens while the map is still empty; if nothing remembers the size,
+    /// the shell opens at the library default and wraps at the wrong width for the
+    /// rest of its life. Measured before the fix: `stty size` reporting `24 80`
+    /// inside a 40x132 pty.
+    #[tokio::test]
+    async fn a_resize_before_a_session_is_born_is_applied_to_it() {
+        let (mut router, _rx, backend) = router_with(TerminalType::Beeds);
+        backend.clear_log();
+
+        router
+            .handle(UiCommand::Resize {
+                rows: 44,
+                cols: 150,
+            })
+            .await
+            .unwrap();
+        assert!(
+            backend.log().is_empty(),
+            "remembering a size is not a reason to spawn: {:?}",
+            backend.log()
+        );
+
+        router.ensure(TerminalType::Bash).unwrap();
+        let log = backend.log();
+        assert!(
+            log.iter()
+                .any(|c| c.starts_with("resize Bash ") && c.ends_with("44x150")),
+            "the session born after the resize never learned the size: {log:?}"
+        );
     }
 
     // ---------------------------- shutdown ----------------------------

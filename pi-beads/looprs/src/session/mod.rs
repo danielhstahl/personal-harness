@@ -13,10 +13,10 @@
 
 #![allow(dead_code)] // some of this layer is contract surface for tickets that have not landed
 
+pub mod bash;
 pub mod beads;
 pub mod pi_chat;
 pub mod router;
-pub mod stubs;
 pub mod view;
 
 use std::sync::Arc;
@@ -25,9 +25,9 @@ use tokio::sync::mpsc;
 
 use crate::app::PiEvent;
 
+pub use bash::BashSession;
 pub use beads::BeadsSession;
 pub use pi_chat::PiChatSession;
-pub use stubs::BashSession;
 pub use view::ChatState;
 
 /// The three terminal states. This is a *session* identity, not a widget property, so
@@ -238,11 +238,51 @@ impl Default for SessionConfig {
         Self {
             pi_bin: std::env::var("LOOPRS_PI_BIN").unwrap_or_else(|_| "pi".to_string()),
             bd_bin: std::env::var("LOOPRS_BD_BIN").unwrap_or_else(|_| "bd".to_string()),
-            shell_bin: std::env::var("LOOPRS_SHELL_BIN")
-                .or_else(|_| std::env::var("SHELL"))
-                .unwrap_or_else(|_| "/bin/bash".to_string()),
+            shell_bin: default_shell_bin(),
         }
     }
+}
+
+/// Is `path` plausibly a bash (including a renamed one like `bash5`)?
+///
+/// This matters because Bash mode's whole integration is bash-specific: `--rcfile`
+/// and the `PROMPT_COMMAND` exit marker have no zsh or fish equivalent. Pointing
+/// Bash mode at `$SHELL` because it is *the* shell is how you get a pane that runs
+/// zsh with no exit codes, no readiness signal and a `--rcfile` it does not
+/// understand. So `$SHELL` is consulted, but only honored when it is a bash.
+pub fn looks_like_bash(path: &str) -> bool {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains("bash"))
+}
+
+/// The shell Bash mode spawns: an explicit override, else a **bash**, found rather
+/// than assumed.
+fn default_shell_bin() -> String {
+    // An override is honored verbatim, even if it names a non-bash: it is also
+    // how you point at a bash built somewhere unusual, and BashSession warns about
+    // the non-bash case at spawn rather than silently misbehaving.
+    if let Ok(v) = std::env::var("LOOPRS_SHELL_BIN") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if let Ok(s) = std::env::var("SHELL") {
+        if looks_like_bash(&s) {
+            return s;
+        }
+    }
+    for cand in [
+        "/bin/bash",
+        "/opt/homebrew/bin/bash",
+        "/usr/local/bin/bash",
+    ] {
+        if std::path::Path::new(cand).exists() {
+            return cand.to_string();
+        }
+    }
+    "/bin/bash".to_string()
 }
 
 /// What [`spawn`] hands back: the control handle and the event stream.
@@ -324,6 +364,13 @@ pub trait Session: Send {
     /// BeadsSession uses it to stop starting new passes while hidden
     /// ([`SwitchAway::DrainThenPark`]).
     fn set_active(&mut self, _active: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// The real terminal changed shape. Bash forwards this to its pty so the
+    /// child wraps for the window it is actually shown in (ADR-0001 rule 6);
+    /// the pi-backed modes do not care and inherit the no-op.
+    fn resize(&mut self, _rows: u16, _cols: u16) -> anyhow::Result<()> {
         Ok(())
     }
 

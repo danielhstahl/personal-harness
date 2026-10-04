@@ -1,0 +1,27 @@
+# Bash mode + a full-screen program (vim): the measured gap 
+# date: 2026-10-04T13:14:17Z
+# command: python3 spikes/vim_fullscreen.py
+# result: the gap ADR-0001 Q8 predicted. Recorded so "vim works in Bash mode" is never
+#         repeated as a claim without the screen-buffer path behind it.
+
+spawned target/debug/looprs (pid 25619)
+PASS  the shell reports a real tty size (stty), so vim is not warned off
+PASS  vim starts without the 'not to a terminal' warning
+FAIL  vim can write the file it was told to write
+PASS  vim quit and the shell is back
+PASS  screen evidence: the filename appeared
+FAIL  screen evidence: the insert-mode status line appeared
+FAIL  screen evidence: blank-line tildes appeared
+vim screen text captured (normalized, whitespace-free): 81 chars
+first 200 chars of the vim stretch: 'bash-3.2$vim-uNONE-iNONE-n/tmp/looprs-vim-probe.txtiwritten-by-vim-through-looprs'
+FAIL  after vim, the shell still runs commands and they reach the screen  -- never saw 'POST-VIM' after b'echo post-vim | tr a-z A-Z\r'
+PASS  Ctrl-Q quits after vim
+5/9 checks passed
+failed: vim can write the file it was told to write, screen evidence: the insert-mode status line appeared, screen evidence: blank-line tildes appeared, after vim, the shell still runs commands and they reach the screen
+raw vim stretch: /tmp/vimprobe.raw
+
+# --- why: the shell's bytes as measured in looprs.log (TEMP instrumentation, this run) ---
+# vim's full-screen paint arrives in ~1 KB chunks containing ZERO linefeeds:
+#   1024 bytes, 0 LF, 0 CR / 1023 bytes, 0 LF, 0 CR / 957 bytes, 0 LF, 0 CR ...
+# while line-oriented output always ends in CRLF. The transcript flush is line
+# delimited, so a stream with no newlines never reaches the screen.

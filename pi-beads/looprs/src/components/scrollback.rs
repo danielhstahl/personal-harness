@@ -72,12 +72,12 @@ impl Flusher {
         let w = content_width(term_width);
         let mut out = Vec::new();
         while let Some(e) = t.entries.get(self.first) {
-            /*let lines = match e.kind {
-                MessageKind::Thinking | MessageKind::Answer => self.cur.drain_stream(e, w),
-                MessageKind::Tool { .. } => vec![tool_line(e, 0)],
-                _ => render_simple(e, w), // always created `done`
-            };*/
-            let lines = if e.kind.is_streamed() {
+            let lines = if e.kind.is_raw() {
+                // Shell output: verbatim lines, no markdown, no re-wrap
+                // (ADR-0001 rule 1). Complete lines go out as they arrive; the
+                // partial tail stays in the live region.
+                self.cur.drain_raw(e)
+            } else if e.kind.is_streamed() {
                 self.cur.drain_stream(e, w)
             } else if !e.done {
                 break; // open tool: the viewport owns it
@@ -102,7 +102,11 @@ impl Flusher {
             return vec![];
         };
         let c = &self.cur;
-        let lines = if c.fence.is_some() {
+        let lines = if e.kind.is_raw() {
+            // The unfinished last line of shell output: verbatim, and never
+            // re-flowed through the markdown path.
+            vec![Line::from(e.text[c.scan..].to_string())]
+        } else if c.fence.is_some() {
             vec![Line::from(e.text[c.scan..].to_string())]
         } else {
             md::render_markdown(&e.text[c.block..], content_width(term_width))
@@ -115,6 +119,27 @@ impl Flusher {
 }
 
 impl Cursor {
+    /// Raw, line-at-a-time rendering for shell output.
+    ///
+    /// Deliberately *not* `drain_stream`: that one accumulates a prose block and
+    /// renders it through markdown when the block closes. Shell output must reach
+    /// the scrollback as the exact lines the child wrote, as soon as each line is
+    /// complete — waiting for a blank line would hold back everything a shell does
+    /// between prompts, and markdown would reinterpret `# comment` as a heading.
+    fn drain_raw(&mut self, e: &Entry) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        while let Some(nl) = e.text[self.scan..].find('\n') {
+            let line = e.text[self.scan..self.scan + nl].trim_end_matches('\r');
+            out.push(Line::from(line.to_string()));
+            self.scan += nl + 1;
+        }
+        if e.done && self.scan < e.text.len() {
+            out.push(Line::from(e.text[self.scan..].trim_end_matches('\r').to_string()));
+            self.scan = e.text.len();
+        }
+        out
+    }
+
     fn drain_stream(&mut self, e: &Entry, w: u16) -> Vec<Line<'static>> {
         let mut out = Vec::new();
         while let Some(nl) = e.text[self.scan..].find('\n') {

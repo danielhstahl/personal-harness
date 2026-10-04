@@ -239,3 +239,101 @@ Costs / follow-ups:
 - **Option D — pi's RPC `bash`.** Rejected in question 4.
 - **Option E — run the shell inside tmux and scrape it.** Solves resize/passthrough but adds a
   harder external dependency and a worse UX than owning the pty.
+
+## Amendment 2 — as built (`looprs-553`), including four things the spike did not know
+
+`BashSession` is in `src/session/bash.rs`; `Msg::BashOutput` carries raw chunks to
+`SessionView::push_bash`, and the transcript renders them with no markdown pass. The
+decision above holds. Four things found while building it change the shape of the code,
+and are recorded here rather than left in comments.
+
+**1. `--rcfile` must come before `-i` on macOS.** The sketch above spawns
+`[program, "-i", "--rcfile", rc]`. macOS's `/bin/bash` 3.2 parses `-i` as the end of
+option parsing and answers `--: invalid option`; the shell never starts, and the failure
+looks like a silent pty, not an argument error. `bash --rcfile <rc> -i` is accepted by
+3.2 and by 5.x, so that is the order used. Anyone re-deriving this from the earlier
+text in this file will get it wrong; that is why the order is called out.
+
+**2. `$SHELL` is a lie for Bash mode.** This machine has `SHELL=/bin/zsh`. Taking
+`$SHELL` as "the bash binary" produces a shell that accepts the spawn, prints a prompt,
+and has no idea what our `PROMPT_COMMAND` marker means — every command then looks like it
+never returned. Resolution order is: `LOOPRS_SHELL_BIN` verbatim (test override), then
+`$SHELL` *only if it looks like bash*, then a search of the usual paths, then
+`/bin/bash`. Configuring a `BashSession` with a non-bash program logs a warning rather
+than failing, because the user may have a bash-alike we did not recognize.
+
+**3. Readiness is a queue, not a gate.** The first prompt marker arrives *before bash has
+read anything*, so the answer to a command sent cold is ambiguous — bash's own first
+prompt can be read as that command's `exit 0`. Input arriving early is queued and flushed
+when the first marker lands, and each command written is pushed onto an `outstanding`
+queue so that each exit marker pops the command it belongs to. That is what makes
+"which exit code goes with which line" correct for typed-ahead input instead of merely
+plausible.
+
+**4. The reader thread holds a sender, so dropping the session must ask to shut down.**
+The `Shell` is owned by the session task, and that task ends when its command mailbox
+closes — but the pty reader thread holds a clone of the mailbox sender for its whole
+life. So the mailbox never closes while the reader runs: the task never exits, the `Shell`
+is never dropped, the child is never killed, the child never exits, and the reader never
+sees the EOF that would end it. A cycle with a live child in the middle, which is exactly
+how the app leaves a bash behind after "quitting" (`looprs-ecr`'s unkillable bash).
+`impl Drop for BashSession` sends `Shutdown` explicitly: the shell dies, the reader hits
+EOF, the thread ends, every sender dies. Any session type with a child behind a thread
+boundary has the same trap, and the test that catches it is "no orphaned child after
+Ctrl-Q" — invisible in the UI, cheap in a driver.
+
+**5. Resize has to survive the session not existing yet.** `main.rs` broadcasts the size
+at startup, but Bash spawns lazily, so that broadcast lands in an empty map. Measured
+before the fix: `stty size` reporting `24 80` inside a 40x132 pty, which wraps every
+program's output at the wrong width forever. The Router now records `last_size` and applies
+it to a session at the moment it is created, as well as forwarding every resize to the
+sessions that already exist — and still never spawns one on a resize.
+
+**6. A restart is announced by whoever performs it, which is the Router.** `exit` inside
+the shell kills the child but not the mode. The next command finds the session `Dead` and
+replaces the generation; the replacement does not know it is a replacement, and the old
+one is already off the air. Without a word the user gets the dying session's last line
+and then a stranger's banner — a crash, not a restart — so `ensure` emits
+"`Bash#1` was gone; started `Bash#2` in its place" into the new session's stream.
+
+**7. Ctrl-C is the shell's; Ctrl-Q is ours.** In Bash mode Ctrl-C routes as `Cancel` and
+the session writes `0x03` to the master (measured: 0.06 s to `interrupted (exit 130)` on
+a `sleep 30`, app alive, shell reused). That chord is gone from the app, so Ctrl-Q quits
+in every mode.
+
+## Known gap: full-screen programs do not work yet (measured, not guessed)
+
+Rule 1 says passthrough, and the acceptance line further up this file claims "vim works
+(measured)". **That was measured on a raw pty spike, where the child's bytes went to a
+terminal. It is not true of the shipped path, and it is not true now.**
+
+`spikes/vim_fullscreen.py` (output in `spikes/results/vim-fullscreen.log`) drives the
+real TUI in a real PTY and types into vim. What happens:
+
+| observation | result |
+| --- | --- |
+| the shell is on a real tty (`stty size` = the window) | works |
+| vim starts, no "not to a terminal" warning | works |
+| vim's screen reaches the user | **nothing**: no `--INSERT--`, no `~` filler lines, no file written |
+| the app survives | yes; Ctrl-Q quits it normally |
+
+The cause is measurable, and it is our path, not vim's. Instrumenting the reader showed
+vim's full-screen paint arriving in ~1 KB chunks containing **zero linefeeds** (line-oriented
+output always ends in CRLF). The transcript flushes line by line: a partial line stays
+live until a `\n` arrives, and for a cursor-addressed program none ever does. So the pane
+sits frozen on whatever was there before, while the shell streams a screen's worth of bytes
+we cannot show.
+
+Two consequences to carry forward:
+
+* ADR-0001 Q8's "full-screen passthrough, screen-buffer path" is **not** implemented.
+  Until it is, Bash mode is a line-oriented shell transcript: superb for `git log`, `ls`,
+  `cd`, `grep`, `python -c`; not a terminal for `vim`, `less`, `htop`.
+* Bash mode maps Esc to `Cancel`, which is `0x03`. For a line command that is right
+  (ticket: "Esc/Ctrl-C interrupts"). For vim, Esc is the key that leaves insert mode, and
+  we send SIGINT instead. Raw keystroke passthrough and the Esc mapping are both part of
+  the same follow-on; neither can be fixed without the other.
+
+What is *not* the cause, ruled out by measurement: a big burst of ordinary output is fine.
+`seq 1 400` flushes, stays responsive, and the app quits clean. The problem is the absence
+of newlines, not the volume.

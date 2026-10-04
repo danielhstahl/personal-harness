@@ -94,7 +94,10 @@ struct R {
 /// Render a *complete* markdown fragment to wrapped lines (no trailing blank).
 /// Tables/images/html are not handled in this sketch.
 pub fn render_markdown(src: &str, width: u16) -> Vec<Line<'static>> {
-    let mut r = R { width: width.max(20) as usize, ..Default::default() };
+    let mut r = R {
+        width: width.max(20) as usize,
+        ..Default::default()
+    };
     let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     for ev in Parser::new_ext(src, opts) {
         r.event(ev);
@@ -127,7 +130,9 @@ impl R {
             }
             Event::Code(t) => self.cur.push(Span::styled(
                 t.to_string(),
-                Style::default().fg(Color::Yellow).bg(Color::Rgb(45, 45, 45)),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .bg(Color::Rgb(45, 45, 45)),
             )),
             Event::SoftBreak => self.cur.push(Span::raw(" ")),
             Event::HardBreak => self.flush(),
@@ -162,7 +167,9 @@ impl R {
             Tag::CodeBlock(kind) => {
                 self.flush();
                 let lang = match kind {
-                    CodeBlockKind::Fenced(l) => l.split([' ', ',']).next().unwrap_or("").to_string(),
+                    CodeBlockKind::Fenced(l) => {
+                        l.split([' ', ',']).next().unwrap_or("").to_string()
+                    }
                     _ => String::new(),
                 };
                 self.out.push(code_header(&lang));
@@ -183,15 +190,20 @@ impl R {
                     _ => "• ".into(),
                 });
             }
-            Tag::Emphasis => self.style.push(Style::default().add_modifier(Modifier::ITALIC)),
+            Tag::Emphasis => self
+                .style
+                .push(Style::default().add_modifier(Modifier::ITALIC)),
             Tag::Strong => self.style.push(bold),
-            Tag::Strikethrough => {
-                self.style.push(Style::default().add_modifier(Modifier::CROSSED_OUT))
-            }
+            Tag::Strikethrough => self
+                .style
+                .push(Style::default().add_modifier(Modifier::CROSSED_OUT)),
             Tag::Link { dest_url, .. } => {
                 self.links.push(dest_url.to_string());
-                self.style
-                    .push(Style::default().fg(Color::Blue).add_modifier(Modifier::UNDERLINED));
+                self.style.push(
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::UNDERLINED),
+                );
             }
             _ => {}
         }
@@ -254,16 +266,30 @@ impl R {
             None => (String::new(), String::new()),
         };
         let spans = std::mem::take(&mut self.cur);
-        let lines = wrap(spans, self.width, format!("{quote}{indent}{ft}"), format!("{quote}{indent}{rt}"));
+        let lines = wrap(
+            spans,
+            self.width,
+            format!("{quote}{indent}{ft}"),
+            format!("{quote}{indent}{rt}"),
+        );
         self.out.extend(lines);
     }
 }
 
 /// Greedy word-wrap over styled spans. Prefixes count toward `width`.
 /// (Words longer than a full line are not hard-split in this sketch.)
-pub fn wrap(spans: Vec<Span<'static>>, width: usize, first: String, rest: String) -> Vec<Line<'static>> {
+pub fn wrap(
+    spans: Vec<Span<'static>>,
+    width: usize,
+    first: String,
+    rest: String,
+) -> Vec<Line<'static>> {
     let mk = |p: &str| -> Vec<Span<'static>> {
-        if p.is_empty() { vec![] } else { vec![Span::styled(p.to_string(), DIM)] }
+        if p.is_empty() {
+            vec![]
+        } else {
+            vec![Span::styled(p.to_string(), DIM)]
+        }
     };
     let mut lines = Vec::new();
     let mut cur = mk(&first);

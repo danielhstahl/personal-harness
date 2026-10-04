@@ -23,6 +23,7 @@ use ratatui::text::Line;
 use super::SessionId;
 use crate::components::scrollback::Flusher;
 use crate::session::{BeadStep, SessionStatus};
+use crate::utils::utils::ControlStripper;
 use crate::state::state::{Entry, MessageKind, Transcript};
 
 /// Default cap on how much text an *inactive* view will hold.
@@ -93,6 +94,9 @@ pub struct SessionView {
     /// Dropped-line bookkeeping for the buffer cap (see [`DEFAULT_VIEW_BUFFER`]).
     dropped: usize,
     limit: usize,
+    /// Escape-sequence stripper for this view's Bash output (see [`Self::push_bash`]).
+    /// Per-view because a sequence can straddle two reads.
+    bash_strip: ControlStripper,
 }
 
 impl SessionView {
@@ -115,7 +119,22 @@ impl SessionView {
             step: None,
             dropped: 0,
             limit,
+            bash_strip: ControlStripper::default(),
         }
+    }
+
+    /// Shell output into the transcript: verbatim content, presentation stripped,
+    /// **never** markdown and **never** re-wrapped (ADR-0001 rules 1 and 5).
+    ///
+    /// The strip is per-view because a colour sequence split across two reads must
+    /// not come out as half-dropped, half-printed-garbage.
+    pub fn push_bash(&mut self, chunk: &str) {
+        let text = self.bash_strip.strip(chunk);
+        if text.is_empty() {
+            return;
+        }
+        self.transcript.push_delta(MessageKind::Bash, &text);
+        self.enforce_buffer();
     }
 
     /// Lines that became final since the last call. Call once per frame, for the
@@ -142,6 +161,11 @@ impl SessionView {
     /// invariant, so it is part of the contract rather than a detail.
     pub fn seal(&mut self) {
         self.transcript.finish_last();
+        // A half-parsed escape sequence belongs to a stream that is never going to
+        // send the rest of it. Left as it is, the next Bash generation's first
+        // bytes get eaten by the previous one's dangling `\x1b[`, which shows up
+        // as the first line of a brand new shell silently missing its head.
+        self.bash_strip.reset();
     }
 
     /// A finished, one-shot line (status notices, the mode-switch separator).
@@ -424,6 +448,33 @@ mod tests {
             assert!(
                 remaining.iter().any(|e| e.contains(t)),
                 "emitted a line the view does not hold: {line:?}"
+            );
+        }
+    }
+
+    /// Sealing drops a half-parsed escape sequence along with the open entry. The
+    /// bytes a dangling `\x1b[` is holding belong to a stream that will never
+    /// finish, and if they stay they get charged to whatever streams next.
+    #[test]
+    fn sealing_drops_a_dangling_escape_sequence_too() {
+        let mut v = view(TerminalType::Bash);
+        v.push_bash("first-line\u{1b}["); // ends mid-escape-sequence
+        v.seal();
+        let first = v.flush(60);
+
+        v.push_bash("second-line\n"); // the next stream, which must be unaffected
+        v.seal();
+        let second = v.flush(60);
+
+        let joined: String = second.iter().map(|l| l.to_string()).collect();
+        assert!(
+            joined.contains("second-line"),
+            "the next stream arrived intact: {joined:?}"
+        );
+        for line in first.iter().chain(second.iter()) {
+            assert!(
+                !line.to_string().contains('\u{1b}'),
+                "a raw escape byte reached the scrollback: {line:?}"
             );
         }
     }

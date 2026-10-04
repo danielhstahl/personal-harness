@@ -17,12 +17,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 serde_json = "1.0.151"
 serde = { version = "1.0.229", features = ["derive"] }
+# ADR-0001: the Bash terminal state runs `bash -i` on a real pty. Moved from
+# dev-dependencies to dependencies when looprs-553 landed. Its transitive `nix 0.28`
+# trips a future-incompat lint inside nix's own build script; that is a dependency
+# warning, not ours (see ADR-0001 "Costs / follow-ups").
+portable-pty = "0.9.0"
 
 [dev-dependencies]
-# Used by examples/spike_bash.rs (ADR-0001 spike). looprs-553 moves this to
-# [dependencies] when the Bash terminal state actually lands; until then it would
-# trip cargo's unused_dependencies lint on the test target.
-portable-pty = "0.9.0"
+# examples/spike_bash.rs (the ADR-0001 spike) uses portable-pty, which is now a
+# regular dependency, so there is nothing left to declare here.
 
 [lints.cargo]
 unused_dependencies = "allow"

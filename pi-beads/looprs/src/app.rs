@@ -115,6 +115,14 @@ pub enum UiCommand {
     },
     /// Esc. Routed by the router to the *active* session only.
     Cancel,
+    /// The real terminal changed shape.
+    ///
+    /// Not user intent — an environment fact — but the Router is the only thing
+    /// that can reach a session, and ADR-0001 rule 6 says the shell's pty is sized
+    /// to the window it is actually shown in rather than a virtual 80x24. Without
+    /// this the child wraps for a terminal that does not exist and every table it
+    /// prints is wrong forever, in the transcript as well as on screen.
+    Resize { rows: u16, cols: u16 },
 }
 
 fn print_json_value_to_string(v: &Value) -> String {
@@ -441,17 +449,13 @@ impl App {
                 self.dirty = true;
                 self.on_pi(session, event);
             }
-            Msg::BashOutput {
-                session,
-                stream,
-                chunk,
-            } => {
-                // Routed, deliberately not rendered yet: looprs-553 owns the Bash
-                // display path, and that path must be a raw passthrough. Pushing
-                // these bytes in as `Answer` would run the markdown renderer over a
-                // shell's output, which Q5 rejects outright — so the bytes are
-                // dropped in one obvious place rather than rendered wrongly here.
-                let _ = (session, stream, chunk);
+            Msg::BashOutput { session, chunk, .. } => {
+                // Raw passthrough into the owning view: `push_bash` strips the
+                // presentation but never re-wraps and never reaches markdown
+                // (ADR-0001 rule 1). `stream` is not consulted: a pty hands us one
+                // merged byte stream and `ByteStream::Merged` is what it says.
+                self.dirty = true;
+                self.view_mut(session).push_bash(&chunk);
             }
             Msg::BeadStep { session, step } => {
                 self.dirty = true;
@@ -482,6 +486,15 @@ impl App {
         }
     }
 
+    /// Tell every live session the real terminal changed shape (ADR-0001 rule 6).
+    ///
+    /// Best-effort on purpose: the command channel is small and a resize that cannot
+    /// be queued is superseded by the next one. Blocking the input loop to deliver a
+    /// window size would be worse than delivering a stale one.
+    pub fn forward_resize(&self, rows: u16, cols: u16) {
+        let _ = self.cmd_tx.try_send(UiCommand::Resize { rows, cols });
+    }
+
     /// Hand text back to the input box (Esc's queued-message restore).
     ///
     /// Two guards, both about not losing what the user has:
@@ -508,19 +521,44 @@ impl App {
 
     fn on_key(&mut self, k: crossterm::event::KeyEvent) {
         self.dirty = true;
-        if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
-            self.should_quit = true;
-            return;
+        if k.modifiers.contains(KeyModifiers::CONTROL) {
+            match k.code {
+                // ADR-0001 Q3: in the Bash view Ctrl-C belongs to the shell, not
+                // to looprs. It goes down the same road Esc takes — the router hands
+                // it to the Bash session, which writes `0x03` to the pty master
+                // and lets the line discipline SIGINT the foreground process
+                // group. Quitting on Ctrl-C here would make `sleep 30` unstoppable
+                // and `vim` unreachable, which is the entire reason Bash mode has a
+                // pty. Other modes keep their present meaning until looprs-5g7
+                // gives them a Cancel worth the name.
+                KeyCode::Char('c') => {
+                    if self.active == TerminalType::Bash {
+                        let _ = self.cmd_tx.try_send(UiCommand::Cancel);
+                    } else {
+                        self.should_quit = true;
+                    }
+                    return;
+                }
+                // The chord we do own in every mode, Bash included: quit without
+                // touching the shell (the child is killed on the way out).
+                KeyCode::Char('q') => {
+                    self.should_quit = true;
+                    return;
+                }
+                _ => {}
+            }
         }
 
         if let Some(action) = self.input.handle_key(k) {
             match action {
                 InputAction::Submit { text, mode } => {
-                    // Every mode is addressed to a session now; whether it can
-                    // answer is the backend's business (Pi/Bash still refuse,
-                    // loudly, and the refusal comes back as `Msg::Error` against
-                    // the same view the echo is in).
-                    self.echo_local(mode, text.clone());
+                    // The shell echoes what it reads — through the pty, into our
+                    // transcript — so echoing it here too would show the line
+                    // twice. Every other mode needs the local echo because nothing
+                    // else will show what was typed.
+                    if mode != TerminalType::Bash {
+                        self.echo_local(mode, text.clone());
+                    }
                     let _ = self.cmd_tx.try_send(UiCommand::Submit { mode, text });
                 }
                 InputAction::SwitchMode { from, to } => {
@@ -556,6 +594,15 @@ impl App {
     }
 }
 
+/// Why Bash output never enters the live region (`ChatState`), stated once:
+///
+/// The shell has no `agent_settled` to stop the spinner with, and the bytes that
+/// follow every command — its own prompt — look exactly like output that is still
+/// arriving. Arming a live region on shell bytes therefore means a spinner that
+/// spins forever over an idle prompt, which is worse than no live region at all.
+/// So Bash output goes straight to the scrollback as complete lines (raw, unwrapped,
+/// via `MessageKind::Bash`) and "is the shell working?" is answered by the status
+/// row (`SessionStatus::Running`) instead of by a spinner.
 /// Apply one pi event to one session's view.
 ///
 /// A free function on purpose: it cannot reach `App`'s globals — no `input`, no
@@ -1113,6 +1160,87 @@ mod tests {
         assert!(
             text_of(&app, TerminalType::Pi).contains("and also this"),
             "and the restored text is visible rather than lost"
+        );
+    }
+
+    /// **Ctrl-C in the Bash view belongs to the shell, not to looprs**
+    /// (ADR-0001 Q3). It has to arrive at the session as a cancel — the Bash
+    /// session turns that into `0x03` on the pty master, and the line discipline
+    /// SIGINTs the foreground process group — and it must not quit the app. A
+    /// Bash pane where `sleep 30` cannot be stopped is not a shell.
+    #[tokio::test]
+    async fn ctrl_c_in_bash_mode_cancels_the_shell_and_does_not_quit() {
+        let (mut app, mut rx) = app_with(TerminalType::Bash);
+        app.update(Msg::Term(Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        ))));
+
+        assert!(!app.should_quit, "Ctrl-C must not quit Bash mode");
+        match rx.recv().await {
+            Some(UiCommand::Cancel) => {}
+            other => panic!("Ctrl-C should reach the shell as Cancel, got {other:?}"),
+        }
+    }
+
+    /// Outside Bash, Ctrl-C keeps the meaning it has today. Pinned rather than left
+    /// implicit so that looprs-5g7 changing it is a deliberate edit to this test
+    /// and not a regression nobody noticed.
+    #[tokio::test]
+    async fn ctrl_c_outside_bash_mode_still_quits_for_now() {
+        for mode in [TerminalType::Beeds, TerminalType::Pi] {
+            let (mut app, mut rx) = app_with(mode);
+            app.update(Msg::Term(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))));
+            assert!(app.should_quit, "Ctrl-C in {} mode", mode.label());
+            assert!(
+                rx.try_recv().is_err(),
+                "quitting is not a cancel; nothing was sent"
+            );
+        }
+    }
+
+    /// Ctrl-Q is the chord looprs owns in **every** mode, Bash included — the
+    /// way out when Ctrl-C has been handed to a shell.
+    #[test]
+    fn ctrl_q_quits_in_every_mode() {
+        for mode in TerminalType::ALL {
+            let (mut app, _rx) = app_with(mode);
+            app.update(Msg::Term(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+            ))));
+            assert!(app.should_quit, "Ctrl-Q in {} mode", mode.label());
+        }
+    }
+
+    /// **A `Msg::BashOutput` lands in the Bash view as raw text** and never in the
+    /// mode the input box happens to be in — and the chunk is kept whole rather
+    /// than re-split into lines (ADR-0001 rule 1: the child owns its framing).
+    #[test]
+    fn bash_output_lands_in_its_own_view_verbatim() {
+        let mut app = {
+            let (tx, _rx) = mpsc::channel::<UiCommand>(16);
+            App::new(tx, InputState::new(), TerminalType::Beeds, 80)
+        };
+        let bash = SessionId::new(TerminalType::Bash, 1);
+        let chunk = "first line\nsecond line, with no trailing newline";
+        app.update(Msg::BashOutput {
+            session: bash,
+            stream: ByteStream::Merged,
+            chunk: chunk.into(),
+        });
+
+        assert_eq!(
+            text_of(&app, TerminalType::Bash),
+            chunk,
+            "the read chunk arrived whole — not re-split, not re-joined"
+        );
+        assert!(
+            app.view(TerminalType::Beeds).is_none(),
+            "and it went nowhere near the mode the box was in"
         );
     }
 
