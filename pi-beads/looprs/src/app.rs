@@ -539,6 +539,31 @@ impl App {
         }
     }
 
+    /// The active view's live (not-yet-final) tail, taken once per frame.
+    ///
+    /// The frame needs it twice — as the *height* the live region should be, and as
+    /// the lines to draw — so it is computed here and handed to both. That is also
+    /// why it goes through the same one-viewport-one-flusher door as
+    /// [`Self::flush_active`]: `SessionView::preview` is the only way in, so the
+    /// count that sized the pane cannot describe a different view than the pixels
+    /// that fill it (ADR-0002 Q5).
+    pub fn preview_active(&self, width: u16) -> Vec<Line<'static>> {
+        self.active_view()
+            .map(|v| v.preview(width))
+            .unwrap_or_default()
+    }
+
+    /// How many tool rows the live region is carrying right now.
+    ///
+    /// The frame paints at most [`crate::viewport::MAX_TOOL_ROWS`] of them and the
+    /// height policy budgets the same cap, so a wall of concurrent calls cannot
+    /// take the live text's rows — or the input box's — away (looprs-afw).
+    pub fn live_tool_rows(&self) -> u16 {
+        self.active_view()
+            .map(|v| v.transcript.open_tools().count() as u16)
+            .unwrap_or(0)
+    }
+
     /// Echo the user's own line into the mode it was typed into.
     ///
     /// It targets the view that *exists* for that mode rather than a synthetic

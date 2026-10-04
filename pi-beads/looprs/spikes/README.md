@@ -16,6 +16,8 @@ evidence, so a future reader can re-run it instead of re-arguing.
 | `spikes/vim_fullscreen.py` | looprs-4hv: does vim's screen reach the user? Scored against a bare-pty control. |
 | `spikes/fullscreen_e2e.py` | looprs-4hv acceptance: vim + less + a program that repaints in place, each against a bare-pty control. |
 | `spikes/cancel_e2e.py` | looprs-5g7 acceptance: Esc in all three modes inside the real TUI — latency to the acknowledgement and to the completion word, the silent-idle rows, and "a cancelled beads pass did not start another bead". `pi`/`bd` are fakes the script writes, so it costs no model call. |
+| `spikes/viewport_e2e.py` | looprs-afw acceptance: the live region's *shape* in a real pty. A long streamed answer has to reach more than the ten rows `const VIEWPORT_H: u16 = 10` allowed, grow into them as the text arrives, and survive a window resize taken mid-stream. Run against the pre-afw binary as a control it fails both counts (`spikes/results/viewport-e2e-before-afw.log`), which is the point. |
+| `spikes/fake_pi_slow.py` | The `pi` that spike needs: one assistant message held **open** while a paragraph dribbles out. `tests/fixtures/fake_pi_chat.py` emits `text_delta` and `message_end` back to back, so its reply is flushed before a frame can be drawn over it and there is no live tail to measure. |
 | `spikes/results/` | Committed raw output of the runs quoted in the ADR. |
 
 ## Running it
@@ -35,6 +37,12 @@ python3 spikes/bash_e2e.py        | tee spikes/results/bash-e2e.log
 python3 spikes/fullscreen_e2e.py  | tee spikes/results/fullscreen-e2e.log
 python3 spikes/vim_fullscreen.py  | tee spikes/results/vim-fullscreen.log
 python3 spikes/cancel_e2e.py      | tee spikes/results/cancel-e2e.log
+python3 spikes/viewport_e2e.py    | tee spikes/results/viewport-e2e.log
+
+# …and the same viewport spike against the pre-looprs-afw binary, as a control
+# (build that revision into its own target dir first, so this one stays usable):
+#   git stash && cargo build --target-dir /tmp/base-target && git stash pop
+#   LOOPRS_BIN=/tmp/base-target/debug/looprs python3 spikes/viewport_e2e.py
 ```
 
 **Why the full-screen spikes run a control.** "Did the user see it?" is not answered

@@ -1,0 +1,40 @@
+[  0.00s] spawned /tmp/base-target/debug/looprs (pid 22429) in a 44x100 pty
+[  0.01s]   pump saw ESC[6n cursor query
+[  1.21s] PASS  the app boots and is alive
+[  2.03s] PASS  Tab reaches the Bash mode
+[  4.03s] PASS  Bash mode puts 60 lines of shell output on the screen
+[  4.03s] PASS  …and nothing is painted below the bottom of the window
+[  4.84s] PASS  Tab reaches the Pi mode
+[  7.87s]   (raw capture -> /tmp/spike-raw.txt)
+[  7.87s]   live rows early window: [34, 35, 36, 38]
+[  7.87s]   live rows later window: [34, 35, 36, 37, 38]
+[  7.87s]   answer rows on screen so far: 5
+[  7.87s] FAIL  a long streamed answer uses more than the old 10 rows  -- only 5 rows carried the answer
+[  7.87s] PASS  …and it grew into them rather than starting full size
+[  7.87s] PASS  …and the live rows are contiguous
+[  7.87s]   window resized to 30x80
+[  7.87s]   pump saw ESC[6n cursor query
+[  9.88s]   pump saw ESC[6n cursor query
+[  9.91s]   app died, exit=1; tail -> /tmp/looprs-viewport-died.txt
+[  9.91s]   tail: 'm    \x1b[39;1Hvictor bravo ch\x1b[39;17Hrlie \x1b[39;23Hcho foxtrot golf hotel india juliett kilo lima \x1b[39;71Hike november oscar papa\x1b[40;1Hquebec\x1b[40;8Hromeo\x1b[40;14Hsierra\x1b[40;21Htango\x1b[40;27Huniform\x1b[40;35Hvictor\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[?25h\x1b[43;2H\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[?25h\x1b[43;2H\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[?25h\x1b[43;2H\x1b[6n\x1b[6n\x1b[35;1H\x1b[J\x1b[2;1H\r\nError: The cursor position could not be read within a normal duration\r\n'
+[  9.91s] FAIL  the app survives a resize during a live stream
+[  9.91s] PASS  …and it repaints text after the resize
+[  9.91s]   first text paint 2038ms after the resize
+[ 11.11s]   rows painted since then: []
+[ 11.11s]   answer rows among them: []
+[ 11.11s] FAIL  …and the streamed answer is still on screen after the resize  -- 0 answer rows visible
+[ 11.11s] FAIL  …and the app is still alive
+[ 12.62s] FAIL  …and the live region keeps following the stream at the new size  -- answer rows after the resize: 0, then 0
+[ 12.62s] FAIL  …and the frames keep coming  -- no text painted
+[ 12.62s] FAIL  …and the app is still alive at the end
+Traceback (most recent call last):
+  File "/Users/danielstahl/Documents/code/ml/personal-harness/pi-beads/looprs/spikes/viewport_e2e.py", line 384, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/danielstahl/Documents/code/ml/personal-harness/pi-beads/looprs/spikes/viewport_e2e.py", line 376, in main
+    d.send(b"\x11")  # Ctrl-Q: quit without touching the shell
+    ~~~~~~^^^^^^^^^
+  File "/Users/danielstahl/Documents/code/ml/personal-harness/pi-beads/looprs/spikes/viewport_e2e.py", line 206, in send
+    os.write(self.master, b)
+    ~~~~~~~~^^^^^^^^^^^^^^^^
+OSError: [Errno 5] Input/output error
