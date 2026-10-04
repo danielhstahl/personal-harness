@@ -171,7 +171,8 @@ for "what was this conversation". Warm is simpler and instant.
   forwards, so the router never has to select over a growing set of streams.
 * Commands keep the existing `cmd_tx` (cap 16). `UiCommand` becomes
   `Submit { mode, text }` (replacing the `UserMessage` / `UserBeadMessage` pair),
-  `SwitchMode { from, to }`, `Cancel`, plus the legacy `BeadsNext` that looprs-msj deletes.
+  `SwitchMode { from, to }`, `Cancel`. ~~plus the legacy `BeadsNext` that
+  looprs-msj deletes~~ — deleted, as of msj; see its amendment at the end.
 
 Rejected: **`App` owns the session map.** `App` is driven by the draw loop and must stay cheap
 enough for ~60fps; session control is nothing but awaits (spawn, prompt round-trip, close stdin,
@@ -220,7 +221,7 @@ interleaved, *wrong*.
 | `session/view.rs` | `SessionView`: `flush`, `preview`, `seal`, `push_note`, `push_error` | **done**; adopting it in `App`/`main` is the wiring | looprs-05j, looprs-afw |
 | `session/stubs.rs` | `BashSession` | every operation refuses, naming its ticket | 553 |
 | `session/pi_chat.rs` | `PiChatSession` — one persistent `pi --mode rpc` child, steer-while-running, Esc = `clear_queue`+`abort`+restore, respawn after a dead child | **done — looprs-ctn** | — |
-| `src/app.rs` | `Msg` envelope applied; `UiCommand::Submit`/`SwitchMode`; `BeadsLoop` stamps its `SessionId` | wired, behavior unchanged | msj (`on_pi`), 05j (per-view state) |
+| `src/app.rs` | `Msg` envelope applied; `UiCommand::Submit`/`SwitchMode`; `BeadsLoop` stamps its `SessionId` | **done** — `on_pi` renders and decides nothing (msj) | — |
 | `components/input.rs` | `Tab` now emits `SwitchMode` | wired | 05j |
 
 Stubs return `Err`, never a plausible no-op: a stub that silently succeeds lets a wiring ticket
@@ -239,6 +240,8 @@ pass a test that exercised nothing.
 * **looprs-msj** — **confirmed, unchanged**; this ADR is what unblocks it. `Msg::Agent { session }`
   now exists, and the fix is exactly "drive the beads machine off `session` + the beads session's
   own `BeadStep`". `App::on_pi` keeps its bug, with a comment marking the line, so msj owns it.
+  *(Landed: the bug is gone. `App::on_pi` renders; the transition lives in `BeadsSession`. See the
+  msj amendment below.)*
 * **looprs-553** — gets `Msg::BashOutput { session, stream: Merged, chunk }`: chunk not line, one
   merged stream (Q2).
 * **looprs-5g7 / looprs-ecr / looprs-guh** — consistent with the interfaces they need
@@ -289,6 +292,8 @@ contract, so they are recorded rather than slipped in.
    It is a wart on a generic trait and it should die with looprs-msj, which moves the
    step machine inside `BeadsSession` where the decision belongs. Default is a no-op
    so only the beads session answers it.
+   *(Dead, both of them, as of msj — see below. The Router no longer has any
+   beads-specific command to route.)*
 2. **The per-view buffer cap is entry-granular, and the notice is inserted at the
    render cursor, not at the head of the transcript.** Doing it the obvious way
    (prepend, then shift) either re-emits lines the terminal already has or never
@@ -355,3 +360,61 @@ app's; and `App` holds `HashMap<TerminalType, SessionView>` with `need_input` /
    refuse until the Router noticed — trades a delivered message for a purer
    sentence.
 
+
+## Amendments made while implementing looprs-msj (provenance for loop transitions)
+
+The bug this ticket filed was Q2 being broken in one specific place: `App::on_pi`
+answered "does this settle mean *take the next bead*?" from `session.mode == Beeds`,
+and `session.mode` was standing in for a question only the beads session can answer.
+Everything below is that correction, plus three things it turned out to require.
+
+1. **`UiCommand::BeadsNext` and `Session::advance()` are deleted.** Not
+   deprecated, not routed to a no-op — gone, so that "the UI asks the beads loop to
+   go again" is not expressible again. The beads loop is now driven by
+   `BeadsCmd::WorkerSettled`, produced *inside* `BeadsSession` by the forwarder on
+   its own worker's stdout (`BeadsLoop::forward_records`). The App renders a settle
+   (`view.chat = Stopped`) and sends nothing for it. `apply_pi` no longer returns a
+   command, which is the compile-time form of "the UI is out of this decision". The
+   App-side test is therefore the blunt one: handling a settle emits **no**
+   `UiCommand` at all, whichever session made it and whichever mode the box is in —
+   plus a source check that event handling never reads the input mode.
+
+2. **A worker pass gets its own serial, one level below `SessionId`.** This ADR made
+   generations mandatory because a bare `TerminalType` cannot tell a live session
+   from its corpse; the same argument applies inside the loop, because
+   `BeadsLoop::close()` kills a worker whose last records are already in flight. An
+   untagged late `agent_settled` reads as "*my* pass finished", retires the live
+   pass's `streaming` flag, and starts a third pass over the top of a second one —
+   killing work that was already paid for. So every worker is tagged at spawn, and
+   the loop only advances on a settle whose serial it is currently holding. Two
+   consequences worth stating: a settle with no pass behind it starts nothing, and a
+   duplicate from a retired pass is a no-op.
+
+3. **Esc-in-beads is implemented to the point where the Q3 rule is enforceable.**
+   The table already said "abort the pi run **and** park; an aborted worker must
+   never read as `agent_settled` → next bead" — but that rule is unenforceable
+   without state, because the settle looks identical either way. `BeadsTask::aborted`
+   is that state: set before the abort goes out, so the unwinding settle parks the
+   loop instead of claiming the next bead. **looprs-5g7 still owns the polish** (the
+   grace/escalation numbers, the wording, the spinner, and Bash's `0x03`); what
+   landed here is the minimum needed so that a settle cannot be misread.
+
+4. **A worker whose stream ends without settling parks the loop with an error.**
+   Once the settle was the only thing that drove the loop, the stream end became the
+   symmetric edge, and it was unhandled: a worker that crashed or exited early left
+   the loop claiming `WorkTickets` forever — which, via `SessionView::set_step`,
+   means the input box stayed hidden behind a claim that nothing would ever
+   discharge. Note that Q2's exactly-one-`SessionDown` guarantee does *not* cover
+   this: that promise is about the **session**, and here the session outlives its
+   worker by design (fresh child per pass, Q3). The loop has to notice its own
+   worker's going, and a park is the right answer rather than an auto-retry — a
+   crash that auto-restarts is a respawn storm with a bill attached.
+
+**Test seams added**, all mirrors or polling, none of them production behavior:
+`BeadsSession::in_flight()` (the live pass serial, published the same way `status`
+is, so a test can settle against a serial it did not invent),
+`Fakes::wait_for_pi_spawns`, and the settle-path tests run on `PiFake::Chat`, so
+the settle under test is a real `agent_settled` off a real child process rather
+than a hand-built event. Incidentally: both sessions' `quiesce()` now publish their
+status mirror *before* acking, so "waited on the seam, then read the status" means
+what it says on a multi-threaded runtime.

@@ -94,6 +94,14 @@ pub enum Msg {
 }
 
 /// UI -> session layer. Every variant says which terminal state it is *for*.
+///
+/// Note what is **not** here: any way to advance the beads loop. There was one
+/// (`BeadsNext`), and it was looprs-msj's bug made expressible — the App could ask
+/// "someone take the next bead" on the strength of a settle it had seen, while the
+/// thing that owned the step, the worker and the parked flag was a session it could
+/// not see inside. The beads loop now moves off its own worker's stream, inside
+/// [`BeadsSession`](crate::session::BeadsSession); the App cannot drive it because
+/// it has nothing to say.
 #[derive(Debug)]
 pub enum UiCommand {
     /// Enter in the input box. `mode` is where the text was typed: declared
@@ -107,9 +115,6 @@ pub enum UiCommand {
     },
     /// Esc. Routed by the router to the *active* session only.
     Cancel,
-    /// Legacy: the App asks the beads loop to advance. Goes away with looprs-msj,
-    /// which moves that transition inside `BeadsSession` where it belongs.
-    BeadsNext,
 }
 
 fn print_json_value_to_string(v: &Value) -> String {
@@ -532,29 +537,33 @@ impl App {
         }
     }
 
-    /// A pi protocol event, applied to the view of the session that made it.
+    /// A pi protocol event, applied to the view of the session that made it — and
+    /// **rendered only**.
     ///
-    /// `session` decides *where it lands* — never `self.input.mode`, and never
-    /// `self.active` (ADR-0002 Q2). The `session.mode` test at `AgentSettled` is a
-    /// statement about the event's *producer*, not about where the user happens to
-    /// be looking; that is the difference between routing and guessing, and it is
-    /// the whole of looprs-msj's bug class. (`msj` still owns deleting the
-    /// App-driven advance altogether.)
+    /// `session` decides where it lands (ADR-0002 Q2); nothing else about the event
+    /// is consulted, and nothing is decided. In particular this function no longer
+    /// answers "does this settle mean take the next bead?": that question needs the
+    /// step, the worker and the parked flag, all of which live inside
+    /// [`BeadsSession`](crate::session::BeadsSession) and none of which the App can
+    /// see. It used to answer it anyway, from `session.mode == Beeds`, and that was
+    /// looprs-msj — a Pi answer settling could drive the beads machine, and a beads
+    /// worker settling with the box on Pi stalled the loop.
+    ///
+    /// So: every session's events are paint here. Who advances is nobody's business.
     pub fn on_pi(&mut self, session: SessionId, ev: PiEvent) {
         self.dirty = true;
-        let advance = apply_pi(self.view_mut(session), session, ev);
-        if let Some(cmd) = advance {
-            let _ = self.cmd_tx.try_send(cmd);
-        }
+        apply_pi(self.view_mut(session), ev);
     }
 }
 
-/// Apply one pi event to one session's view, and report the follow-up command (if
-/// any) that the App still owes.
+/// Apply one pi event to one session's view.
 ///
-/// A free function on purpose: it cannot reach `App`'s globals, so "which view does
-/// this touch" is answered by the signature rather than by the current mode.
-fn apply_pi(view: &mut SessionView, session: SessionId, ev: PiEvent) -> Option<UiCommand> {
+/// A free function on purpose: it cannot reach `App`'s globals — no `input`, no
+/// `active`, no `cmd_tx` — so "which view does this touch" is answered by the
+/// signature, and "what does this make happen next" is answered by nothing. The
+/// only mutations are to the transcript and the live-region state of the view it was
+/// handed.
+fn apply_pi(view: &mut SessionView, ev: PiEvent) {
     match ev {
         PiEvent::MessageUpdate {
             assistant_message_event: e,
@@ -569,12 +578,10 @@ fn apply_pi(view: &mut SessionView, session: SessionId, ev: PiEvent) -> Option<U
                 }
                 _ => {}
             }
-            None
         }
         // user messages are already echoed locally on submit; ignore pi's copy
         PiEvent::MessageEnd { message } if message.role == "assistant" => {
             view.transcript.finish_last();
-            None
         }
         PiEvent::ToolExecutionStart {
             tool_call_id,
@@ -585,7 +592,6 @@ fn apply_pi(view: &mut SessionView, session: SessionId, ev: PiEvent) -> Option<U
             // upsert: fills in the args
             view.transcript
                 .start_tool(tool_call_id, tool_name, print_json_value_to_string(&args));
-            None
         }
         // PiEvent::ToolExecutionUpdate { .. } => stream partial output into the row if you want it
         PiEvent::ToolExecutionEnd {
@@ -595,15 +601,15 @@ fn apply_pi(view: &mut SessionView, session: SessionId, ev: PiEvent) -> Option<U
         } => {
             view.transcript
                 .finish_tool(tool_call_id, result.text(), is_error);
-            None
         }
-        PiEvent::AgentSettled => {
-            view.chat = ChatState::Stopped;
-            // Legacy: see `App::on_pi`. Keyed on the *producer's* mode.
-            (session.mode == TerminalType::Beeds).then_some(UiCommand::BeadsNext)
-        }
+        // Settled: this session has no more automatic work, so its live region stops.
+        // That is *all* this event means here. Whether it is also "the beads pass
+        // finished, take the next one" is decided inside the beads session by the
+        // beads session, and this arm must not grow an opinion about it: the same
+        // `AgentSettled` arrives from Pi chat, where there is no loop to advance.
+        PiEvent::AgentSettled => view.chat = ChatState::Stopped,
         // AutoRetryStart / CompactionStart: show a status note if you want one
-        _ => None,
+        _ => {}
     }
 }
 
@@ -908,50 +914,97 @@ mod tests {
 
     // ---------------------- the Pi terminal state, from the UI side ----------------------
 
-    /// **A Pi run must never move the beads machine** (looprs-ctn, re-verifying
-    /// looprs-msj). The two are separate sessions with separate processes, and the
-    /// only thing that decides whether a settle means "advance the loop" is who
-    /// produced it.
-    #[tokio::test]
-    async fn a_pi_run_never_moves_the_beads_machine() {
-        let (mut app, mut rx) = app_with(TerminalType::Pi);
+    /// **A settle never drives the beads machine from the App** (looprs-msj).
+    ///
+    /// The bug as filed had two halves, and they are the same half twice: a Pi run
+    /// settling while the box happened to be on Beads drove the beads state
+    /// machine, and a beads worker settling while the box was on Pi left it
+    /// stalled. Both came from the App deciding what a settle *meant*.
+    ///
+    /// So the assertion is the blunt one, run with the box in every mode and with
+    /// the settle from every session: handling a settle sends **nothing** to the
+    /// router. Not "the right command for the right mode" — nothing. The beads loop
+    /// is driven from inside `BeadsSession` off its own worker's stream, which is
+    /// pinned in `session::beads::tests`; all this side may do is paint.
+    #[test]
+    fn no_settle_ever_turns_into_a_command_from_the_app() {
+        for ui_mode in TerminalType::ALL {
+            for producer in [pi_id(), beads_id(), SessionId::new(TerminalType::Bash, 1)] {
+                let (mut app, mut rx) = app_with(ui_mode);
 
-        app.update(Msg::Agent {
-            session: pi_id(),
-            event: PiEvent::MessageUpdate {
-                assistant_message_event: AssistantEvent::TextDelta {
-                    content_index: 0,
-                    delta: "a chat answer".into(),
-                },
-            },
-        });
-        app.update(Msg::Agent {
-            session: pi_id(),
-            event: PiEvent::AgentSettled,
-        });
+                app.update(Msg::Agent {
+                    session: producer,
+                    event: PiEvent::AgentSettled,
+                });
 
-        assert!(
-            rx.try_recv().is_err(),
-            "a Pi settle must not ask anyone to advance a beads pass"
-        );
-        assert!(
-            app.view(TerminalType::Beeds).is_none(),
-            "and must not create one"
-        );
-        assert!(
-            text_of(&app, TerminalType::Beeds).chars().count() == 0,
-            "nothing of the Pi chat belongs in the beads view"
-        );
+                assert!(
+                    rx.try_recv().is_err(),
+                    "box on {}, {} settled, and the App still sent a command",
+                    ui_mode.label(),
+                    producer
+                );
+                // It rendered, though — that part is the whole job.
+                assert_eq!(
+                    app.view(producer.mode)
+                        .expect("the producer has a view")
+                        .chat,
+                    ChatState::Stopped,
+                    "settling must still stop {}'s live region",
+                    producer
+                );
+                // And no other view was touched by a session that never spoke to it.
+                for other in TerminalType::ALL {
+                    if other != producer.mode {
+                        assert!(
+                            app.view(other).is_none(),
+                            "{} settling created a {} view out of the UI's guesswork",
+                            producer,
+                            other.label()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
-        // The contrast, so it is clear the rule is about the *producer* and not an
-        // accident of ordering: the same settle from the beads session does advance.
-        app.update(Msg::Agent {
-            session: beads_id(),
-            event: PiEvent::AgentSettled,
-        });
+    /// The grep check the ticket asked for, kept as a test so it stays checked.
+    ///
+    /// ADR-0002 Q2: the input mode is authoritative for *intent* — where the
+    /// user's keystrokes go — and never for *origin*. So here the field may only
+    /// ever be *assigned* (the one line in `App::new` that pins the box to the mode
+    /// the app opened in, which is the same fact the render pointer gets) and never
+    /// *read* to decide anything about an event. Reads by another name are caught
+    /// too, because every read of the box goes through this text.
+    #[test]
+    fn the_ui_never_reads_the_input_mode_to_route_an_event() {
+        // Assembled rather than written out, so this test's own source cannot match
+        // the pattern it is looking for.
+        let mode_field = concat!("input", ".mode");
+        let assigned = concat!("input", ".mode = ");
+        let src = include_str!("app.rs");
+        let mentions: Vec<String> = src
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//")) // prose is allowed to name the bug
+            .filter(|l| l.contains(mode_field))
+            .map(|l| l.to_string())
+            .collect();
+        let offenders: Vec<&String> = mentions
+            .iter()
+            // Assignments are not routing. `App::new` sets the box onto the mode it
+            // opened in, and the tests set a scenario up; neither decides where an
+            // event belongs.
+            .filter(|l| !l.starts_with(assigned))
+            .collect();
         assert!(
-            matches!(rx.try_recv(), Ok(UiCommand::BeadsNext)),
-            "only the beads session's settle is a step in the beads machine"
+            offenders.is_empty(),
+            "event handling must never consult the input mode (that is looprs-msj): {offenders:?}"
+        );
+        // And the checker is really looking at something: the allowed line must be
+        // there, or this test would be green because the pattern rotted away.
+        assert!(
+            mentions.iter().any(|l| l.starts_with(assigned)),
+            "no `{mode_field}` assignment found — the checker matched nothing: {mentions:?}"
         );
     }
 

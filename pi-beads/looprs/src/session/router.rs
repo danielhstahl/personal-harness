@@ -255,25 +255,6 @@ impl Router {
                     }
                 }
             }
-            UiCommand::BeadsNext => {
-                // Legacy shim: the App still says "the beads pass settled, take the
-                // next one". Note it is routed by the beads *mode*, never by the
-                // active mode — the settled event named the beads session, and
-                // whether a new pass may start is that session's parked-state
-                // decision (Q3), not ours. Goes away with looprs-msj.
-                let mode = TerminalType::Beeds;
-                if let Some(m) = self.sessions.get_mut(&mode) {
-                    let id = m.id;
-                    let session = &mut m.session;
-                    if let Err(e) = session.advance() {
-                        let _ = self.app_tx.send(Msg::Error {
-                            session: Some(id),
-                            text: format!("beads advance: {e:#}"),
-                        });
-                    }
-                }
-                Ok(())
-            }
         }
     }
 
@@ -862,32 +843,26 @@ mod tests {
         );
     }
 
-    /// The legacy `BeadsNext` is routed by the beads *mode*, not by the active
-    /// mode: the settled event that triggered it named the beads session.
-    #[tokio::test]
-    async fn beads_next_is_routed_by_mode_not_by_what_is_on_screen() {
-        let (mut router, _rx, backend) = router_with(TerminalType::Pi);
-        router.boot().await.unwrap();
-        router.switch_to(TerminalType::Bash).await.unwrap();
-        // A beads session exists behind the Bash view (booting Pi created it via a
-        // later ensure, so create one here to stand in for "a beads pass is live").
-        router.ensure(TerminalType::Beeds).unwrap();
-        backend.clear_log();
-
-        router.handle(UiCommand::BeadsNext).await.unwrap();
-
-        let log = backend.log();
-        assert_eq!(
-            log.iter()
-                .filter(|c| c.starts_with("advance") && c.contains("Beeds"))
-                .count(),
-            1,
-            "the beads session got the advance while Bash was on screen: {log:?}"
-        );
+    /// The legacy `BeadsNext` is gone, and with it the whole "the UI asks the beads
+    /// loop to go again" surface. Asserted against the source because the compile
+    /// time version of this is just "it does not build", which is a worse error
+    /// message than this one.
+    #[test]
+    fn the_router_has_no_beads_advance_path_left() {
+        // Assembled so this test's own source cannot match what it greps for.
+        let cmd = concat!("Beads", "Next");
+        let call = concat!(".", "advance(");
+        let src = include_str!("router.rs");
+        let hits: Vec<String> = src
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//"))
+            .filter(|l| l.contains(cmd) || l.contains(call))
+            .map(|l| l.to_string())
+            .collect();
         assert!(
-            !log.iter()
-                .any(|c| c.starts_with("advance") && c.contains("Bash")),
-            "the visible mode must not be advanced by a beads settle: {log:?}"
+            hits.is_empty(),
+            "the beads loop is driven from inside BeadsSession, never from here: {hits:?}"
         );
     }
 

@@ -179,6 +179,25 @@ impl Fakes {
         );
     }
 
+    /// Wait until the fake `pi` has been spawned at least `n` times.
+    ///
+    /// Same polling rationale as [`Fakes::wait_for_log_line`]: a test that sleeps a
+    /// fixed amount is a test that fails on a slow machine and passes for the wrong
+    /// reason on a fast one.
+    pub async fn wait_for_pi_spawns(&self, n: usize) {
+        for _ in 0..800 {
+            if self.pi_spawns() >= n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "only {} fake pi spawn(s) after the wait, wanted {n}; log was:\n{}",
+            self.pi_spawns(),
+            self.read(&self.pi_log)
+        );
+    }
+
     pub fn bd_calls(&self) -> usize {
         self.read(&self.bd_log)
             .lines()
@@ -606,15 +625,6 @@ impl Session for FakeSession {
                 reason: crate::session::ExitReason::Shutdown,
             });
         }
-        Ok(())
-    }
-
-    fn advance(&mut self) -> anyhow::Result<()> {
-        self.backend.inner.lock().unwrap().log.push(format!(
-            "advance {} #{}",
-            self.id.mode.label(),
-            self.id.generation
-        ));
         Ok(())
     }
 

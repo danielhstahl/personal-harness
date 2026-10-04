@@ -212,9 +212,10 @@ pub enum SessionEvent {
 
 /// The beads loop's own state, owned by the beads *session*, never by the UI.
 ///
-/// `looprs-msj` is the ticket whose whole bug is that `App` used to derive this
+/// `looprs-msj` is the ticket whose whole bug was that `App` used to derive this
 /// state from `self.input.mode`. With the envelope above, the App only *renders*
-/// a step it was handed.
+/// a step it was handed — and the loop that moves between these steps is moved by
+/// its own worker, inside `BeadsSession`, not by anything upstream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BeadStep {
     AwaitInput,
@@ -323,19 +324,6 @@ pub trait Session: Send {
     /// BeadsSession uses it to stop starting new passes while hidden
     /// ([`SwitchAway::DrainThenPark`]).
     fn set_active(&mut self, _active: bool) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Legacy hook for [`crate::app::UiCommand::BeadsNext`]: "your last unit of
-    /// work settled, take the next one".
-    ///
-    /// This should not exist on a generic `Session` — the decision belongs inside
-    /// the beads session, where its step lives — and it will not, after looprs-msj
-    /// moves that state machine home. Until then it is here rather than in a
-    /// downcast, because the Router routes by *mode* (`Beeds`) and must not have to
-    /// know a concrete backend type. Default: no-op, so only the beads session
-    /// answers.
-    fn advance(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
 

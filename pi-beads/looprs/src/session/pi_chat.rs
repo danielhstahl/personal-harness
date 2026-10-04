@@ -488,6 +488,13 @@ impl PiChatSession {
                     PiCmd::Record(v) => chat.on_record(v),
                     PiCmd::StreamEnd { serial } => chat.child_gone(serial).await,
                     PiCmd::Sync(tx) => {
+                        // Publish the status mirror before acking, so a caller that
+                        // waits on the seam and then reads `status()` sees the state
+                        // as of the ack rather than one command stale. (The
+                        // end-of-iteration mirror below is not enough: on a
+                        // multi-threaded runtime the ack can wake the waiter
+                        // first.)
+                        *task_status.lock().unwrap() = chat.status();
                         let _ = tx.send(());
                     }
                     PiCmd::Shutdown => {
@@ -728,6 +735,9 @@ mod tests {
 
         s.send_text("write me a story".to_string()).unwrap();
         f.wait_for_log_line("prompt write me a story").await;
+        // The fake logs the prompt before it answers, so the status mirror is only
+        // meaningful once this session's own mailbox has drained past the submit.
+        assert!(s.quiesce().await, "the submit was handled");
         assert_eq!(
             s.status(),
             SessionStatus::Running,

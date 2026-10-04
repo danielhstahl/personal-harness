@@ -17,6 +17,26 @@
 //! pass already running is allowed to finish, because killing it throws away
 //! paid-for work. Both rules funnel through [`BeadsTask::run_pending`], so
 //! reversing a cell of the Q3 table is one function.
+//!
+//! ## Who drives the loop (looprs-msj)
+//!
+//! **The worker drives it, from inside this session.** `agent_settled` off the
+//! loop's own `pi` child arrives at [`BeadsTask::worker_settled`] and is where the
+//! "is there another pass?" question gets answered — together with the loop's own
+//! [`BeadStep`], the parked flag and the abort flag. Nothing upstream of this file
+//! is in that path.
+//!
+//! It used to be. The App read a settle and sent `UiCommand::BeadsNext` back down,
+//! which meant the transition was keyed off *whatever the input box was set to*
+//! when the event happened to arrive: a Pi answer settling while the box was on
+//! Beads drove the beads machine, and a beads worker settling while the box was on
+//! Pi left it stalled. Both were the same mistake — asking the UI who made an event.
+//!
+//! So `UiCommand::BeadsNext` and `Session::advance()` are gone (a generic
+//! `Session` had no business carrying "take another bead"), and the settle is
+//! routed from the child to the task that owns the loop by
+//! [`BeadsLoop::forward_worker`], tagged with the serial of the pass that made it.
+//! The App renders the same records and decides nothing.
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -25,23 +45,36 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::app::parse;
+use crate::app::{PiEvent, parse};
 use crate::services::bd::{Bead, ready_beads_with};
 use crate::services::pi::PiRpc;
 use crate::services::prompts::{PLANNER, WORKER, generate_prompt};
 use crate::session::{
     BeadStep, ExitReason, Session, SessionConfig, SessionEvent, SessionId, SessionStatus, Spawned,
 };
+use serde_json::Value;
 
-/// Commands to the task that owns the [`BeadsLoop`].
+/// Commands to the task that owns the [`BeadsCmd`] mailbox.
+///
+/// Two groups, and the split is the whole point: the top half is what the *UI*
+/// asks of this session, the bottom half is what this session's own *worker*
+/// reports to it. Both land in one mailbox, so they are handled one at a time, in
+/// the order they occurred — which is what makes "the Tab arrived before the
+/// settle" and "the settle arrived before the Tab" each have exactly one answer.
 enum BeadsCmd {
     /// A planner instruction typed into the beads box.
     Submit(String),
-    /// "The last pass settled, go again." Legacy App-driven advance (looprs-msj
-    /// moves this decision inside the loop, where the step already lives).
-    Advance,
+    /// `Esc`: abort the in-flight pass and park (ADR-0002 Q3).
+    Abort,
     /// The mode became, or stopped being, the one on screen. Q3's policy input.
     Active(bool),
+    /// This session's own worker settled (`agent_settled`) on the pass tagged
+    /// `serial`. The only thing that ever drives the loop forward.
+    WorkerSettled { serial: u64 },
+    /// This session's worker's stdout closed. Same serial rule as
+    /// [`BeadsCmd::WorkerSettled`]: a notice from a pass this loop already
+    /// retired says nothing about the one in flight.
+    WorkerGone { serial: u64 },
     /// Test seam: ack once every command queued before this one is fully handled.
     Sync(oneshot::Sender<()>),
     /// App is exiting: reap the worker and report the session gone.
@@ -50,7 +83,7 @@ enum BeadsCmd {
 
 /// The beads machine, running inside its own task.
 ///
-/// These three flags are the whole parked-state machine, and they are the reason a
+/// These flags are the whole parked-state machine, and they are the reason a
 /// re-entry cannot double-spawn: exactly one place calls [`BeadsLoop::next`], and
 /// it refuses unless the loop is started, visible, idle, and holding a deferred
 /// request.
@@ -66,9 +99,16 @@ struct BeadsTask {
     /// A pass is in flight that has not been reported as settled. This is what
     /// keeps "come back and continue" from turning into "kill the running pass and
     /// start another": the only thing that clears it is the settle signal itself
-    /// ([`BeadsCmd::Advance`]), because the loop's own step cannot tell
-    /// "still streaming" from "finished, and nobody has asked to advance yet".
+    /// ([`BeadsCmd::WorkerSettled`]) or the worker's death, because the loop's
+    /// own step cannot tell "still streaming" from "finished, and nobody has
+    /// asked to advance yet".
     streaming: bool,
+    /// `Esc` landed on the in-flight pass. The settle that follows is the abort
+    /// unwinding, **not** a pass that finished, so it parks instead of taking the
+    /// next bead (ADR-0002 Q3: "an aborted worker must never read as
+    /// `agent_settled` → next bead"). This flag is why that rule can be enforced
+    /// at all: `agent_settled` looks identical either way.
+    aborted: bool,
 }
 
 impl BeadsTask {
@@ -81,8 +121,101 @@ impl BeadsTask {
         }
     }
 
+    /// Is `serial` the pass this loop is actually running right now?
+    ///
+    /// The staleness check, and the reason every worker edge carries a serial. A
+    /// killed worker's last records can arrive after the loop has moved on, and an
+    /// untagged late settle would read as "my current pass finished": it would
+    /// retire a live pass's `streaming` flag and start another one, killing work
+    /// that is already paid for. Same shape as a stale `SessionId` in the router,
+    /// one level down.
+    fn is_live(&self, serial: u64) -> bool {
+        self.inner.worker_serial() == Some(serial)
+    }
+
+    /// The pass in flight settled. This is the transition.
+    async fn worker_settled(&mut self, serial: u64) {
+        if !self.is_live(serial) {
+            return; // retired pass; nothing here belongs to it
+        }
+        self.streaming = false;
+        if self.aborted {
+            self.park_after(
+                Some("beads: cancelled — the loop is parked. Type an instruction to start again."),
+                None,
+            )
+            .await;
+            return;
+        }
+        self.pending = true;
+        self.run_pending().await;
+    }
+
+    /// The worker's stream ended without a settle.
+    ///
+    /// The symmetric edge of `worker_settled`, and the one that used to hang the
+    /// mode: crash, OOM, `kill -9`, or a pi that exits early all leave the loop
+    /// "working" forever with the input box hidden behind it, because nothing was
+    /// ever going to send the settle it was waiting for. A loop that cannot advance
+    /// must say so and hand the box back rather than spin.
+    async fn worker_gone(&mut self, serial: u64) {
+        if !self.is_live(serial) {
+            // We closed this worker ourselves at a pass boundary. Expected, and
+            // silent by design: the next pass reports its own news.
+            return;
+        }
+        self.streaming = false;
+        if self.aborted {
+            self.park_after(Some("beads: cancelled — the loop is parked."), None)
+                .await;
+        } else {
+            self.park_after(
+                None,
+                Some("beads: the worker exited without settling; the loop is parked. Type an instruction to start again."),
+            )
+            .await;
+        }
+    }
+
+    /// Stop wanting a pass, reap the worker, and go back to waiting for a human.
+    ///
+    /// Only the cancel/death paths park here, and they reap because nothing else
+    /// will: an ordinary settle that arrives while the mode is hidden deliberately
+    /// leaves the settled worker alone (looprs-05j pins "a Tab never kills, hidden
+    /// or not", and the next pass reaps it at its own boundary). A pass that was
+    /// cancelled or died has no following pass to do that reaping, so the park has
+    /// to — a beads loop parked on top of a live child is the idle-child trap this
+    /// loop was rewritten to avoid. `set_step(AwaitInput)` is what hands the input
+    /// box back.
+    async fn park_after(&mut self, note: Option<&str>, error: Option<&str>) {
+        self.aborted = false;
+        self.pending = false;
+        self.inner.close().await;
+        if let Some(text) = error {
+            self.inner.report_error(text.to_string());
+        } else if let Some(text) = note {
+            self.inner.report_system(text.to_string());
+        }
+        self.inner.set_step(BeadStep::AwaitInput);
+    }
+
+    /// `Esc`. Tell the worker to stop, and remember that we did.
+    ///
+    /// The flag is set *before* the command goes out, so the settle that pi emits
+    /// as it unwinds is already classified as a cancellation and cannot be
+    /// misread as a finished pass. An idle loop is a no-op, not an error
+    /// (looprs-5g7).
+    fn abort_pass(&mut self) {
+        if self.inner.abort_worker() {
+            self.aborted = true;
+            self.pending = false;
+        }
+    }
+
     fn status(&self) -> SessionStatus {
-        if self.inner.has_live_worker() {
+        if self.aborted {
+            SessionStatus::Aborting
+        } else if self.inner.has_live_worker() {
             SessionStatus::Running
         } else if self.started {
             SessionStatus::Idle
@@ -99,6 +232,11 @@ pub struct BeadsSession {
     id: SessionId,
     cmd: mpsc::UnboundedSender<BeadsCmd>,
     status: Arc<StdMutex<SessionStatus>>,
+    /// Mirror of the pass the loop has in flight, published by the task the same way
+    /// `status` is. Nothing outside the task may write it, which keeps the loop's
+    /// state single-owner while still letting the status row (looprs-guh) say *which*
+    /// pass is running — and letting a test settle against a serial it did not make up.
+    in_flight: Arc<StdMutex<Option<u64>>>,
 }
 
 impl BeadsSession {
@@ -123,12 +261,15 @@ impl BeadsSession {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<BeadsCmd>();
         let status = Arc::new(StdMutex::new(SessionStatus::NotStarted));
         let task_status = status.clone();
+        let in_flight = Arc::new(StdMutex::<Option<u64>>::new(None));
+        let task_in_flight = in_flight.clone();
         let mut task = BeadsTask {
-            inner: BeadsLoop::new(id, ev_tx.clone(), cfg.clone()),
+            inner: BeadsLoop::new(id, ev_tx.clone(), cmd_tx.clone(), cfg.clone()),
             started: false,
             parked: false,
             pending: false,
             streaming: false,
+            aborted: false,
         };
 
         tokio::spawn(async move {
@@ -155,21 +296,28 @@ impl BeadsSession {
                             task.inner.set_step(BeadStep::AwaitInput);
                         }
                     }
-                    // Deferred while parked, so a Tab back produces one pass rather
-                    // than one per settle that happened to arrive off-screen. This
-                    // command *is* the settle signal, so it is what retires
-                    // `streaming`.
-                    BeadsCmd::Advance => {
-                        task.streaming = false;
-                        task.pending = true;
-                        task.run_pending().await;
-                    }
+                    // This command *is* the settle signal for the pass that made
+                    // it, so it is what retires `streaming`. Deferred while
+                    // parked, so a Tab back produces one pass rather than one per
+                    // settle that happened to arrive off-screen.
+                    BeadsCmd::WorkerSettled { serial } => task.worker_settled(serial).await,
+                    BeadsCmd::WorkerGone { serial } => task.worker_gone(serial).await,
+                    BeadsCmd::Abort => task.abort_pass(),
                     BeadsCmd::Sync(tx) => {
+                        // Publish the mirrors *before* acking. A caller that waits
+                        // on the seam and then reads `status()` / `in_flight()`
+                        // must see the state as of that ack, not one command
+                        // stale — and on a multi-threaded runtime the ack wakes
+                        // the waiter before this task necessarily gets to the
+                        // end-of-iteration mirror below.
+                        *task_status.lock().unwrap() = task.status();
+                        *task_in_flight.lock().unwrap() = task.inner.worker_serial();
                         let _ = tx.send(());
                     }
                     BeadsCmd::Shutdown => {
                         task.inner.close().await;
                         *task_status.lock().unwrap() = SessionStatus::Dead;
+                        *task_in_flight.lock().unwrap() = None;
                         let _ = ev_tx.send(SessionEvent::Exited {
                             reason: ExitReason::Shutdown,
                         });
@@ -177,6 +325,7 @@ impl BeadsSession {
                     }
                 }
                 *task_status.lock().unwrap() = task.status();
+                *task_in_flight.lock().unwrap() = task.inner.worker_serial();
             }
             // The task ends here and `ev_tx` drops with it, so the router's pump
             // still owes — and supplies — the exactly-one SessionDown.
@@ -187,9 +336,17 @@ impl BeadsSession {
                 id,
                 cmd: cmd_tx,
                 status,
+                in_flight,
             },
             ev_rx,
         ))
+    }
+
+    /// The pass this session has in flight right now, `None` when nothing is
+    /// running. A snapshot taken from outside the task, so it is only as fresh as
+    /// the last command the task finished — see [`Self::quiesce`].
+    pub fn in_flight(&self) -> Option<u64> {
+        *self.in_flight.lock().unwrap()
     }
 
     /// Test seam: returns once every command queued before this call has been
@@ -218,11 +375,15 @@ impl Session for BeadsSession {
     }
 
     fn abort(&mut self) -> Result<()> {
-        // looprs-5g7: abort the pi run AND park; an aborted worker must not be
-        // mistaken for agent_settled -> next bead. Refused rather than faked: a
-        // half-implemented cancel is worse than none, because it can be mistaken
-        // for a working one.
-        crate::session::stubs::todo_method("BeadsSession::abort", "looprs-5g7")
+        // `Esc` in the beads view: abort the worker *and* park. The parking is
+        // not optional — a settle arriving from an aborted worker is pi unwinding,
+        // not a pass that finished, and advancing on it would claim the next bead
+        // the user just refused to spend the turn on. looprs-5g7 owns the
+        // escalation numbers and the wording; the rule itself lives here, because
+        // the loop is the only thing that knows what it aborted.
+        self.cmd
+            .send(BeadsCmd::Abort)
+            .map_err(|_| anyhow!("beads session task is gone"))
     }
 
     fn shutdown(&mut self) -> Result<()> {
@@ -237,12 +398,6 @@ impl Session for BeadsSession {
             .map_err(|_| anyhow!("beads session task is gone"))
     }
 
-    fn advance(&mut self) -> Result<()> {
-        self.cmd
-            .send(BeadsCmd::Advance)
-            .map_err(|_| anyhow!("beads session task is gone"))
-    }
-
     fn status(&self) -> SessionStatus {
         *self.status.lock().unwrap()
     }
@@ -254,15 +409,28 @@ impl Session for BeadsSession {
 
 /// The beads terminal state, as a `BeadsLoop`.
 pub struct BeadsLoop {
-    /// This loop's identity, stamped on nothing directly but kept for logs and for
-    /// the events' provenance chain (ADR-0002 Q2: the pump adds the id).
-    #[allow(dead_code)]
+    /// This loop's identity, kept for logs and for the events' provenance chain
+    /// (ADR-0002 Q2: the pump adds the id to what reaches the UI).
     id: SessionId,
-    /// The pi session currently driven by the loop. `None` whenever the loop is parked.
-    pi_rx: Option<PiRpc>,
+    /// The worker currently driven by the loop. `None` whenever the loop is parked.
+    pi_rx: Option<Worker>,
+    /// Serial source for workers. One per spawned pass, never reused, so a record
+    /// from a pass this loop retired is distinguishable from one it is still
+    /// waiting on (see [`BeadsTask::is_live`]).
+    next_serial: u64,
     ev_tx: mpsc::UnboundedSender<SessionEvent>,
+    /// This session's own mailbox. A worker's control edges go here, **not** out to
+    /// the UI: the loop advances itself rather than being told to by whichever
+    /// mode happened to be on screen (looprs-msj).
+    ctl: mpsc::UnboundedSender<BeadsCmd>,
     cfg: SessionConfig,
     bead_step: BeadStep,
+}
+
+/// The worker child, plus the serial that says *which* pass it belongs to.
+struct Worker {
+    serial: u64,
+    rpc: PiRpc,
 }
 
 /// What a worker pass did.
@@ -279,15 +447,22 @@ impl BeadsLoop {
     /// constructed-but-unstarted loop can never be holding an idle, unprompted
     /// pi child (the bug this replaces: `new()` used to spawn a session nobody
     /// ever prompted, and nothing else would ever prompt it).
-    pub fn new(
+    ///
+    /// Private to the module on purpose: `BeadsCmd` is private, and a public
+    /// constructor taking one would advertise the loop's own mailbox.
+    /// [`BeadsSession::start`] is the way in.
+    fn new(
         id: SessionId,
         ev_tx: mpsc::UnboundedSender<SessionEvent>,
+        ctl: mpsc::UnboundedSender<BeadsCmd>,
         cfg: SessionConfig,
     ) -> Self {
         Self {
             id,
             pi_rx: None,
+            next_serial: 1,
             ev_tx,
+            ctl,
             cfg,
             bead_step: BeadStep::AwaitInput,
         }
@@ -310,6 +485,12 @@ impl BeadsLoop {
     /// "one pass at a time" a property of the machine rather than a hope.
     pub fn has_live_worker(&self) -> bool {
         self.pi_rx.is_some()
+    }
+
+    /// The serial of the pass currently in flight, `None` when nothing is running.
+    /// A settle means "advance" only when it carries this serial.
+    pub fn worker_serial(&self) -> Option<u64> {
+        self.pi_rx.as_ref().map(|w| w.serial)
     }
 
     /// Tear down the current session, then work the next ready bead or park.
@@ -345,39 +526,75 @@ impl BeadsLoop {
         };
         tracing::info!(bead = %bead.id(), "starting worker pass");
 
-        // The session is built against locals: if any step below fails, `pi` drops here
-        // and kill_on_drop reaps it, so a failed pass cannot leave an orphan behind.
-        let (pi, ev_rx) = PiRpc::spawn_with(&self.cfg.pi_bin, &[])?;
-        self.forward_pi_events(ev_rx);
-        let disposition = pi.prompt(&worker_prompt(bead)).await?;
+        // The session is built against locals: if any step below fails, `worker`
+        // drops here and kill_on_drop reaps it, so a failed pass cannot leave an
+        // orphan behind.
+        let worker = self.spawn_worker(&[])?;
+        let disposition = worker.rpc.prompt(&worker_prompt(bead)).await?;
         if disposition == "handled" {
             // pi took the prompt but started no run, so no `agent_settled` will ever
             // arrive to advance the loop. Do not hold an idle session open.
-            drop(pi);
+            drop(worker);
             return Err(anyhow!(
                 "worker prompt for {} was handled without starting a run",
                 bead.id()
             ));
         }
 
-        self.pi_rx = Some(pi);
+        self.pi_rx = Some(worker);
         self.report_system(format!("beads: working {}", bead.id()));
         self.set_step(BeadStep::WorkTickets);
         Ok(WorkerPass::Working)
     }
 
-    /// Pipe a pi event stream into the session's event stream until the child's
-    /// stdout closes.
-    fn forward_pi_events(&self, mut ev_rx: mpsc::UnboundedReceiver<serde_json::Value>) {
-        let tx = self.ev_tx.clone();
+    /// Spawn one pass's `pi` child and wire its records into this session.
+    ///
+    /// The child comes back *unassigned*: the caller decides the moment the pass is
+    /// live by storing it in `self.pi_rx`, which keeps "a pass is in flight" a
+    /// fact the loop controls rather than a side effect of a spawn having
+    /// happened somewhere.
+    fn spawn_worker(&mut self, args: &[&str]) -> Result<Worker> {
+        let (rpc, records) = PiRpc::spawn_with(&self.cfg.pi_bin, args)?;
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        self.forward_records(serial, records);
+        Ok(Worker { serial, rpc })
+    }
+
+    /// Pipe one worker's records into this session: two copies of the same fact,
+    /// deliberately.
+    ///
+    /// * the **render** copy goes out on `ev_tx` unchanged, and the App turns it
+    ///   into transcript lines knowing nothing about beads;
+    /// * the **control** copy — the edges only, `agent_settled` and the end of the
+    ///   stream — goes into the task that owns this loop, tagged with the serial of
+    ///   the pass that produced it.
+    ///
+    /// The serial is not decoration. A killed worker's last records can arrive
+    /// after the loop has moved on, and an untagged late settle would read as
+    /// "the pass in flight finished", killing work that is already paid for to
+    /// start a pass nobody asked for. The control copy is also why no UI message is
+    /// involved in advancing the loop: this used to be `UiCommand::BeadsNext`,
+    /// arriving from whichever mode the input box happened to be in (looprs-msj).
+    fn forward_records(&self, serial: u64, mut records: mpsc::UnboundedReceiver<Value>) {
+        let render = self.ev_tx.clone();
+        let ctl = self.ctl.clone();
         tokio::spawn(async move {
-            while let Some(v) = ev_rx.recv().await {
-                if let Some(ev) = parse(&v)
-                    && tx.send(SessionEvent::Agent(ev)).is_err()
-                {
-                    break;
+            while let Some(v) = records.recv().await {
+                let Some(ev) = parse(&v) else {
+                    continue; // `parse` logs the offender
+                };
+                let settled = matches!(ev, PiEvent::AgentSettled);
+                if render.send(SessionEvent::Agent(ev)).is_err() {
+                    return; // the session is gone: nothing to render, nothing to advance
+                }
+                if settled {
+                    let _ = ctl.send(BeadsCmd::WorkerSettled { serial });
                 }
             }
+            // stdout closed. Whether that is expected is the task's call, not this
+            // task's: it needs the loop's state to know.
+            let _ = ctl.send(BeadsCmd::WorkerGone { serial });
         });
     }
 
@@ -389,28 +606,51 @@ impl BeadsLoop {
         let _ = self.ev_tx.send(SessionEvent::System(text));
     }
 
+    /// Tear down the current worker, if any.
+    ///
+    /// `take()` happens before the kill on purpose: from that instant the loop has
+    /// no live pass, so the dying child's own `WorkerGone` carries a serial that
+    /// matches nothing and is ignored instead of being read as "the pass in flight
+    /// died".
     pub async fn close(&mut self) {
-        if let Some(mut old_pi) = self.pi_rx.take() {
-            let _ = old_pi.kill().await;
+        if let Some(mut old) = self.pi_rx.take() {
+            let _ = old.rpc.kill().await;
         }
+    }
+
+    /// `Esc`. Tell the in-flight worker to stop; `true` if there was one.
+    ///
+    /// Fire-and-forget, exactly like Pi's own Esc: `abort` is answered only once
+    /// the run has unwound, and parking this loop on that answer would put the
+    /// user's next keystroke behind the very run they are trying to stop. The end
+    /// of the run arrives where every other end arrives — on the stream — and the
+    /// caller's `aborted` flag is what makes it read as a cancellation rather than
+    /// as a pass that finished (ADR-0002 Q3).
+    pub fn abort_worker(&mut self) -> bool {
+        let Some(worker) = self.pi_rx.as_ref() else {
+            return false;
+        };
+        if let Err(e) = worker.rpc.abort() {
+            tracing::warn!("{}: abort did not reach the worker: {e:#}", self.id);
+        }
+        true
     }
 
     pub async fn launch_create_tickets(&mut self, instructions: &str) -> Result<()> {
         tracing::debug!("Launched tickets with these instructions: {}", instructions);
         self.close().await;
         let args = vec!["--tools", "read,bash"];
-        let (pi, ev_rx) = PiRpc::spawn_with(&self.cfg.pi_bin, &args)?;
+        let worker = self.spawn_worker(&args)?;
         self.set_step(BeadStep::CreateTickets);
-        self.forward_pi_events(ev_rx);
         let prompt = generate_prompt(PLANNER, instructions);
-        let disposition = pi.prompt(&prompt).await?;
+        let disposition = worker.rpc.prompt(&prompt).await?;
         if disposition == "handled" {
-            drop(pi);
+            drop(worker);
             return Err(anyhow!(
                 "planner prompt was handled without starting a run; no tickets were requested"
             ));
         }
-        self.pi_rx = Some(pi);
+        self.pi_rx = Some(worker);
 
         Ok(())
     }
@@ -451,29 +691,73 @@ mod tests {
         }
     }
 
-    fn loop_with(fakes: &Fakes) -> (BeadsLoop, mpsc::UnboundedReceiver<SessionEvent>) {
+    /// A bare loop, with its two output streams held open by the test.
+    ///
+    /// The control receiver comes back rather than being dropped: these tests drive
+    /// the loop by calling it directly, so nothing is expected on that mailbox —
+    /// but dropping the receiver would silently discard the worker's control edges,
+    /// and a test that silently discards the thing under test is worse than one that
+    /// fails.
+    fn loop_with(
+        fakes: &Fakes,
+    ) -> (
+        BeadsLoop,
+        mpsc::UnboundedReceiver<SessionEvent>,
+        mpsc::UnboundedReceiver<BeadsCmd>,
+    ) {
         let (tx, rx) = mpsc::unbounded_channel();
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<BeadsCmd>();
         let id = SessionId::new(TerminalType::Beeds, 0);
-        (BeadsLoop::new(id, tx, fakes_cfg(fakes)), rx)
+        (BeadsLoop::new(id, tx, ctl_tx, fakes_cfg(fakes)), rx, ctl_rx)
+    }
+
+    /// One event, described as a stable string so a failing assertion prints
+    /// something readable instead of four nested enums.
+
+    fn describe(m: SessionEvent) -> String {
+        match m {
+            SessionEvent::BeadStep(BeadStep::AwaitInput) => "step:await".into(),
+            SessionEvent::BeadStep(BeadStep::CreateTickets) => "step:plan".into(),
+            SessionEvent::BeadStep(BeadStep::WorkTickets) => "step:work".into(),
+            SessionEvent::Error(text) => format!("error: {text}"),
+            SessionEvent::System(text) => format!("system: {text}"),
+            SessionEvent::RestoreInput { text } => format!("restore: {text}"),
+            SessionEvent::Agent(PiEvent::AgentSettled) => "agent_settled".into(),
+            SessionEvent::Agent(_) => "agent".into(),
+            SessionEvent::Exited { .. } => "session-down".into(),
+            SessionEvent::BashOutput { .. } => "bash".into(),
+        }
     }
 
     /// Snapshot of what the loop told the UI, as stable strings.
     fn drain(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> Vec<String> {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
-            out.push(match m {
-                SessionEvent::BeadStep(BeadStep::AwaitInput) => "step:await".into(),
-                SessionEvent::BeadStep(BeadStep::CreateTickets) => "step:plan".into(),
-                SessionEvent::BeadStep(BeadStep::WorkTickets) => "step:work".into(),
-                SessionEvent::Error(text) => format!("error: {text}"),
-                SessionEvent::System(text) => format!("system: {text}"),
-                SessionEvent::RestoreInput { text } => format!("restore: {text}"),
-                SessionEvent::Agent(_) => "agent".into(),
-                SessionEvent::Exited { .. } => "session-down".into(),
-                SessionEvent::BashOutput { .. } => "bash".into(),
-            });
+            out.push(describe(m));
         }
         out
+    }
+
+    /// Read events until the loop lands in `AwaitInput`, and return everything it
+    /// said on the way.
+    ///
+    /// "Parked" is the observable end state of every one of these tests, and it is
+    /// the state a human has to be able to reach: a loop that keeps saying it is
+    /// working while nothing is running is a loop that hid the input box forever.
+    async fn drain_until_parked(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            let line = match timeout(NO_HANG, rx.recv()).await {
+                Ok(Some(m)) => describe(m),
+                Ok(None) => panic!("the session stream closed before the loop parked: {out:?}"),
+                Err(_) => panic!("the loop never parked within {NO_HANG:?}: {out:?}"),
+            };
+            let parked = line == "step:await";
+            out.push(line);
+            if parked {
+                return out;
+            }
+        }
     }
 
     fn has_error(msgs: &[String]) -> bool {
@@ -485,7 +769,7 @@ mod tests {
     #[tokio::test]
     async fn constructing_a_loop_spawns_nothing() {
         let fakes = Fakes::new("ctor", PiFake::Started, BdFake::Ok, ONE_BEADED_BOARD);
-        let (l, mut rx) = loop_with(&fakes);
+        let (l, mut rx, _ctl) = loop_with(&fakes);
 
         assert!(l.is_awaiting_input(), "a new loop starts parked");
         assert_eq!(fakes.pi_spawns(), 0, "new() must not spawn a pi child");
@@ -498,7 +782,7 @@ mod tests {
     #[tokio::test]
     async fn a_non_empty_board_self_starts_a_prompted_worker() {
         let fakes = Fakes::new("self-start", PiFake::Started, BdFake::Ok, ONE_BEADED_BOARD);
-        let (mut l, mut rx) = loop_with(&fakes);
+        let (mut l, mut rx, _ctl) = loop_with(&fakes);
 
         assert!(
             timeout(NO_HANG, l.next()).await.is_ok(),
@@ -528,7 +812,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_board_parks_without_spawning() {
         let fakes = Fakes::new("empty", PiFake::Started, BdFake::Ok, EMPTY_BOARD);
-        let (mut l, mut rx) = loop_with(&fakes);
+        let (mut l, mut rx, _ctl) = loop_with(&fakes);
 
         assert!(timeout(NO_HANG, l.next()).await.is_ok());
 
@@ -547,7 +831,7 @@ mod tests {
     #[tokio::test]
     async fn driving_the_loop_reaps_the_previous_worker() {
         let fakes = Fakes::new("reap", PiFake::Started, BdFake::Ok, ONE_BEADED_BOARD);
-        let (mut l, _rx) = loop_with(&fakes);
+        let (mut l, _rx, _ctl) = loop_with(&fakes);
 
         timeout(NO_HANG, l.next()).await.unwrap();
         let first = fakes.pi_pids()[0];
@@ -584,7 +868,7 @@ mod tests {
             BdFake::Ok,
             ONE_BEADED_BOARD,
         );
-        let (mut l, mut rx) = loop_with(&fakes);
+        let (mut l, mut rx, _ctl) = loop_with(&fakes);
 
         assert!(
             timeout(NO_HANG, l.next()).await.is_ok(),
@@ -604,7 +888,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_bd_is_reported_and_parks() {
         let fakes = Fakes::new("bad-bd", PiFake::Started, BdFake::Fails, EMPTY_BOARD);
-        let (mut l, mut rx) = loop_with(&fakes);
+        let (mut l, mut rx, _ctl) = loop_with(&fakes);
 
         assert!(timeout(NO_HANG, l.next()).await.is_ok());
 
@@ -620,7 +904,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_prompt_is_reported_and_keeps_no_session() {
         let fakes = Fakes::new("refused", PiFake::Rejects, BdFake::Ok, ONE_BEADED_BOARD);
-        let (mut l, mut rx) = loop_with(&fakes);
+        let (mut l, mut rx, _ctl) = loop_with(&fakes);
 
         assert!(timeout(NO_HANG, l.next()).await.is_ok());
 
@@ -635,7 +919,7 @@ mod tests {
     #[tokio::test]
     async fn a_handled_prompt_does_not_leave_an_idle_worker() {
         let fakes = Fakes::new("handled", PiFake::Handled, BdFake::Ok, ONE_BEADED_BOARD);
-        let (mut l, mut rx) = loop_with(&fakes);
+        let (mut l, mut rx, _ctl) = loop_with(&fakes);
 
         assert!(timeout(NO_HANG, l.next()).await.is_ok());
 
@@ -713,10 +997,14 @@ mod tests {
             "a Tab must not kill the in-flight worker: that work is already paid for"
         );
 
-        // Three "settled, go again" signals arrive while hidden.
+        // Three settles arrive while hidden — the loop's own worker, tagged with
+        // the pass that made them.
         fakes.set_board(SECOND_BOARD);
+        let pass = s.in_flight().expect("a pass is in flight");
         for _ in 0..3 {
-            s.cmd.send(BeadsCmd::Advance).unwrap();
+            s.cmd
+                .send(BeadsCmd::WorkerSettled { serial: pass })
+                .unwrap();
         }
         assert!(s.quiesce().await);
         assert_eq!(
@@ -788,5 +1076,192 @@ mod tests {
                 Err(_) => return out,
             }
         }
+    }
+
+    // ------------- who drives the loop? (looprs-msj) -------------
+    //
+    // Four tests, one claim each: the transition happens inside this session, off
+    // this session's own worker, and off nothing else. None of them has an App, an
+    // input mode, or a `UiCommand` in it, which is the point — the App cannot be
+    // part of the path any more because there is nothing left for it to send.
+
+    /// **The acceptance case, run end to end with real processes.** A beads worker
+    /// settles, and the next pass starts. There is no UI in this test in any form:
+    /// the only things that ever touched this session were one `set_active` and the
+    /// fake worker's own stdout, so the advance cannot have come from anywhere but
+    /// the bead's side of the boundary.
+    #[tokio::test]
+    async fn the_loop_takes_its_next_pass_from_its_own_workers_settle() {
+        let fakes = Fakes::new(
+            "settle-drives-loop",
+            PiFake::Chat,
+            BdFake::Ok,
+            ONE_BEADED_BOARD,
+        );
+        let (mut s, mut rx) = beads(&fakes, 1);
+
+        s.set_active(true).unwrap();
+        // `quiesce`, not a log poll: the fake logs the prompt *before* it answers,
+        // so a status asserted against the log races the answer. Quiesce is FIFO on
+        // the session's own mailbox — when it returns, the pass has started and the
+        // status mirror has been published behind it.
+        assert!(s.quiesce().await, "the entry command was handled");
+        assert_eq!(fakes.pi_spawns(), 1, "one pass, from entering the mode");
+        assert_eq!(s.in_flight(), Some(1));
+
+        // The worker settles. That is the whole input.
+        fakes.settle();
+        fakes.wait_for_pi_spawns(2).await;
+
+        assert_eq!(
+            fakes.pi_spawns(),
+            2,
+            "the settle drove the next pass — no command told anyone to"
+        );
+        assert_eq!(
+            fakes.pi_prompts().len(),
+            2,
+            "and the new pass was prompted, not left idle the way this loop used to start"
+        );
+        assert_eq!(s.in_flight(), Some(2), "the new pass is the live one");
+        assert!(
+            drain(&mut rx).contains(&"step:work".to_string()),
+            "and the UI was told, as a render, not asked, as a command"
+        );
+
+        // Nothing drives a *third* pass: the loop moves when a pass settles and
+        // nowhere else, so it sits waiting rather than running the board by itself.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(fakes.pi_spawns(), 2, "no settle, no pass");
+    }
+
+    /// A settle only moves the loop when it names the pass that is actually in
+    /// flight. A late or duplicated tail from an already-retired worker looks
+    /// identical on the wire otherwise, and acting on it would kill the live pass
+    /// — work already paid for — to start a pass nobody asked for.
+    #[tokio::test]
+    async fn a_settle_from_a_pass_this_loop_does_not_own_moves_nothing() {
+        let fakes = Fakes::new(
+            "stale-settle",
+            PiFake::Started,
+            BdFake::Ok,
+            ONE_BEADED_BOARD,
+        );
+        let (mut s, _rx) = beads(&fakes, 1);
+
+        // (a) Nothing is running: a settle cannot conjure work out of nowhere.
+        s.cmd.send(BeadsCmd::WorkerSettled { serial: 1 }).unwrap();
+        assert!(s.quiesce().await);
+        assert_eq!(
+            fakes.pi_spawns(),
+            0,
+            "a settle with no pass behind it starts nothing"
+        );
+        assert_eq!(s.status(), SessionStatus::NotStarted);
+
+        // (b) A real pass, retired by a real settle, which then arrives late again.
+        s.set_active(true).unwrap();
+        assert!(s.quiesce().await);
+        let first = s.in_flight().expect("the first pass is live");
+        s.cmd
+            .send(BeadsCmd::WorkerSettled { serial: first })
+            .unwrap();
+        assert!(s.quiesce().await);
+        assert_eq!(fakes.pi_spawns(), 2, "the real settle drove the next pass");
+        let second = s.in_flight().expect("the second pass is live");
+        assert_ne!(first, second, "each pass gets its own serial");
+
+        s.cmd
+            .send(BeadsCmd::WorkerSettled { serial: first })
+            .unwrap();
+        assert!(s.quiesce().await);
+        assert_eq!(
+            fakes.pi_spawns(),
+            2,
+            "the late echo of a retired pass must not come over the top of the live one"
+        );
+        assert!(
+            process_alive(fakes.pi_pids()[1]),
+            "the live worker was not touched"
+        );
+        assert_eq!(s.in_flight(), Some(second));
+    }
+
+    /// **ADR-0002 Q3, the rule that makes the settle path not a tautology**: a
+    /// settle means "a pass finished" only when nobody cancelled it. An aborted
+    /// worker settles on the way out — that is how pi unwinds — and reading that as
+    /// "next bead" would spend a turn on the next ticket *because* the user pressed
+    /// Esc, which is the exact opposite of what Esc is for.
+    #[tokio::test]
+    async fn an_aborted_pass_parks_instead_of_advancing() {
+        let fakes = Fakes::new("abort-parks", PiFake::Chat, BdFake::Ok, ONE_BEADED_BOARD);
+        let (mut s, mut rx) = beads(&fakes, 1);
+
+        s.set_active(true).unwrap();
+        assert!(s.quiesce().await, "the entry command was handled");
+        let worker = fakes.pi_pids()[0];
+        assert!(process_alive(worker), "a pass is running");
+
+        s.abort().unwrap();
+        let msgs = drain_until_parked(&mut rx).await;
+
+        assert_eq!(
+            fakes.pi_spawns(),
+            1,
+            "the abort parked the loop; it did not take the next bead: {msgs:?}"
+        );
+        assert!(
+            !process_alive(worker),
+            "a parked beads loop holds no warm child — the mode is cold by policy"
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("cancel")),
+            "the park says why, rather than looking like the board ran dry: {msgs:?}"
+        );
+        assert_eq!(s.status(), SessionStatus::Idle, "waiting on a human");
+        assert_eq!(s.in_flight(), None, "nothing is in flight any more");
+        assert_eq!(
+            fakes.pi_verbs().iter().filter(|v| *v == "prompt").count(),
+            1,
+            "exactly one prompt ever went out: {:?}",
+            fakes.pi_verbs()
+        );
+    }
+
+    /// The symmetric edge of the settle path. A worker that dies mid-run never
+    /// sends `agent_settled`, so without handling the stream end the loop sits
+    /// claiming it is working forever — with the input box hidden behind that
+    /// claim. It must come back to the human instead.
+    #[tokio::test]
+    async fn a_worker_that_dies_mid_pass_parks_the_loop_instead_of_hanging_it() {
+        let fakes = Fakes::new("worker-dies", PiFake::Chat, BdFake::Ok, ONE_BEADED_BOARD);
+        let (mut s, mut rx) = beads(&fakes, 1);
+
+        s.set_active(true).unwrap();
+        assert!(
+            s.quiesce().await,
+            "the pass started before anything killed it"
+        );
+        let victim = fakes.pi_pids()[0];
+        assert_eq!(s.status(), SessionStatus::Running);
+
+        crate::testing::kill_pid(victim);
+
+        let msgs = drain_until_parked(&mut rx).await;
+        assert!(
+            has_error(&msgs),
+            "the death is reported, not swallowed: {msgs:?}"
+        );
+        assert_eq!(
+            fakes.pi_spawns(),
+            1,
+            "parking is not a restart: a crash that auto-retries is a respawn storm"
+        );
+        assert!(!process_alive(victim));
+        assert_eq!(
+            s.status(),
+            SessionStatus::Idle,
+            "the loop is back in the human's hands, so the box comes back too"
+        );
     }
 }
