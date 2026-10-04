@@ -10,8 +10,19 @@
 //! 1. A *session* is one child process plus one stream of events about that process.
 //! 2. Every event carries the [`SessionId`] that produced it; the UI never guesses.
 //! 3. A `Tab` changes which session you are *looking at*; it never destroys work.
-
-#![allow(dead_code)] // some of this layer is contract surface for tickets that have not landed
+//!
+//! ## Dead code, and why there is no blanket `allow` here
+//!
+//! This module used to open with `#![allow(dead_code)]`, which silenced the whole
+//! subtree — five files of half-wired paths reporting nothing. That is the wrong
+//! trade: a blanket allow makes "unreachable" the same color as "fine".
+//!
+//! So there is none, and each item that is not reachable from the binary carries its
+//! own `#[allow(dead_code)]` with the reason it stays: usually "test seam" (the
+//! lifecycle tests would otherwise be sleeps) or a named ticket that will read it
+//! (looprs-guh's status row is the usual suspect). An allow without a reason is a
+//! warning we deleted rather than answered; `cargo clippy --all-targets -- -D
+//! warnings` is the gate that keeps that list honest.
 
 pub mod bash;
 pub mod beads;
@@ -46,6 +57,13 @@ pub enum TerminalType {
 
 impl TerminalType {
     /// All modes, in Tab order.
+    ///
+    /// Nothing in the shipped binary enumerates the modes (it cycles them with
+    /// [`TerminalType::next`]), so this reads as dead there; it is the one place the
+    /// order is written down, and the tests that would otherwise hard-code
+    /// "Beeds, Pi, Bash" in nine spots walk it. The status row (looprs-guh) needs
+    /// the same table to print every mode, not just the live one.
+    #[allow(dead_code)] // consumers: the mode-table tests; looprs-guh enumerates modes
     pub const ALL: [TerminalType; 3] = [TerminalType::Beeds, TerminalType::Pi, TerminalType::Bash];
 
     pub fn label(self) -> &'static str {
@@ -151,7 +169,14 @@ impl std::fmt::Display for SessionId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ByteStream {
     Merged,
+    /// Not constructed yet: the only producer today is a pty, which cannot tell the
+    /// two apart. Kept (individually, rather than by relaxing the whole enum) so
+    /// that a backend which *does* read separate pipes has a way to say so, and so
+    /// nobody builds a "stderr" label out of a stream that never had one.
+    #[allow(dead_code)] // consumer: a piped (non-pty) shell fallback, not yet wired
     Stdout,
+    /// As [`ByteStream::Stdout`]: the pipe a tool's own stderr would arrive on.
+    #[allow(dead_code)] // consumer: per-tool stderr routing, not yet wired
     Stderr,
 }
 
@@ -175,6 +200,11 @@ pub enum SessionStatus {
 
 impl SessionStatus {
     /// "Do not let the user start another thing right now."
+    ///
+    /// The bin does not call it yet — the App's input box currently gates on the
+    /// active *view* rather than the session's liveness — but it is the predicate
+    /// the router tests against, and the one looprs-guh's busy indicator reads.
+    #[allow(dead_code)] // consumers: router tests; looprs-guh (busy indicator)
     pub fn is_busy(self) -> bool {
         matches!(self, Self::Running | Self::Aborting)
     }
@@ -256,11 +286,29 @@ pub enum SessionEvent {
 /// state from `self.input.mode`. With the envelope above, the App only *renders*
 /// a step it was handed — and the loop that moves between these steps is moved by
 /// its own worker, inside `BeadsSession`, not by anything upstream.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The transition *into* one of these is not chosen here: see
+/// [`StepCause`](crate::session::beads::StepCause), which is where the machine's
+/// table lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BeadStep {
     AwaitInput,
     CreateTickets,
     WorkTickets,
+}
+
+impl BeadStep {
+    /// The one step that hands the keyboard back to the human.
+    ///
+    /// This predicate — not the step itself — is what the UI needs: the input box
+    /// opens on "is it my turn", and two different steps that both mean "you may
+    /// type" must not need their own `matches!` at every call site. The beads
+    /// session and the view both ask it through here, so the answer cannot drift
+    /// between them (looprs-6ol: one place per decision, and that place is testable
+    /// without a subprocess).
+    pub fn awaits_user(self) -> bool {
+        matches!(self, Self::AwaitInput)
+    }
 }
 
 /// Everything a session needs in order to be started, injected so tests can point
@@ -303,15 +351,15 @@ fn default_shell_bin() -> String {
     // An override is honored verbatim, even if it names a non-bash: it is also
     // how you point at a bash built somewhere unusual, and BashSession warns about
     // the non-bash case at spawn rather than silently misbehaving.
-    if let Ok(v) = std::env::var("LOOPRS_SHELL_BIN") {
-        if !v.is_empty() {
-            return v;
-        }
+    if let Ok(v) = std::env::var("LOOPRS_SHELL_BIN")
+        && !v.is_empty()
+    {
+        return v;
     }
-    if let Ok(s) = std::env::var("SHELL") {
-        if looks_like_bash(&s) {
-            return s;
-        }
+    if let Ok(s) = std::env::var("SHELL")
+        && looks_like_bash(&s)
+    {
+        return s;
     }
     for cand in ["/bin/bash", "/opt/homebrew/bin/bash", "/usr/local/bin/bash"] {
         if std::path::Path::new(cand).exists() {
@@ -374,6 +422,13 @@ pub trait Session: Send {
     /// The id this session was spawned with, unchanged until it dies.
     fn id(&self) -> SessionId;
 
+    /// The mode this session is the backend for.
+    ///
+    /// A convenience over `id().mode`. The router keys everything by
+    /// [`SessionId`] and never asks a session for its mode, so this is the test
+    /// surface for "the factory gave me the mode I asked for" (and for the
+    /// lying-factory refusal).
+    #[allow(dead_code)] // consumers: spawn/factory tests; routing is by `SessionId`
     fn mode(&self) -> TerminalType {
         self.id().mode
     }
@@ -432,11 +487,6 @@ pub trait Session: Send {
 
     /// Liveness for the status row and for input gating.
     fn status(&self) -> SessionStatus;
-
-    /// Convenience for `App`: is this session doing something right now?
-    fn is_running(&self) -> bool {
-        self.status().is_busy()
-    }
 }
 
 #[cfg(test)]
@@ -493,5 +543,119 @@ mod tests {
         assert_eq!(TerminalType::Bash.switch_away_policy(), KeepRunning);
         assert_eq!(TerminalType::Pi.switch_away_policy(), KeepRunning);
         assert_eq!(TerminalType::Beeds.switch_away_policy(), DrainThenPark);
+    }
+
+    /// The input box opens on one step and no other. Asserted here, on the step
+    /// itself, because two different types (the beads session and the view) ask
+    /// this question and must not answer it twice in two places.
+    #[test]
+    fn only_await_input_hands_the_keyboard_back_to_the_human() {
+        assert!(BeadStep::AwaitInput.awaits_user());
+        assert!(
+            !BeadStep::CreateTickets.awaits_user(),
+            "a planning loop owns the keyboard, not the user"
+        );
+        assert!(
+            !BeadStep::WorkTickets.awaits_user(),
+            "a working loop owns the keyboard, not the user"
+        );
+    }
+
+    /// **The mode table, pure and with no subprocess** (looprs-6ol: "the mode
+    /// table (Bash/Beeds/Pi x Tab)").
+    ///
+    /// Tab is a permutation, not a suggestion. Asserted as the table itself, then
+    /// as the properties the table has to have, so a change to `next()` that
+    /// breaks the cycle fails with the row named rather than in somebody's muscle
+    /// memory: a Tab that lands on the mode you were already on reads as a dropped
+    /// keystroke, and a Tab that skips a mode reads as a lost session.
+    #[test]
+    fn tab_walks_the_whole_mode_table_and_back_to_where_it_started() {
+        use TerminalType::*;
+        let table = [(Bash, Beeds), (Beeds, Pi), (Pi, Bash)];
+
+        // Every row of the table is what `next()` actually does.
+        for (from, to) in table {
+            assert_eq!(
+                from.next(),
+                to,
+                "Tab from {} goes to {}",
+                from.label(),
+                to.label()
+            );
+        }
+
+        // It is one 3-cycle, not three separate hops: each mode is exactly one
+        // source and exactly one target, and none of them is a fixed point.
+        for mode in TerminalType::ALL {
+            let as_source = table.iter().filter(|(f, _)| *f == mode).count();
+            let as_target = table.iter().filter(|(_, t)| *t == mode).count();
+            assert_eq!(
+                (as_source, as_target),
+                (1, 1),
+                "{mode:?} is not one-in-one-out of the Tab table"
+            );
+            assert_ne!(
+                mode.next(),
+                mode,
+                "Tab from {mode:?} must actually change mode"
+            );
+        }
+
+        // Three Tabs is exactly one lap, from anywhere: no early close, no drift.
+        for start in TerminalType::ALL {
+            let mut m = start;
+            for _ in 0..2 {
+                m = m.next();
+                assert_ne!(m, start, "the cycle closed early from {start:?}");
+            }
+            m = m.next();
+            assert_eq!(m, start, "three Tabs from {start:?} must land back on it");
+        }
+
+        // The table and `ALL` describe the same three modes, once each — so a
+        // fourth mode cannot be added to the enum without a row here.
+        let mut from_table: Vec<String> = table.iter().map(|(f, _)| format!("{f:?}")).collect();
+        let mut all: Vec<String> = TerminalType::ALL.iter().map(|m| format!("{m:?}")).collect();
+        from_table.sort();
+        all.sort();
+        assert_eq!(from_table, all, "the Tab table does not cover `ALL`");
+    }
+
+    /// **The mode x Tab x policy table.** What `Tab` does *to* the mode it leaves
+    /// is per-mode policy (ADR-0002 Q3), and it is the row a future change has to
+    /// answer for. Asserted as one row per mode, with the coverage count spelled
+    /// out: three modes, three rows, no missing cell.
+    #[test]
+    fn every_row_of_the_mode_table_names_where_tab_goes_and_what_it_leaves_behind() {
+        use SwitchAway::*;
+        use TerminalType::*;
+        let table = [
+            // mode,   Tab goes to, what leaving it does
+            (Beeds, Pi, DrainThenPark),
+            (Pi, Bash, KeepRunning),
+            (Bash, Beeds, KeepRunning),
+        ];
+
+        assert_eq!(
+            table.len(),
+            TerminalType::ALL.len(),
+            "the table must have exactly one row per mode"
+        );
+        for (mode, target, policy) in table {
+            assert_eq!(mode.next(), target, "Tab target for {mode:?}");
+            assert_eq!(
+                mode.switch_away_policy(),
+                policy,
+                "switch-away policy for {mode:?}"
+            );
+        }
+        // Only Beads is `DrainThenPark`: it is the mode that spends money on its
+        // own, so it is the only one that must stop starting things while hidden.
+        let parking: Vec<TerminalType> = TerminalType::ALL
+            .into_iter()
+            .filter(|m| m.switch_away_policy() == DrainThenPark)
+            .collect();
+        assert_eq!(parking, vec![Beeds], "only the self-advancing mode parks");
     }
 }

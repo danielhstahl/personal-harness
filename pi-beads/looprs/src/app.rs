@@ -11,7 +11,7 @@ use crate::session::view::SessionView;
 use crate::session::{
     ActiveBead, ByteStream, ChatState, ExitReason, SessionId, SessionStatus, TerminalType,
 };
-use crate::state::state::MessageKind;
+use crate::state::transcript::MessageKind;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::text::Line;
 use serde::Deserialize;
@@ -56,6 +56,13 @@ pub enum Msg {
     /// buffer, not a line — do not re-split it.
     BashOutput {
         session: SessionId,
+        /// Kept because the envelope has to be able to say *which* pipe a byte came
+        /// from even though today's only producer (a pty) cannot tell them apart.
+        /// Consumed by looprs-guh, which wants stderr lines marked as such in the
+        /// status row; until then the transcript deliberately prints one merged
+        /// stream, because inventing a split the backend cannot back up is worse
+        /// than not having one.
+        #[allow(dead_code)] // consumer: looprs-guh (status row marks stderr distinctly)
         stream: ByteStream,
         chunk: String,
     },
@@ -142,10 +149,7 @@ pub enum UiCommand {
     /// added on the way. This is the half of the screen problem that the
     /// "`Esc` means `0x03`" mapping cannot be separated from (looprs-4hv): one
     /// without the other leaves vim reading interrupts where it expects keys.
-    Keys {
-        mode: TerminalType,
-        bytes: Vec<u8>,
-    },
+    Keys { mode: TerminalType, bytes: Vec<u8> },
     /// The real terminal changed shape.
     ///
     /// Not user intent — an environment fact — but the Router is the only thing
@@ -170,6 +174,15 @@ fn print_json_value_to_string(v: &Value) -> String {
 // `ChatState` now lives in `session::view` — it describes one session's live
 // region, not the app's. It is imported above rather than re-declared here.
 /// Only fields you consume are declared; everything else in the record is skipped.
+///
+/// Where a field is parsed but **nothing renders it yet**, it carries its own
+/// `#[allow(dead_code)]` with the reason it stays (looprs-6ol's warning-gate rule:
+/// a dead-code allow is allowed only when it is individually justified, never
+/// blanket). The reason is almost always the same one and it is a real one: this
+/// enum *is* the harness's record of pi's RPC wire format, and a field that is
+/// written down here is a field a later ticket cannot silently misread as absent.
+/// Deleting them would make the next protocol-facing ticket a reverse-engineering
+/// exercise; keeping them is documentation that the compiler otherwise cannot see.
 #[derive(Debug, Deserialize)]
 #[serde(
     tag = "type",
@@ -183,6 +196,11 @@ pub enum PiEvent {
     TurnStart,
     TurnEnd,
     MessageStart {
+        /// pi says a message began; it has no text in it yet, and the transcript is
+        /// built from the authoritative `message_end` record. Parsed so that
+        /// "a message started" stays a distinguishable event from "a message
+        /// arrived" once the live region needs it (looprs-guh's streaming cursor).
+        #[allow(dead_code)] // consumer: looprs-guh (live region wants start-of-message)
         message: WireMessage,
     },
     MessageUpdate {
@@ -196,6 +214,14 @@ pub enum PiEvent {
         tool_name: String,
         args: Value,
     },
+    /// A tool's partial output. Nothing renders in-place tool updates yet: the card
+    /// is drawn at `ToolExecutionStart` and rewritten at `ToolExecutionEnd`.
+    ///
+    /// * `tool_call_id` — which card to update, needed the moment updates repaint
+    ///   instead of being appended (looprs-guh's live tool preview);
+    /// * `partial_result` — the streamed output itself, same content the end record
+    ///   carries, so nothing is lost by not printing it here.
+    #[allow(dead_code)] // consumer: looprs-guh (in-place tool card repaint)
     ToolExecutionUpdate {
         tool_call_id: String,
         partial_result: ToolOutput,
@@ -205,26 +231,46 @@ pub enum PiEvent {
         result: ToolOutput,
         is_error: bool,
     },
+    /// pi is retrying a failed request on its own. None of this is displayed yet,
+    /// and every one of the four fields is something the user needs to know is
+    /// happening rather than watching a frozen transcript (looprs-guh: "is it
+    /// working or is it hung?").
+    #[allow(dead_code)] // consumer: looprs-guh (retry shown as a status, not silence)
     AutoRetryStart {
         attempt: u32,
         max_attempts: u32,
         delay_ms: u64,
         error_message: String,
     },
+    /// As [`PiEvent::AutoRetryStart`]: the outcome of pi's own retry ladder. The
+    /// transcript currently treats a successful retry as invisible, which is fine
+    /// for a run that recovers and terrible for one that does not — hence kept.
+    #[allow(dead_code)] // consumer: looprs-guh (retry outcome, esp. `final_error`)
     AutoRetryEnd {
         success: bool,
         #[serde(default)]
         final_error: Option<String>,
     },
+    /// Context compaction began. Until the UI can say "compacting…" (looprs-guh)
+    /// this arrives as an unexplained pause, which is the bug class the ticket is
+    /// about — so the reason is parsed and kept, not dropped.
+    #[allow(dead_code)] // consumer: looprs-guh ("compacting: <reason>")
     CompactionStart {
         reason: String,
     },
+    /// Compaction finished, was aborted, or failed. `aborted`/`error_message` are
+    /// the two things a user must not have to guess about.
+    #[allow(dead_code)] // consumer: looprs-guh (aborted/failed compaction is loud)
     CompactionEnd {
         #[serde(default)]
         aborted: bool,
         #[serde(default)]
         error_message: Option<String>,
     },
+    /// An extension in the pi child raised. Not the harness's fault, but it is the
+    /// harness's screen, so the path and the message are recorded now that the
+    /// status row exists to put them in (looprs-guh).
+    #[allow(dead_code)] // consumer: looprs-guh (extension errors are surfaced, not swallowed)
     ExtensionError {
         extension_path: String,
         error: String,
@@ -239,6 +285,14 @@ pub struct WireMessage {
 }
 
 /// The nested `assistantMessageEvent` of `message_update` (delta-only on the wire).
+///
+/// Every `content_index` here is the index of the content block inside the
+/// assistant message. Nothing reads it yet because the transcript assumes one
+/// stream per message; the moment a message has a text block *and* a tool call
+/// block side by side, that index is what keeps the two from being appended into
+/// each other. It is written down now, per variant, for exactly that reason — and
+/// each allow below says what it is waiting for (looprs-6ol: individually justified,
+/// never blanket).
 #[derive(Debug, Deserialize)]
 #[serde(
     tag = "type",
@@ -247,44 +301,76 @@ pub struct WireMessage {
 )]
 pub enum AssistantEvent {
     Start,
+    /// Block N began. Nothing draws a per-block cursor yet (looprs-guh's live
+    /// region), so the index is unread.
+    #[allow(dead_code)] // consumer: looprs-guh (per-block live region)
     TextStart {
         content_index: usize,
     },
+    /// The visible stream: this delta is what gets printed. The index beside it is
+    /// unread for the same one-block-per-message reason as above.
     TextDelta {
+        #[allow(dead_code)] // consumer: looprs-guh (which block this delta belongs to)
         content_index: usize,
         delta: String,
     },
+    /// `content` is read (the authoritative block text, tee'd by the beads
+    /// planner's "last words"); the index still isn't.
     TextEnd {
+        #[allow(dead_code)] // consumer: looprs-guh (which block ended)
         content_index: usize,
         content: String,
     },
+    /// Thinking is parsed and deliberately not shown. Both fields unread today:
+    /// the transcript prints answers, not reasoning. Kept because "pi is thinking"
+    /// is the single most useful thing a status row can say while a run is open.
+    #[allow(dead_code)] // consumer: looprs-guh ("thinking…" while a run is open)
     ThinkingStart {
         content_index: usize,
     },
+    #[allow(dead_code)] // consumer: looprs-guh (thinking stream, if ever surfaced)
     ThinkingDelta {
         content_index: usize,
         delta: String,
     },
+    #[allow(dead_code)] // consumer: looprs-guh (the finished thinking block)
     ThinkingEnd {
         content_index: usize,
         content: String,
     },
+    /// The tool call inside the assistant's own stream. The card the user sees is
+    /// built from the top-level `ToolExecutionStart`, which carries the same
+    /// identity; this variant is the assistant-side view of it, and is kept so the
+    /// two can be correlated when the live region (looprs-guh) renders calls as
+    /// they are minted rather than when they run.
+    #[allow(dead_code)] // consumer: looprs-guh (tool call as the model writes it)
     ToolcallStart {
         content_index: usize,
         id: String,
         tool_name: String,
     },
+    /// Partial argument JSON. Printing half-written JSON is worse than printing
+    /// nothing until the call lands, so it is parsed, unread, and available.
+    #[allow(dead_code)] // consumer: looprs-guh (streaming args, once renderable)
     ToolcallDelta {
         content_index: usize,
         delta: String,
     }, // serialized (partial) argument JSON
+    #[allow(dead_code)] // consumer: looprs-guh (the completed call object)
     ToolcallEnd {
         content_index: usize,
         tool_call: Value,
     },
+    /// Why the assistant stopped (stop / end_turn / length / …). Unread today; a
+    /// run that ended for `length` looks exactly like one that finished, which is
+    /// precisely the distinction looprs-guh exists to make.
+    #[allow(dead_code)] // consumer: looprs-guh ("ended early: <reason>")
     Done {
         reason: String,
     },
+    /// The assistant-side error. Surfacing is the status row's job (looprs-guh);
+    /// until that row exists the harness deliberately does not half-report it.
+    #[allow(dead_code)] // consumer: looprs-guh (assistant errors are shown, not hidden)
     Error {
         reason: String,
     },
@@ -672,9 +758,10 @@ impl App {
         // take back are exactly the two that were never the child's to take.
         if self.passthrough() {
             if let Some(bytes) = crate::screen::key_bytes(k) {
-                let _ = self
-                    .cmd_tx
-                    .try_send(UiCommand::Keys { mode: self.active, bytes });
+                let _ = self.cmd_tx.try_send(UiCommand::Keys {
+                    mode: self.active,
+                    bytes,
+                });
             }
             return;
         }
@@ -847,9 +934,9 @@ mod tests {
         });
 
         assert!(text_of(&app, TerminalType::Beeds).contains("beads answer"));
-        assert!(text_of(&app, TerminalType::Beeds).contains("pi answer") == false);
+        assert!(!text_of(&app, TerminalType::Beeds).contains("pi answer"));
         assert!(text_of(&app, TerminalType::Pi).contains("pi answer"));
-        assert!(text_of(&app, TerminalType::Pi).contains("beads answer") == false);
+        assert!(!text_of(&app, TerminalType::Pi).contains("beads answer"));
     }
 
     /// `need_input` follows the ACTIVE view, not the beads machine: a beads pass
@@ -1414,10 +1501,7 @@ mod tests {
             session: bash_id(),
             active: true,
         });
-        assert!(
-            app.passthrough(),
-            "the active Bash session owns the screen"
-        );
+        assert!(app.passthrough(), "the active Bash session owns the screen");
 
         app.update(Msg::BashOutput {
             session: bash_id(),
@@ -1544,7 +1628,10 @@ mod tests {
             session: bash_id(),
             active: true,
         });
-        assert!(!app.reanchor, "taking the screen over is not a reason to resize");
+        assert!(
+            !app.reanchor,
+            "taking the screen over is not a reason to resize"
+        );
         app.update(Msg::ScreenHeld {
             session: bash_id(),
             active: false,

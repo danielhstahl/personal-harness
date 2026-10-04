@@ -77,14 +77,16 @@ pub fn queued_text(resp: &Value) -> Vec<String> {
 }
 
 impl PiRpc {
-    /// Spawns `pi` and returns the client plus a stream of every non-response
-    /// message (agent events, extension UI requests, ...). Events stay as `Value` so protocol
-    /// additions never break parsing;
-    pub fn spawn(extra_args: &[&str]) -> Result<(Self, mpsc::UnboundedReceiver<Value>)> {
-        Self::spawn_with("pi", extra_args)
-    }
-
-    /// Same as [`PiRpc::spawn`] but with an explicit executable (fakes in tests).
+    /// Spawn `bin` in `--mode rpc` and return the client plus a stream of every
+    /// non-response message (agent events, extension UI requests, ...).
+    ///
+    /// Events stay as `Value` so protocol additions never break parsing, and the
+    /// executable is a parameter rather than a hardcoded `"pi"`: every caller in
+    /// this repo goes through `SessionConfig::pi_bin` (overridable with
+    /// `$LOOPRS_PI_BIN`), which is the seam the fake-`pi` tests are built on. A
+    /// no-argument `spawn("pi")` convenience existed here once; nothing called it,
+    /// and anything that did would have been untestable for the reason the parameter
+    /// exists.
     pub fn spawn_with(
         bin: &str,
         extra_args: &[&str],
@@ -124,13 +126,12 @@ impl PiRpc {
                 let Ok(v) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
-                if v["type"] == "response" {
-                    if let Some(id) = v["id"].as_str() {
-                        if let Some(tx) = p.lock().unwrap().txs.remove(id) {
-                            let _ = tx.send(v);
-                            continue;
-                        }
-                    }
+                if v["type"] == "response"
+                    && let Some(id) = v["id"].as_str()
+                    && let Some(tx) = p.lock().unwrap().txs.remove(id)
+                {
+                    let _ = tx.send(v);
+                    continue;
                 }
                 if ev_tx.send(v).is_err() {
                     break;

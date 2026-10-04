@@ -286,6 +286,12 @@ enum BashCmd {
     /// size, not a virtual 80x24.
     Resize { rows: u16, cols: u16 },
     /// Test seam: ack once every command queued before this one is handled.
+    ///
+    /// Only [`BashSession::quiesce`] ever sends one, which makes it unreachable in
+    /// the binary and load-bearing in the test suite: without it every lifecycle
+    /// assertion in `bash::tests` would be a sleep, and a sleep is a test that
+    /// passes on a fast machine for the wrong reason.
+    #[allow(dead_code)] // consumer: BashSession::quiesce (test seam)
     Sync(oneshot::Sender<()>),
     /// The app is exiting.
     Shutdown,
@@ -981,6 +987,7 @@ impl BashSession {
 
     /// Test seam: returns once every command queued before this call has been
     /// fully handled.
+    #[allow(dead_code)] // consumer: bash::tests (deterministic lifecycle, no sleeps)
     pub async fn quiesce(&self) -> bool {
         let (tx, rx) = oneshot::channel();
         if self.cmd.send(BashCmd::Sync(tx)).is_err() {
@@ -989,14 +996,6 @@ impl BashSession {
         tokio::time::timeout(Duration::from_secs(15), rx)
             .await
             .is_ok()
-    }
-
-    /// Ask the shell to interrupt whatever it is running. Distinct from
-    /// [`Session::abort`] only in that a test can name what it is asking for.
-    pub fn interrupt(&self) -> Result<()> {
-        self.cmd
-            .send(BashCmd::Interrupt)
-            .map_err(|_| anyhow!("bash session task is gone"))
     }
 }
 
@@ -1416,7 +1415,7 @@ mod tests {
     async fn esc_says_cancelling_before_the_command_reports_itself_done() {
         let (mut s, mut rx) = bash(22);
         s.send_text("sleep 30".into()).unwrap();
-        wait_running(&mut s).await;
+        wait_running(&s).await;
         drain(&mut rx);
 
         let started = std::time::Instant::now();
@@ -1424,8 +1423,7 @@ mod tests {
         // Well inside both the one-second bar and the grace, so whatever arrives
         // here arrived because the session said it, not because the shell did.
         let got =
-            crate::testing::collect_within(&mut rx, Duration::from_millis(800), |ev| describe(ev))
-                .await;
+            crate::testing::collect_within(&mut rx, Duration::from_millis(800), describe).await;
         let ack = got
             .iter()
             .position(|l| l.starts_with("system: cancelling") && l.contains("sleep 30"));
@@ -1456,7 +1454,7 @@ mod tests {
     async fn a_command_that_traps_the_interrupt_is_reported_not_silently_wedged() {
         let (mut s, mut rx) = bash(23);
         s.send_text("trap '' INT; sleep 30".into()).unwrap();
-        wait_running(&mut s).await;
+        wait_running(&s).await;
 
         s.abort().unwrap();
         assert!(s.quiesce().await, "the Esc was handled");
@@ -1465,8 +1463,7 @@ mod tests {
         // Not early: reporting a stall before the grace would cry wolf at a
         // command that was still on its way out.
         let early =
-            crate::testing::collect_within(&mut rx, Duration::from_millis(500), |ev| describe(ev))
-                .await;
+            crate::testing::collect_within(&mut rx, Duration::from_millis(500), describe).await;
         assert!(
             early.iter().all(|l| !l.contains("still running")),
             "escalated before the grace was up: {early:?}"
@@ -1493,8 +1490,7 @@ mod tests {
         s.abort().unwrap();
         assert!(s.quiesce().await, "the second Esc was handled");
         let again =
-            crate::testing::collect_within(&mut rx, Duration::from_millis(800), |ev| describe(ev))
-                .await;
+            crate::testing::collect_within(&mut rx, Duration::from_millis(800), describe).await;
         assert!(
             again
                 .iter()

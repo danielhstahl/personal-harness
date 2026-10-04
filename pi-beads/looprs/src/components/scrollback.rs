@@ -1,8 +1,8 @@
 // scrollback.rs
 use crate::{
     components::tool::tool_line,
-    state::state::{Entry, MessageKind, Transcript},
-    theme::theme::{content_width, restyle, style_for},
+    state::transcript::{Entry, MessageKind, Transcript},
+    theme::styles::{content_width, restyle, style_for},
     utils::md,
 };
 use ratatui::style::Style;
@@ -134,7 +134,9 @@ impl Cursor {
             self.scan += nl + 1;
         }
         if e.done && self.scan < e.text.len() {
-            out.push(Line::from(e.text[self.scan..].trim_end_matches('\r').to_string()));
+            out.push(Line::from(
+                e.text[self.scan..].trim_end_matches('\r').to_string(),
+            ));
             self.scan = e.text.len();
         }
         out

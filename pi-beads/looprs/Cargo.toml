@@ -29,3 +29,15 @@ portable-pty = "0.9.0"
 
 [lints.cargo]
 unused_dependencies = "allow"
+
+# The warning gate is configured in the manifest, not only in the invocation, so a
+# warning cannot be walked past on the assumption that whoever ran clippy forgot
+# `-D warnings` (looprs-6ol). `clippy::all` is the standard warn set (correctness,
+# style, complexity, perf); denying it here means `cargo clippy` alone is a gate.
+#
+# The exceptions are *not* declared here. They are per-item `#[allow(dead_code)]`s
+# in the source, each carrying the reason it stays and the thing that will read it —
+# the policy is written out in the "Dead code" section of `src/session/mod.rs`,
+# and `./scripts/check.sh` is the command that keeps the list honest.
+[lints.clippy]
+all = { level = "deny", priority = -1 }

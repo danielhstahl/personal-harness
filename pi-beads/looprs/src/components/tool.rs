@@ -5,8 +5,8 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
-use crate::state::state::{Entry, MessageKind};
-use crate::utils::utils::FRAMES;
+use crate::state::transcript::{Entry, MessageKind};
+use crate::utils::render::FRAMES;
 
 pub fn tool_line(e: &Entry, spinner: usize) -> Line<'static> {
     let MessageKind::Tool {

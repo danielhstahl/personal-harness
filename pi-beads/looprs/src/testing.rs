@@ -33,7 +33,7 @@ pub enum PiFake {
     DiesImmediately,
     /// A stateful chat child: streams a turn, remembers the conversation it was
     /// given, and holds each run open until [`Fakes::settle`] (see
-    /// [`chat_pi_script`]). This is the one the Pi terminal state tests drive.
+    /// [`Fakes::settle`]). This is the one the Pi terminal state tests drive.
     Chat,
 }
 
@@ -88,10 +88,7 @@ impl Fakes {
         let pi_bin = dir.join("pi");
         let bd_bin = dir.join("bd");
 
-        let script = match pi {
-            PiFake::Chat => chat_pi_script(),
-            _ => pi_script(&pi_log, pi),
-        };
+        let script = pi_script(&pi_log, pi);
         write_script(&pi_bin, &script);
         write_script(
             &bd_bin,
@@ -344,14 +341,33 @@ fn write_script(path: &Path, body: &str) {
     }
 }
 
+/// The fake binaries live under `tests/fixtures/`, as real files rather than string
+/// literals (looprs-6ol: "keep the fixtures under `tests/`"). They are programs —
+/// bash and python, a hundred-plus lines each — and a program inside a Rust string
+/// literal cannot be linted, syntax-checked, diffed readably, or opened in an
+/// editor without quoting soup.
+///
+/// `include_str!` rather than a runtime read: a missing or renamed fixture is a
+/// compile error at the place that needs it, not a spawn failure in whichever test
+/// happens to get there first.
+const FAKE_PI: &str = include_str!("../tests/fixtures/fake_pi.sh");
+const FAKE_PI_DIES: &str = include_str!("../tests/fixtures/fake_pi_dies.sh");
+const FAKE_PI_CHAT: &str = include_str!("../tests/fixtures/fake_pi_chat.py");
+const FAKE_BD: &str = include_str!("../tests/fixtures/fake_bd.sh");
+
+/// Build the fake `pi` for one personality out of the fixtures.
+///
+/// The personality is a token rather than a separate file because the three of them
+/// differ only in the one line that answers a prompt, and three copies of a script
+/// that drift apart is worse than one template.
 fn pi_script(log: &Path, mode: PiFake) -> String {
-    let log = log.display();
-    let head = format!("#!/usr/bin/env bash\nset -u\nLOG={log}\n");
+    let log = log.display().to_string();
     match mode {
-        // The chat fake is a different program entirely (see `chat_pi_script`);
-        // `Fakes::new` never routes here for it.
-        PiFake::Chat => unreachable!("the chat fake is built by chat_pi_script"),
-        PiFake::DiesImmediately => format!("{head}echo \"spawn pid=$$\" >>\"$LOG\"\nexit 1\n"),
+        // The chat fake is a whole program of its own; it needs no tokens because it
+        // finds its own state next to its own file.
+        PiFake::Chat => FAKE_PI_CHAT.to_string(),
+        // This one logs its pid and leaves; there is no reply to build.
+        PiFake::DiesImmediately => FAKE_PI_DIES.replace("{{LOG}}", &log),
         PiFake::Started | PiFake::Handled | PiFake::Rejects => {
             let reply = match mode {
                 PiFake::Started => {
@@ -364,208 +380,18 @@ fn pi_script(log: &Path, mode: PiFake) -> String {
                     "printf '{\"type\":\"response\",\"id\":\"%s\",\"command\":\"prompt\",\"success\":false,\"error\":\"fake pi refused the prompt\"}\\n' \"$id\""
                 }
             };
-            format!(
-                r#"{head}echo "spawn pid=$$ args=$*" >>"$LOG"
-while IFS= read -r line; do
-  case "$line" in
-    *'"type":"prompt"'*)
-      echo "prompt $line" >>"$LOG"
-      id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-      {reply}
-      ;;
-    *)
-      echo "cmd $line" >>"$LOG"
-      ;;
-  esac
-done
-"#
-            )
+            FAKE_PI.replace("{{LOG}}", &log).replace("{{REPLY}}", reply)
         }
     }
 }
 
-/// A stateful fake `pi --mode rpc`, in python because it needs real concurrency:
-/// it must keep reading commands *while* a run is in flight, which is exactly when
-/// a test wants to `steer`, `Esc`, or `kill -9` it.
+/// Build the fake `bd` for one personality out of `tests/fixtures/fake_bd.sh`.
 ///
-/// Three properties the Pi terminal state tests depend on, and nothing else:
-///
-/// * **It remembers.** Every prompt lands in this process's own memory, and the
-///   answer to turn N quotes turns 1..N-1. A client that spawned a child per
-///   message would get an empty `<memory=>` on turn 2, which is the persistence
-///   claim under test, falsifiable.
-/// * **A run is held open** until the test touches `settle` next to this script,
-///   so the test can act *during* a run rather than after it.
-/// * **`abort` stops the held run** and settles it, the way pi unwinds.
-///
-/// It logs one line per command (`recv <verb> <args>`) so command *order* is
-/// assertable — `clear_queue` before `abort` is not a detail.
-fn chat_pi_script() -> String {
-    r###"#!/usr/bin/env python3
-import json, os, sys, threading, time
-
-HERE = os.path.dirname(os.path.realpath(__file__))
-LOG = os.path.join(HERE, "pi.log")
-SETTLE = os.path.join(HERE, "settle")
-# When this marker exists, `abort` is answered but the run keeps going: the shape
-# of a child that traps the cancel rather than honouring it (Fakes::stubborn_pi).
-STUBBORN = os.path.join(HERE, "stubborn")
-# A run never stays open forever: a test that forgets to settle is a hung test.
-MAX_HOLD = float(os.environ.get("LOOPRS_FAKE_HOLD", "20"))
-
-out_lock = threading.Lock()
-log_lock = threading.Lock()
-st_lock = threading.Lock()
-
-memory = []        # prompts this process has seen == its only context
-queued = []        # steering / follow-up text, in queue order
-state = {"turns": 0}
-
-
-def log(msg):
-    with log_lock:
-        with open(LOG, "a") as f:
-            f.write(msg + "\n")
-
-
-def one_line(s):
-    """Flatten a message so one command is one log line.
-
-    `Fakes::pi_prompts()` reads this log *by line*. A real planner prompt is a
-    multi-line block of instructions, and a raw newline through this path splits
-    `"prompt " + msg` into a `"prompt "` line and an orphan — which makes every
-    assertion about what the harness actually sent to the planner quietly useless.
-    Only newlines are escaped, so plain substring assertions still match.
-    """
-    return s.replace("\r", " ").replace("\n", "\\n")
-
-
-def emit(obj):
-    with out_lock:
-        sys.stdout.write(json.dumps(obj) + "\n")
-        sys.stdout.flush()
-
-
-def response(rid, command, data=None, success=True, error=None):
-    rec = {"type": "response", "command": command, "success": success}
-    if rid is not None:
-        rec["id"] = rid
-    if data is not None:
-        rec["data"] = data
-    if error is not None:
-        rec["error"] = error
-    emit(rec)
-
-
-def run_turn(n, user_text, answer, aborted):
-    """Stream one assistant turn the way pi does, then hold it open."""
-    emit({"type": "agent_start"})
-    emit({"type": "turn_start"})
-    emit({"type": "message_start", "message": {"role": "user", "content": user_text}})
-    emit({"type": "message_end", "message": {"role": "user", "content": user_text}})
-    emit({"type": "message_start", "message": {"role": "assistant", "content": []}})
-    emit({"type": "message_update", "assistantMessageEvent":
-          {"type": "text_delta", "contentIndex": 0, "delta": answer}})
-    emit({"type": "message_update", "assistantMessageEvent":
-          {"type": "text_end", "contentIndex": 0, "content": answer}})
-    emit({"type": "message_end", "message": {"role": "assistant", "content": []}})
-    emit({"type": "turn_end", "message": {"role": "assistant"}, "toolResults": []})
-
-    deadline = time.time() + MAX_HOLD
-    while time.time() < deadline:
-        if aborted["hit"]:
-            break
-        if os.path.exists(SETTLE):
-            try:
-                os.remove(SETTLE)
-            except OSError:
-                pass
-            break
-        time.sleep(0.01)
-
-    emit({"type": "agent_end", "messages": [], "willRetry": False})
-    emit({"type": "agent_settled"})
-    log("aborted turn %d" % n if aborted["hit"] else "settled turn %d" % n)
-
-
-def main():
-    log("spawn pid=%d args=%s" % (os.getpid(), " ".join(sys.argv[1:])))
-    while True:
-        line = sys.stdin.readline()
-        if not line:
-            break
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            cmd = json.loads(line)
-        except ValueError:
-            continue
-        kind = cmd.get("type")
-        rid = cmd.get("id")
-        msg = cmd.get("message", "")
-        log("recv %s %s" % (kind, one_line(msg)))
-
-        if kind == "prompt":
-            # Also logged in the pre-existing "prompt <text>" shape so the shared
-            # `pi_prompts()` reader works for both fakes.
-            log("prompt " + one_line(msg))
-            with st_lock:
-                prior = list(memory)
-                memory.append(msg)
-                state["turns"] += 1
-                n = state["turns"]
-            # The answer's memory is the whole trick: it can only be non-empty if
-            # the same child process that heard turn 1 is still here.
-            answer = "reply %d <memory=%s>" % (n, "|".join(prior))
-            response(rid, "prompt", {"disposition": "started"})
-            aborted = {"hit": False}
-            t = threading.Thread(target=run_turn, args=(n, msg, answer, aborted), daemon=True)
-            t.start()
-            live.append(aborted)
-        elif kind == "steer":
-            with st_lock:
-                queued.append(msg)
-            response(rid, "steer", {"disposition": "queued"})
-        elif kind == "follow_up":
-            with st_lock:
-                queued.append(msg)
-            response(rid, "follow_up", {"disposition": "queued"})
-        elif kind == "clear_queue":
-            with st_lock:
-                taken = list(queued)
-                del queued[:]
-            response(rid, "clear_queue", {"steering": taken, "followUp": []})
-        elif kind == "abort":
-            # Tell every open run to unwind, then answer like pi does: abort waits
-            # for the session to become idle. Under the `stubborn` marker the
-            # answer still goes back but nothing is told to unwind, which is how a
-            # cancelled-but-uncancellable run actually presents.
-            if not os.path.exists(STUBBORN):
-                for a in list(live):
-                    a["hit"] = True
-                del live[:]
-            response(rid, "abort")
-        elif kind == "get_state":
-            response(rid, "get_state", {"isStreaming": len(live) > 0,
-                                        "messageCount": len(memory)})
-        else:
-            response(rid, kind, success=False,
-                     error="fake pi: unknown command %r" % kind)
-
-
-live = []
-main()
-"###
-    .to_string()
-}
-
-/// The fake `bd`: records every command line, then answers each verb from a file
-/// the test can rewrite.
-///
-/// Written in bash and file-driven for the same reason the rest of the fakes are:
-/// the assertions are about what the *harness* asked for, in what order, and a
-/// mock that only supports one verb cannot answer "did it claim before prompting?"
+/// The personality table below is the only thing that varies; the script itself is
+/// the fixture. Note that the substituted strings are *bash program text*, because
+/// the fake's job is to answer each verb like a different `bd` would, and a verb
+/// that has to fail differently per personality (`exit 3` vs `cat the board` vs
+/// "not json at all") is a program-level answer, not a value.
 fn bd_script(
     log: &Path,
     board: &Path,
@@ -594,41 +420,13 @@ fn bd_script(
             "exit 0".into(),
         ),
     };
-    format!(
-        r#"#!/usr/bin/env bash
-set -u
-echo "bd $*" >>"{log}"
-# Mid-run failure lever: see `Fakes::fail_bd`. Checked per invocation, so a test
-# can flip the board's health between two reads of the same pass.
-if [ -e "{fail_mark}" ]; then
-  echo "fake bd: failing on request (fail marker set)" >&2
-  exit 3
-fi
-verb="${{1:-}}"
-# A refused claim is its own failure mode, distinct from "bd is down": reads still
-# work, only `--claim` says no. Exit 4 so the two are not confusable.
-case "$verb" in
-  update)
-    if [ -e "{refuse_mark}" ]; then
-      echo "fake bd: cannot claim: already claimed by another owner" >&2
-      exit 4
-    fi
-    ;;
-esac
-case "$verb" in
-  ready|list) {read_cmd} ;;
-  show) {show_cmd} ;;
-  update|create|close) {write_cmd} ;;
-  *) echo "fake bd: unsupported verb $verb" >&2; exit 2 ;;
-esac
-"#,
-        log = log.display(),
-        fail_mark = fail_mark.display(),
-        refuse_mark = refuse_mark.display(),
-        read_cmd = read_cmd,
-        show_cmd = show_cmd,
-        write_cmd = write_cmd,
-    )
+    FAKE_BD
+        .replace("{{LOG}}", &log.display().to_string())
+        .replace("{{FAIL_MARK}}", &fail_mark.display().to_string())
+        .replace("{{REFUSE_MARK}}", &refuse_mark.display().to_string())
+        .replace("{{READ_CMD}}", &read_cmd)
+        .replace("{{SHOW_CMD}}", &show_cmd)
+        .replace("{{WRITE_CMD}}", &write_cmd)
 }
 
 /// Is this pid still a live process (not a reaped one)?

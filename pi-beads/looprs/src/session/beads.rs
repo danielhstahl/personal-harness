@@ -100,8 +100,8 @@ use crate::services::bd::{Bead, BeadStatus, claim_with, list_status_with, ready_
 use crate::services::pi::PiRpc;
 use crate::services::prompts::{PLANNER, WORKER, generate_prompt};
 use crate::session::{
-    ActiveBead, BeadStep, ExitReason, Session, SessionConfig, SessionEvent, SessionId, SessionStatus,
-    Spawned, cancel,
+    ActiveBead, BeadStep, ExitReason, Session, SessionConfig, SessionEvent, SessionId,
+    SessionStatus, Spawned, cancel,
 };
 use serde_json::Value;
 
@@ -133,6 +133,11 @@ enum BeadsCmd {
     /// retired says nothing about the one in flight.
     WorkerGone { serial: u64 },
     /// Test seam: ack once every command queued before this one is fully handled.
+    ///
+    /// Only [`BeadsSession::quiesce`] sends one; the loop itself never needs to
+    /// ask itself. Needed because the beads machine is driven by another task's
+    /// events, so "the loop has caught up" is otherwise unobservable.
+    #[allow(dead_code)] // consumer: BeadsSession::quiesce (test seam)
     Sync(oneshot::Sender<()>),
     /// App is exiting: reap the worker and report the session gone.
     Shutdown,
@@ -176,14 +181,135 @@ struct BeadsTask {
     stall_reported: bool,
 }
 
+// ---------------------------------------------------------------------------------
+// The decision layer, kept pure (looprs-6ol).
+//
+// Every condition that decides *whether the beads loop may act* is a plain function
+// of plain arguments here, not an inline `if` inside an `async fn`. That is the
+// whole point:
+//
+// * A condition inside an `async fn` can only be exercised by whatever state the
+//   test's trajectory happens to reach, so "the guard holds when the mode is
+//   hidden" ends up being a claim about that one test rather than about the guard.
+//   A function of four bools can be enumerated, and enumeration is what turns "we
+//   tested one path" into "the table has one yes-row and fifteen no-rows".
+// * These guards are the money-safety story. One pass at a time; a claim before any
+//   spawn; a cancel that cannot fire twice; a stall timer that cannot answer for a
+//   pass it did not arm. Each is a handful of boolean operators, and each one being
+//   wrong is a bill or a killed worker.
+//
+// The `async` half of this file stays what it always was — an interpreter that reads
+// these answers and then does the thing.
+// ---------------------------------------------------------------------------------
+
+/// The four flags in front of [`BeadsLoop::next`], as a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PassGate {
+    /// Has the beads mode ever been entered?
+    started: bool,
+    /// Is the mode off-screen ([`SwitchAway::DrainThenPark`])?
+    parked: bool,
+    /// Is a pass in flight that has not been reported as settled?
+    streaming: bool,
+    /// Is a pass wanted?
+    pending: bool,
+}
+
+impl PassGate {
+    /// May the loop start a pass right now?
+    ///
+    /// Exactly one of the sixteen rows says yes — the tests enumerate all of them.
+    /// Each conjunct is a thing that used to go wrong: `started` (a mode nobody
+    /// entered must not run), `!parked` (a hidden mode must not spend),
+    /// `!streaming` (never two passes at once), `pending` (nothing was asked for).
+    const fn allows(self) -> bool {
+        self.pending && self.started && !self.parked && !self.streaming
+    }
+}
+
+/// Why the beads step machine moved.
+///
+/// The loop names a *cause* at every transition and the step is computed from it
+/// ([`StepCause::step`]), so the table exists once instead of being re-implied at
+/// six call sites. A caller cannot put the machine somewhere its own story does not
+/// justify: there is no `set_step(anything)`, only `set_step(why)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepCause {
+    /// A human typed an instruction into the beads box, and the planner is
+    /// starting. Deliberately the *only* cause that enters `CreateTickets`: a Tab,
+    /// a settle, or a timer never plans on somebody's behalf.
+    Planning,
+    /// A bead was claimed and a worker is running it.
+    Working,
+    /// The loop is waiting for a human: parked, board empty, claim refused, plan
+    /// unverifiable, child died, pass cancelled. Several stories, one step, because
+    /// the human's next move is the same in all of them — type something.
+    Awaiting,
+}
+
+impl StepCause {
+    /// The transition function.
+    ///
+    /// Total and pure: a cause always has exactly one destination, and none of them
+    /// depend on anything outside the argument (which is why the loop's own step is
+    /// not an input — see the test that pins the canonical cycle
+    /// `AwaitInput → CreateTickets → WorkTickets → AwaitInput`).
+    pub const fn step(self) -> BeadStep {
+        match self {
+            StepCause::Planning => BeadStep::CreateTickets,
+            StepCause::Working => BeadStep::WorkTickets,
+            StepCause::Awaiting => BeadStep::AwaitInput,
+        }
+    }
+
+    /// Every cause. Test-only on purpose: production gets its exhaustiveness from
+    /// the `match` above, and the test needs the list to walk the table.
+    #[cfg(test)]
+    pub const ALL: [StepCause; 3] = [StepCause::Planning, StepCause::Working, StepCause::Awaiting];
+}
+
+/// Can this `Esc` be acted on, or is one already in progress?
+///
+/// A second `Esc` while the first is still unwinding is dropped: the worker has
+/// already been told to stop, and stacking another `abort` on the same run buys
+/// nothing and re-arms a stall timer that is already armed. Once the stall *has*
+/// been reported the answer flips — that is what makes the user's next `Esc`
+/// mean "try again" instead of being swallowed forever (ADR-0003).
+fn abort_is_redundant(aborted: bool, stall_reported: bool) -> bool {
+    aborted && !stall_reported
+}
+
+/// Is this stall timer still the live one?
+///
+/// Four ways a timer arrives that must not be answered, and every one of them is a
+/// real race rather than a hypothetical:
+///
+/// * `!aborted` — nothing was cancelled; a stale timer from a previous attempt.
+/// * `stall_reported` — this stall has already been said once; the escalation is
+///   one sentence, not an alarm that repeats.
+/// * `armed != attempt` — the user pressed `Esc` again, so a *newer* attempt owns
+///   the deadline now, and the old timer must be unable to kill the new pass.
+/// * (the worker serial is checked at the call site, one level down, where the
+///   pass itself is identified.)
+fn stall_timer_is_live(aborted: bool, stall_reported: bool, armed: u32, attempt: u32) -> bool {
+    aborted && !stall_reported && armed == attempt
+}
+
 impl BeadsTask {
     /// The single door to [`BeadsLoop::next`].
     async fn run_pending(&mut self) {
-        if self.pending && self.started && !self.parked && !self.streaming {
-            self.pending = false;
-            self.inner.next().await;
-            self.streaming = self.inner.has_live_worker();
+        let gate = PassGate {
+            started: self.started,
+            parked: self.parked,
+            streaming: self.streaming,
+            pending: self.pending,
+        };
+        if !gate.allows() {
+            return;
         }
+        self.pending = false;
+        self.inner.next().await;
+        self.streaming = self.inner.has_live_worker();
     }
 
     /// Is `serial` the pass this loop is actually running right now?
@@ -231,7 +357,8 @@ impl BeadsTask {
                 // The worker handed this ticket to a human. The rest of the board
                 // is still ours, so the loop goes on — with the skip on the record.
                 PassOutcome::LeftForHuman(claim, status) => {
-                    self.inner.report_system(left_for_human_note(&claim, status));
+                    self.inner
+                        .report_system(left_for_human_note(&claim, status));
                 }
                 PassOutcome::NotClosed(claim, status) => {
                     self.park_after(None, Some(&not_closed_note(&claim, status)))
@@ -314,7 +441,7 @@ impl BeadsTask {
     /// or not", and the next pass reaps it at its own boundary). A pass that was
     /// cancelled or died has no following pass to do that reaping, so the park has
     /// to — a beads loop parked on top of a live child is the idle-child trap this
-    /// loop was rewritten to avoid. `set_step(AwaitInput)` is what hands the input
+    /// loop was rewritten to avoid. `set_step(Awaiting)` is what hands the input
     /// box back.
     async fn park_after(&mut self, note: Option<&str>, error: Option<&str>) {
         self.aborted = false;
@@ -325,7 +452,7 @@ impl BeadsTask {
         } else if let Some(text) = note {
             self.inner.report_system(text.to_string());
         }
-        self.inner.set_step(BeadStep::AwaitInput);
+        self.inner.set_step(StepCause::Awaiting);
     }
 
     /// `Esc`. Tell the worker to stop, and remember that we did.
@@ -338,7 +465,7 @@ impl BeadsTask {
     fn abort_pass(&mut self) {
         // Already aborting and the attempt is still live: the first abort is on
         // its way, and stacking a second one on the same run buys nothing.
-        if self.aborted && !self.stall_reported {
+        if abort_is_redundant(self.aborted, self.stall_reported) {
             return;
         }
         let Some(serial) = self.inner.abort_worker() else {
@@ -385,7 +512,12 @@ impl BeadsTask {
         // Not ours unless this attempt is still the live one: the settle may have
         // landed first, or the user may have Esc'd again and a newer attempt owns
         // the deadline now.
-        if !self.aborted || self.stall_reported || self.abort_attempt != attempt {
+        if !stall_timer_is_live(
+            self.aborted,
+            self.stall_reported,
+            self.abort_attempt,
+            attempt,
+        ) {
             return;
         }
         if self.inner.worker_serial() != Some(serial) {
@@ -433,6 +565,7 @@ pub struct BeadsSession {
     /// `status` is. Nothing outside the task may write it, which keeps the loop's
     /// state single-owner while still letting the status row (looprs-guh) say *which*
     /// pass is running — and letting a test settle against a serial it did not make up.
+    #[allow(dead_code)] // read via BeadsSession::in_flight (looprs-guh + tests)
     in_flight: Arc<StdMutex<Option<u64>>>,
 }
 
@@ -492,7 +625,7 @@ impl BeadsSession {
                         if let Err(e) = task.inner.launch_create_tickets(&text).await {
                             tracing::error!("planner pass failed: {e:#}");
                             task.inner.report_error(format!("planner: {e:#}"));
-                            task.inner.set_step(BeadStep::AwaitInput);
+                            task.inner.set_step(StepCause::Awaiting);
                         }
                     }
                     // This command *is* the settle signal for the pass that made
@@ -547,6 +680,7 @@ impl BeadsSession {
     /// The pass this session has in flight right now, `None` when nothing is
     /// running. A snapshot taken from outside the task, so it is only as fresh as
     /// the last command the task finished — see [`Self::quiesce`].
+    #[allow(dead_code)] // consumers: beads::tests; looprs-guh (which pass is running)
     pub fn in_flight(&self) -> Option<u64> {
         *self.in_flight.lock().unwrap()
     }
@@ -554,6 +688,7 @@ impl BeadsSession {
     /// Test seam: returns once every command queued before this call has been
     /// fully handled by the session's task. Makes lifecycle assertions
     /// deterministic instead of sleep-based.
+    #[allow(dead_code)] // consumer: beads::tests (deterministic lifecycle, no sleeps)
     pub async fn quiesce(&self) -> bool {
         let (tx, rx) = oneshot::channel();
         if self.cmd.send(BeadsCmd::Sync(tx)).is_err() {
@@ -689,6 +824,7 @@ enum PlanCheck {
 /// "the only thing left is one I already burned a pass on" are different
 /// sentences and the human's next action differs: wait for instructions, or go
 /// close the ticket.
+#[derive(Debug)]
 enum Pick {
     /// Work this one.
     Work(Bead),
@@ -775,17 +911,36 @@ impl BeadsLoop {
         }
     }
 
-    pub fn set_step(&mut self, s: BeadStep) {
-        self.bead_step = s.clone(); // keep the field private
-        let _ = self.ev_tx.send(SessionEvent::BeadStep(s));
+    /// Move the machine, naming why.
+    ///
+    /// There is deliberately no `set_step(BeadStep)`: a caller cannot put the loop
+    /// somewhere its own story does not justify, and the step is looked up in one
+    /// place ([`StepCause::step`]) rather than decided six times. Every emitted
+    /// [`SessionEvent::BeadStep`] therefore arrived through the same table the
+    /// tests enumerate.
+    pub fn set_step(&mut self, cause: StepCause) {
+        let next = cause.step();
+        self.bead_step = next;
+        let _ = self.ev_tx.send(SessionEvent::BeadStep(next));
     }
 
+    /// The step the machine is on, as the machine sees it.
+    ///
+    /// The UI never calls this: it renders the [`SessionEvent::BeadStep`] it was
+    /// handed and must not re-derive the step (looprs-msj). This is the loop's own
+    /// state, exposed so a test can assert a transition happened instead of
+    /// inferring one from a transcript.
+    #[allow(dead_code)] // consumers: beads::tests; the UI renders the event, never this
     pub fn get_step(&self) -> &BeadStep {
         &self.bead_step
     }
 
+    /// As [`Self::get_step`], in the one question the loop is actually asked:
+    /// "is a human's turn now?" — and through [`BeadStep::awaits_user`], so the
+    /// loop and the view cannot disagree about what "my turn" means.
+    #[allow(dead_code)] // consumers: beads::tests; the UI asks its own view
     pub fn is_awaiting_input(&self) -> bool {
-        matches!(self.bead_step, BeadStep::AwaitInput)
+        self.bead_step.awaits_user()
     }
 
     /// Is there a worker process behind this loop? This is the check that makes
@@ -813,12 +968,12 @@ impl BeadsLoop {
             Ok(WorkerPass::Idle) => {
                 tracing::debug!("board empty, awaiting input");
                 self.report_system("beads: board empty, awaiting input".to_string());
-                self.set_step(BeadStep::AwaitInput);
+                self.set_step(StepCause::Awaiting);
             }
             Err(e) => {
                 tracing::error!("beads worker pass failed: {e:#}");
                 self.report_error(format!("beads: {e:#}"));
-                self.set_step(BeadStep::AwaitInput);
+                self.set_step(StepCause::Awaiting);
             }
         }
     }
@@ -877,7 +1032,7 @@ impl BeadsLoop {
 
         self.pi_rx = Some(worker);
         self.report_system(format!("beads: working {}", claim.id));
-        self.set_step(BeadStep::WorkTickets);
+        self.set_step(StepCause::Working);
         Ok(WorkerPass::Working)
     }
 
@@ -991,10 +1146,9 @@ impl BeadsLoop {
                 if let PiEvent::MessageUpdate {
                     assistant_message_event: AssistantEvent::TextEnd { content, .. },
                 } = &ev
+                    && !content.trim().is_empty()
                 {
-                    if !content.trim().is_empty() {
-                        *said.lock().unwrap() = content.clone();
-                    }
+                    *said.lock().unwrap() = content.clone();
                 }
                 let settled = matches!(ev, PiEvent::AgentSettled);
                 if render.send(SessionEvent::Agent(ev)).is_err() {
@@ -1048,12 +1202,19 @@ impl BeadsLoop {
         if self.claim == claim {
             return;
         }
-        let _ = self.ev_tx.send(SessionEvent::ActiveBead { bead: claim.clone() });
+        let _ = self.ev_tx.send(SessionEvent::ActiveBead {
+            bead: claim.clone(),
+        });
         self.claim = claim;
     }
 
-    /// The ticket this loop holds, if any. Read by the post-settle check to say
-    /// *which* ticket it is reporting on.
+    /// The ticket this loop holds, if any.
+    ///
+    /// The post-settle check reads the field directly (`self.claim.clone()`), so
+    /// this accessor has no caller inside the binary: it is the way a test asks the
+    /// loop what it is accountable for, which is exactly the thing looprs-w7q was
+    /// filed to make knowable.
+    #[allow(dead_code)] // consumers: beads::tests (the claim is the assertion)
     pub fn claim(&self) -> Option<&ActiveBead> {
         self.claim.as_ref()
     }
@@ -1124,7 +1285,7 @@ impl BeadsLoop {
         let args = vec!["--tools", "read,bash"];
         let worker = self.spawn_worker(&args)?;
         let said = worker.said.clone();
-        self.set_step(BeadStep::CreateTickets);
+        self.set_step(StepCause::Planning);
         let prompt = generate_prompt(PLANNER, instructions);
         let disposition = worker.rpc.prompt(&prompt).await?;
         if disposition == "handled" {
@@ -1205,9 +1366,7 @@ impl BeadsLoop {
         };
         match show_with(&self.cfg.bd_bin, &claim.id).await {
             Ok(Some(bead)) if bead.is_closed() => PassOutcome::Closed(claim),
-            Ok(Some(bead)) if bead.needs_human() => {
-                PassOutcome::LeftForHuman(claim, bead.status())
-            }
+            Ok(Some(bead)) if bead.needs_human() => PassOutcome::LeftForHuman(claim, bead.status()),
             Ok(Some(bead)) => PassOutcome::NotClosed(claim, bead.status()),
             // `bd` has never heard of the ticket we are holding. That is not
             // "closed", any more than an empty phone book is "nobody is sick".
@@ -1444,7 +1603,6 @@ mod tests {
 
     /// One event, described as a stable string so a failing assertion prints
     /// something readable instead of four nested enums.
-
     fn describe(m: &SessionEvent) -> String {
         match m {
             SessionEvent::BeadStep(BeadStep::AwaitInput) => "step:await".into(),
@@ -1452,9 +1610,7 @@ mod tests {
             SessionEvent::BeadStep(BeadStep::WorkTickets) => "step:work".into(),
             // The claim, as the UI is told it: which ticket the loop holds, and
             // when it lets go of it.
-            SessionEvent::ActiveBead {
-                bead: Some(bead),
-            } => format!("active:{}", bead.id),
+            SessionEvent::ActiveBead { bead: Some(bead) } => format!("active:{}", bead.id),
             SessionEvent::ActiveBead { bead: None } => "active:-".into(),
             SessionEvent::Error(text) => format!("error: {text}"),
             SessionEvent::System(text) => format!("system: {text}"),
@@ -1803,7 +1959,12 @@ mod tests {
     /// pass to run when the user comes back.
     #[tokio::test]
     async fn switching_away_drains_then_parks_and_resuming_never_double_spawns() {
-        let fakes = Fakes::new("park", PiFake::Started, BdFake::ShowStatus, ONE_BEADED_BOARD);
+        let fakes = Fakes::new(
+            "park",
+            PiFake::Started,
+            BdFake::ShowStatus,
+            ONE_BEADED_BOARD,
+        );
         let (mut s, _rx) = beads(&fakes, 2);
 
         s.set_active(true).unwrap();
@@ -2096,8 +2257,7 @@ mod tests {
         // words — but the fake unwinds quickly, so the park may land inside it
         // too, and the assertions read the whole of it either way.
         let mut got =
-            crate::testing::collect_within(&mut rx, Duration::from_millis(800), |ev| describe(&ev))
-                .await;
+            crate::testing::collect_within(&mut rx, Duration::from_millis(800), describe).await;
         let ack = got
             .iter()
             .position(|l| l.starts_with("system: cancelling") && l.contains("looprs-26r"));
@@ -2141,7 +2301,7 @@ mod tests {
         assert!(s.quiesce().await, "the Esc was handled");
         let late =
             crate::testing::collect_within(&mut rx, cancel::GRACE + Duration::from_secs(1), |ev| {
-                describe(&ev)
+                describe(ev)
             })
             .await;
         assert!(late.is_empty(), "an idle Esc made noise: {late:?}");
@@ -2181,7 +2341,7 @@ mod tests {
 
         let late =
             crate::testing::collect_within(&mut rx, cancel::GRACE + Duration::from_secs(6), |ev| {
-                describe(&ev)
+                describe(ev)
             })
             .await;
         assert!(
@@ -2707,7 +2867,8 @@ mod tests {
         );
         let msgs = drain(&mut rx);
         assert!(
-            msgs.iter().any(|m| m.contains("need a human") && m.contains("looprs-26r")),
+            msgs.iter()
+                .any(|m| m.contains("need a human") && m.contains("looprs-26r")),
             "the skip is said out loud, with the ticket named: {msgs:?}"
         );
     }
@@ -2744,7 +2905,8 @@ mod tests {
             "a worker handing a ticket to a human is not an error: {msgs:?}"
         );
         assert!(
-            msgs.iter().any(|m| m.contains("blocked") && m.contains("looprs-26r")),
+            msgs.iter()
+                .any(|m| m.contains("blocked") && m.contains("looprs-26r")),
             "the hand-off is on the record: {msgs:?}"
         );
         assert_eq!(fakes.pi_spawns(), 2, "the loop moved on to the next ticket");
@@ -2851,8 +3013,15 @@ mod tests {
             .filter(|m| m.contains("need a human"))
             .cloned()
             .collect::<Vec<_>>();
-        assert_eq!(said.len(), 1, "one note per pass, not one per skipped ticket: {msgs:?}");
-        assert!(said[0].contains("skip-1") && said[0].contains("skip-2"), "{said:?}");
+        assert_eq!(
+            said.len(),
+            1,
+            "one note per pass, not one per skipped ticket: {msgs:?}"
+        );
+        assert!(
+            said[0].contains("skip-1") && said[0].contains("skip-2"),
+            "{said:?}"
+        );
 
         assert!(
             matches!(
@@ -2885,12 +3054,12 @@ mod tests {
         let (mut l, _rx, _ctl) = loop_with(&fakes);
 
         timeout(NO_HANG, l.next()).await.unwrap();
-        let prompt = fakes
-            .pi_prompts()
-            .pop()
-            .expect("the worker was prompted");
+        let prompt = fakes.pi_prompts().pop().expect("the worker was prompted");
 
-        assert!(prompt.contains("looprs-26r"), "the concrete id is in the prompt: {prompt}");
+        assert!(
+            prompt.contains("looprs-26r"),
+            "the concrete id is in the prompt: {prompt}"
+        );
         assert!(
             prompt.contains("Beads loop never self-starts"),
             "and so is the title, so the worker knows what it is doing: {prompt}"
@@ -2961,5 +3130,343 @@ mod tests {
         assert_eq!(clipped.chars().count(), 11, "10 kept + the ellipsis");
         assert!(std::str::from_utf8(clipped.as_bytes()).is_ok());
         assert_eq!(clip("short", 100), "short");
+    }
+
+    // =========================================================================
+    // The decision layer, as tables (looprs-6ol).
+    //
+    // Nothing below this line spawns a process, reads a fake binary, or waits on a
+    // channel. These are the beads step machine and the claim / cancel guards
+    // enumerated as functions, which is the half the process-level tests above
+    // cannot do: those show that the loop *can* reach a state, and a trajectory
+    // only ever shows the one it took. A table says how many rows say yes, which is
+    // the only way to notice an extra one.
+    // =========================================================================
+
+    /// A loop with no fixtures. The bins point at `/bin/true` and nothing here
+    /// ever runs them: a test in this section that spawns a child has stopped
+    /// being a table test and should move back above.
+    fn bare_loop() -> (BeadsLoop, mpsc::UnboundedReceiver<SessionEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (ctl_tx, _ctl_rx) = mpsc::unbounded_channel::<BeadsCmd>();
+        let cfg = SessionConfig {
+            pi_bin: "/bin/true".into(),
+            bd_bin: "/bin/true".into(),
+            shell_bin: "/bin/true".into(),
+        };
+        (
+            BeadsLoop::new(SessionId::new(TerminalType::Beeds, 0), tx, ctl_tx, cfg),
+            rx,
+        )
+    }
+
+    fn bead_status_row(id: &str, status: BeadStatus) -> Bead {
+        bead_status(id, "a title, for the row that names it", status)
+    }
+
+    /// Everything this loop has announced on its event stream, concatenated.
+    fn spoken(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> String {
+        let mut out = String::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let SessionEvent::System(text) = ev {
+                out.push_str(&text);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// **The step table.** Every cause the machine accepts maps to exactly one
+    /// step, and the step it maps to is published, not just stored — the UI renders
+    /// the event and never re-derives the step (looprs-msj), so a transition that
+    /// updated the field without emitting would freeze the screen on the old step.
+    #[test]
+    fn every_step_cause_lands_on_one_step_and_says_so() {
+        let (mut l, mut rx) = bare_loop();
+        assert_eq!(*l.get_step(), BeadStep::AwaitInput, "a new loop waits");
+
+        let table = [
+            (StepCause::Planning, BeadStep::CreateTickets, "step:plan"),
+            (StepCause::Working, BeadStep::WorkTickets, "step:work"),
+            (StepCause::Awaiting, BeadStep::AwaitInput, "step:await"),
+        ];
+        for (cause, step, published) in table {
+            l.set_step(cause);
+            assert_eq!(
+                *l.get_step(),
+                step,
+                "set_step({cause:?}) stored the wrong step"
+            );
+            let ev = rx
+                .try_recv()
+                .expect("a transition must be published, not only remembered");
+            assert_eq!(
+                describe(&ev),
+                published,
+                "set_step({cause:?}) published something else"
+            );
+        }
+    }
+
+    /// **The cycle the ticket names**: `AwaitInput -> CreateTickets -> WorkTickets
+    /// -> AwaitInput`. Walked once end to end, from a real loop, in that order.
+    #[test]
+    fn the_machine_walks_await_plan_work_and_home_again() {
+        let (mut l, _rx) = bare_loop();
+        let lap = [StepCause::Planning, StepCause::Working, StepCause::Awaiting];
+        assert!(l.is_awaiting_input(), "one lap starts at the human");
+        for cause in lap {
+            l.set_step(cause);
+        }
+        assert!(
+            l.is_awaiting_input(),
+            "three causes, one lap, back where a human is needed: got {:?}",
+            l.get_step()
+        );
+    }
+
+    /// **No orphan states, no unmapped causes, no two causes claiming one state.**
+    /// The mapping is a bijection between the causes and the steps, which is what
+    /// makes "what is the loop doing" answerable in one word with no ambiguity.
+    #[test]
+    fn the_step_table_is_a_bijection_over_the_whole_enum() {
+        let produced: Vec<BeadStep> = StepCause::ALL.iter().map(|c| c.step()).collect();
+        assert_eq!(
+            produced.len(),
+            StepCause::ALL.len(),
+            "every cause must produce a step"
+        );
+        for step in [
+            BeadStep::AwaitInput,
+            BeadStep::CreateTickets,
+            BeadStep::WorkTickets,
+        ] {
+            assert!(
+                produced.contains(&step),
+                "{step:?} can never be reached: no cause produces it"
+            );
+        }
+        for (i, a) in StepCause::ALL.iter().enumerate() {
+            for (j, b) in StepCause::ALL.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        a.step(),
+                        b.step(),
+                        "{a:?} and {b:?} both claim {:?}; the UI could not tell them apart",
+                        a.step()
+                    );
+                }
+            }
+        }
+    }
+
+    /// **One pass at a time, as sixteen rows.** The gate in front of
+    /// `BeadsLoop::next` is four bools, so the whole thing fits in one loop, and
+    /// the assertion that matters is a *count*: exactly one row opens it. "We
+    /// tested parked-and-streaming" is one trajectory; sixteen is a proof there is
+    /// no fifth combination that sneaks a second pass out.
+    #[test]
+    fn the_pass_gate_has_exactly_one_open_row_in_sixteen() {
+        let no_yes = [false, true];
+        let mut rows = 0usize;
+        let mut open: Vec<PassGate> = Vec::new();
+        for &started in &no_yes {
+            for &parked in &no_yes {
+                for &streaming in &no_yes {
+                    for &pending in &no_yes {
+                        let g = PassGate {
+                            started,
+                            parked,
+                            streaming,
+                            pending,
+                        };
+                        rows += 1;
+                        if g.allows() {
+                            open.push(g);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            rows, 16,
+            "four flags means sixteen rows: the count is the test"
+        );
+        assert_eq!(open.len(), 1, "exactly one row may start a pass: {open:?}");
+        assert_eq!(
+            open[0],
+            PassGate {
+                started: true,
+                parked: false,
+                streaming: false,
+                pending: true,
+            },
+            "the one open row is: entered, visible, idle, and asked"
+        );
+    }
+
+    /// The same gate read one flag at a time, so a regression names the promise it
+    /// broke rather than just the boolean that flipped.
+    #[test]
+    fn each_flag_closes_the_pass_gate_by_itself() {
+        let open = PassGate {
+            started: true,
+            parked: false,
+            streaming: false,
+            pending: true,
+        };
+        assert!(open.allows(), "the reference row opens");
+        assert!(
+            !PassGate {
+                started: false,
+                ..open
+            }
+            .allows(),
+            "a mode nobody entered must not run"
+        );
+        assert!(
+            !PassGate {
+                parked: true,
+                ..open
+            }
+            .allows(),
+            "a hidden mode must not spend (DrainThenPark)"
+        );
+        assert!(
+            !PassGate {
+                streaming: true,
+                ..open
+            }
+            .allows(),
+            "never two passes at once"
+        );
+        assert!(
+            !PassGate {
+                pending: false,
+                ..open
+            }
+            .allows(),
+            "nothing was asked for"
+        );
+    }
+
+    /// **The cancel guard, all four rows.** `Esc` while a cancel is unwinding is
+    /// absorbed; `Esc` after the stall has been reported is a fresh try.
+    #[test]
+    fn esc_is_absorbed_while_a_cancel_is_unwinding_and_only_while() {
+        // (aborted, stall_reported, is the new Esc redundant?)
+        let table = [
+            (false, false, false, "idle: nothing to absorb"),
+            (true, false, true, "unwinding: swallow the second Esc"),
+            (
+                true,
+                true,
+                false,
+                "stalled and said: this Esc means 'again'",
+            ),
+            (
+                false,
+                true,
+                false,
+                "cannot be mid-stall without being aborted",
+            ),
+        ];
+        for (aborted, reported, redundant, why) in table {
+            assert_eq!(
+                abort_is_redundant(aborted, reported),
+                redundant,
+                "abort_is_redundant({aborted}, {reported}) — {why}"
+            );
+        }
+    }
+
+    /// **The stall timer's rows.** A timer is only ever answered for the attempt
+    /// that armed it: the user pressing `Esc` twice means attempt 2 is live, and a
+    /// late attempt-1 timer killing that pass would be the harness throwing away
+    /// work the user just asked for a second chance on. Enumerated rather than
+    /// reasoned about, because every row here is a real interleaving.
+    #[test]
+    fn a_stall_timer_only_answers_for_the_attempt_that_armed_it() {
+        let flags = [(false, false), (false, true), (true, false), (true, true)];
+        let timers = [(1, 1), (1, 2), (2, 1), (2, 2), (3, 1)];
+        let mut rows = 0usize;
+        let mut live_rows: Vec<(bool, bool, u32, u32)> = Vec::new();
+        for &(aborted, reported) in &flags {
+            for &(armed, timer) in &timers {
+                rows += 1;
+                let live = stall_timer_is_live(aborted, reported, armed, timer);
+                assert_eq!(
+                    live,
+                    aborted && !reported && armed == timer,
+                    "stall_timer_is_live({aborted}, {reported}, armed={armed}, timer={timer})"
+                );
+                if timer < armed {
+                    assert!(!live, "an older attempt's timer must never fire");
+                }
+                if live {
+                    live_rows.push((aborted, reported, armed, timer));
+                }
+            }
+        }
+        assert_eq!(rows, 20, "4 flag pairs x 5 timer pairs");
+        assert_eq!(
+            live_rows,
+            vec![(true, false, 1, 1), (true, false, 2, 2)],
+            "live means: aborted, not yet reported, and the timer carries the current attempt"
+        );
+    }
+
+    /// **The claim guard, without `bd`.** Same three rules the process-level tests
+    /// check through a fake board, read straight off the function that decides:
+    /// skip what needs a human (out loud), refuse what this loop already worked,
+    /// and treat an unknown status as workable.
+    #[test]
+    fn the_claim_guard_skips_refuses_and_works_in_that_order_pure() {
+        let (mut l, mut rx) = bare_loop();
+
+        // Nothing on the board is nothing to work — not an error, not a pass.
+        assert!(matches!(l.pick_bead(&[]), Pick::Nothing), "empty board");
+
+        // A blocked ticket is walked past and *named*: the human has to be able to
+        // see that the loop saw it.
+        let board = vec![
+            bead_status_row("looprs-blocked", BeadStatus::Blocked),
+            bead_status_row("looprs-workable", BeadStatus::Open),
+        ];
+        let pick = l.pick_bead(&board);
+        assert!(
+            matches!(pick, Pick::Work(ref b) if b.id() == "looprs-workable"),
+            "a blocked ticket must be skipped: {pick:?}"
+        );
+        let said = spoken(&mut rx);
+        assert!(
+            said.contains("looprs-blocked") && said.contains("need a human"),
+            "the skip has to be said out loud: {said}"
+        );
+
+        // The workable one has already had a pass spent on it: refused, never
+        // re-run, because `bd ready` hands the same bead back and every pass is
+        // billed (the runaway looprs-w7q was filed for).
+        l.worked.insert("looprs-workable".into());
+        let pick = l.pick_bead(&board);
+        assert!(
+            matches!(pick, Pick::AlreadyWorked(ref b) if b.id() == "looprs-workable"),
+            "a worked ticket must be refused, not re-bought: {pick:?}"
+        );
+
+        // A deferred ticket is the same story as a blocked one, and a ticket in a
+        // status this build cannot name is *workable*: skipping what we cannot
+        // classify would let a `bd` upgrade silently empty the board
+        // (looprs-037's conflation, one level up).
+        let deferred = vec![bead_status_row("looprs-defer", BeadStatus::Deferred)];
+        assert!(
+            matches!(l.pick_bead(&deferred), Pick::Nothing),
+            "a deferred-only board has nothing for a worker"
+        );
+        let unknown = vec![bead_status_row("looprs-newstatus", BeadStatus::Unknown)];
+        assert!(
+            matches!(l.pick_bead(&unknown), Pick::Work(ref b) if b.id() == "looprs-newstatus"),
+            "an unknown status is workable, never silently skipped"
+        );
     }
 }

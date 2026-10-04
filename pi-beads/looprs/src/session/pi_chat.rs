@@ -76,6 +76,11 @@ enum PiCmd {
     /// notice from one we already replaced cannot clobber the live one.
     StreamEnd { serial: u64 },
     /// Test seam: ack once every command queued before this one is handled.
+    ///
+    /// Only [`PiChatSession::quiesce`] sends one. The chat session has no other
+    /// way to answer "has my send actually reached the child yet?", and a test that
+    /// cannot ask that can only sleep.
+    #[allow(dead_code)] // consumer: PiChatSession::quiesce (test seam)
     Sync(oneshot::Sender<()>),
     /// The app is exiting.
     Shutdown,
@@ -345,7 +350,6 @@ impl PiChat {
             // "aborting" for a child that was never told.
             self.aborting = false;
             self.err(format!("cancel failed: {e}"));
-            return;
         }
     }
 
@@ -371,10 +375,10 @@ impl PiChat {
             "{} — killing it. The next message starts a new Pi session, and that conversation's context goes with the old child.",
             cancel::stalled("pi")
         ));
-        if let Some(child) = self.child.as_mut() {
-            if let Err(e) = child.rpc.kill().await {
-                tracing::warn!("{}: killing the stalled pi failed: {e:#}", self.id);
-            }
+        if let Some(child) = self.child.as_mut()
+            && let Err(e) = child.rpc.kill().await
+        {
+            tracing::warn!("{}: killing the stalled pi failed: {e:#}", self.id);
         }
         // Reap for the code (the log wants it), then report the death as what it
         // actually was: ours, on the user's instruction. The stream end that
@@ -617,6 +621,11 @@ impl PiChatSession {
 
     /// Test seam: returns once every command queued before this call has been
     /// fully handled.
+    ///
+    /// The Pi chat session is a child process with a task in front of it, so
+    /// "handled" and "sent" are different instants; every cancel/steer test needs
+    /// the former and nothing in the binary does.
+    #[allow(dead_code)] // consumer: pi_chat::tests (deterministic lifecycle, no sleeps)
     pub async fn quiesce(&self) -> bool {
         let (tx, rx) = oneshot::channel();
         if self.cmd.send(PiCmd::Sync(tx)).is_err() {
@@ -721,7 +730,12 @@ mod tests {
             // A pi chat session never holds a bead; if this shows up in this file's
             // test output, the event came from somewhere it should not have.
             SessionEvent::ActiveBead { bead } => {
-                format!("active_bead {}", bead.as_ref().map(|b| b.id.clone()).unwrap_or_else(|| "-".into()))
+                format!(
+                    "active_bead {}",
+                    bead.as_ref()
+                        .map(|b| b.id.clone())
+                        .unwrap_or_else(|| "-".into())
+                )
             }
             SessionEvent::BashOutput { chunk, .. } => format!("bash {chunk}"),
             // A pi chat session has no screen to take over; seeing this in test
@@ -1013,8 +1027,7 @@ mod tests {
         let started = Instant::now();
         s.abort().unwrap();
         let got =
-            crate::testing::collect_within(&mut rx, Duration::from_millis(800), |ev| describe(ev))
-                .await;
+            crate::testing::collect_within(&mut rx, Duration::from_millis(800), describe).await;
         let ack = got
             .iter()
             .position(|l| l == "system: cancelling the Pi run…");

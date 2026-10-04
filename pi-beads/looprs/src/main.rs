@@ -37,7 +37,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::session::router::{Router, SHUTDOWN_GRACE};
 use crate::session::{ChatState, SessionConfig, SessionStatus, TerminalType};
-use crate::state::state::Entry;
+use crate::state::transcript::Entry;
 
 fn init_logging() -> anyhow::Result<WorkerGuard> {
     //let dir = std::env::temp_dir(); // or a proper data dir, e.g. via the `dirs` crate

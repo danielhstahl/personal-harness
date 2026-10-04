@@ -457,7 +457,10 @@ mod tests {
         w.observe(b"\x1b[?1049h");
         let pieces = w.observe(b"line one\r\nline two\x1b[24;1Hstatus");
         assert_eq!(
-            pieces.iter().filter(|p| matches!(p, Piece::Change(_))).count(),
+            pieces
+                .iter()
+                .filter(|p| matches!(p, Piece::Change(_)))
+                .count(),
             0,
             "a held screen does not keep announcing itself"
         );
@@ -686,12 +689,18 @@ mod tests {
     /// insert mode, and `0x03` is not it.
     #[test]
     fn esc_is_esc_and_not_a_signal() {
-        assert_eq!(key_bytes(key(KeyCode::Esc, KeyModifiers::NONE)), Some(vec![0x1b]));
+        assert_eq!(
+            key_bytes(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(vec![0x1b])
+        );
     }
 
     #[test]
     fn ordinary_keys_become_the_bytes_the_terminal_would_have_sent() {
-        assert_eq!(key_bytes(key(KeyCode::Char('i'), KeyModifiers::NONE)), Some(b"i".to_vec()));
+        assert_eq!(
+            key_bytes(key(KeyCode::Char('i'), KeyModifiers::NONE)),
+            Some(b"i".to_vec())
+        );
         assert_eq!(
             key_bytes(key(KeyCode::Enter, KeyModifiers::NONE)),
             Some(vec![0x0d]),
@@ -701,7 +710,10 @@ mod tests {
             key_bytes(key(KeyCode::Backspace, KeyModifiers::NONE)),
             Some(vec![0x7f])
         );
-        assert_eq!(key_bytes(key(KeyCode::Tab, KeyModifiers::NONE)), Some(vec![0x09]));
+        assert_eq!(
+            key_bytes(key(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(vec![0x09])
+        );
         for (code, want) in [
             (KeyCode::Up, b"\x1b[A".to_vec()),
             (KeyCode::Down, b"\x1b[B".to_vec()),

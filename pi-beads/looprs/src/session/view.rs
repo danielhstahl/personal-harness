@@ -21,11 +21,11 @@
 use ratatui::text::Line;
 
 use super::SessionId;
-use crate::session::ActiveBead;
 use crate::components::scrollback::Flusher;
+use crate::session::ActiveBead;
 use crate::session::{BeadStep, SessionStatus};
-use crate::utils::utils::ControlStripper;
-use crate::state::state::{Entry, MessageKind, Transcript};
+use crate::state::transcript::{Entry, MessageKind, Transcript};
+use crate::utils::render::ControlStripper;
 
 /// Default cap on how much text an *inactive* view will hold.
 ///
@@ -207,12 +207,21 @@ impl SessionView {
     }
 
     /// The beads machine moved: record the step (status row) and gate input on it.
+    ///
+    /// The gate is [`BeadStep::awaits_user`], the same predicate the beads session
+    /// uses, so "the loop is waiting" and "the box may open" cannot drift apart
+    /// even though two different types are asking.
     pub fn set_step(&mut self, step: BeadStep) {
-        self.awaiting_user = matches!(step, BeadStep::AwaitInput);
+        self.awaiting_user = step.awaits_user();
         self.step = Some(step);
     }
 
     /// How many bytes of this view's output were dropped by the cap (status row).
+    ///
+    /// The counter is what makes an eviction honest rather than invisible; nothing
+    /// draws it until the status row exists (looprs-guh), and the tests assert both
+    /// the count and the message that quotes it.
+    #[allow(dead_code)] // consumers: view tests; looprs-guh ("N bytes dropped")
     pub fn dropped_bytes(&self) -> usize {
         self.dropped
     }

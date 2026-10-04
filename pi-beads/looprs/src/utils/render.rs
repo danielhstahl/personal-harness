@@ -56,11 +56,9 @@ impl ControlStripper {
                 StripState::Osc => {
                     if c == '\u{7}' {
                         self.state = StripState::Text;
-                    } else if c == '\u{1b}' {
-                        if chars.peek() == Some(&'\\') {
-                            chars.next();
-                            self.state = StripState::Text;
-                        }
+                    } else if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        self.state = StripState::Text;
                     }
                 }
             }

@@ -7,7 +7,7 @@
 //!    worker for hundreds of ms on a Dolt-backed board, which shows up as the
 //!    60 fps tick stuttering in `main.rs`.
 //! 2. **Never conflate "bd is broken" with "the board is empty".** Both are
-//!   `Result`s: an empty board is `Ok(vec![])`, a failing `bd` is
+//!    `Result`s: an empty board is `Ok(vec![])`, a failing `bd` is
 //!    [`BdError::Failed`] carrying the exit code *and* the captured stderr. The
 //!    difference is the whole reason the old code looked healthy while doing
 //!    nothing: `stderr(Stdio::null())` threw "bd: command not found" away and a
@@ -27,8 +27,8 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 use std::process::Stdio;
+use tokio::process::Command;
 
 /// Bound on any single `bd` invocation.
 ///
@@ -85,17 +85,18 @@ impl std::fmt::Display for BdError {
                 Ok(())
             }
             BdError::Malformed {
-                bin, args, reason, raw
+                bin,
+                args,
+                reason,
+                raw,
             } => write!(
                 f,
                 "`{bin} {args}` returned unreadable JSON: {reason} (got {:?})",
                 truncate(raw, 200)
             ),
-            BdError::Timeout { bin, args } => write!(
-                f,
-                "`{bin} {args}` did not answer within {:?}",
-                BD_TIMEOUT
-            ),
+            BdError::Timeout { bin, args } => {
+                write!(f, "`{bin} {args}` did not answer within {:?}", BD_TIMEOUT)
+            }
         }
     }
 }
@@ -369,6 +370,14 @@ pub async fn list_status_with(bin: &str, status: &str) -> Result<Vec<Bead>, BdEr
 }
 
 /// `bd show <id> --json` — one bead by id, `Ok(None)` if bd knows nothing of it.
+///
+/// The read of truth for the post-settle check in looprs-w7q: "the worker
+/// settled" and "the bead is closed" are different claims, and only `bd` can
+/// answer the second one, so the caller asks for the bead's current status here
+/// rather than trusting the worker's own last words.
+///
+/// `Ok(None)` — `bd` has never heard of this id — is *not* "closed". A claim on a
+/// bead that is not on the board is the least verifiable state there is.
 pub async fn show_with(bin: &str, id: &str) -> Result<Option<Bead>, BdError> {
     let found = beads(bin, &["show", id, "--json"]).await?;
     Ok(found.into_iter().find(|b| b.id == id))
@@ -384,25 +393,23 @@ pub async fn claim_with(bin: &str, id: &str) -> Result<(), BdError> {
     Ok(())
 }
 
-/// The read of truth for the post-settle check in looprs-w7q: "the worker
-/// settled" and "the bead is closed" are different claims, and only `bd` can
-/// answer the second one, so the caller asks [`show_with`] for the bead's current
-/// status rather than trusting the worker's own last words.
-///
-/// `Ok(None)` — `bd` has never heard of this id — is *not* "closed". A claim on a
-/// bead that is not on the board is the least verifiable state there is.
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::{BdFake, EMPTY_BOARD, Fakes, ONE_BEADED_BOARD};
 
-
     /// The three outcomes looprs-037 refuses to conflate, as three distinct tests.
     #[tokio::test]
     async fn an_empty_board_is_ok_with_nothing_in_it() {
-        let fakes = Fakes::new("bd-empty", crate::testing::PiFake::Started, BdFake::Ok, EMPTY_BOARD);
-        let beads = ready_with(fakes.bd_bin()).await.expect("empty is not an error");
+        let fakes = Fakes::new(
+            "bd-empty",
+            crate::testing::PiFake::Started,
+            BdFake::Ok,
+            EMPTY_BOARD,
+        );
+        let beads = ready_with(fakes.bd_bin())
+            .await
+            .expect("empty is not an error");
         assert!(beads.is_empty(), "an empty board must be Ok(vec![])");
     }
 
@@ -492,9 +499,7 @@ mod tests {
         let enveloped = r#"{"data":[{"id":"a-1","title":"T","status":"open","issue_type":"task"}],"schema_version":1}"#;
         let bare = r#"[{"id":"a-1","title":"T","status":"open","issue_type":"task"}]"#;
         for src in [enveloped, bare] {
-            let got: Vec<Bead> = serde_json::from_str::<BdList>(src)
-                .expect(src)
-                .into_vec();
+            let got: Vec<Bead> = serde_json::from_str::<BdList>(src).expect(src).into_vec();
             assert_eq!(got.len(), 1, "{src}");
             assert_eq!(got[0].id(), "a-1");
         }
@@ -545,7 +550,12 @@ mod tests {
     /// guard's "did the harness actually claim" assertion possible.
     #[tokio::test]
     async fn claim_runs_the_documented_command() {
-        let fakes = Fakes::new("bd-claim", crate::testing::PiFake::Started, BdFake::Ok, EMPTY_BOARD);
+        let fakes = Fakes::new(
+            "bd-claim",
+            crate::testing::PiFake::Started,
+            BdFake::Ok,
+            EMPTY_BOARD,
+        );
         claim_with(fakes.bd_bin(), "looprs-77").await.unwrap();
         assert!(
             fakes
@@ -604,16 +614,27 @@ mod tests {
             EMPTY_BOARD,
         );
         fakes.set_show(r#"{"id":"looprs-9","title":"t","status":"closed","issue_type":"task"}"#);
-        assert!(show_with(fakes.bd_bin(), "looprs-9").await.unwrap().is_some_and(|b| b.is_closed()));
+        assert!(
+            show_with(fakes.bd_bin(), "looprs-9")
+                .await
+                .unwrap()
+                .is_some_and(|b| b.is_closed())
+        );
         fakes.set_show(r#"{"id":"looprs-9","title":"t","status":"open","issue_type":"task"}"#);
         assert!(
-            !show_with(fakes.bd_bin(), "looprs-9").await.unwrap().is_some_and(|b| b.is_closed()),
+            !show_with(fakes.bd_bin(), "looprs-9")
+                .await
+                .unwrap()
+                .is_some_and(|b| b.is_closed()),
             "an un-closed bead must read as un-closed"
         );
         // A bead bd does not know about is not "closed": the harness must not
         // conclude the worker finished just because the lookup came back empty.
         assert!(
-            show_with(fakes.bd_bin(), "looprs-404").await.unwrap().is_none(),
+            show_with(fakes.bd_bin(), "looprs-404")
+                .await
+                .unwrap()
+                .is_none(),
             "an unknown bead is not closed"
         );
     }

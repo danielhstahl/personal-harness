@@ -1,6 +1,6 @@
 use crate::session::view::SessionView;
 
-use crate::utils::utils::FRAMES;
+use crate::utils::render::FRAMES;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;

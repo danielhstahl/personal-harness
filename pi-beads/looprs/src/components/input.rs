@@ -68,7 +68,7 @@ impl InputState {
         match k.code {
             KeyCode::Enter => {
                 let text = std::mem::take(&mut self.text);
-                (!text.trim().is_empty()).then(|| InputAction::Submit {
+                (!text.trim().is_empty()).then_some(InputAction::Submit {
                     text,
                     mode: self.mode,
                 })

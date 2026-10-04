@@ -77,7 +77,10 @@ pub fn wrap(id: SessionId, ev: SessionEvent) -> Msg {
             session: Some(id),
             text,
         },
-        SessionEvent::ScreenHeld { active } => Msg::ScreenHeld { session: id, active },
+        SessionEvent::ScreenHeld { active } => Msg::ScreenHeld {
+            session: id,
+            active,
+        },
         SessionEvent::Exited { reason } => Msg::SessionDown {
             session: id,
             reason,
@@ -146,10 +149,22 @@ impl Router {
         }
     }
 
+    /// Which mode is on screen.
+    ///
+    /// The router keeps this to itself while routing, so the binary has no caller;
+    /// it is the assertion surface for "Tab actually moved the address" (and the
+    /// status row, looprs-guh, wants the same answer).
+    #[allow(dead_code)] // consumers: router tests; looprs-guh (mode in the status row)
     pub fn active_mode(&self) -> TerminalType {
         self.active
     }
 
+    /// The live session for `mode`, if one has been built.
+    ///
+    /// "Is there a Pi session at all, and which incarnation is it?" — the
+    /// one-slot-per-mode and respawn tests are entirely about this, and the App has
+    /// no reason to look (it sends commands and lets the router address them).
+    #[allow(dead_code)] // consumers: router tests (one slot per mode, respawn identity)
     pub fn session(&self, mode: TerminalType) -> Option<&Managed> {
         self.sessions.get(&mode)
     }
@@ -162,6 +177,7 @@ impl Router {
     }
 
     /// For the status row: which modes have a live child right now (looprs-guh).
+    #[allow(dead_code)] // consumers: router tests; looprs-guh (the row is not wired yet)
     pub fn live_modes(&self) -> Vec<TerminalType> {
         let mut live: Vec<TerminalType> = self
             .sessions
@@ -333,10 +349,10 @@ impl Router {
             return Ok(());
         }
         let policy = from.switch_away_policy();
-        if let Some(m) = self.sessions.get_mut(&from) {
-            if let Err(e) = m.session.set_active(false) {
-                tracing::warn!(mode = ?from, ?policy, "set_active(false) failed: {e:#}");
-            }
+        if let Some(m) = self.sessions.get_mut(&from)
+            && let Err(e) = m.session.set_active(false)
+        {
+            tracing::warn!(mode = ?from, ?policy, "set_active(false) failed: {e:#}");
         }
         self.active = to;
         if let Err(e) = self.ensure(to) {
@@ -346,10 +362,10 @@ impl Router {
             });
             return Err(e);
         }
-        if let Some(m) = self.sessions.get_mut(&to) {
-            if let Err(e) = m.session.set_active(true) {
-                tracing::warn!(mode = ?to, "set_active(true) failed: {e:#}");
-            }
+        if let Some(m) = self.sessions.get_mut(&to)
+            && let Err(e) = m.session.set_active(true)
+        {
+            tracing::warn!(mode = ?to, "set_active(true) failed: {e:#}");
         }
         let id = self.sessions[&to].id;
         let _ = self.app_tx.send(Msg::System {
@@ -448,16 +464,15 @@ impl Router {
         );
         // A session born after the last resize would otherwise open at the default
         // size and stay there: the resize it needed was broadcast before it existed.
-        if let Some((rows, cols)) = self.last_size {
-            if let Err(e) = self
+        if let Some((rows, cols)) = self.last_size
+            && let Err(e) = self
                 .sessions
                 .get_mut(&mode)
                 .expect("just inserted")
                 .session
                 .resize(rows, cols)
-            {
-                tracing::warn!("{id} initial size {rows}x{cols} not applied: {e:#}");
-            }
+        {
+            tracing::warn!("{id} initial size {rows}x{cols} not applied: {e:#}");
         }
         // A replacement is said out loud, and it is said here, because nobody else
         // can. The new session does not know it is a replacement (it never had a

@@ -1,4 +1,4 @@
-use crate::state::state::MessageKind;
+use crate::state::transcript::MessageKind;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 
