@@ -142,10 +142,24 @@ impl BeadStatus {
         matches!(self, Self::Done | Self::Closed)
     }
 
-    /// "A worker could be pointed at this." Mirrors what `bd ready` promises, used
-    /// for the re-work guard in looprs-w7q.
-    pub fn is_workable(self) -> bool {
-        matches!(self, Self::Open | Self::InProgress | Self::Ready)
+    /// "A human took this out of the loop on purpose, and a worker must not put
+    /// itself back in."
+    ///
+    /// A `blocked` bead is waiting on somebody else; a `deferred` one has been
+    /// postponed. A pass spent on either buys a ticket that is neither closer nor
+    /// finished, so the loop skips them — and says so, because a silently skipped
+    /// ticket is indistinguishable from a lost one.
+    ///
+    /// `Unknown` is deliberately **not** in here: treating a status this build has
+    /// never seen as "needs a human" would let a `bd` upgrade silently drain the
+    /// board. Unknown beads stay workable; unknown *closures* are the conservative
+    /// side of the same rule (see [`BeadStatus::is_closed`]).
+    ///
+    /// This is the whole "may the worker take this?" question, expressed as a
+    /// refusal rather than as a whitelist of open/in_progress/ready: a whitelist
+    /// would silently exclude exactly the one case a newer `bd` can produce.
+    pub fn needs_human(self) -> bool {
+        matches!(self, Self::Blocked | Self::Deferred)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -232,6 +246,9 @@ impl Bead {
     }
     pub fn is_closed(&self) -> bool {
         self.status().is_closed()
+    }
+    pub fn needs_human(&self) -> bool {
+        self.status().needs_human()
     }
 }
 
@@ -367,12 +384,13 @@ pub async fn claim_with(bin: &str, id: &str) -> Result<(), BdError> {
     Ok(())
 }
 
-/// Is this bead closed? A read of truth for the post-settle check in looprs-w7q:
-/// "the worker settled" and "the bead is closed" are different claims, and only
-/// `bd` can answer the second one.
-pub async fn is_closed_with(bin: &str, id: &str) -> Result<bool, BdError> {
-    Ok(show_with(bin, id).await?.is_some_and(|b| b.is_closed()))
-}
+/// The read of truth for the post-settle check in looprs-w7q: "the worker
+/// settled" and "the bead is closed" are different claims, and only `bd` can
+/// answer the second one, so the caller asks [`show_with`] for the bead's current
+/// status rather than trusting the worker's own last words.
+///
+/// `Ok(None)` — `bd` has never heard of this id — is *not* "closed". A claim on a
+/// bead that is not on the board is the least verifiable state there is.
 
 #[cfg(test)]
 mod tests {
@@ -576,9 +594,9 @@ mod tests {
         );
     }
 
-    /// `is_closed` reads the board rather than trusting the worker's own report.
+    /// The post-settle read: the board's answer, not the worker's.
     #[tokio::test]
-    async fn is_closed_reads_the_truth_from_bd() {
+    async fn the_board_reads_as_the_truth_it_is_and_not_as_the_hope_it_isnt() {
         let fakes = Fakes::new(
             "bd-show",
             crate::testing::PiFake::Started,
@@ -586,18 +604,38 @@ mod tests {
             EMPTY_BOARD,
         );
         fakes.set_show(r#"{"id":"looprs-9","title":"t","status":"closed","issue_type":"task"}"#);
-        assert!(is_closed_with(fakes.bd_bin(), "looprs-9").await.unwrap());
+        assert!(show_with(fakes.bd_bin(), "looprs-9").await.unwrap().is_some_and(|b| b.is_closed()));
         fakes.set_show(r#"{"id":"looprs-9","title":"t","status":"open","issue_type":"task"}"#);
         assert!(
-            !is_closed_with(fakes.bd_bin(), "looprs-9").await.unwrap(),
+            !show_with(fakes.bd_bin(), "looprs-9").await.unwrap().is_some_and(|b| b.is_closed()),
             "an un-closed bead must read as un-closed"
         );
         // A bead bd does not know about is not "closed": the harness must not
         // conclude the worker finished just because the lookup came back empty.
         assert!(
-            !is_closed_with(fakes.bd_bin(), "looprs-404").await.unwrap(),
+            show_with(fakes.bd_bin(), "looprs-404").await.unwrap().is_none(),
             "an unknown bead is not closed"
         );
+    }
+
+    /// The two states the loop must not spend a pass on, and the ones it must not
+    /// mistake for them.
+    #[test]
+    fn blocked_and_deferred_are_the_humans_tickets_not_the_loops() {
+        assert!(BeadStatus::Blocked.needs_human());
+        assert!(BeadStatus::Deferred.needs_human());
+        for s in [
+            BeadStatus::Open,
+            BeadStatus::InProgress,
+            BeadStatus::Ready,
+            // An unfamiliar status is worked, not skipped: skipping it would let a
+            // `bd` upgrade quietly empty the board.
+            BeadStatus::Unknown,
+            BeadStatus::Done,
+            BeadStatus::Closed,
+        ] {
+            assert!(!s.needs_human(), "{s} is not a human-only ticket");
+        }
     }
 
     /// The old serialization fixture, kept working through the field changes.

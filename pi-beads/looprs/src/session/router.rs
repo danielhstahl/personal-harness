@@ -67,6 +67,7 @@ pub fn wrap(id: SessionId, ev: SessionEvent) -> Msg {
             chunk,
         },
         SessionEvent::BeadStep(step) => Msg::BeadStep { session: id, step },
+        SessionEvent::ActiveBead { bead } => Msg::ActiveBead { session: id, bead },
         SessionEvent::System(text) => Msg::System {
             session: Some(id),
             text,
@@ -529,6 +530,10 @@ mod tests {
                 Msg::Agent { session, .. } => format!("agent@{session}"),
                 Msg::BashOutput { session, .. } => format!("bash@{session}"),
                 Msg::BeadStep { session, step } => format!("step@{session} {step:?}"),
+                Msg::ActiveBead { session, bead } => format!(
+                    "active_bead@{session} {}",
+                    bead.map(|b| b.id).unwrap_or_else(|| "-".into())
+                ),
                 Msg::SessionDown { session, reason } => format!("down@{session} {reason:?}"),
                 // The full `SessionId` is in the string on purpose: the staleness
                 // tests look for a specific incarnation, and a bare mode label would

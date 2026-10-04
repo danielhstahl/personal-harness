@@ -8,7 +8,9 @@
 
 use crate::components::input::{InputAction, InputState};
 use crate::session::view::SessionView;
-use crate::session::{ByteStream, ChatState, ExitReason, SessionId, SessionStatus, TerminalType};
+use crate::session::{
+    ActiveBead, ByteStream, ChatState, ExitReason, SessionId, SessionStatus, TerminalType,
+};
 use crate::state::state::MessageKind;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::text::Line;
@@ -61,6 +63,13 @@ pub enum Msg {
     BeadStep {
         session: SessionId,
         step: BeadStep,
+    },
+    /// The ticket the beads loop holds right now, `None` when it holds none
+    /// (looprs-w7q). Rendered, never re-derived — see
+    /// [`SessionEvent::ActiveBead`](crate::session::SessionEvent::ActiveBead).
+    ActiveBead {
+        session: SessionId,
+        bead: Option<ActiveBead>,
     },
     /// A session's child is gone. Guaranteed exactly once per session, so the
     /// receiver can always seal that session's transcript.
@@ -403,6 +412,10 @@ impl App {
             v.seal();
             v.session = id;
             v.status = SessionStatus::NotStarted;
+            // A new incarnation of a mode is not holding the previous one's
+            // ticket. Leaving a stale claim on the row would have the UI naming a
+            // bead no live process owns.
+            v.active_bead = None;
         }
         v
     }
@@ -510,6 +523,13 @@ impl App {
             Msg::BeadStep { session, step } => {
                 self.dirty = true;
                 self.view_mut(session).set_step(step);
+            }
+            Msg::ActiveBead { session, bead } => {
+                // A mirror of the loop's claim, recorded rather than interpreted:
+                // the status row (looprs-guh) reads this field, and nothing here
+                // decides what to *do* with it.
+                self.dirty = true;
+                self.view_mut(session).active_bead = bead;
             }
             Msg::SessionDown { session, reason } => {
                 // Q5 rule 3: death must seal. Unconditional, because the pump

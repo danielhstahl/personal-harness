@@ -718,6 +718,11 @@ mod tests {
             SessionEvent::RestoreInput { text } => format!("restore: {text}"),
             SessionEvent::Exited { reason } => format!("down {reason:?}"),
             SessionEvent::BeadStep(s) => format!("step {s:?}"),
+            // A pi chat session never holds a bead; if this shows up in this file's
+            // test output, the event came from somewhere it should not have.
+            SessionEvent::ActiveBead { bead } => {
+                format!("active_bead {}", bead.as_ref().map(|b| b.id.clone()).unwrap_or_else(|| "-".into()))
+            }
             SessionEvent::BashOutput { chunk, .. } => format!("bash {chunk}"),
             // A pi chat session has no screen to take over; seeing this in test
             // output would mean the event came from somewhere it should not have.

@@ -58,6 +58,34 @@
 //!   worker is paid to read it;
 //! * "the board could not be read" is its own verdict, never a synonym for either
 //!   of the above — including for "empty".
+//!
+//! ## Who claims the bead (looprs-w7q)
+//!
+//! **The harness claims; the worker just works.** [`BeadsLoop::work_next_bead`]
+//! runs `bd update <id> --claim` *before* a `pi` child is bought, so the loop
+//! knows — independently of anything the agent later says or fails to say — which
+//! ticket it is spending money on. Everything else in this section falls out of
+//! that one ordering:
+//!
+//! * the claimed id and title go into the worker's prompt, so the agent never runs
+//!   `bd ready` itself and cannot end up working (and getting billed for) a
+//!   different ticket than the one being reported. That was a race, not a style
+//!   point, and `bd ready` is gone from [`WORKER`] for exactly that reason;
+//! * a claim `bd` refuses costs one CLI call rather than a whole worker session
+//!   pointed at a bead nobody holds;
+//! * the claim is published to the UI as it is taken and released
+//!   ([`SessionEvent::ActiveBead`]), which is what lets the status row
+//!   (looprs-guh) name the active ticket without shelling out mid-frame;
+//! * when the worker settles, [`BeadsLoop::verify_worker_pass`] asks the board the
+//!   only question that matters — *did it close?* — and a ticket left open stops
+//!   the loop instead of buying another pass on itself, because `bd ready` hands
+//!   the same bead straight back and each pass is billed. That is the runaway this
+//!   ticket was filed for.
+//!
+//! The guard releases on one thing only: a new instruction from a human, which in
+//! beads mode arrives through [`BeadsLoop::launch_create_tickets`]. Re-entering
+//! the mode is *not* an acknowledgement — a Tab back means "let me look", not
+//! "spend on that one again".
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -68,12 +96,12 @@ use anyhow::{Result, anyhow};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::app::{AssistantEvent, PiEvent, parse};
-use crate::services::bd::{Bead, list_status_with, ready_with};
+use crate::services::bd::{Bead, BeadStatus, claim_with, list_status_with, ready_with, show_with};
 use crate::services::pi::PiRpc;
 use crate::services::prompts::{PLANNER, WORKER, generate_prompt};
 use crate::session::{
-    BeadStep, ExitReason, Session, SessionConfig, SessionEvent, SessionId, SessionStatus, Spawned,
-    cancel,
+    ActiveBead, BeadStep, ExitReason, Session, SessionConfig, SessionEvent, SessionId, SessionStatus,
+    Spawned, cancel,
 };
 use serde_json::Value;
 
@@ -192,7 +220,34 @@ impl BeadsTask {
         // just got. Checking the board here — before `pending` is set — is what
         // stops a plan of zero from turning into N workers spinning on nothing.
         match self.inner.verify_plan().await {
-            PlanCheck::NotPlanning => {}
+            // Not a planner, so a worker. The question this side of the boundary is
+            // not "is there a plan?" but "did the ticket it was paid for close?"
+            // and it gets asked here, before `pending` can buy another worker.
+            PlanCheck::NotPlanning => match self.inner.verify_worker_pass().await {
+                PassOutcome::Closed(claim) => {
+                    self.inner
+                        .report_system(format!("beads: {} closed", claim.id));
+                }
+                // The worker handed this ticket to a human. The rest of the board
+                // is still ours, so the loop goes on — with the skip on the record.
+                PassOutcome::LeftForHuman(claim, status) => {
+                    self.inner.report_system(left_for_human_note(&claim, status));
+                }
+                PassOutcome::NotClosed(claim, status) => {
+                    self.park_after(None, Some(&not_closed_note(&claim, status)))
+                        .await;
+                    return;
+                }
+                PassOutcome::Unverifiable(claim, reason) => {
+                    self.park_after(None, Some(&unverified_pass_note(&claim, &reason)))
+                        .await;
+                    return;
+                }
+                PassOutcome::NothingHeld => {
+                    self.park_after(None, Some(nothing_held_note())).await;
+                    return;
+                }
+            },
             // The human sees the plan before the first worker is paid to read it.
             PlanCheck::Created(tickets) => self.inner.report_system(plan_note(&tickets)),
             PlanCheck::NothingCreated { said } => {
@@ -576,12 +631,25 @@ pub struct BeadsLoop {
     /// run, plus a handle on the run's own last words. `None` means the pass in
     /// flight is a worker's (or there is no pass), and there is nothing to diff.
     planning: Option<PlanPass>,
-    /// What the pass in flight is working on, for the human-facing sentence that
-    /// has to name it: a bead id for a worker, "the planner" for a planning pass.
-    /// Set with the pass and cleared with it, so a cancel can never name a bead the
-    /// loop is not actually holding — and so a *late* label cannot make an idle
-    /// loop look busy.
-    pass_label: Option<String>,
+    /// The ticket this pass holds a claim on, `None` between passes and for every
+    /// planner pass (looprs-w7q).
+    ///
+    /// Taken before the worker is spawned and published to the UI in the same step
+    /// ([`BeadsLoop::set_claim`]), so the loop's own knowledge of what it is
+    /// paying for and what the screen is told cannot drift apart.
+    claim: Option<ActiveBead>,
+    /// Every ticket this loop has put a worker on since the last human instruction.
+    ///
+    /// This is the re-work guard, and the reason it is a *set* rather than "the
+    /// last one" is that a board can hand a worked bead back two passes later — a
+    /// cycle of X, Y, X is the same runaway as X, X. It is filled the moment a
+    /// claim succeeds (not when a pass ends), so a worker that died, was killed or
+    /// settled without closing is all three, and is still covered.
+    ///
+    /// It clears only on `launch_create_tickets`, i.e. on a new instruction from a
+    /// human. That is deliberate: the guard exists to stop *automatic* re-work, and
+    /// a typed instruction is the only deliberate thing the beads mode accepts.
+    worked: HashSet<String>,
 }
 
 /// What one planner pass has to be checked against when it settles (looprs-k7v).
@@ -613,6 +681,49 @@ enum PlanCheck {
     /// board is unreadable" are the two facts that must never be conflated, which
     /// is the exact conflation looprs-037 was about, one level up.
     Unverifiable { stage: &'static str, reason: String },
+}
+
+/// What the loop decided to do with the tickets `bd ready` offered it.
+///
+/// Three answers rather than an `Option`, because "there is nothing to work" and
+/// "the only thing left is one I already burned a pass on" are different
+/// sentences and the human's next action differs: wait for instructions, or go
+/// close the ticket.
+enum Pick {
+    /// Work this one.
+    Work(Bead),
+    /// `bd ready` was empty. The board is done; the loop parks for an instruction.
+    Nothing,
+    /// The first workable ticket is one this loop already ran a pass on and did not
+    /// close. Refused, not re-run — the runaway guard (looprs-w7q).
+    AlreadyWorked(Bead),
+}
+
+/// What the board says about the ticket a worker pass just stopped talking about
+/// (looprs-w7q). One arm per thing the human can act on, because a bool cannot
+/// tell "keep going" from "go close it" from "fix `bd`".
+enum PassOutcome {
+    /// The ticket closed. This pass earned its keep; take the next one.
+    Closed(ActiveBead),
+    /// The worker left it `blocked` / `deferred`: it stopped on purpose and handed
+    /// it to a human. Not the loop's problem, and not a thing it will re-buy — a
+    /// blocked ticket is not ready work. Moving on is right; saying nothing about it
+    /// would leave the human hunting for why a ticket did not finish.
+    LeftForHuman(ActiveBead, BeadStatus),
+    /// The pass ended and the ticket is still `open` / `in_progress` / unreadable-
+    /// as-`unknown`. `bd ready` offers this exact bead back, so carrying on here
+    /// is the loop running itself up a hill. Stops the loop.
+    NotClosed(ActiveBead, BeadStatus),
+    /// `bd` could not answer, so nobody knows. Deliberately **not** foldable into
+    /// [`PassOutcome::Closed`] nor into [`PassOutcome::NotClosed`]: the remedy is
+    /// "repair `bd`", not "close the ticket", and the loop must not silently pick
+    /// one of those two readings on a read that failed.
+    Unverifiable(ActiveBead, String),
+    /// A worker settled while the loop held no claim. Nothing can be verified
+    /// against nothing; said out loud rather than assumed harmless, because a
+    /// settle that cannot be attributed to a ticket is the very event that used to
+    /// drive this loop blind (looprs-msj).
+    NothingHeld,
 }
 
 /// The worker child, plus the serial that says *which* pass it belongs to.
@@ -659,7 +770,8 @@ impl BeadsLoop {
             cfg,
             bead_step: BeadStep::AwaitInput,
             planning: None,
-            pass_label: None,
+            claim: None,
+            worked: HashSet::new(),
         }
     }
 
@@ -711,36 +823,120 @@ impl BeadsLoop {
         }
     }
 
-    /// The one code path that owns "spawn a worker for the current ready bead":
-    /// spawn, wire up event forwarding, and prompt. Callers never see a pi child
-    /// that is alive but unprompted.
+    /// Claim the next bead, then buy the worker for it — in that order.
+    ///
+    /// The claim comes first because everything after it is paid for: the pass is
+    /// only worth reporting, verifying and guarding once the harness actually holds
+    /// the ticket. Spawn-first would mean a refused claim still cost a whole `pi`
+    /// session, and one pointed at a bead we do not own answers to whoever prompts
+    /// it rather than to us (looprs-w7q).
+    ///
+    /// Also the only place a worker is both spawned *and* prompted, so callers
+    /// never see a pi child that is alive but has been given nothing to do.
     async fn work_next_bead(&mut self) -> Result<WorkerPass> {
         let beads = ready_with(&self.cfg.bd_bin).await?;
-        let Some(bead) = beads.first() else {
-            return Ok(WorkerPass::Idle);
+        let bead = match self.pick_bead(&beads) {
+            Pick::Nothing => return Ok(WorkerPass::Idle),
+            Pick::AlreadyWorked(bead) => return Err(anyhow!(already_worked_note(&bead))),
+            Pick::Work(bead) => bead,
         };
-        tracing::info!(bead = %bead.id(), "starting worker pass");
+        tracing::info!(bead = %bead.id(), "claiming a worker pass");
+
+        let claim = ActiveBead {
+            id: bead.id().to_string(),
+            title: bead.title().to_string(),
+        };
+        claim_with(&self.cfg.bd_bin, &claim.id)
+            .await
+            .map_err(|e| anyhow!("could not claim {} before buying a worker: {e}", claim.id))?;
+
+        // Two records of one claim, both taken before anything is prompted:
+        // `worked` is the guard that outlives the pass, `claim` is the live one the
+        // UI and the post-settle check read. Recording the claim *before* the spawn
+        // is what covers the pass that never reaches a settle at all — a spawn that
+        // fails, a prompt that is refused, a worker that is killed mid-run. Each of
+        // those leaves the ticket claimed on the board, and `bd ready` hands it
+        // back, so the guard has to already know about it.
+        self.worked.insert(claim.id.clone());
+        self.set_claim(Some(claim.clone()));
 
         // The session is built against locals: if any step below fails, `worker`
         // drops here and kill_on_drop reaps it, so a failed pass cannot leave an
         // orphan behind.
         let worker = self.spawn_worker(&[])?;
-        let disposition = worker.rpc.prompt(&worker_prompt(bead)).await?;
+        let disposition = worker.rpc.prompt(&worker_prompt(&claim)).await?;
         if disposition == "handled" {
             // pi took the prompt but started no run, so no `agent_settled` will ever
             // arrive to advance the loop. Do not hold an idle session open.
             drop(worker);
             return Err(anyhow!(
                 "worker prompt for {} was handled without starting a run",
-                bead.id()
+                claim.id
             ));
         }
 
         self.pi_rx = Some(worker);
-        self.pass_label = Some(bead.id().to_string());
-        self.report_system(format!("beads: working {}", bead.id()));
+        self.report_system(format!("beads: working {}", claim.id));
         self.set_step(BeadStep::WorkTickets);
         Ok(WorkerPass::Working)
+    }
+
+    /// Decide which bead this pass works, given what `bd ready` offered.
+    ///
+    /// Three rules, in this order, and each one is a thing that used to go wrong:
+    ///
+    /// 1. **A ticket that needs a human is skipped, out loud.** `blocked` and
+    ///    `deferred` mean somebody — a planner, or a worker that gave up — took it
+    ///    out of the loop on purpose, and `bd ready` should not have listed it.
+    ///    Spending a metered pass on one is the worst possible answer; staying
+    ///    quiet about the skip would make it indistinguishable from a lost ticket.
+    /// 2. **A ticket this loop already worked is refused, never re-run.** If the
+    ///    first workable bead is one whose pass already ended without closing it,
+    ///    starting another pass on it is the runaway this ticket was filed for:
+    ///    `bd ready` will keep offering a bead for exactly as long as it stays
+    ///    open, and every pass is billed. The refusal parks the loop with its two
+    ///    ways out, both of which belong to a human.
+    /// 3. **Otherwise the first workable bead**, in `bd`'s own priority order.
+    ///
+    /// What is deliberately *not* a rule: an unknown status is workable. Skipping
+    /// what this build cannot classify would let a `bd` upgrade silently empty the
+    /// board, which is looprs-037's conflation wearing a different hat.
+    fn pick_bead(&self, beads: &[Bead]) -> Pick {
+        let mut skipped: Vec<Bead> = Vec::new();
+        let mut pick = Pick::Nothing;
+        for bead in beads {
+            if bead.needs_human() {
+                skipped.push(bead.clone());
+                continue;
+            }
+            pick = if self.worked.contains(bead.id()) {
+                Pick::AlreadyWorked(bead.clone())
+            } else {
+                Pick::Work(bead.clone())
+            };
+            break;
+        }
+        self.report_skipped(&skipped);
+        pick
+    }
+
+    /// "Here is what I walked past, and why." Bounded like the plan note: the
+    /// transcript is a screen, not a dump.
+    fn report_skipped(&self, skipped: &[Bead]) {
+        if skipped.is_empty() {
+            return;
+        }
+        let mut note = format!(
+            "beads: skipping {} ticket(s) that need a human, not a worker:",
+            skipped.len()
+        );
+        for b in skipped.iter().take(MAX_SKIPPED_LISTED) {
+            note.push_str(&format!("\n  {} ({}) — {}", b.id(), b.status(), b.title()));
+        }
+        if let Some(rest) = skipped.len().checked_sub(MAX_SKIPPED_LISTED) {
+            note.push_str(&format!("\n  \u{2026} and {rest} more"));
+        }
+        self.report_system(note);
     }
 
     /// Spawn one pass's `pi` child and wire its records into this session.
@@ -835,16 +1031,48 @@ impl BeadsLoop {
     /// worker's settle ends up being reported as a plan of zero.
     pub async fn close(&mut self) {
         self.planning = None;
-        self.pass_label = None;
+        self.set_claim(None);
         if let Some(mut old) = self.pi_rx.take() {
             let _ = old.rpc.kill().await;
         }
     }
 
+    /// Take (or release) the loop's claim, and publish it in the same step.
+    ///
+    /// Setting the field and sending the event are one function rather than two
+    /// because the failure mode of two is the one this whole ticket is about: a
+    /// screen claiming to show a ticket the loop is not holding, or a loop holding
+    /// one the screen never heard about. Nothing may set `claim` without the
+    /// publish, so nothing can.
+    fn set_claim(&mut self, claim: Option<ActiveBead>) {
+        if self.claim == claim {
+            return;
+        }
+        let _ = self.ev_tx.send(SessionEvent::ActiveBead { bead: claim.clone() });
+        self.claim = claim;
+    }
+
+    /// The ticket this loop holds, if any. Read by the post-settle check to say
+    /// *which* ticket it is reporting on.
+    pub fn claim(&self) -> Option<&ActiveBead> {
+        self.claim.as_ref()
+    }
+
     /// What the pass in flight is working on — a bead id, or "the planner" — for
     /// the cancel sentences that have to name a thing rather than say "a pass".
+    ///
+    /// Derived from `claim` / `planning` rather than kept beside them: two fields
+    /// that must be set and cleared together is one field too many, and a label
+    /// that outlived the claim it came from would let a cancel name a bead the
+    /// loop is not holding.
     pub fn pass_label(&self) -> Option<&str> {
-        self.pass_label.as_deref()
+        if let Some(claim) = &self.claim {
+            return Some(claim.id.as_str());
+        }
+        if self.planning.is_some() {
+            return Some("the planner");
+        }
+        None
     }
 
     /// `Esc`. Tell the in-flight worker to stop, and return the serial of the pass
@@ -880,6 +1108,12 @@ impl BeadsLoop {
     /// and the honest error costs one `bd` call instead of a whole pi session.
     pub async fn launch_create_tickets(&mut self, instructions: &str) -> Result<()> {
         tracing::debug!("Launched tickets with these instructions: {}", instructions);
+        // A human spoke. In beads mode this is the *only* door a deliberate human
+        // instruction comes through, which makes it the acknowledgement that
+        // releases the re-work guard (looprs-w7q): every automatic pass stays
+        // answerable to the guard, and nothing restarts a refused ticket on a
+        // timer or on a Tab.
+        self.worked.clear();
         self.close().await;
         let baseline: HashSet<String> = list_status_with(&self.cfg.bd_bin, "open")
             .await?
@@ -905,10 +1139,9 @@ impl BeadsLoop {
         }
         self.planning = Some(PlanPass { baseline, said });
         self.pi_rx = Some(worker);
-        // A planner pass has no bead to name, but it still has something to be
-        // cancelled *as*, or "cancelling…" would have to say nothing at all while
-        // a child is running.
-        self.pass_label = Some("the planner".to_string());
+        // A planner pass holds no bead — `pass_label` answers "the planner" for it
+        // off `planning`, which is set just above — because there is no ticket here
+        // to claim, only one to invent.
 
         Ok(())
     }
@@ -955,14 +1188,55 @@ impl BeadsLoop {
             PlanCheck::Created(created)
         }
     }
+
+    /// Did the worker that just settled actually finish the ticket it was paid for?
+    ///
+    /// `agent_settled` means the worker stopped talking. It is not evidence that
+    /// anything closed, and cannot be: the identical settle arrives whether the
+    /// worker shipped the feature, hit a snag and said nothing, or ran out of
+    /// steam mid-sentence with the ticket still `open` — and in the last case
+    /// `bd ready` hands the *same bead* straight back to the next pass, which is
+    /// how a self-advancing loop turns into an uncapped bill. Only the board can
+    /// answer, so the loop asks it, one `bd show` per pass, before anything else
+    /// is spawned (looprs-w7q).
+    async fn verify_worker_pass(&self) -> PassOutcome {
+        let Some(claim) = self.claim.clone() else {
+            return PassOutcome::NothingHeld;
+        };
+        match show_with(&self.cfg.bd_bin, &claim.id).await {
+            Ok(Some(bead)) if bead.is_closed() => PassOutcome::Closed(claim),
+            Ok(Some(bead)) if bead.needs_human() => {
+                PassOutcome::LeftForHuman(claim, bead.status())
+            }
+            Ok(Some(bead)) => PassOutcome::NotClosed(claim, bead.status()),
+            // `bd` has never heard of the ticket we are holding. That is not
+            // "closed", any more than an empty phone book is "nobody is sick".
+            Ok(None) => PassOutcome::NotClosed(claim, BeadStatus::Unknown),
+            Err(e) => PassOutcome::Unverifiable(claim, e.to_string()),
+        }
+    }
 }
 
-/// The worker prompt, with the target bead named so the worker does not have to
-/// re-run `bd ready` to find out what it is supposed to be doing.
-fn worker_prompt(bead: &Bead) -> String {
+/// The worker prompt: the standing instructions, plus the one ticket this worker
+/// owns and the fact that the harness has already claimed it.
+///
+/// The claim is stated rather than assumed, because the alternative — telling the
+/// agent to go find work — is a race with every other hand on the board, and the
+/// worker would end up doing (and billing) a different ticket than the one the
+/// loop reports, guards and verifies. Hence `bd ready` is gone from the worker's
+/// command list in `prompts::WORKER`: a prompt that advertises it invites the
+/// agent to shop.
+fn worker_prompt(claim: &ActiveBead) -> String {
     generate_prompt(
         WORKER,
-        &format!("Claim and work ticket {} ({}).", bead.id(), bead.title()),
+        &format!(
+            "Your assigned ticket: {id} — {title}\n\n\
+             The harness has already run `bd update {id} --claim`, so this ticket is yours. \
+             Work it and close it when the work is done. Do not look for other work and do not \
+             pick a different ticket: {id} is the one being reported, guarded and paid for.\n",
+            id = claim.id,
+            title = claim.title,
+        ),
     )
 }
 
@@ -972,6 +1246,9 @@ fn worker_prompt(bead: &Bead) -> String {
 /// of dozen lines the list is no longer readable anyway, and the count is the
 /// number they actually wanted.
 const MAX_PLAN_LISTED: usize = 20;
+
+/// How many skipped tickets get listed before the note truncates.
+const MAX_SKIPPED_LISTED: usize = 5;
 
 /// "Here is the plan, before anybody spends money on it."
 fn plan_note(tickets: &[Bead]) -> String {
@@ -1009,6 +1286,55 @@ fn unverifiable_note(stage: &str, reason: &str) -> String {
     format!(
         "beads: cannot verify the plan ({stage}): {}. Nothing was queued and no workers started — this is a board read failure, not an empty plan.",
         clip(reason, 300)
+    )
+}
+
+/// "Worked it, did not close it, and I am not paying for that a second time."
+///
+/// Names both exits, because the point of stopping the loop is that a human now
+/// decides — and a stop that does not say what would unblock it just moves the
+/// confusion from the transcript to the terminal.
+fn not_closed_note(claim: &ActiveBead, status: BeadStatus) -> String {
+    format!(
+        "beads: worked {} but `bd` says it is `{}`, not closed. The loop is stopped: `bd ready` hands this same ticket back, so another automatic pass would be a retry nobody asked for. Close it (`bd close {}`) or type a new instruction to let this loop work it again.",
+        claim.id, status, claim.id
+    )
+}
+
+/// A worker pass that could not be checked is not a worker pass that succeeded, and
+/// the sentence must not be able to collapse into either of its neighbours.
+fn unverified_pass_note(claim: &ActiveBead, reason: &str) -> String {
+    format!(
+        "beads: cannot verify whether {} was closed: {}. Nothing is queued and the loop is stopped — this is a board read failure, not a finished ticket. Type a new instruction to continue.",
+        claim.id,
+        clip(reason, 300)
+    )
+}
+
+/// The worker pushed this one to a human; the rest of the board is still the
+/// loop's business.
+fn left_for_human_note(claim: &ActiveBead, status: BeadStatus) -> String {
+    format!(
+        "beads: {} was left `{}` by its worker, so a human has to move that one. The loop is moving on to the rest of the board and will not pick this ticket up again by itself.",
+        claim.id, status
+    )
+}
+
+/// A settle with no ticket behind it: nothing to verify, and something to report.
+fn nothing_held_note() -> &'static str {
+    "beads: a worker settled while this loop held no claimed ticket, so there is nothing to verify. The loop is stopped; type a new instruction to continue."
+}
+
+/// The guard speaking for itself, at the pass boundary: `bd ready` offered a ticket
+/// this loop already burned a pass on, and it is still open. A refusal has to say
+/// what it refused *and* what would unblock it, or the human reads the stop as a
+/// crash.
+fn already_worked_note(bead: &Bead) -> String {
+    format!(
+        "`bd ready` offered {} again, but this loop already worked it and `bd` says it is `{}`, not closed. It will not be started a second time by itself: `bd close {}`, or type a new instruction to continue.",
+        bead.id(),
+        bead.status(),
+        bead.id()
     )
 }
 
@@ -1068,6 +1394,26 @@ mod tests {
   "schema_version": 1
 }"#;
 
+    /// Two open tickets, so "the loop moved on to the next one" is observable
+    /// rather than merely not-stopped.
+    const TWO_OPEN: &str = r#"{
+  "data": [
+    {"id": "looprs-26r", "title": "Beads loop never self-starts", "status": "open", "issue_type": "bug"},
+    {"id": "looprs-99", "title": "the next ticket", "status": "open", "issue_type": "task"}
+  ],
+  "schema_version": 1
+}"#;
+
+    /// The first ticket blocked and the second left workable: the shape `bd ready`
+    /// is not supposed to produce, and the shape the loop has to cope with anyway.
+    const BLOCKED_THEN_READY: &str = r#"{
+  "data": [
+    {"id": "looprs-26r", "title": "waiting on somebody else", "status": "blocked", "issue_type": "bug"},
+    {"id": "looprs-99", "title": "the next ticket", "status": "open", "issue_type": "task"}
+  ],
+  "schema_version": 1
+}"#;
+
     fn fakes_cfg(fakes: &Fakes) -> SessionConfig {
         SessionConfig {
             pi_bin: fakes.pi_bin().to_string(),
@@ -1104,6 +1450,12 @@ mod tests {
             SessionEvent::BeadStep(BeadStep::AwaitInput) => "step:await".into(),
             SessionEvent::BeadStep(BeadStep::CreateTickets) => "step:plan".into(),
             SessionEvent::BeadStep(BeadStep::WorkTickets) => "step:work".into(),
+            // The claim, as the UI is told it: which ticket the loop holds, and
+            // when it lets go of it.
+            SessionEvent::ActiveBead {
+                bead: Some(bead),
+            } => format!("active:{}", bead.id),
+            SessionEvent::ActiveBead { bead: None } => "active:-".into(),
             SessionEvent::Error(text) => format!("error: {text}"),
             SessionEvent::System(text) => format!("system: {text}"),
             SessionEvent::RestoreInput { text } => format!("restore: {text}"),
@@ -1199,14 +1551,39 @@ mod tests {
     }
 
     fn bead(id: &str, title: &str) -> Bead {
+        bead_status(id, title, crate::services::bd::BeadStatus::Open)
+    }
+
+    /// As [`bead`], with a chosen status — the knob for "this ticket is not for a
+    /// worker", which the guard tests use without needing a board file for it.
+    fn bead_status(id: &str, title: &str, status: crate::services::bd::BeadStatus) -> Bead {
         Bead {
             id: id.to_string(),
             title: title.to_string(),
-            status: crate::services::bd::BeadStatusFallback::Known(
-                crate::services::bd::BeadStatus::Open,
-            ),
+            status: crate::services::bd::BeadStatusFallback::Known(status),
             issue_type: crate::services::bd::BeadIssueType::Task,
         }
+    }
+
+    /// Tell the fake `bd` what status a ticket now has, for the one read the loop
+    /// cannot fake for itself: `bd show <id> --json`, the post-settle check
+    /// (looprs-w7q).
+    ///
+    /// Tests that want the loop to *keep going* have to say the worker closed its
+    /// ticket, because a settle that leaves the ticket open now stops the loop on
+    /// purpose. That is the point of the guard, and it is why every "the settle
+    /// drove the next pass" test below carries this line: the loop advances on a
+    /// closed ticket, not on a quiet one.
+    fn show_status(fakes: &Fakes, id: &str, status: &str) {
+        fakes.set_show(&format!(
+            r#"{{"id":"{id}","title":"whatever {id} was called","status":"{status}","issue_type":"task"}}"#
+        ));
+    }
+
+    /// As [`show_status`], with the ticket finished — the shape of a worker that
+    /// did the job.
+    fn show_closed(fakes: &Fakes, id: &str) {
+        show_status(fakes, id, "closed");
     }
 
     /// A constructed loop must not have touched any process. The old code spawned a
@@ -1426,7 +1803,7 @@ mod tests {
     /// pass to run when the user comes back.
     #[tokio::test]
     async fn switching_away_drains_then_parks_and_resuming_never_double_spawns() {
-        let fakes = Fakes::new("park", PiFake::Started, BdFake::Ok, ONE_BEADED_BOARD);
+        let fakes = Fakes::new("park", PiFake::Started, BdFake::ShowStatus, ONE_BEADED_BOARD);
         let (mut s, _rx) = beads(&fakes, 2);
 
         s.set_active(true).unwrap();
@@ -1443,8 +1820,11 @@ mod tests {
         );
 
         // Three settles arrive while hidden — the loop's own worker, tagged with
-        // the pass that made them.
+        // the pass that made them, on a ticket that has now closed so that none of
+        // them is a stop condition (looprs-w7q). Three *un-closed* settles would
+        // be a different test: the first one stops the loop.
         fakes.set_board(SECOND_BOARD);
+        show_closed(&fakes, "looprs-26r");
         let pass = s.in_flight().expect("a pass is in flight");
         for _ in 0..3 {
             s.cmd
@@ -1540,7 +1920,7 @@ mod tests {
         let fakes = Fakes::new(
             "settle-drives-loop",
             PiFake::Chat,
-            BdFake::Ok,
+            BdFake::ShowStatus,
             ONE_BEADED_BOARD,
         );
         let (mut s, mut rx) = beads(&fakes, 1);
@@ -1553,8 +1933,17 @@ mod tests {
         assert!(s.quiesce().await, "the entry command was handled");
         assert_eq!(fakes.pi_spawns(), 1, "one pass, from entering the mode");
         assert_eq!(s.in_flight(), Some(1));
+        // The harness claimed the ticket before it bought the worker, so the id it
+        // claimed is the id the worker was prompted with and the id the settle is
+        // about to be checked against (looprs-w7q).
+        assert!(fakes.claimed("looprs-26r"), "{:?}", fakes.bd_log());
 
-        // The worker settles. That is the whole input.
+        // The worker did its job: the ticket is closed, and the next ready bead is
+        // a *different* one. Both halves are load-bearing — the loop advances on a
+        // closed ticket, and an un-closed one stops it dead rather than buying a
+        // second pass on the same thing.
+        fakes.set_board(SECOND_BOARD);
+        show_closed(&fakes, "looprs-26r");
         fakes.settle();
         fakes.wait_for_pi_spawns(2).await;
 
@@ -1598,7 +1987,7 @@ mod tests {
         let fakes = Fakes::new(
             "stale-settle",
             PiFake::Started,
-            BdFake::Ok,
+            BdFake::ShowStatus,
             ONE_BEADED_BOARD,
         );
         let (mut s, _rx) = beads(&fakes, 1);
@@ -1617,6 +2006,12 @@ mod tests {
         s.set_active(true).unwrap();
         assert!(s.quiesce().await);
         let first = s.in_flight().expect("the first pass is live");
+        // The ticket finished and the board moved on, so the pass below is retired
+        // by a *successful* settle rather than stopped by the un-closed-ticket
+        // guard — which would halt the loop for a reason that has nothing to do
+        // with what this test is about.
+        fakes.set_board(SECOND_BOARD);
+        show_closed(&fakes, "looprs-26r");
         s.cmd
             .send(BeadsCmd::WorkerSettled { serial: first })
             .unwrap();
@@ -1953,8 +2348,8 @@ mod tests {
             "the first child was the planner"
         );
         assert!(
-            prompts[1].contains("Claim and work ticket looprs-101"),
-            "and the second was put to work on a ticket from the plan: {}",
+            prompts[1].contains("Your assigned ticket: looprs-101 — first planned ticket"),
+            "and the second was put to work on a named ticket from the plan: {}",
             prompts[1]
         );
     }
@@ -2127,7 +2522,394 @@ mod tests {
         assert!(!msgs.contains(&"step:work".to_string()), "{msgs:?}");
     }
 
-    // --------- the notes themselves, pinned without a subprocess in the way ---------
+    // --------- the harness claims, and cannot re-work an un-closed bead (looprs-w7q) ---------
+    //
+    // The bug this section exists for: `bd ready` hands back any ticket that is
+    // still open, and a self-advancing loop that takes whatever it is handed will
+    // take the same one forever. Every test here pins one of the four things that
+    // have to be true instead — the harness claims, the board is asked whether the
+    // work landed, a ticket that needs a human is not worked, and nothing restarts
+    // without a human.
+
+    /// **The harness claims, before it pays.** `bd update <id> --claim` comes from
+    /// the loop rather than from the agent, so "which ticket is this run about" has
+    /// an answer that does not depend on the agent saying so.
+    #[tokio::test]
+    async fn the_harness_claims_the_ticket_it_is_paying_for() {
+        let fakes = Fakes::new(
+            "w7q-claims",
+            PiFake::Started,
+            BdFake::ShowStatus,
+            ONE_BEADED_BOARD,
+        );
+        let (mut l, _rx, _ctl) = loop_with(&fakes);
+
+        timeout(NO_HANG, l.next()).await.unwrap();
+
+        assert!(
+            fakes.claimed("looprs-26r"),
+            "the harness must run `bd update <id> --claim` itself: {:?}",
+            fakes.bd_log()
+        );
+        assert_eq!(
+            fakes.bd_call_count("update looprs-26r --claim"),
+            1,
+            "one claim per pass, not one per question about the pass: {:?}",
+            fakes.bd_log()
+        );
+        assert_eq!(l.claim().map(|c| c.id.as_str()), Some("looprs-26r"));
+        assert!(l.worked.contains("looprs-26r"), "claimed == on the hook");
+    }
+
+    /// **The ordering proof, run as a consequence.** If the claim came after the
+    /// spawn, a refused claim would still have bought a `pi` session — aimed at a
+    /// bead the harness does not hold, answering to whoever prompted it. Claiming
+    /// first makes a refusal cost one CLI call.
+    #[tokio::test]
+    async fn a_claim_bd_refuses_buys_no_worker() {
+        let fakes = Fakes::new(
+            "w7q-claim-refused",
+            PiFake::Started,
+            BdFake::ShowStatus,
+            TWO_OPEN,
+        );
+        fakes.refuse_claim(true);
+        let (mut l, mut rx, _ctl) = loop_with(&fakes);
+
+        timeout(NO_HANG, l.next()).await.unwrap();
+
+        assert_eq!(
+            fakes.pi_spawns(),
+            0,
+            "a ticket we could not claim must never have a worker pointed at it"
+        );
+        let err = last_error(&drain(&mut rx)).expect("a refused claim is reported");
+        assert!(err.contains("looprs-26r"), "{err}");
+        assert!(err.contains("claim"), "{err}");
+        assert!(l.claim().is_none(), "nothing is held on a failed claim");
+        assert!(l.is_awaiting_input(), "and the box comes back");
+    }
+
+    /// **The acceptance case: a fake `bd` that never closes the ticket proves the
+    /// loop stops instead of spinning.** This is the runaway the ticket was filed
+    /// for — the worker settles, `bd ready` returns the same open bead, another
+    /// worker is bought, and nothing anywhere counts. One pass is spent, the loop
+    /// says which ticket and why it stopped, and further nudges buy nothing.
+    #[tokio::test]
+    async fn a_ticket_that_is_never_closed_stops_the_loop_instead_of_spinning() {
+        let fakes = Fakes::new(
+            "w7q-never-closes",
+            PiFake::Chat,
+            BdFake::ShowStatus,
+            ONE_BEADED_BOARD,
+        );
+        // The worker talks, settles, and closes nothing — forever.
+        show_status(&fakes, "looprs-26r", "open");
+        let (mut s, mut rx) = beads(&fakes, 1);
+
+        s.set_active(true).unwrap();
+        assert!(s.quiesce().await, "the pass started");
+        assert_eq!(fakes.pi_spawns(), 1, "one worker, claimed and prompted");
+        drain(&mut rx);
+
+        fakes.settle();
+        let msgs = drain_until_parked(&mut rx).await;
+        let err = last_error(&msgs).expect("an un-closed ticket is an error, not a shrug");
+        assert!(err.contains("looprs-26r"), "{err}");
+        assert!(err.contains("not closed"), "{err}");
+        assert!(
+            err.contains("bd close looprs-26r"),
+            "a stop that does not say what would unblock it just moves the confusion: {err}"
+        );
+        assert!(!msgs.contains(&"step:work".to_string()), "{msgs:?}");
+        assert_eq!(s.status(), SessionStatus::Idle, "waiting on a human");
+
+        // And it *stays* stopped. The board never changed, so every later nudge
+        // re-reads the same un-closed ticket and refuses again — three nudges,
+        // zero extra workers. Before this ticket the same sequence is unbounded.
+        for _ in 0..3 {
+            s.set_active(true).unwrap();
+            assert!(s.quiesce().await);
+        }
+        assert_eq!(
+            fakes.pi_spawns(),
+            1,
+            "the guard held: no second pass on the ticket that was never closed"
+        );
+        assert_eq!(fakes.pi_prompts().len(), 1);
+        assert_eq!(s.in_flight(), None);
+    }
+
+    /// The guard releases on a human and only on a human: a new instruction is
+    /// planned, verified, and the board is workable again — while merely looking at
+    /// the mode again (the loop above) deliberately is not.
+    #[tokio::test]
+    async fn a_new_instruction_is_the_acknowledgement_that_releases_the_guard() {
+        let fakes = Fakes::new(
+            "w7q-acknowledged",
+            PiFake::Chat,
+            BdFake::ShowStatus,
+            ONE_BEADED_BOARD,
+        );
+        show_status(&fakes, "looprs-26r", "open");
+        let (mut s, mut rx) = beads(&fakes, 1);
+
+        s.set_active(true).unwrap();
+        assert!(s.quiesce().await);
+        fakes.settle();
+        drain_until_parked(&mut rx).await;
+        assert_eq!(fakes.pi_spawns(), 1, "stopped by the guard");
+
+        // The human acts: a fresh instruction, planned into real tickets.
+        start_planner(&mut s, "here is what I actually want").await;
+        fakes.set_board(PLAN_TWO_TICKETS);
+        show_closed(&fakes, "looprs-101");
+        fakes.settle();
+
+        let msgs = drain_until(&mut rx, |m| m == "step:work").await;
+        assert_eq!(
+            fakes.pi_spawns(),
+            3,
+            "the refused worker, the planner, and one worker after the acknowledgement: {msgs:?}"
+        );
+        assert!(fakes.claimed("looprs-101"), "{:?}", fakes.bd_log());
+    }
+
+    /// A ticket `bd` reports as blocked is not work, even in a `ready` list: a
+    /// human (or a worker that gave up) took it out of the loop on purpose, and a
+    /// metered pass on it finishes nothing. It is skipped **and named**, because a
+    /// silent skip is indistinguishable from a lost ticket.
+    #[tokio::test]
+    async fn a_blocked_ticket_is_skipped_named_and_never_claimed() {
+        let fakes = Fakes::new(
+            "w7q-blocked-skip",
+            PiFake::Started,
+            BdFake::ShowStatus,
+            BLOCKED_THEN_READY,
+        );
+        let (mut l, mut rx, _ctl) = loop_with(&fakes);
+
+        timeout(NO_HANG, l.next()).await.unwrap();
+
+        assert!(
+            !fakes.claimed("looprs-26r"),
+            "a blocked ticket is never claimed: {:?}",
+            fakes.bd_log()
+        );
+        assert!(
+            fakes.claimed("looprs-99"),
+            "the workable ticket behind it is the one worked: {:?}",
+            fakes.bd_log()
+        );
+        assert!(
+            !l.worked.contains("looprs-26r"),
+            "skipped is not the same as worked"
+        );
+        let msgs = drain(&mut rx);
+        assert!(
+            msgs.iter().any(|m| m.contains("need a human") && m.contains("looprs-26r")),
+            "the skip is said out loud, with the ticket named: {msgs:?}"
+        );
+    }
+
+    /// A worker that leaves its ticket `blocked` has handed it to a human, which is
+    /// the worker doing the right thing loudly — not the loop failing. So the loop
+    /// reports the hand-off and keeps going with the rest of the board rather than
+    /// parking on a ticket that was never its own to finish.
+    #[tokio::test]
+    async fn a_ticket_its_worker_left_blocked_does_not_stop_the_loop() {
+        let fakes = Fakes::new(
+            "w7q-left-blocked",
+            PiFake::Chat,
+            BdFake::ShowStatus,
+            TWO_OPEN,
+        );
+        let (mut s, mut rx) = beads(&fakes, 1);
+
+        s.set_active(true).unwrap();
+        assert!(s.quiesce().await);
+        assert_eq!(fakes.pi_spawns(), 1);
+        assert!(fakes.claimed("looprs-26r"));
+        drain(&mut rx);
+
+        // The worker gives up properly: marks the ticket blocked (which takes it
+        // out of `bd ready`), then settles.
+        show_status(&fakes, "looprs-26r", "blocked");
+        fakes.set_board(BLOCKED_THEN_READY);
+        fakes.settle();
+
+        let msgs = drain_until(&mut rx, |m| m == "step:work").await;
+        assert!(
+            !has_error(&msgs),
+            "a worker handing a ticket to a human is not an error: {msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("blocked") && m.contains("looprs-26r")),
+            "the hand-off is on the record: {msgs:?}"
+        );
+        assert_eq!(fakes.pi_spawns(), 2, "the loop moved on to the next ticket");
+        assert!(fakes.claimed("looprs-99"), "{:?}", fakes.bd_log());
+    }
+
+    /// A board that cannot answer is neither "closed" nor "left open". The loop
+    /// says which of the two it could not determine, because the user's next
+    /// command differs — `bd close` the ticket, or fix `bd`.
+    #[tokio::test]
+    async fn an_unreadable_board_after_a_pass_is_unverifiable_not_a_verdict() {
+        let fakes = Fakes::new(
+            "w7q-unreadable",
+            PiFake::Chat,
+            BdFake::ShowStatus,
+            ONE_BEADED_BOARD,
+        );
+        let (mut s, mut rx) = beads(&fakes, 1);
+
+        s.set_active(true).unwrap();
+        assert!(s.quiesce().await, "the pass started while bd still worked");
+        fakes.fail_bd(true); // the ticket may well have closed; nobody can read that
+        fakes.settle();
+
+        let msgs = drain_until_parked(&mut rx).await;
+        let err = last_error(&msgs).expect("an unreadable board is an error");
+        assert!(err.contains("looprs-26r"), "{err}");
+        assert!(err.contains("cannot verify"), "{err}");
+        assert!(
+            !err.contains("not closed"),
+            "a read failure must not be reported as a verdict about the ticket: {err}"
+        );
+        assert_eq!(
+            fakes.pi_spawns(),
+            1,
+            "no further pass on a ticket nobody can vouch for"
+        );
+        assert_eq!(s.status(), SessionStatus::Idle, "the box comes back");
+    }
+
+    /// The claim is published when it is taken and when it is released, so the
+    /// status row (looprs-guh) can name the active ticket without asking `bd` —
+    /// and cannot keep naming one after the loop let go of it.
+    #[tokio::test]
+    async fn the_active_ticket_is_published_when_taken_and_when_released() {
+        let fakes = Fakes::new(
+            "w7q-active-bead",
+            PiFake::Started,
+            BdFake::ShowStatus,
+            ONE_BEADED_BOARD,
+        );
+        let (mut l, mut rx, _ctl) = loop_with(&fakes);
+
+        assert!(
+            drain(&mut rx).is_empty(),
+            "a loop that has not claimed says nothing about a ticket"
+        );
+
+        timeout(NO_HANG, l.next()).await.unwrap();
+        assert!(
+            drain(&mut rx).contains(&"active:looprs-26r".to_string()),
+            "the claim is published as it is taken"
+        );
+
+        l.close().await;
+        assert!(
+            drain(&mut rx).contains(&"active:-".to_string()),
+            "and released with the pass"
+        );
+        assert!(l.claim().is_none());
+    }
+
+    /// The pick rules on their own, with no subprocess in the way: work the first
+    /// workable ticket, skip what a human has taken out of the loop, refuse what
+    /// this loop already burned a pass on — and keep working what this build cannot
+    /// classify, so a `bd` upgrade cannot quietly empty the board.
+    #[tokio::test]
+    async fn the_pick_rules_work_skip_then_refuse_in_that_order() {
+        let fakes = Fakes::new(
+            "w7q-pick-rules",
+            PiFake::Started,
+            BdFake::ShowStatus,
+            EMPTY_BOARD,
+        );
+        let (mut l, mut rx, _ctl) = loop_with(&fakes);
+
+        assert!(
+            matches!(l.pick_bead(&[bead("a", "first"), bead("b", "second")]), Pick::Work(b) if b.id() == "a"),
+            "bd's own priority order is kept"
+        );
+
+        let mixed = vec![
+            bead_status("skip-1", "waiting on a human", BeadStatus::Blocked),
+            bead_status("skip-2", "postponed", BeadStatus::Deferred),
+            bead("work-me", "actually workable"),
+        ];
+        assert!(
+            matches!(l.pick_bead(&mixed), Pick::Work(b) if b.id() == "work-me"),
+            "blocked and deferred are walked past"
+        );
+        let msgs = drain(&mut rx);
+        let said = msgs
+            .iter()
+            .filter(|m| m.contains("need a human"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(said.len(), 1, "one note per pass, not one per skipped ticket: {msgs:?}");
+        assert!(said[0].contains("skip-1") && said[0].contains("skip-2"), "{said:?}");
+
+        assert!(
+            matches!(
+                l.pick_bead(&[bead_status("u", "from the future", BeadStatus::Unknown)]),
+                Pick::Work(b) if b.id() == "u"
+            ),
+            "an unfamiliar status is worked, not skipped"
+        );
+
+        l.worked.insert("again".to_string());
+        assert!(
+            matches!(l.pick_bead(&[bead("again", "been worked")]), Pick::AlreadyWorked(b) if b.id() == "again"),
+            "a worked-and-un-closed ticket is refused, not re-run"
+        );
+    }
+
+    /// **No work-discovery in the worker's instructions.** The agent is *told*
+    /// which ticket it owns. Handing it `bd ready` and hoping it picks the bead the
+    /// loop is reporting on is a race with every other hand on the board, so the
+    /// prompt names the ticket, says it is already claimed, and does not offer the
+    /// commands that would let the worker wander somewhere else.
+    #[tokio::test]
+    async fn the_worker_is_told_its_ticket_not_invited_to_go_shopping() {
+        let fakes = Fakes::new(
+            "w7q-prompt",
+            PiFake::Started,
+            BdFake::ShowStatus,
+            ONE_BEADED_BOARD,
+        );
+        let (mut l, _rx, _ctl) = loop_with(&fakes);
+
+        timeout(NO_HANG, l.next()).await.unwrap();
+        let prompt = fakes
+            .pi_prompts()
+            .pop()
+            .expect("the worker was prompted");
+
+        assert!(prompt.contains("looprs-26r"), "the concrete id is in the prompt: {prompt}");
+        assert!(
+            prompt.contains("Beads loop never self-starts"),
+            "and so is the title, so the worker knows what it is doing: {prompt}"
+        );
+        assert!(
+            prompt.contains("already"),
+            "it says the claim is already done: {prompt}"
+        );
+        assert!(
+            !prompt.contains("bd ready"),
+            "`bd ready` must not be offered to a worker the harness has assigned: {prompt}"
+        );
+        assert!(
+            !prompt.contains("bd update <id> --claim"),
+            "nor a claim instruction — the harness claims, the worker works: {prompt}"
+        );
+    }
+
+    // ---------------- the notes themselves, pinned without a subprocess in the way ---------
 
     #[test]
     fn the_plan_note_lists_every_ticket_up_to_the_cap_and_counts_the_rest() {

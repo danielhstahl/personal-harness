@@ -95,7 +95,14 @@ impl Fakes {
         write_script(&pi_bin, &script);
         write_script(
             &bd_bin,
-            &bd_script(&bd_log, &board_file, &show_file, &dir.join("fail"), bd),
+            &bd_script(
+                &bd_log,
+                &board_file,
+                &show_file,
+                &dir.join("fail"),
+                &dir.join("refuse_claim"),
+                bd,
+            ),
         );
         std::fs::write(&board_file, board).unwrap();
         // No bead is known to `bd show` until a test says otherwise: an unset
@@ -127,6 +134,23 @@ impl Fakes {
     /// read as "unverifiable", never as "the board is empty".
     pub fn fail_bd(&self, on: bool) {
         let mark = self.dir.join("fail");
+        if on {
+            std::fs::write(&mark, b"").unwrap();
+        } else {
+            let _ = std::fs::remove_file(&mark);
+        }
+    }
+
+    /// Make every *subsequent* fake `bd` **claim** fail (exit 4), leaving reads and
+    /// other writes alone.
+    ///
+    /// The lever for "`bd` would not give us that ticket", which [`Fakes::fail_bd`]
+    /// cannot express: failing *everything* proves only that a broken `bd` stops
+    /// the loop, not that a refused *claim* does — and the claim is now the call
+    /// the harness makes before it spends anything (looprs-w7q). Exit 4 rather
+    /// than 3 keeps "refused this claim" from reading as "bd is down".
+    pub fn refuse_claim(&self, on: bool) {
+        let mark = self.dir.join("refuse_claim");
         if on {
             std::fs::write(&mark, b"").unwrap();
         } else {
@@ -542,7 +566,14 @@ main()
 /// Written in bash and file-driven for the same reason the rest of the fakes are:
 /// the assertions are about what the *harness* asked for, in what order, and a
 /// mock that only supports one verb cannot answer "did it claim before prompting?"
-fn bd_script(log: &Path, board: &Path, show: &Path, fail_mark: &Path, mode: BdFake) -> String {
+fn bd_script(
+    log: &Path,
+    board: &Path,
+    show: &Path,
+    fail_mark: &Path,
+    refuse_mark: &Path,
+    mode: BdFake,
+) -> String {
     // (read verb, `bd show`, write verb) per personality.
     let (read_cmd, show_cmd, write_cmd): (String, String, String) = match mode {
         BdFake::Fails => ("exit 3".into(), "exit 3".into(), "exit 3".into()),
@@ -574,6 +605,16 @@ if [ -e "{fail_mark}" ]; then
   exit 3
 fi
 verb="${{1:-}}"
+# A refused claim is its own failure mode, distinct from "bd is down": reads still
+# work, only `--claim` says no. Exit 4 so the two are not confusable.
+case "$verb" in
+  update)
+    if [ -e "{refuse_mark}" ]; then
+      echo "fake bd: cannot claim: already claimed by another owner" >&2
+      exit 4
+    fi
+    ;;
+esac
 case "$verb" in
   ready|list) {read_cmd} ;;
   show) {show_cmd} ;;
@@ -583,6 +624,7 @@ esac
 "#,
         log = log.display(),
         fail_mark = fail_mark.display(),
+        refuse_mark = refuse_mark.display(),
         read_cmd = read_cmd,
         show_cmd = show_cmd,
         write_cmd = write_cmd,

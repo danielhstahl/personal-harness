@@ -21,6 +21,7 @@
 use ratatui::text::Line;
 
 use super::SessionId;
+use crate::session::ActiveBead;
 use crate::components::scrollback::Flusher;
 use crate::session::{BeadStep, SessionStatus};
 use crate::utils::utils::ControlStripper;
@@ -88,6 +89,13 @@ pub struct SessionView {
     /// matters — `false` here only ever means "this session is busy", so it must
     /// never be set on the basis of the input mode.
     pub awaiting_user: bool,
+    /// The ticket the beads loop holds right now (looprs-w7q). `None` for every
+    /// other mode, and for beads between passes.
+    ///
+    /// Set from the session's own `SessionEvent::ActiveBead` — the loop publishes
+    /// its claim, it does not have it inferred. Consumer: the status row
+    /// (looprs-guh), which cannot name the active ticket without this.
+    pub active_bead: Option<ActiveBead>,
     /// The beads machine's step, for the status row. `None` for every other mode.
     /// Rendered, never re-derived (looprs-msj).
     pub step: Option<BeadStep>,
@@ -117,6 +125,7 @@ impl SessionView {
             chat: ChatState::Stopped,
             awaiting_user: true,
             step: None,
+            active_bead: None,
             dropped: 0,
             limit,
             bash_strip: ControlStripper::default(),

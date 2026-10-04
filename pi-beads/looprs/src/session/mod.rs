@@ -93,6 +93,27 @@ pub enum SwitchAway {
     DrainThenPark,
 }
 
+/// The ticket a beads pass is holding.
+///
+/// The title travels with the id because the status row (looprs-guh) has to say
+/// what the loop is spending money on in words a human recognises, and because
+/// reading it back from `bd` at draw time would put a subprocess inside the frame.
+///
+/// This is the harness's own knowledge of its claim (looprs-w7q), not a copy of
+/// the bead: it is set when `bd update --claim` succeeded and cleared when the pass
+/// ends, which is exactly the window in which the loop is accountable for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveBead {
+    pub id: String,
+    pub title: String,
+}
+
+impl std::fmt::Display for ActiveBead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.id, self.title)
+    }
+}
+
 /// Which session produced an event, and which *incarnation* of it.
 ///
 /// `generation` (`gen`) is mandatory, not decoration. `TerminalType` alone cannot tell a live Pi
@@ -194,6 +215,15 @@ pub enum SessionEvent {
     BashOutput { stream: ByteStream, chunk: String },
     /// The beads machine moved. Only BeadsSession ever sends this.
     BeadStep(BeadStep),
+    /// The ticket the beads loop currently holds a claim on, `None` when it holds
+    /// none. Only BeadsSession ever sends this.
+    ///
+    /// Published by the loop itself at the two moments that matter — the claim was
+    /// taken, and the pass that held it ended — so the status row (looprs-guh) can
+    /// name the active bead without asking `bd`, and without deriving it from
+    /// whichever transcript line happens to be on screen. Same rule as
+    /// [`SessionEvent::BeadStep`]: render it, never re-derive it.
+    ActiveBead { bead: Option<ActiveBead> },
     /// A status line for the transcript ("working looprs-1", "board empty, ...").
     System(String),
     /// Text that belongs back in the user's input box rather than in the transcript.
