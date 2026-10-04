@@ -336,12 +336,19 @@ pub async fn ready_with(bin: &str) -> Result<Vec<Bead>, BdError> {
     beads(bin, &["ready", "--json"]).await
 }
 
-/// `bd list --status <status> --json` — every bead in one lifecycle state.
+/// `bd list --status <status> --json --limit 0` — every bead in one lifecycle
+/// state, with the default page size turned off.
 ///
 /// The planner diff (looprs-k7v) needs a board snapshot that does not depend on
 /// priority/dependency filtering the way `ready` does.
+///
+/// `--limit 0` is load-bearing, not tidying: `bd list` defaults to 50 rows, and a
+/// *differential* read over a truncated page reads as "nothing new" the moment the
+/// board outgrows that page. A short read and an empty read have to stay
+/// distinguishable, and the only way to keep them so is not to truncate in the
+/// first place.
 pub async fn list_status_with(bin: &str, status: &str) -> Result<Vec<Bead>, BdError> {
-    beads(bin, &["list", "--status", status, "--json"]).await
+    beads(bin, &["list", "--status", status, "--limit", "0", "--json"]).await
 }
 
 /// `bd show <id> --json` — one bead by id, `Ok(None)` if bd knows nothing of it.
@@ -544,6 +551,29 @@ mod tests {
         );
         let err = claim_with(fakes.bd_bin(), "looprs-77").await.unwrap_err();
         assert!(matches!(err, BdError::Failed { .. }), "{err:?}");
+    }
+
+    /// The listing used by the planner diff must not be paginated: a truncated page
+    /// and an empty board would otherwise be the same read, and the diff would say
+    /// "nothing was created" about a board with 51 open tickets.
+    #[tokio::test]
+    async fn listing_a_status_asks_bd_for_the_whole_page() {
+        let fakes = Fakes::new(
+            "bd-list-unlimited",
+            crate::testing::PiFake::Started,
+            BdFake::Ok,
+            ONE_BEADED_BOARD,
+        );
+        list_status_with(fakes.bd_bin(), "open").await.unwrap();
+        let lines = fakes.bd_log();
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("list --status open"))
+            .unwrap_or_else(|| panic!("expected a `bd list --status open …`: {lines:?}"));
+        assert!(
+            line.contains("--limit 0"),
+            "a paginated diff read is a silent lie about a big board: {line}"
+        );
     }
 
     /// `is_closed` reads the board rather than trusting the worker's own report.

@@ -95,7 +95,7 @@ impl Fakes {
         write_script(&pi_bin, &script);
         write_script(
             &bd_bin,
-            &bd_script(&bd_log, &board_file, &show_file, bd),
+            &bd_script(&bd_log, &board_file, &show_file, &dir.join("fail"), bd),
         );
         std::fs::write(&board_file, board).unwrap();
         // No bead is known to `bd show` until a test says otherwise: an unset
@@ -116,6 +116,22 @@ impl Fakes {
     /// Point the loop's fakes at a different board without restarting them.
     pub fn set_board(&self, board: &str) {
         std::fs::write(&self.board_file, board).unwrap();
+    }
+
+    /// Make every *subsequent* fake `bd` call fail (exit 3), without restarting it.
+    ///
+    /// The lever for "the board was readable when the pass started and is not now".
+    /// That distinction is not expressible with a `BdFake` personality, which is
+    /// fixed at construction, and it is exactly what the planner verification
+    /// (looprs-k7v) has to survive: a read that fails halfway through a pass must
+    /// read as "unverifiable", never as "the board is empty".
+    pub fn fail_bd(&self, on: bool) {
+        let mark = self.dir.join("fail");
+        if on {
+            std::fs::write(&mark, b"").unwrap();
+        } else {
+            let _ = std::fs::remove_file(&mark);
+        }
     }
 
     /// What `bd show <id> --json` answers: a single bead object, or `[]`.
@@ -365,6 +381,18 @@ def log(msg):
             f.write(msg + "\n")
 
 
+def one_line(s):
+    """Flatten a message so one command is one log line.
+
+    `Fakes::pi_prompts()` reads this log *by line*. A real planner prompt is a
+    multi-line block of instructions, and a raw newline through this path splits
+    `"prompt " + msg` into a `"prompt "` line and an orphan — which makes every
+    assertion about what the harness actually sent to the planner quietly useless.
+    Only newlines are escaped, so plain substring assertions still match.
+    """
+    return s.replace("\r", " ").replace("\n", "\\n")
+
+
 def emit(obj):
     with out_lock:
         sys.stdout.write(json.dumps(obj) + "\n")
@@ -429,12 +457,12 @@ def main():
         kind = cmd.get("type")
         rid = cmd.get("id")
         msg = cmd.get("message", "")
-        log("recv %s %s" % (kind, msg))
+        log("recv %s %s" % (kind, one_line(msg)))
 
         if kind == "prompt":
             # Also logged in the pre-existing "prompt <text>" shape so the shared
             # `pi_prompts()` reader works for both fakes.
-            log("prompt " + msg)
+            log("prompt " + one_line(msg))
             with st_lock:
                 prior = list(memory)
                 memory.append(msg)
@@ -488,7 +516,7 @@ main()
 /// Written in bash and file-driven for the same reason the rest of the fakes are:
 /// the assertions are about what the *harness* asked for, in what order, and a
 /// mock that only supports one verb cannot answer "did it claim before prompting?"
-fn bd_script(log: &Path, board: &Path, show: &Path, mode: BdFake) -> String {
+fn bd_script(log: &Path, board: &Path, show: &Path, fail_mark: &Path, mode: BdFake) -> String {
     // (read verb, `bd show`, write verb) per personality.
     let (read_cmd, show_cmd, write_cmd): (String, String, String) = match mode {
         BdFake::Fails => ("exit 3".into(), "exit 3".into(), "exit 3".into()),
@@ -513,6 +541,12 @@ fn bd_script(log: &Path, board: &Path, show: &Path, mode: BdFake) -> String {
         r#"#!/usr/bin/env bash
 set -u
 echo "bd $*" >>"{log}"
+# Mid-run failure lever: see `Fakes::fail_bd`. Checked per invocation, so a test
+# can flip the board's health between two reads of the same pass.
+if [ -e "{fail_mark}" ]; then
+  echo "fake bd: failing on request (fail marker set)" >&2
+  exit 3
+fi
 verb="${{1:-}}"
 case "$verb" in
   ready|list) {read_cmd} ;;
@@ -522,6 +556,7 @@ case "$verb" in
 esac
 "#,
         log = log.display(),
+        fail_mark = fail_mark.display(),
         read_cmd = read_cmd,
         show_cmd = show_cmd,
         write_cmd = write_cmd,

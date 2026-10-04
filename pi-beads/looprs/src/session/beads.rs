@@ -37,7 +37,29 @@
 //! routed from the child to the task that owns the loop by
 //! [`BeadsLoop::forward_worker`], tagged with the serial of the pass that made it.
 //! The App renders the same records and decides nothing.
+//!
+//! ## Who checks the planner (looprs-k7v)
+//!
+//! **A planner pass is not believed until the board says so.** `agent_settled` from
+//! the planner means "the planner stopped talking", which is a different fact from
+//! "there is a plan", and the two used to be treated as one: a planner that
+//! misread the instructions, refused, or whose every `bd create` failed settled
+//! just as cleanly as one that worked, and the loop rolled into `AwaitInput`
+//! looking exactly like a successful no-op with the user's request on the floor.
+//!
+//! So [`BeadsLoop::launch_create_tickets`] snapshots the open board *before* the
+//! child is spawned, [`BeadsLoop::verify_plan`] diffs it after the settle, and
+//! [`BeadsTask::worker_settled`] will not queue a worker until that diff has a
+//! verdict. Three things fall out of that ordering, and they are the whole feature:
+//!
+//! * zero new tickets is a loud error that quotes the planner's own last words, and
+//!   parks rather than advancing;
+//! * a real plan is listed (`id: title`) in the transcript **before** the first
+//!   worker is paid to read it;
+//! * "the board could not be read" is its own verdict, never a synonym for either
+//!   of the above — including for "empty".
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
@@ -45,8 +67,8 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::app::{PiEvent, parse};
-use crate::services::bd::{Bead, ready_with};
+use crate::app::{AssistantEvent, PiEvent, parse};
+use crate::services::bd::{Bead, list_status_with, ready_with};
 use crate::services::pi::PiRpc;
 use crate::services::prompts::{PLANNER, WORKER, generate_prompt};
 use crate::session::{
@@ -147,6 +169,24 @@ impl BeadsTask {
             .await;
             return;
         }
+        // A settle off the *planner* means something different than a settle off a
+        // worker, and this is the only place in the loop that knows which one it
+        // just got. Checking the board here — before `pending` is set — is what
+        // stops a plan of zero from turning into N workers spinning on nothing.
+        match self.inner.verify_plan().await {
+            PlanCheck::NotPlanning => {}
+            // The human sees the plan before the first worker is paid to read it.
+            PlanCheck::Created(tickets) => self.inner.report_system(plan_note(&tickets)),
+            PlanCheck::NothingCreated { said } => {
+                self.park_after(None, Some(&no_plan_note(&said))).await;
+                return;
+            }
+            PlanCheck::Unverifiable { stage, reason } => {
+                self.park_after(None, Some(&unverifiable_note(stage, &reason)))
+                    .await;
+                return;
+            }
+        }
         self.pending = true;
         self.run_pending().await;
     }
@@ -168,6 +208,19 @@ impl BeadsTask {
         if self.aborted {
             self.park_after(Some("beads: cancelled — the loop is parked."), None)
                 .await;
+        } else if self.inner.is_planning() {
+            // The planner dying mid-run is the no-settle case this branch exists
+            // for, and it needs saying in *planner* words: no plan was verified, so
+            // nothing is queued and no worker will run. Silently falling through to
+            // the worker wording would leave the user guessing which half of the
+            // loop they just lost.
+            self.park_after(
+                None,
+                Some(
+                    "beads: the planner exited without settling; the plan was never verified, so nothing was queued and no workers started. Type an instruction to try again.",
+                ),
+            )
+            .await;
         } else {
             self.park_after(
                 None,
@@ -425,12 +478,52 @@ pub struct BeadsLoop {
     ctl: mpsc::UnboundedSender<BeadsCmd>,
     cfg: SessionConfig,
     bead_step: BeadStep,
+    /// Set for the duration of one planner pass: the board as it looked *before* the
+    /// run, plus a handle on the run's own last words. `None` means the pass in
+    /// flight is a worker's (or there is no pass), and there is nothing to diff.
+    planning: Option<PlanPass>,
+}
+
+/// What one planner pass has to be checked against when it settles (looprs-k7v).
+struct PlanPass {
+    /// Ids that were already open when the planner was spawned. Set membership, not
+    /// a count: on a live board a plan of two plus an unrelated close elsewhere is
+    /// not evidence of anything, and a count-based diff would read that as noise.
+    baseline: HashSet<String>,
+    /// The planner's last assistant text, tee'd off its stdout by
+    /// [`BeadsLoop::forward_records`]. A zero-ticket plan is a lot more
+    /// diagnosable with the model's own sentence attached: "it refused", "it asked
+    /// a question back" and "it narrated a plan it never wrote down" are otherwise
+    /// indistinguishable, and only the first two are the harness's problem.
+    said: Arc<StdMutex<String>>,
+}
+
+/// The verdict of checking a planner pass against the board. Four outcomes, because
+/// there are four things the user can act on and a bool cannot name them.
+enum PlanCheck {
+    /// The pass that settled was a worker's, not a planner's: nothing to check.
+    NotPlanning,
+    /// The planner added these tickets to the board. Show them, then work them.
+    Created(Vec<Bead>),
+    /// The planner settled and the board gained nothing — the silent no-op this
+    /// ticket was filed for, now an explicit one.
+    NothingCreated { said: String },
+    /// A `bd` read failed, so the plan is unverifiable. Deliberately **not**
+    /// foldable into [`PlanCheck::NothingCreated`]: "the board is empty" and "the
+    /// board is unreadable" are the two facts that must never be conflated, which
+    /// is the exact conflation looprs-037 was about, one level up.
+    Unverifiable { stage: &'static str, reason: String },
 }
 
 /// The worker child, plus the serial that says *which* pass it belongs to.
 struct Worker {
     serial: u64,
     rpc: PiRpc,
+    /// The last non-empty assistant text this child streamed. Only the planner pass
+    /// ever reads it, but every worker carries one because the tee lives in the
+    /// shared record-forwarding path and a `Worker` without it would be a worker
+    /// whose last words were thrown away.
+    said: Arc<StdMutex<String>>,
 }
 
 /// What a worker pass did.
@@ -465,6 +558,7 @@ impl BeadsLoop {
             ctl,
             cfg,
             bead_step: BeadStep::AwaitInput,
+            planning: None,
         }
     }
 
@@ -499,7 +593,7 @@ impl BeadsLoop {
     /// that never gets answered is reported to the transcript and the loop parks in
     /// `AwaitInput` for a human. Nothing here retries on a timer, so a broken board
     /// cannot turn into a respawn storm.
-    pub async fn next(&mut self) {
+    async fn next(&mut self) {
         self.close().await;
         match self.work_next_bead().await {
             Ok(WorkerPass::Working) => {}
@@ -557,8 +651,9 @@ impl BeadsLoop {
         let (rpc, records) = PiRpc::spawn_with(&self.cfg.pi_bin, args)?;
         let serial = self.next_serial;
         self.next_serial += 1;
-        self.forward_records(serial, records);
-        Ok(Worker { serial, rpc })
+        let said = Arc::new(StdMutex::new(String::new()));
+        self.forward_records(serial, records, said.clone());
+        Ok(Worker { serial, rpc, said })
     }
 
     /// Pipe one worker's records into this session: two copies of the same fact,
@@ -576,7 +671,18 @@ impl BeadsLoop {
     /// start a pass nobody asked for. The control copy is also why no UI message is
     /// involved in advancing the loop: this used to be `UiCommand::BeadsNext`,
     /// arriving from whichever mode the input box happened to be in (looprs-msj).
-    fn forward_records(&self, serial: u64, mut records: mpsc::UnboundedReceiver<Value>) {
+    ///
+    /// A third, smaller copy: the child's last completed assistant text lands in
+    /// `said` on the way past, so the planner check can quote the model's own
+    /// conclusion instead of the harness inventing one. `TextEnd` rather than the
+    /// deltas because it is the authoritative final content of the block — the
+    /// deltas are what was typed, this is what landed.
+    fn forward_records(
+        &self,
+        serial: u64,
+        mut records: mpsc::UnboundedReceiver<Value>,
+        said: Arc<StdMutex<String>>,
+    ) {
         let render = self.ev_tx.clone();
         let ctl = self.ctl.clone();
         tokio::spawn(async move {
@@ -584,6 +690,14 @@ impl BeadsLoop {
                 let Some(ev) = parse(&v) else {
                     continue; // `parse` logs the offender
                 };
+                if let PiEvent::MessageUpdate {
+                    assistant_message_event: AssistantEvent::TextEnd { content, .. },
+                } = &ev
+                {
+                    if !content.trim().is_empty() {
+                        *said.lock().unwrap() = content.clone();
+                    }
+                }
                 let settled = matches!(ev, PiEvent::AgentSettled);
                 if render.send(SessionEvent::Agent(ev)).is_err() {
                     return; // the session is gone: nothing to render, nothing to advance
@@ -612,7 +726,13 @@ impl BeadsLoop {
     /// no live pass, so the dying child's own `WorkerGone` carries a serial that
     /// matches nothing and is ignored instead of being read as "the pass in flight
     /// died".
+    ///
+    /// A pass with no child also has no planner to verify: `planning` goes with it,
+    /// because a stale `PlanPass` left across the boundary would make the *next*
+    /// pass's settle get diffed against this one's baseline — which is how a
+    /// worker's settle ends up being reported as a plan of zero.
     pub async fn close(&mut self) {
+        self.planning = None;
         if let Some(mut old) = self.pi_rx.take() {
             let _ = old.rpc.kill().await;
         }
@@ -636,23 +756,87 @@ impl BeadsLoop {
         true
     }
 
+    /// Run the planner over `instructions`, remembering what the board looked like
+    /// first so the result can be checked (looprs-k7v).
+    ///
+    /// The snapshot is taken *before* the child is spawned, which is the only order
+    /// in which it means anything: a baseline captured after the run is not a
+    /// baseline. And if that snapshot cannot be read, the pass is refused rather
+    /// than run — an unverifiable planner is the exact failure this ticket is
+    /// about, so buying a run that cannot be checked is worse than not buying it,
+    /// and the honest error costs one `bd` call instead of a whole pi session.
     pub async fn launch_create_tickets(&mut self, instructions: &str) -> Result<()> {
         tracing::debug!("Launched tickets with these instructions: {}", instructions);
         self.close().await;
+        let baseline: HashSet<String> = list_status_with(&self.cfg.bd_bin, "open")
+            .await?
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+
         let args = vec!["--tools", "read,bash"];
         let worker = self.spawn_worker(&args)?;
+        let said = worker.said.clone();
         self.set_step(BeadStep::CreateTickets);
         let prompt = generate_prompt(PLANNER, instructions);
         let disposition = worker.rpc.prompt(&prompt).await?;
         if disposition == "handled" {
+            // pi took the prompt but started no run, so there is no settle coming
+            // to trigger the verification either. Dropping the child and reporting
+            // is the whole response; `planning` deliberately stays unset so this
+            // dead pass cannot be mistaken for one that owes a verdict.
             drop(worker);
             return Err(anyhow!(
                 "planner prompt was handled without starting a run; no tickets were requested"
             ));
         }
+        self.planning = Some(PlanPass { baseline, said });
         self.pi_rx = Some(worker);
 
         Ok(())
+    }
+
+    /// Is the pass in flight a planner's? Lets the no-settle path (`WorkerGone`)
+    /// say which half of the loop it lost instead of blaming a worker that was
+    /// never running.
+    pub fn is_planning(&self) -> bool {
+        self.planning.is_some()
+    }
+
+    /// Did the planner that just settled actually put tickets on the board?
+    ///
+    /// `agent_settled` means "the planner stopped talking". It is not, and never
+    /// was, evidence of a plan: a planner that misread the instructions, refused
+    /// them, or whose every `bd create` failed settled just as cleanly as one that
+    /// worked. The board answers the real question, and answers it before a single
+    /// worker is paid to read a plan that may not exist.
+    ///
+    /// Takes the pass rather than borrowing it: one planner pass gets exactly one
+    /// verdict, so a second settle off the same child cannot re-diff a board that
+    /// has since moved under it.
+    async fn verify_plan(&mut self) -> PlanCheck {
+        let Some(pass) = self.planning.take() else {
+            return PlanCheck::NotPlanning;
+        };
+        let after = match list_status_with(&self.cfg.bd_bin, "open").await {
+            Ok(beads) => beads,
+            Err(e) => {
+                return PlanCheck::Unverifiable {
+                    stage: "reading the board after the planner ran",
+                    reason: e.to_string(),
+                };
+            }
+        };
+        let created: Vec<Bead> = after
+            .into_iter()
+            .filter(|b| !pass.baseline.contains(b.id()))
+            .collect();
+        let said = pass.said.lock().unwrap().clone();
+        if created.is_empty() {
+            PlanCheck::NothingCreated { said }
+        } else {
+            PlanCheck::Created(created)
+        }
     }
 }
 
@@ -663,6 +847,63 @@ fn worker_prompt(bead: &Bead) -> String {
         WORKER,
         &format!("Claim and work ticket {} ({}).", bead.id(), bead.title()),
     )
+}
+
+/// How many of a plan's tickets get listed before the note truncates.
+///
+/// Bounded because the transcript is the human's screen, not a dump: past a couple
+/// of dozen lines the list is no longer readable anyway, and the count is the
+/// number they actually wanted.
+const MAX_PLAN_LISTED: usize = 20;
+
+/// "Here is the plan, before anybody spends money on it."
+fn plan_note(tickets: &[Bead]) -> String {
+    let mut out = format!("beads: planner created {} ticket(s):", tickets.len());
+    for t in tickets.iter().take(MAX_PLAN_LISTED) {
+        out.push_str(&format!("\n  {}: {}", t.id(), t.title()));
+    }
+    if let Some(rest) = tickets.len().checked_sub(MAX_PLAN_LISTED) {
+        out.push_str(&format!("\n  … and {rest} more"));
+    }
+    out
+}
+
+/// The planner settled with nothing on the board to show for it.
+///
+/// The planner's own last words are quoted rather than paraphrased: the model
+/// usually states its reason ("I need more information about X", "already
+/// covered by looprs-1"), and that sentence is the thing the user needs in order
+/// to re-instruct it. Without it, "no tickets" is a dead end.
+fn no_plan_note(said: &str) -> String {
+    let said = clip(said, 400);
+    let reason = if said.is_empty() {
+        "The planner left no message to explain itself.".to_string()
+    } else {
+        format!("The planner said: “{said}”")
+    };
+    format!(
+        "beads: the planner finished and created no tickets — nothing was queued, and no workers were started. {reason}"
+    )
+}
+
+/// The plan could not be checked, which is not the same sentence as "the plan is
+/// empty" and must never be shortened into it.
+fn unverifiable_note(stage: &str, reason: &str) -> String {
+    format!(
+        "beads: cannot verify the plan ({stage}): {}. Nothing was queued and no workers started — this is a board read failure, not an empty plan.",
+        clip(reason, 300)
+    )
+}
+
+/// Bound a quoted child message so a rambling refusal cannot bury the transcript.
+/// Char-based, not byte-based, so a multi-byte codepoint cannot be cut in half.
+fn clip(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max).collect();
+    format!("{kept}\u{2026}")
 }
 
 #[cfg(test)]
@@ -682,6 +923,33 @@ mod tests {
     /// Generous, but bounded: a hang is a failure of this ticket, and a bounded test
     /// reports it instead of wedging the suite.
     const NO_HANG: Duration = Duration::from_secs(10);
+
+    /// A board with two tickets the planner "created" mid-run.
+    const PLAN_TWO_TICKETS: &str = r#"{
+  "data": [
+    {"id": "looprs-101", "title": "first planned ticket", "status": "open", "issue_type": "task"},
+    {"id": "looprs-102", "title": "second planned ticket", "status": "open", "issue_type": "task"}
+  ],
+  "schema_version": 1
+}"#;
+
+    /// A board carrying one ticket that predates any planner.
+    const PRE_EXISTING: &str = r#"{
+  "data": [
+    {"id": "looprs-old", "title": "was already here", "status": "open", "issue_type": "task"}
+  ],
+  "schema_version": 1
+}"#;
+
+    /// The same pre-existing ticket, plus one the planner added on top of it. The
+    /// diff must report only the second one.
+    const OLD_PLUS_ONE_NEW: &str = r#"{
+  "data": [
+    {"id": "looprs-old", "title": "was already here", "status": "open", "issue_type": "task"},
+    {"id": "looprs-101", "title": "first planned ticket", "status": "open", "issue_type": "task"}
+  ],
+  "schema_version": 1
+}"#;
 
     fn fakes_cfg(fakes: &Fakes) -> SessionConfig {
         SessionConfig {
@@ -729,6 +997,30 @@ mod tests {
         }
     }
 
+    /// Read events until one satisfies `done`, returning everything said on the way.
+    ///
+    /// "Every pass that ends" is not one end state — a verified plan stops at
+    /// `step:work`, a refusal stops at `step:await` — so the parked variant below is
+    /// just this with a predicate, and tests that care about ordering can use their own.
+    async fn drain_until<F>(rx: &mut mpsc::UnboundedReceiver<SessionEvent>, done: F) -> Vec<String>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let mut out = Vec::new();
+        loop {
+            let line = match timeout(NO_HANG, rx.recv()).await {
+                Ok(Some(m)) => describe(m),
+                Ok(None) => panic!("the session stream closed first: {out:?}"),
+                Err(_) => panic!("no matching event within {NO_HANG:?}: {out:?}"),
+            };
+            let stop = done(&line);
+            out.push(line);
+            if stop {
+                return out;
+            }
+        }
+    }
+
     /// Snapshot of what the loop told the UI, as stable strings.
     fn drain(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> Vec<String> {
         let mut out = Vec::new();
@@ -745,23 +1037,56 @@ mod tests {
     /// the state a human has to be able to reach: a loop that keeps saying it is
     /// working while nothing is running is a loop that hid the input box forever.
     async fn drain_until_parked(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> Vec<String> {
-        let mut out = Vec::new();
-        loop {
-            let line = match timeout(NO_HANG, rx.recv()).await {
-                Ok(Some(m)) => describe(m),
-                Ok(None) => panic!("the session stream closed before the loop parked: {out:?}"),
-                Err(_) => panic!("the loop never parked within {NO_HANG:?}: {out:?}"),
-            };
-            let parked = line == "step:await";
-            out.push(line);
-            if parked {
-                return out;
-            }
-        }
+        drain_until(rx, |line| line == "step:await").await
     }
 
     fn has_error(msgs: &[String]) -> bool {
         msgs.iter().any(|m| m.starts_with("error: "))
+    }
+
+    /// The last thing the loop called an error. "Last" because the park note is
+    /// written after the verdict in some paths, and the assertion should be about
+    /// the verdict rather than about whichever string happened to land first.
+    fn last_error(msgs: &[String]) -> Option<String> {
+        msgs.iter()
+            .rev()
+            .find(|m| m.starts_with("error: "))
+            .cloned()
+    }
+
+    /// Send a planner instruction the way the beads input box sends it, and return
+    /// only once the pass is demonstrably live — a test that plans "and hopes" is a
+    /// test that settles the wrong run half the time.
+    async fn start_planner(s: &mut BeadsSession, text: &str) -> u64 {
+        s.send_text(text.to_string()).unwrap();
+        assert!(s.quiesce().await, "the submit was handled");
+        assert_eq!(
+            s.status(),
+            SessionStatus::Running,
+            "the planner pass is live"
+        );
+        s.in_flight().expect("the planner pass is in flight")
+    }
+
+    /// How many times the harness asked the board for the open tickets — the two
+    /// halves of the planner diff, counted separately from every other `bd` call.
+    fn board_reads(fakes: &Fakes) -> usize {
+        fakes
+            .bd_log()
+            .iter()
+            .filter(|l| l.starts_with("list --status open"))
+            .count()
+    }
+
+    fn bead(id: &str, title: &str) -> Bead {
+        Bead {
+            id: id.to_string(),
+            title: title.to_string(),
+            status: crate::services::bd::BeadStatusFallback::Known(
+                crate::services::bd::BeadStatus::Open,
+            ),
+            issue_type: crate::services::bd::BeadIssueType::Task,
+        }
     }
 
     /// A constructed loop must not have touched any process. The old code spawned a
@@ -1123,6 +1448,15 @@ mod tests {
             2,
             "and the new pass was prompted, not left idle the way this loop used to start"
         );
+        // `wait_for_pi_spawns` returns the moment the fake logs the spawn, which is
+        // *inside* the session task's still-running settle handler — before that
+        // handler returns and republishes the `in_flight` mirror. This assertion
+        // raced that gap (a flake it had been carrying since looprs-msj); the seam
+        // is the only honest way to read a mirror written by another task.
+        assert!(
+            s.quiesce().await,
+            "the settle-driven pass finished starting and published its serial"
+        );
         assert_eq!(s.in_flight(), Some(2), "the new pass is the live one");
         assert!(
             drain(&mut rx).contains(&"step:work".to_string()),
@@ -1263,5 +1597,329 @@ mod tests {
             SessionStatus::Idle,
             "the loop is back in the human's hands, so the box comes back too"
         );
+    }
+
+    // ---------------- the planner is checked before anybody works (looprs-k7v) ----------------
+    //
+    // `agent_settled` was being read as "there is a plan". It is not. Every test
+    // below pins one of the four verdicts the diff can return, and the two things
+    // the ticket asked for: a plan of zero is impossible to miss, and a plan of N
+    // is on screen before the first worker is paid to read it.
+
+    /// **The acceptance case.** A planner that creates nothing must not look like a
+    /// successful no-op: it must be an error, it must say so, and it must not
+    /// queue a worker.
+    #[tokio::test]
+    async fn a_plan_that_creates_no_tickets_is_a_loud_error_not_a_silent_idle() {
+        let fakes = Fakes::new("plan-nothing", PiFake::Chat, BdFake::Ok, EMPTY_BOARD);
+        let (mut s, mut rx) = beads(&fakes, 1);
+        s.set_active(true).unwrap();
+        assert!(s.quiesce().await);
+        drain(&mut rx); // the "board empty" park note from entering the mode
+
+        start_planner(&mut s, "gibberish that plans nothing").await;
+        assert_eq!(
+            board_reads(&fakes),
+            1,
+            "the board was snapshotted before the planner ran: {:?}",
+            fakes.bd_log()
+        );
+
+        fakes.settle(); // the planner finishes, having written nothing
+
+        let msgs = drain_until_parked(&mut rx).await;
+        let err = last_error(&msgs)
+            .unwrap_or_else(|| panic!("a zero-ticket plan must be an error: {msgs:?}"));
+        assert!(err.contains("created no tickets"), "{err}");
+        assert!(
+            err.contains("reply 1"),
+            "the planner's own final message is quoted, not paraphrased: {err}"
+        );
+        assert!(
+            !msgs.contains(&"step:work".to_string()),
+            "nothing was queued, so no worker runs: {msgs:?}"
+        );
+        assert_eq!(
+            fakes.pi_spawns(),
+            1,
+            "exactly the planner ran — no worker was bought: {:?}",
+            fakes.pi_pids()
+        );
+        assert_eq!(
+            board_reads(&fakes),
+            2,
+            "one snapshot before, one diff after: {:?}",
+            fakes.bd_log()
+        );
+        assert_eq!(s.status(), SessionStatus::Idle, "the box comes back");
+        assert_eq!(s.in_flight(), None, "and nothing is left in flight");
+    }
+
+    /// **The other acceptance case**, including its ordering: the human sees the
+    /// plan — id and title per ticket — before the first worker starts burning
+    /// tokens on it, so a bad plan can be Esc'd while it is still cheap.
+    #[tokio::test]
+    async fn a_successful_plan_is_listed_before_the_first_worker_starts() {
+        let fakes = Fakes::new("plan-listed", PiFake::Chat, BdFake::Ok, EMPTY_BOARD);
+        let (mut s, mut rx) = beads(&fakes, 1);
+        s.set_active(true).unwrap();
+        assert!(s.quiesce().await);
+        drain(&mut rx);
+
+        start_planner(&mut s, "two tickets, please").await;
+        fakes.set_board(PLAN_TWO_TICKETS); // the planner created them mid-run
+        fakes.settle();
+
+        let msgs = drain_until(&mut rx, |m| m == "step:work").await;
+        let listed = msgs
+            .iter()
+            .position(|m| m.contains("planner created 2"))
+            .unwrap_or_else(|| panic!("the plan was never listed: {msgs:?}"));
+        let working = msgs.iter().position(|m| m == "step:work").unwrap();
+        assert!(
+            listed < working,
+            "the plan is on screen before the first worker runs: {msgs:?}"
+        );
+        let note = &msgs[listed];
+        assert!(note.contains("looprs-101: first planned ticket"), "{note}");
+        assert!(note.contains("looprs-102: second planned ticket"), "{note}");
+        assert!(
+            msgs[..=listed].iter().all(|m| !m.starts_with("error: ")),
+            "a plan that worked is not reported as a failure: {msgs:?}"
+        );
+
+        assert_eq!(fakes.pi_spawns(), 2, "planner, then exactly one worker");
+        let prompts = fakes.pi_prompts();
+        assert!(
+            prompts[0].contains("engineering manager"),
+            "the first child was the planner"
+        );
+        assert!(
+            prompts[1].contains("Claim and work ticket looprs-101"),
+            "and the second was put to work on a ticket from the plan: {}",
+            prompts[1]
+        );
+    }
+
+    /// The diff is a set difference on ticket ids, not a count of the board. A
+    /// ticket that was already there is not evidence of a plan, and reporting it as
+    /// one would let "nothing was created" pass for "here is the plan".
+    #[tokio::test]
+    async fn tickets_that_predate_the_planner_are_not_reported_as_planned() {
+        let fakes = Fakes::new("plan-diff", PiFake::Chat, BdFake::Ok, EMPTY_BOARD);
+        let (mut s, mut rx) = beads(&fakes, 1);
+        s.set_active(true).unwrap();
+        assert!(s.quiesce().await);
+        drain(&mut rx);
+        // A ticket that was already on the board before the planner was asked for
+        // anything. It goes in after entering the mode and before the submit, so
+        // the loop is not off working it by the time the baseline is taken.
+        fakes.set_board(PRE_EXISTING);
+        start_planner(&mut s, "add one more ticket").await;
+        fakes.set_board(OLD_PLUS_ONE_NEW);
+        fakes.settle();
+
+        let msgs = drain_until(&mut rx, |m| m == "step:work").await;
+        let note = msgs
+            .iter()
+            .find(|m| m.contains("planner created 1"))
+            .unwrap_or_else(|| panic!("only the new ticket should count: {msgs:?}"));
+        assert!(note.contains("looprs-101"), "{note}");
+        assert!(
+            !note.contains("looprs-old"),
+            "the pre-existing ticket is not part of the plan: {note}"
+        );
+    }
+
+    /// A board that cannot be read at verification time is *unverifiable*, which is
+    /// a different sentence from "empty" and must never be shortened into it — the
+    /// user's next action differs (fix `bd` vs. re-word the instruction).
+    #[tokio::test]
+    async fn a_board_that_cannot_be_read_after_planning_is_unverifiable_not_empty() {
+        let fakes = Fakes::new("plan-unreadable", PiFake::Chat, BdFake::Ok, EMPTY_BOARD);
+        let (mut s, mut rx) = beads(&fakes, 1);
+        start_planner(&mut s, "plan something").await;
+        fakes.fail_bd(true); // the snapshot got through; the diff read does not
+        fakes.settle();
+
+        let msgs = drain_until_parked(&mut rx).await;
+        let err = last_error(&msgs)
+            .unwrap_or_else(|| panic!("an unreadable board must be an error: {msgs:?}"));
+        assert!(err.contains("cannot verify"), "{err}");
+        assert!(
+            !err.contains("created no tickets"),
+            "a read failure must not be reported as an empty plan: {err}"
+        );
+        assert_eq!(
+            fakes.pi_spawns(),
+            1,
+            "no worker runs on a plan that could not be checked"
+        );
+        assert!(!msgs.contains(&"step:work".to_string()), "{msgs:?}");
+    }
+
+    /// The snapshot is taken before the child is bought, so a board that was never
+    /// readable costs one `bd` call rather than a whole planner session.
+    #[tokio::test]
+    async fn a_board_that_cannot_be_snapshotted_costs_no_planner_run() {
+        let fakes = Fakes::new("plan-no-baseline", PiFake::Chat, BdFake::Fails, EMPTY_BOARD);
+        let (mut s, mut rx) = beads(&fakes, 1);
+
+        s.send_text("plan something".to_string()).unwrap();
+        assert!(s.quiesce().await);
+
+        let msgs = drain(&mut rx);
+        assert!(has_error(&msgs), "the refusal is visible: {msgs:?}");
+        assert_eq!(
+            fakes.pi_spawns(),
+            0,
+            "a pass that could not be verified afterwards should not have been paid for"
+        );
+        assert_eq!(s.status(), SessionStatus::NotStarted);
+    }
+
+    /// The planner dying mid-run is the no-settle case: nothing is ever going to
+    /// advance this loop, so it has to say so within a bounded time rather than go
+    /// on claiming it is planning.
+    #[tokio::test]
+    async fn a_planner_that_dies_mid_run_is_surfaced_and_starts_no_workers() {
+        let fakes = Fakes::new("planner-dies", PiFake::Chat, BdFake::Ok, EMPTY_BOARD);
+        let (mut s, mut rx) = beads(&fakes, 1);
+        s.set_active(true).unwrap();
+        assert!(s.quiesce().await);
+        drain(&mut rx); // the empty-board park note
+        start_planner(&mut s, "plan something").await;
+        let victim = fakes.pi_pids()[0];
+        assert!(
+            process_alive(victim),
+            "the planner is running before the kill"
+        );
+
+        crate::testing::kill_pid(victim);
+
+        let msgs = drain_until_parked(&mut rx).await;
+        let err =
+            last_error(&msgs).unwrap_or_else(|| panic!("the death must be reported: {msgs:?}"));
+        assert!(err.contains("planner"), "and named as the planner: {err}");
+        assert!(
+            !msgs.contains(&"step:work".to_string()),
+            "an unverified plan never reaches the workers: {msgs:?}"
+        );
+        assert_eq!(
+            fakes.pi_spawns(),
+            1,
+            "parking is not a restart: a crash that auto-retries is a respawn storm"
+        );
+        assert!(!process_alive(victim));
+        assert_eq!(s.status(), SessionStatus::Idle);
+    }
+
+    /// `disposition: "handled"` means no run started, so no `agent_settled` will
+    /// ever arrive to trigger the verification. Waiting for one is the hang; the
+    /// child is dropped and the failure is reported instead.
+    #[tokio::test]
+    async fn a_handled_planner_prompt_waits_for_no_settle_that_never_comes() {
+        let fakes = Fakes::new("planner-handled", PiFake::Handled, BdFake::Ok, EMPTY_BOARD);
+        let (mut s, mut rx) = beads(&fakes, 1);
+
+        s.send_text("plan something".to_string()).unwrap();
+        assert!(s.quiesce().await);
+
+        let msgs = drain(&mut rx);
+        assert!(
+            msgs.iter()
+                .any(|m| m.starts_with("error: ") && m.contains("handled")),
+            "{msgs:?}"
+        );
+        assert_eq!(
+            s.in_flight(),
+            None,
+            "the handled child is dropped, not held"
+        );
+
+        // And nothing resurrects the pass later: there is no settle to wait for,
+        // and nothing that should.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(fakes.pi_spawns(), 1, "one spawn, ever");
+        assert_eq!(s.status(), SessionStatus::NotStarted);
+    }
+
+    /// Esc on the planner is a cancellation, not a verdict. Reporting "created no
+    /// tickets" here would blame the planner for work the user just stopped, and
+    /// would train them to ignore the message that matters.
+    #[tokio::test]
+    async fn an_aborted_planner_is_cancelled_not_reported_as_an_empty_plan() {
+        let fakes = Fakes::new("planner-abort", PiFake::Chat, BdFake::Ok, EMPTY_BOARD);
+        let (mut s, mut rx) = beads(&fakes, 1);
+        start_planner(&mut s, "plan something").await;
+
+        s.abort().unwrap();
+
+        let msgs = drain_until_parked(&mut rx).await;
+        assert!(msgs.iter().any(|m| m.contains("cancel")), "{msgs:?}");
+        assert!(
+            !msgs.iter().any(|m| m.contains("created no tickets")),
+            "an interrupted planner is not a failed plan: {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("cannot verify")),
+            "and not an unverifiable one either: {msgs:?}"
+        );
+        assert_eq!(fakes.pi_spawns(), 1);
+        assert!(!msgs.contains(&"step:work".to_string()), "{msgs:?}");
+    }
+
+    // --------- the notes themselves, pinned without a subprocess in the way ---------
+
+    #[test]
+    fn the_plan_note_lists_every_ticket_up_to_the_cap_and_counts_the_rest() {
+        let tickets: Vec<Bead> = (0..MAX_PLAN_LISTED + 3)
+            .map(|i| bead(&format!("looprs-{i:03}"), &format!("ticket {i}")))
+            .collect();
+        let note = plan_note(&tickets);
+        assert!(
+            note.contains(&format!(
+                "planner created {} ticket(s)",
+                MAX_PLAN_LISTED + 3
+            )),
+            "{note}"
+        );
+        assert!(note.contains("looprs-000: ticket 0"), "{note}");
+        assert!(note.contains("looprs-019: ticket 19"), "{note}");
+        assert!(
+            !note.contains("looprs-020"),
+            "past the cap only the count is shown: {note}"
+        );
+        assert!(note.contains("and 3 more"), "{note}");
+        assert_eq!(note.lines().count(), MAX_PLAN_LISTED + 2, "{note}");
+    }
+
+    #[test]
+    fn the_empty_plan_note_quotes_the_planner_s_own_words() {
+        let note = no_plan_note("I could not parse that request.");
+        assert!(note.contains("created no tickets"), "{note}");
+        assert!(note.contains("I could not parse that request."), "{note}");
+        let quiet = no_plan_note("   ");
+        assert!(quiet.contains("left no message"), "{quiet}");
+    }
+
+    #[test]
+    fn the_unverifiable_note_never_says_the_board_is_empty() {
+        let note = unverifiable_note("reading the board after the planner ran", "bd exited 3");
+        assert!(note.contains("cannot verify"), "{note}");
+        assert!(note.contains("bd exited 3"), "{note}");
+        assert!(
+            !note.contains("created no tickets"),
+            "the two verdicts must never read alike: {note}"
+        );
+    }
+
+    #[test]
+    fn clipping_a_long_quote_never_cuts_a_multibyte_char() {
+        let long = "é".repeat(200); // two bytes each
+        let clipped = clip(&long, 10);
+        assert_eq!(clipped.chars().count(), 11, "10 kept + the ellipsis");
+        assert!(std::str::from_utf8(clipped.as_bytes()).is_ok());
+        assert_eq!(clip("short", 100), "short");
     }
 }
