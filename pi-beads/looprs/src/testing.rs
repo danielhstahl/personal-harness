@@ -271,6 +271,26 @@ impl Fakes {
     pub fn bd_call_count(&self, cmd: &str) -> usize {
         self.bd_log().iter().filter(|l| *l == cmd).count()
     }
+
+    /// Make the chat fake **ignore `abort`**.
+    ///
+    /// The lever for the half of looprs-5g7 that only shows up when the child
+    /// fights back: a run that answers `abort` and then keeps going is exactly
+    /// what a tool which traps the signal, or a runtime wedged mid-call, looks
+    /// like from here. Without it every cancel test is a test of the easy case,
+    /// and the escalation ladder — the part that decides whether a stuck run is
+    /// a stalled sentence or a hung app — never gets exercised at all.
+    ///
+    /// The fake still *answers* the abort, because that is the realistic shape:
+    /// the failure is not "no reply", it is "reply, and no unwind".
+    pub fn stubborn_pi(&self, on: bool) {
+        let mark = self.dir.join("stubborn");
+        if on {
+            std::fs::write(&mark, b"").unwrap();
+        } else {
+            let _ = std::fs::remove_file(&mark);
+        }
+    }
 }
 
 impl Drop for Fakes {
@@ -363,6 +383,9 @@ import json, os, sys, threading, time
 HERE = os.path.dirname(os.path.realpath(__file__))
 LOG = os.path.join(HERE, "pi.log")
 SETTLE = os.path.join(HERE, "settle")
+# When this marker exists, `abort` is answered but the run keeps going: the shape
+# of a child that traps the cancel rather than honouring it (Fakes::stubborn_pi).
+STUBBORN = os.path.join(HERE, "stubborn")
 # A run never stays open forever: a test that forgets to settle is a hung test.
 MAX_HOLD = float(os.environ.get("LOOPRS_FAKE_HOLD", "20"))
 
@@ -491,10 +514,13 @@ def main():
             response(rid, "clear_queue", {"steering": taken, "followUp": []})
         elif kind == "abort":
             # Tell every open run to unwind, then answer like pi does: abort waits
-            # for the session to become idle.
-            for a in list(live):
-                a["hit"] = True
-            del live[:]
+            # for the session to become idle. Under the `stubborn` marker the
+            # answer still goes back but nothing is told to unwind, which is how a
+            # cancelled-but-uncancellable run actually presents.
+            if not os.path.exists(STUBBORN):
+                for a in list(live):
+                    a["hit"] = True
+                del live[:]
             response(rid, "abort")
         elif kind == "get_state":
             response(rid, "get_state", {"isStreaming": len(live) > 0,
@@ -786,4 +812,42 @@ impl Session for FakeSession {
 /// Standalone factory that always produces `claimed`, ignoring the requested mode.
 pub fn fake(claimed: TerminalType) -> SessionFactory {
     FakeBackend::new().factory_claiming(Some(claimed))
+}
+
+/// Collect every session event that arrives within `wait`, described.
+///
+/// The cancel tests need to say *how long* they waited, because the two halves of
+/// the contract are timings and not just contents:
+///
+/// * "cancelling…" must arrive while the child is still running, so the window has
+///   to be shorter than the child's unwind; and
+/// * "still stalled" must **not** arrive early, so the window has to be shorter
+///   than [`cancel::GRACE`](crate::session::cancel).
+///
+/// A test that only asserts "the message eventually showed up" cannot tell those
+/// apart, and cannot fail on the one thing that matters — a cancel acknowledged
+/// *after* the fact is the same silence as no acknowledgement.
+///
+/// `describe` is passed in because each session module renders the same events in
+/// its own words for its own failure messages, and a shared formatter would make
+/// every module's assertion output belong to none of them.
+pub async fn collect_within<F>(
+    rx: &mut mpsc::UnboundedReceiver<SessionEvent>,
+    wait: std::time::Duration,
+    describe: F,
+) -> Vec<String>
+where
+    F: Fn(&SessionEvent) -> String,
+{
+    let mut out = Vec::new();
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Some(ev)) => out.push(describe(&ev)),
+            // Silence or a closed stream ends the window; the caller asserts on
+            // whatever the window contained.
+            Ok(None) | Err(_) => return out,
+        }
+    }
 }

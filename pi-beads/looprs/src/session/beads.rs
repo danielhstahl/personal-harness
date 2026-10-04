@@ -73,6 +73,7 @@ use crate::services::pi::PiRpc;
 use crate::services::prompts::{PLANNER, WORKER, generate_prompt};
 use crate::session::{
     BeadStep, ExitReason, Session, SessionConfig, SessionEvent, SessionId, SessionStatus, Spawned,
+    cancel,
 };
 use serde_json::Value;
 
@@ -88,6 +89,12 @@ enum BeadsCmd {
     Submit(String),
     /// `Esc`: abort the in-flight pass and park (ADR-0002 Q3).
     Abort,
+    /// The abort sent `attempt` attempts ago has still not produced a settle (or a
+    /// stream end) after [`cancel::GRACE`](crate::session::cancel). The worker is
+    /// not unwinding; kill it and say so, naming the bead it leaves claimed
+    /// (ADR-0003). `serial` and `attempt` are what make a deadline from a pass the
+    /// loop has already moved past unmatchable.
+    AbortStalled { serial: u64, attempt: u32 },
     /// The mode became, or stopped being, the one on screen. Q3's policy input.
     Active(bool),
     /// This session's own worker settled (`agent_settled`) on the pass tagged
@@ -131,6 +138,14 @@ struct BeadsTask {
     /// `agent_settled` → next bead"). This flag is why that rule can be enforced
     /// at all: `agent_settled` looks identical either way.
     aborted: bool,
+    /// How many aborts this cancel has sent. The stall deadline carries one, so an
+    /// old timer cannot be mistaken for the live one — the job `serial` does for
+    /// the passes themselves, one level up.
+    abort_attempt: u32,
+    /// The stall has been reported for the current attempt, so the escalation is
+    /// one sentence rather than a repeating alarm. A later `Esc` clears it and
+    /// starts a fresh attempt.
+    stall_reported: bool,
 }
 
 impl BeadsTask {
@@ -163,7 +178,10 @@ impl BeadsTask {
         self.streaming = false;
         if self.aborted {
             self.park_after(
-                Some("beads: cancelled — the loop is parked. Type an instruction to start again."),
+                Some(&format!(
+                    "beads: {} — the loop is parked. Type an instruction to start again.",
+                    cancel::DONE
+                )),
                 None,
             )
             .await;
@@ -206,8 +224,11 @@ impl BeadsTask {
         }
         self.streaming = false;
         if self.aborted {
-            self.park_after(Some("beads: cancelled — the loop is parked."), None)
-                .await;
+            self.park_after(
+                Some(&format!("beads: {} — the loop is parked.", cancel::DONE)),
+                None,
+            )
+            .await;
         } else if self.inner.is_planning() {
             // The planner dying mid-run is the no-settle case this branch exists
             // for, and it needs saying in *planner* words: no plan was verified, so
@@ -257,12 +278,80 @@ impl BeadsTask {
     /// The flag is set *before* the command goes out, so the settle that pi emits
     /// as it unwinds is already classified as a cancellation and cannot be
     /// misread as a finished pass. An idle loop is a no-op, not an error
-    /// (looprs-5g7).
+    /// (looprs-5g7), and a *stalled* abort leaves the ladder in a state where the
+    /// user's next `Esc` means "try again" rather than being swallowed.
     fn abort_pass(&mut self) {
-        if self.inner.abort_worker() {
-            self.aborted = true;
-            self.pending = false;
+        // Already aborting and the attempt is still live: the first abort is on
+        // its way, and stacking a second one on the same run buys nothing.
+        if self.aborted && !self.stall_reported {
+            return;
         }
+        let Some(serial) = self.inner.abort_worker() else {
+            // No pass in flight. Silent: nothing was stopped and nothing failed.
+            return;
+        };
+        self.aborted = true;
+        self.pending = false;
+        self.stall_reported = false;
+        self.abort_attempt += 1;
+        let attempt = self.abort_attempt;
+        // The word goes out now, before anything can come back: the loop has told
+        // the worker to stop, and the user should not have to wonder whether the
+        // keystroke reached it. `pass_label` is what makes "cancelling…" name the
+        // bead rather than a faceless pass.
+        let what = self
+            .inner
+            .pass_label()
+            .map(|l| format!("`{l}`"))
+            .unwrap_or_else(|| "the beads worker".to_string());
+        self.inner.report_system(cancel::started(&what));
+        cancel::arm(
+            self.inner.ctl.clone(),
+            BeadsCmd::AbortStalled { serial, attempt },
+        );
+    }
+
+    /// The abort armed `cancel::GRACE` ago has produced neither a settle nor a
+    /// stream end: the worker is not unwinding.
+    ///
+    /// Killing it is the right escalation here and not elsewhere, because the beads
+    /// loop is the one mode where nothing precious is lost. The pass was a worker
+    /// the user just refused to spend another token on, and the loop's own policy
+    /// is cold between passes anyway (ADR-0002 Q3). The kill also has to happen
+    /// *here*: a parked loop sitting on top of a live child is the idle-child trap
+    /// [`park_after`] exists to avoid, and no later pass is coming to reap it.
+    ///
+    /// What must survive is the *breadcrumb*. A bead whose worker was cancelled
+    /// mid-flight stays claimed, and that is a fact about the board the user cannot
+    /// see from here — so it is named out loud, with the `bd` command that reads
+    /// it back, rather than left to be discovered the next time the loop looks for
+    /// work (the looprs-w7q guard reads exactly this state).
+    async fn abort_stalled(&mut self, serial: u64, attempt: u32) {
+        // Not ours unless this attempt is still the live one: the settle may have
+        // landed first, or the user may have Esc'd again and a newer attempt owns
+        // the deadline now.
+        if !self.aborted || self.stall_reported || self.abort_attempt != attempt {
+            return;
+        }
+        if self.inner.worker_serial() != Some(serial) {
+            return; // that pass is already gone; nothing to kill or explain
+        }
+        self.stall_reported = true;
+        // Captured before `close()`, which takes the label away with the worker.
+        let bead = self.inner.pass_label().map(|s| s.to_string());
+        self.inner.close().await;
+        let left_behind = match &bead {
+            Some(id) => format!("{id} stays claimed — `bd show {id}` says where it stopped"),
+            None => "the bead it was working on stays claimed".to_string(),
+        };
+        self.park_after(
+            None,
+            Some(&format!(
+                "{} — the worker was killed. {left_behind}; the loop is parked. Type an instruction to start again.",
+                cancel::stalled(bead.as_deref().unwrap_or("the beads worker"))
+            )),
+        )
+        .await;
     }
 
     fn status(&self) -> SessionStatus {
@@ -323,6 +412,8 @@ impl BeadsSession {
             pending: false,
             streaming: false,
             aborted: false,
+            abort_attempt: 0,
+            stall_reported: false,
         };
 
         tokio::spawn(async move {
@@ -356,6 +447,9 @@ impl BeadsSession {
                     BeadsCmd::WorkerSettled { serial } => task.worker_settled(serial).await,
                     BeadsCmd::WorkerGone { serial } => task.worker_gone(serial).await,
                     BeadsCmd::Abort => task.abort_pass(),
+                    BeadsCmd::AbortStalled { serial, attempt } => {
+                        task.abort_stalled(serial, attempt).await
+                    }
                     BeadsCmd::Sync(tx) => {
                         // Publish the mirrors *before* acking. A caller that waits
                         // on the seam and then reads `status()` / `in_flight()`
@@ -482,6 +576,12 @@ pub struct BeadsLoop {
     /// run, plus a handle on the run's own last words. `None` means the pass in
     /// flight is a worker's (or there is no pass), and there is nothing to diff.
     planning: Option<PlanPass>,
+    /// What the pass in flight is working on, for the human-facing sentence that
+    /// has to name it: a bead id for a worker, "the planner" for a planning pass.
+    /// Set with the pass and cleared with it, so a cancel can never name a bead the
+    /// loop is not actually holding — and so a *late* label cannot make an idle
+    /// loop look busy.
+    pass_label: Option<String>,
 }
 
 /// What one planner pass has to be checked against when it settles (looprs-k7v).
@@ -559,6 +659,7 @@ impl BeadsLoop {
             cfg,
             bead_step: BeadStep::AwaitInput,
             planning: None,
+            pass_label: None,
         }
     }
 
@@ -636,6 +737,7 @@ impl BeadsLoop {
         }
 
         self.pi_rx = Some(worker);
+        self.pass_label = Some(bead.id().to_string());
         self.report_system(format!("beads: working {}", bead.id()));
         self.set_step(BeadStep::WorkTickets);
         Ok(WorkerPass::Working)
@@ -733,12 +835,25 @@ impl BeadsLoop {
     /// worker's settle ends up being reported as a plan of zero.
     pub async fn close(&mut self) {
         self.planning = None;
+        self.pass_label = None;
         if let Some(mut old) = self.pi_rx.take() {
             let _ = old.rpc.kill().await;
         }
     }
 
-    /// `Esc`. Tell the in-flight worker to stop; `true` if there was one.
+    /// What the pass in flight is working on — a bead id, or "the planner" — for
+    /// the cancel sentences that have to name a thing rather than say "a pass".
+    pub fn pass_label(&self) -> Option<&str> {
+        self.pass_label.as_deref()
+    }
+
+    /// `Esc`. Tell the in-flight worker to stop, and return the serial of the pass
+    /// that was told, `None` when there was nothing to stop.
+    ///
+    /// The serial comes back rather than a bool because the caller has to arm a
+    /// deadline against *that* pass: "did my abort land?" is only answerable about
+    /// a pass with a name, and an untagged timer would eventually fire against a
+    /// later pass's run and kill work nobody cancelled.
     ///
     /// Fire-and-forget, exactly like Pi's own Esc: `abort` is answered only once
     /// the run has unwound, and parking this loop on that answer would put the
@@ -746,14 +861,12 @@ impl BeadsLoop {
     /// of the run arrives where every other end arrives — on the stream — and the
     /// caller's `aborted` flag is what makes it read as a cancellation rather than
     /// as a pass that finished (ADR-0002 Q3).
-    pub fn abort_worker(&mut self) -> bool {
-        let Some(worker) = self.pi_rx.as_ref() else {
-            return false;
-        };
+    pub fn abort_worker(&mut self) -> Option<u64> {
+        let worker = self.pi_rx.as_ref()?;
         if let Err(e) = worker.rpc.abort() {
             tracing::warn!("{}: abort did not reach the worker: {e:#}", self.id);
         }
-        true
+        Some(worker.serial)
     }
 
     /// Run the planner over `instructions`, remembering what the board looked like
@@ -792,6 +905,10 @@ impl BeadsLoop {
         }
         self.planning = Some(PlanPass { baseline, said });
         self.pi_rx = Some(worker);
+        // A planner pass has no bead to name, but it still has something to be
+        // cancelled *as*, or "cancelling…" would have to say nothing at all while
+        // a child is running.
+        self.pass_label = Some("the planner".to_string());
 
         Ok(())
     }
@@ -982,7 +1099,7 @@ mod tests {
     /// One event, described as a stable string so a failing assertion prints
     /// something readable instead of four nested enums.
 
-    fn describe(m: SessionEvent) -> String {
+    fn describe(m: &SessionEvent) -> String {
         match m {
             SessionEvent::BeadStep(BeadStep::AwaitInput) => "step:await".into(),
             SessionEvent::BeadStep(BeadStep::CreateTickets) => "step:plan".into(),
@@ -1012,7 +1129,7 @@ mod tests {
         let mut out = Vec::new();
         loop {
             let line = match timeout(NO_HANG, rx.recv()).await {
-                Ok(Some(m)) => describe(m),
+                Ok(Some(m)) => describe(&m),
                 Ok(None) => panic!("the session stream closed first: {out:?}"),
                 Err(_) => panic!("no matching event within {NO_HANG:?}: {out:?}"),
             };
@@ -1028,7 +1145,7 @@ mod tests {
     fn drain(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> Vec<String> {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
-            out.push(describe(m));
+            out.push(describe(&m));
         }
         out
     }
@@ -1563,6 +1680,144 @@ mod tests {
             "exactly one prompt ever went out: {:?}",
             fakes.pi_verbs()
         );
+    }
+
+    /// **Acceptance: Esc during a beads worker names the bead it is cancelling.**
+    ///
+    /// "cancelling…" about a faceless pass is not much of an answer: the thing the
+    /// user is stopping is a *bead*, and the only way to be sure you cancelled the
+    /// one you meant is for the loop to say which one it was.
+    #[tokio::test]
+    async fn esc_names_the_bead_it_is_cancelling() {
+        let fakes = Fakes::new("esc-names", PiFake::Chat, BdFake::Ok, ONE_BEADED_BOARD);
+        let (mut s, mut rx) = beads(&fakes, 1);
+        s.set_active(true).unwrap();
+        assert!(s.quiesce().await, "the pass started");
+        assert_eq!(s.status(), SessionStatus::Running);
+        drain(&mut rx);
+
+        s.abort().unwrap();
+        // Nothing has been settled yet, so this window is mostly the session's own
+        // words — but the fake unwinds quickly, so the park may land inside it
+        // too, and the assertions read the whole of it either way.
+        let mut got =
+            crate::testing::collect_within(&mut rx, Duration::from_millis(800), |ev| describe(&ev))
+                .await;
+        let ack = got
+            .iter()
+            .position(|l| l.starts_with("system: cancelling") && l.contains("looprs-26r"));
+        assert!(ack.is_some(), "the cancel did not name the bead: {got:?}");
+        if !got.iter().any(|l| l == "step:await") {
+            got.extend(drain_until_parked(&mut rx).await);
+        }
+        // Ordering, not absence: "cancelled" must not arrive before
+        // "cancelling". A completion word that beats the acknowledgement leaves
+        // the same silence in front of it that no acknowledgement at all would.
+        if let Some(done) = got.iter().position(|l| l.contains("cancelled")) {
+            assert!(
+                ack.unwrap() < done,
+                "the pass reported itself cancelled before the cancel was acknowledged: {got:?}"
+            );
+        }
+        // The point of naming it: this is the pass that got stopped, and stopping
+        // it does not buy another one.
+        assert_eq!(
+            fakes.pi_spawns(),
+            1,
+            "naming the bead cancelled that pass and only that pass: {got:?}"
+        );
+        assert_eq!(s.status(), SessionStatus::Idle);
+    }
+
+    /// Esc on a beads loop with nothing running is invisible: no note, no error,
+    /// no worker, and no park — the loop was already waiting for a human, and a
+    /// no-op that announces itself is indistinguishable from a cancel that did
+    /// something.
+    #[tokio::test]
+    async fn esc_on_an_idle_loop_says_nothing_and_starts_nothing() {
+        let fakes = Fakes::new("esc-idle-loop", PiFake::Chat, BdFake::Ok, EMPTY_BOARD);
+        let (mut s, mut rx) = beads(&fakes, 1);
+        s.set_active(true).unwrap();
+        assert!(s.quiesce().await);
+        assert_eq!(fakes.pi_spawns(), 0, "an empty board starts no worker");
+        drain(&mut rx);
+
+        s.abort().unwrap();
+        assert!(s.quiesce().await, "the Esc was handled");
+        let late =
+            crate::testing::collect_within(&mut rx, cancel::GRACE + Duration::from_secs(1), |ev| {
+                describe(&ev)
+            })
+            .await;
+        assert!(late.is_empty(), "an idle Esc made noise: {late:?}");
+        assert_eq!(fakes.pi_spawns(), 0, "and started nothing");
+        assert_eq!(s.status(), SessionStatus::Idle);
+    }
+
+    /// **The escalation: a worker that answers the abort and keeps going.**
+    ///
+    /// This is the mode where the stall matters most, because a beads worker is a
+    /// `pi` child being paid by the token and the loop self-advances. Killed, the
+    /// loop parked, and — the part the board cannot show the user from here — the
+    /// bead named as still claimed, because a cancelled worker leaves its ticket
+    /// `in_progress` and that is the state the claim/close guard has to be able to
+    /// see (looprs-w7q).
+    #[tokio::test]
+    async fn a_worker_that_ignores_the_abort_is_killed_and_leaves_the_bead_named() {
+        let fakes = Fakes::new("abort-stubborn", PiFake::Chat, BdFake::Ok, ONE_BEADED_BOARD);
+        fakes.stubborn_pi(true);
+        let (mut s, mut rx) = beads(&fakes, 1);
+        s.set_active(true).unwrap();
+        assert!(s.quiesce().await, "the pass started");
+        let worker = fakes.pi_pids()[0];
+        assert_eq!(s.status(), SessionStatus::Running);
+
+        s.abort().unwrap();
+        assert!(s.quiesce().await, "the Esc was handled");
+        assert_eq!(
+            s.status(),
+            SessionStatus::Aborting,
+            "waiting on an unwind that is not coming"
+        );
+        assert!(
+            process_alive(worker),
+            "the abort alone has not stopped it (that is the point of this fake)"
+        );
+
+        let late =
+            crate::testing::collect_within(&mut rx, cancel::GRACE + Duration::from_secs(6), |ev| {
+                describe(&ev)
+            })
+            .await;
+        assert!(
+            !process_alive(worker),
+            "the stalled worker was left running — and still billing"
+        );
+        assert!(
+            late.iter().any(|l| l.starts_with("error:")
+                && l.contains("looprs-26r")
+                && l.contains("killed")),
+            "the stall did not say what it did, to which bead: {late:?}"
+        );
+        assert!(
+            late.iter().any(|l| l.contains("stays claimed")),
+            "the bead the worker leaves behind was not named as claimed: {late:?}"
+        );
+        assert!(
+            late.iter().any(|l| l == "step:await"),
+            "the loop stayed 'working' instead of handing the box back: {late:?}"
+        );
+        assert_eq!(
+            fakes.pi_spawns(),
+            1,
+            "killing a stalled worker is not a restart: a cancel that auto-retries is a respawn storm"
+        );
+        assert_eq!(
+            s.status(),
+            SessionStatus::Idle,
+            "parked, waiting on a human"
+        );
+        assert_eq!(s.in_flight(), None, "nothing in flight");
     }
 
     /// The symmetric edge of the settle path. A worker that dies mid-run never

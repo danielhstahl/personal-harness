@@ -15,6 +15,7 @@ evidence, so a future reader can re-run it instead of re-arguing.
 | `spikes/bash_e2e.py` | Drives the real TUI in a real PTY: the Bash terminal state end to end (echo/cd/exit codes/Ctrl-C/`exit`/Ctrl-Q). |
 | `spikes/vim_fullscreen.py` | looprs-4hv: does vim's screen reach the user? Scored against a bare-pty control. |
 | `spikes/fullscreen_e2e.py` | looprs-4hv acceptance: vim + less + a program that repaints in place, each against a bare-pty control. |
+| `spikes/cancel_e2e.py` | looprs-5g7 acceptance: Esc in all three modes inside the real TUI — latency to the acknowledgement and to the completion word, the silent-idle rows, and "a cancelled beads pass did not start another bead". `pi`/`bd` are fakes the script writes, so it costs no model call. |
 | `spikes/results/` | Committed raw output of the runs quoted in the ADR. |
 
 ## Running it
@@ -33,6 +34,7 @@ cargo build
 python3 spikes/bash_e2e.py        | tee spikes/results/bash-e2e.log
 python3 spikes/fullscreen_e2e.py  | tee spikes/results/fullscreen-e2e.log
 python3 spikes/vim_fullscreen.py  | tee spikes/results/vim-fullscreen.log
+python3 spikes/cancel_e2e.py      | tee spikes/results/cancel-e2e.log
 ```
 
 **Why the full-screen spikes run a control.** "Did the user see it?" is not answered

@@ -15,6 +15,7 @@
 
 pub mod bash;
 pub mod beads;
+pub mod cancel;
 pub mod pi_chat;
 pub mod router;
 pub mod view;
@@ -282,11 +283,7 @@ fn default_shell_bin() -> String {
             return s;
         }
     }
-    for cand in [
-        "/bin/bash",
-        "/opt/homebrew/bin/bash",
-        "/usr/local/bin/bash",
-    ] {
+    for cand in ["/bin/bash", "/opt/homebrew/bin/bash", "/usr/local/bin/bash"] {
         if std::path::Path::new(cand).exists() {
             return cand.to_string();
         }
@@ -358,6 +355,13 @@ pub trait Session: Send {
 
     /// `Esc`. Cancel the in-flight work and leave the session usable. Idle session
     /// => no-op, not an error (looprs-5g7).
+    ///
+    /// Every implementation owes the same four-word answer, and [`cancel`] is the
+    /// contract: silence when there is nothing to stop, `cancelling …` the moment
+    /// the keystroke is acted on, `cancelled` when the child unwinds, and — if it
+    /// has not unwound within [`cancel::GRACE`] — one loud line naming what is stuck
+    /// and what the session did about it (ADR-0003). Never a quit, and never a
+    /// timeout that only the log knows about.
     fn abort(&mut self) -> anyhow::Result<()>;
 
     /// Orderly teardown: close the child's stdin so it can dispose its runtime,

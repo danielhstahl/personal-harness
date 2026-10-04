@@ -38,7 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::app::{PiEvent, parse};
 use crate::services::pi::{PiRpc, disposition_of, queued_text, succeeded};
 use crate::session::{
-    ExitReason, Session, SessionConfig, SessionEvent, SessionId, SessionStatus, Spawned,
+    ExitReason, Session, SessionConfig, SessionEvent, SessionId, SessionStatus, Spawned, cancel,
 };
 
 /// How long an orderly `close stdin -> pi disposes itself` gets before we SIGKILL.
@@ -65,6 +65,11 @@ enum PiCmd {
     Submit(String),
     /// `Esc`: `clear_queue` then `abort` (pi's interactive-Esc recipe).
     Cancel,
+    /// The cancel armed `cancel::GRACE` ago has not seen `agent_settled`. `serial`
+    /// is the child the cancel was aimed at and `attempt` which cancel it was, so a
+    /// deadline can only ever be answered against the child and the attempt that
+    /// armed it (ADR-0003).
+    CancelStalled { serial: u64, attempt: u32 },
     /// A protocol record off the child's stdout.
     Record(Value),
     /// The child's stdout closed. Carries the serial of *that* child, so a late
@@ -112,6 +117,12 @@ struct PiChat {
     running: bool,
     /// `Esc` landed on a running session and we are waiting for it to unwind.
     aborting: bool,
+    /// How many cancels this session has sent. The stall deadline carries one so an
+    /// expired timer cannot be mistaken for the live one.
+    cancel_attempt: u32,
+    /// The stall has been reported for the current attempt: the escalation is one
+    /// sentence, not an alarm.
+    stall_reported: bool,
 }
 
 impl PiChat {
@@ -163,6 +174,8 @@ impl PiChat {
         self.had_child = true;
         self.running = false;
         self.aborting = false;
+        self.cancel_attempt = 0;
+        self.stall_reported = false;
         self.child = Some(ChildHandle { serial, rpc });
         self.forward_records(records, serial);
         if respawning {
@@ -269,19 +282,56 @@ impl PiChat {
 
     /// `Esc`. `clear_queue` first, then `abort` — pi's documented recipe, in that
     /// order because `abort` runs whatever is still queued.
+    ///
+    /// The whole cancel ladder for this mode lives here, and the ladder never *waits*
+    /// for the thing it asked for: `abort` is answered when the run has already
+    /// unwound, so awaiting it would put the user's keystroke behind the very run
+    /// they are trying to stop. The four answers the contract owes:
+    ///
+    /// * **no child, or a warm one with nothing running** → a silent no-op. Esc
+    ///   means "stop the thing"; there is no thing, so saying anything would be
+    ///   worse than saying nothing (looprs-5g7).
+    /// * **a run in flight** → `cancelling …` before anything is awaited, status
+    ///   `Aborting`, and a `cancel::GRACE` deadline armed.
+    /// * **the run unwinds** → `cancelled`, said by [`Self::on_record`] when the
+    ///   settle that follows arrives with the cancel flag set.
+    /// * **it does not unwind** → [`Self::cancel_stalled`] escalates (ADR-0003).
+    /// * **the abort could not be sent at all** → an error, and the session is not
+    ///   left claiming to be aborting over a child that never got the message.
     async fn cancel(&mut self) {
+        if self.child.is_none() {
+            // No child, nothing to stop. A no-op rather than an error: Esc means
+            // "stop the thing", and there is no thing (looprs-5g7).
+            return;
+        }
+        if !self.running && !self.aborting {
+            // Warm and idle. `clear_queue` would be a 600 ms round trip asking for
+            // text that cannot exist: a queue only means something to a run that
+            // can consume it.
+            return;
+        }
+        if self.aborting && !self.stall_reported {
+            // The first cancel is still in flight. A second `Esc` must not
+            // re-clear a queue the user may have filled again in the meantime —
+            // that is not what the keystroke means.
+            return;
+        }
+        let serial = self.child.as_ref().expect("checked above").serial;
+        // The word goes out *before* the round trips, so the user is never staring
+        // at a screen that has not answered a key they already pressed.
+        self.aborting = true;
+        self.stall_reported = false;
+        self.cancel_attempt += 1;
+        let attempt = self.cancel_attempt;
+        self.note(cancel::started("the Pi run"));
+        cancel::arm(self.cmd.clone(), PiCmd::CancelStalled { serial, attempt });
+
         // The two round-trips happen with the child borrowed; the reporting happens
         // after that borrow is done, because a session reports through itself.
-        let esc = match self.child.as_mut() {
-            None => {
-                // No child, nothing to stop. A no-op rather than an error: Esc means
-                // "stop the thing", and there is no thing (looprs-5g7).
-                return;
-            }
-            Some(child) => Self::esc_round_trip(child).await,
+        let Some(child) = self.child.as_mut() else {
+            return; // died while we were getting here; the death is its own report
         };
-
-        let (restored, abort_err) = esc;
+        let (restored, abort_err) = Self::esc_round_trip(child).await;
         if !restored.is_empty() {
             // The user's own words go back to the box rather than into the
             // transcript. The App owns the box, so this travels as an event.
@@ -290,12 +340,49 @@ impl PiChat {
             });
         }
         if let Some(e) = abort_err {
+            // Not aborting after all. Leaving the flag set would advertise a
+            // cancellation that can never complete and hold the status row on
+            // "aborting" for a child that was never told.
+            self.aborting = false;
             self.err(format!("cancel failed: {e}"));
             return;
         }
-        if self.running {
-            self.aborting = true;
+    }
+
+    /// The cancel armed `cancel::GRACE` ago has seen no `agent_settled`.
+    ///
+    /// pi took the abort (`clear_queue` answered, the write succeeded) but the run
+    /// is not coming apart — a tool that ignores the abort, or a runtime wedged
+    /// mid-call. Esc cannot be left meaning "aborting…" forever with the transcript
+    /// held open behind it, and this is the one mode where killing the child is a
+    /// proportional escalation: the context that dies with it is the context of the
+    /// very turn the user just cancelled, and the next message cold-starts a
+    /// replacement the same way a crash does (which is already a path this session
+    /// handles, tested, and is not new failure surface).
+    async fn cancel_stalled(&mut self, serial: u64, attempt: u32) {
+        if !self.aborting || self.stall_reported || self.cancel_attempt != attempt {
+            return;
         }
+        if self.child.as_ref().map(|c| c.serial) != Some(serial) {
+            return; // that child is already gone; a newer one is not ours to kill
+        }
+        self.stall_reported = true;
+        self.err(format!(
+            "{} — killing it. The next message starts a new Pi session, and that conversation's context goes with the old child.",
+            cancel::stalled("pi")
+        ));
+        if let Some(child) = self.child.as_mut() {
+            if let Err(e) = child.rpc.kill().await {
+                tracing::warn!("{}: killing the stalled pi failed: {e:#}", self.id);
+            }
+        }
+        // Reap for the code (the log wants it), then report the death as what it
+        // actually was: ours, on the user's instruction. The stream end that
+        // follows is then stale-by-serial and cannot double-report.
+        let _ = self.reap_child().await;
+        self.emit(SessionEvent::Exited {
+            reason: ExitReason::Cancelled,
+        });
     }
 
     /// The two commands an interactive Esc is made of, and what they gave back.
@@ -400,7 +487,7 @@ impl PiChat {
             // The user pressed Esc; tell them it arrived. looprs-5g7 owns the
             // wording and the spinner, but silence while a tool unwinds is not an
             // option either.
-            self.note("cancelled");
+            self.note(cancel::DONE);
         }
     }
 
@@ -478,6 +565,8 @@ impl PiChatSession {
             had_child: false,
             running: false,
             aborting: false,
+            cancel_attempt: 0,
+            stall_reported: false,
         };
 
         tokio::spawn(async move {
@@ -485,6 +574,9 @@ impl PiChatSession {
                 match cmd {
                     PiCmd::Submit(text) => chat.submit(text).await,
                     PiCmd::Cancel => chat.cancel().await,
+                    PiCmd::CancelStalled { serial, attempt } => {
+                        chat.cancel_stalled(serial, attempt).await
+                    }
                     PiCmd::Record(v) => chat.on_record(v),
                     PiCmd::StreamEnd { serial } => chat.child_gone(serial).await,
                     PiCmd::Sync(tx) => {
@@ -613,7 +705,7 @@ mod tests {
         }
     }
 
-    fn describe(ev: SessionEvent) -> String {
+    fn describe(ev: &SessionEvent) -> String {
         match ev {
             SessionEvent::Agent(PiEvent::AgentStart) => "agent_start".into(),
             SessionEvent::Agent(PiEvent::AgentSettled) => "agent_settled".into(),
@@ -638,14 +730,14 @@ mod tests {
             .await
             .expect("the session went silent")
             .expect("the session stream closed");
-        describe(ev)
+        describe(&ev)
     }
 
     /// Whatever has already arrived, described.
     fn drain(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> Vec<String> {
         let mut out = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            out.push(describe(ev));
+            out.push(describe(&ev));
         }
         out
     }
@@ -863,6 +955,137 @@ mod tests {
         assert_eq!(f.pi_verbs(), Vec::<String>::new(), "it barely spoke");
         assert!(drain(&mut rx).is_empty(), "and it must not complain either");
         assert_eq!(s.status(), SessionStatus::NotStarted);
+    }
+
+    /// An idle Esc must be *invisible*, not merely harmless: no note, no error,
+    /// and — because a queue only means something to a run that can consume it —
+    /// not one byte more down to the child.
+    ///
+    /// The window runs past `cancel::GRACE` because what is being ruled out is not
+    /// only a spurious "cancelling…" but a stall report about a run that was
+    /// never in flight.
+    #[tokio::test]
+    async fn an_idle_esc_is_invisible() {
+        let f = fakes("esc-idle-quiet");
+        let (mut s, mut rx) = pi_chat(&f, 1);
+        send_and_settle(&mut s, &f, &mut rx, "one turn").await;
+        let verbs_before = f.pi_verbs();
+        drain(&mut rx);
+
+        s.abort().unwrap();
+        assert!(s.quiesce().await, "the Esc was handled");
+        let late =
+            crate::testing::collect_within(&mut rx, cancel::GRACE + Duration::from_secs(1), |ev| {
+                describe(ev)
+            })
+            .await;
+        assert!(late.is_empty(), "an idle Esc made noise: {late:?}");
+        assert_eq!(
+            f.pi_verbs(),
+            verbs_before,
+            "an idle Esc touched the child at all"
+        );
+        assert_eq!(s.status(), SessionStatus::Idle);
+    }
+
+    /// **Cancel contract, first half: the acknowledgement is instant and comes
+    /// from the session alone.** The fake is holding the run open and has settled
+    /// nothing, so anything inside this window is the session answering the key
+    /// rather than the child answering the abort.
+    #[tokio::test]
+    async fn esc_answers_the_keystroke_before_the_run_has_unwound() {
+        let f = fakes("esc-instant");
+        let (mut s, mut rx) = pi_chat(&f, 1);
+        s.send_text("long task".to_string()).unwrap();
+        f.wait_for_log_line("prompt long task").await;
+        // The seam, not a sleep: `status()` is a mirror the task publishes between
+        // commands, so reading it before the seam can read a turn stale.
+        assert!(s.quiesce().await, "the turn was submitted");
+        assert_eq!(s.status(), SessionStatus::Running);
+        // Whatever streamed by up to here is not a response to Esc.
+        drain(&mut rx);
+
+        let started = Instant::now();
+        s.abort().unwrap();
+        let got =
+            crate::testing::collect_within(&mut rx, Duration::from_millis(800), |ev| describe(ev))
+                .await;
+        let ack = got
+            .iter()
+            .position(|l| l == "system: cancelling the Pi run…");
+        assert!(
+            ack.is_some(),
+            "the keystroke was never acknowledged: {got:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the acknowledgement took {:?}",
+            started.elapsed()
+        );
+        // Ordering, not absence: if the child did manage to unwind inside the
+        // window, the acknowledgement still has to have come first. A "cancelled"
+        // that arrives before "cancelling" is the same silence, just late.
+        if let Some(done) = got.iter().position(|l| l.contains("cancelled")) {
+            assert!(
+                ack.unwrap() < done,
+                "the run was reported finished before the cancel was acknowledged: {got:?}"
+            );
+        }
+    }
+
+    /// **Cancel contract, last half: a child that answers the abort and then keeps
+    /// going.** A tool that ignores the cancel looks identical to this from here,
+    /// and the session cannot be left holding "aborting…" open forever with the
+    /// transcript behind it. It escalates: a loud line, a killed child, and a mode
+    /// that takes the next message like it takes any restart.
+    #[tokio::test]
+    async fn a_pi_that_ignores_the_abort_is_killed_said_so_and_the_mode_recovers() {
+        let f = fakes("esc-stubborn");
+        f.stubborn_pi(true);
+        let (mut s, mut rx) = pi_chat(&f, 1);
+        s.send_text("wedged run".to_string()).unwrap();
+        f.wait_for_log_line("prompt wedged run").await;
+        assert!(s.quiesce().await, "the turn was submitted");
+        assert_eq!(s.status(), SessionStatus::Running);
+
+        s.abort().unwrap();
+        assert!(s.quiesce().await, "the Esc was handled");
+        assert_eq!(
+            s.status(),
+            SessionStatus::Aborting,
+            "still waiting on the unwind the child is not doing"
+        );
+
+        let late =
+            crate::testing::collect_within(&mut rx, cancel::GRACE + Duration::from_secs(6), |ev| {
+                describe(ev)
+            })
+            .await;
+        assert!(
+            late.iter().any(|l| l.starts_with("error:")
+                && l.contains("still running")
+                && l.contains("killing")),
+            "the stall was silent: {late:?}"
+        );
+        assert!(
+            late.iter().any(|l| l.starts_with("down ")),
+            "the child's death was never reported, so the transcript would stay sealed open: {late:?}"
+        );
+        assert!(
+            late.iter().any(|l| l.contains("Cancelled")),
+            "a child we killed because the user cancelled is not a crash: {late:?}"
+        );
+        assert_eq!(
+            s.status(),
+            SessionStatus::Dead,
+            "dead, not aborting — no phantom cancel pending forever"
+        );
+
+        // The mode is not wedged: the next message cold-starts a replacement,
+        // which is the crash-recovery path this session already had.
+        let turn = send_and_settle(&mut s, &f, &mut rx, "back again").await;
+        assert_eq!(f.pi_spawns(), 2, "a replacement child came up");
+        assert!(turn.has("agent_settled"), "and it answers: {turn:?}");
     }
 
     /// **Child killed out from under the app**: reported once, mode not wedged,

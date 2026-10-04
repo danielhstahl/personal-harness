@@ -143,6 +143,12 @@ Not adopted: `pi --session-id <id>` (pi `docs/cli.md`) would let Pi mode be cold
 resumed from disk, trading the resident process for startup latency plus a second source of truth
 for "what was this conversation". Warm is simpler and instant.
 
+**The `Esc` row is a summary; the decision behind it is ADR-0003.** What each mode does when the
+thing it cancelled *refuses* to stop, why Esc never quits, why the grace is three seconds, and
+why Bash is the one mode that must not kill — all of that lives in
+[ADR-0003](0003-cancellation.md). This table says where the mechanism goes; that one says what
+happens when the mechanism does not work.
+
 ## Q4. Ownership and channel topology
 
 **The `Router` actor owns every session. `App` renders.**

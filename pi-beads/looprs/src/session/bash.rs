@@ -41,7 +41,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::screen::{Piece, ScreenWatch};
 use crate::session::{
-    ByteStream, ExitReason, Session, SessionConfig, SessionEvent, SessionId, SessionStatus, Spawned,
+    ByteStream, ExitReason, Session, SessionConfig, SessionEvent, SessionId, SessionStatus,
+    Spawned, cancel,
 };
 
 /// `DC1` — starts the exit marker. A control character no program emits by
@@ -118,7 +119,11 @@ struct Shell {
 }
 
 impl Shell {
-    fn spawn(cfg: &SessionConfig, size: PtySize, tx: mpsc::UnboundedSender<BashCmd>) -> Result<Self> {
+    fn spawn(
+        cfg: &SessionConfig,
+        size: PtySize,
+        tx: mpsc::UnboundedSender<BashCmd>,
+    ) -> Result<Self> {
         let integration = write_integration()?;
         let pty = native_pty_system();
         let pair = pty
@@ -138,7 +143,10 @@ impl Shell {
         // A stable, non-login shell: no /etc/profile surprises on top of bashrc.
         cmd.env("LOOPRS_BASH", "1");
         // The child must not outlive us even if every orderly path fails.
-        cmd.env("TERM", std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()));
+        cmd.env(
+            "TERM",
+            std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
+        );
 
         let child = pair
             .slave
@@ -206,7 +214,9 @@ impl Shell {
                 if status.success() || code == 0 {
                     ExitReason::Shutdown
                 } else {
-                    ExitReason::Crashed { code: Some(code as i32) }
+                    ExitReason::Crashed {
+                        code: Some(code as i32),
+                    }
                 }
             }
             Err(_) => ExitReason::Unknown,
@@ -258,6 +268,11 @@ enum BashCmd {
     /// SIGINT for the child's foreground process group. The command dies; the
     /// shell survives.
     Interrupt,
+    /// The `Interrupt` posted `attempt` attempts ago has not produced an exit
+    /// marker within [`cancel::GRACE`](crate::session::cancel). The command is
+    /// most likely trapping or ignoring SIGINT; the session says so instead of
+    /// leaving the user staring at a spinner (ADR-0003).
+    InterruptStalled { attempt: u32 },
     /// Raw keystrokes for a child that currently holds the screen
     /// ([`ScreenWatch`]): written to the master exactly as typed, with no newline
     /// and no interpretation. This is what makes `Esc` be `Esc` inside vim
@@ -305,6 +320,14 @@ struct BashTask {
     outstanding: VecDeque<String>,
     /// `0x03` went out and we are waiting for the command to unwind.
     aborting: bool,
+    /// How many `0x03`s this cancel has sent. The stall watchdog carries one, so a
+    /// deadline for an interrupt already resolved cannot be mistaken for a deadline
+    /// on the current one — the same job `serial` does everywhere else.
+    interrupt_attempt: u32,
+    /// The stall has been reported for the current attempt. Set once per attempt:
+    /// the escalation is one honest sentence, not a nagging timer. The user's next
+    /// `Esc` clears it and starts a fresh attempt.
+    stall_reported: bool,
     /// Unconsumed marker bytes (a marker can straddle two reads).
     pending: Vec<u8>,
     /// Who owns the real terminal screen, read out of the child's own bytes
@@ -390,6 +413,8 @@ impl BashTask {
         self.ready = false;
         self.outstanding.clear();
         self.aborting = false;
+        self.interrupt_attempt = 0;
+        self.stall_reported = false;
         if respawning {
             self.note("shell restarted (the previous one was gone)");
         }
@@ -427,22 +452,84 @@ impl BashTask {
         }
     }
 
-    /// `Esc` / Ctrl-C.
+    /// `Esc` / Ctrl-C: interrupt the command in front of the shell.
     ///
-    /// Only meaningful while something is running. At an idle prompt `0x03` would
-    /// print a `^C` for no reason, so an idle Bash session ignores it rather than
-    /// making noise about a no-op.
+    /// Three cases, and only the last one sends a byte:
+    ///
+    /// * **nothing outstanding** — an idle prompt. `0x03` would print a `^C` for
+    ///   no reason, so an idle Esc is a silent no-op, not an error (looprs-5g7).
+    /// * **already cancelling and the attempt is still live** — the byte is already
+    ///   in the line discipline. Stacking a second one on it buys nothing and
+    ///   makes "which interrupt is the pending one?" unanswerable, so the repeat
+    ///   keystroke is dropped rather than queued behind it.
+    /// * **cancelling, but the last attempt was reported stalled** — that report
+    ///   is the user being told the command ignored us; hitting Esc again means
+    ///   "try anyway", so the ladder restarts with a fresh attempt and a fresh
+    ///   deadline.
     fn interrupt(&mut self) {
-        if self.outstanding.is_empty() || self.aborting {
+        if self.outstanding.is_empty() {
             return;
         }
-        if let Some(shell) = self.shell.as_mut() {
-            if let Err(e) = shell.write_line("\x03") {
-                self.err(format!("interrupt did not reach the shell: {e:#}"));
-                return;
-            }
-            self.aborting = true;
+        if self.aborting && !self.stall_reported {
+            return;
         }
+        let what = clip(&self.foreground(), 60);
+        let note = if self.aborting {
+            format!("cancelling `{what}` again…")
+        } else {
+            cancel::started(&format!("`{what}`"))
+        };
+        self.send_sigint(note);
+    }
+
+    /// One `0x03`, one word about it, one deadline armed.
+    ///
+    /// The word goes out *before* anything can come back, because the thing this
+    /// row of the contract buys is the end of the silence: the shell may take
+    /// seconds to unwind a `find`, and the user should not have to wonder whether
+    /// their keystroke did anything at all.
+    fn send_sigint(&mut self, note: String) {
+        let Some(shell) = self.shell.as_mut() else {
+            return;
+        };
+        if let Err(e) = shell.write_line("\x03") {
+            self.err(format!("interrupt did not reach the shell: {e:#}"));
+            return;
+        }
+        self.aborting = true;
+        self.stall_reported = false;
+        self.interrupt_attempt += 1;
+        let attempt = self.interrupt_attempt;
+        self.note(note);
+        cancel::arm(self.cmd.clone(), BashCmd::InterruptStalled { attempt });
+    }
+
+    /// The `0x03` sent `attempt` ago produced no exit marker within
+    /// [`cancel::GRACE`].
+    ///
+    /// A command can be uncancellable by us without anything being wrong with the
+    /// shell: `trap '' INT`, a program that reset its own handler, a process stuck
+    /// in an uninterruptible syscall. What the session must **not** do is kill the
+    /// shell to make the prompt come back — cwd, exports, aliases and background
+    /// jobs are the entire reason Bash mode has a pty (ADR-0001), and they are
+    /// exactly what a `kill` here would throw away in order to fix somebody
+    /// else's command.
+    ///
+    /// So the escalation is one sentence, and the choice stays with the user:
+    /// `Esc` sends another interrupt, `Ctrl-Q` quits and takes the shell along.
+    fn interrupt_stalled(&mut self, attempt: u32) {
+        // Not ours if this attempt is no longer the live one: the marker may have
+        // landed first, or the user may have Esc'd again and a newer attempt now
+        // owns the deadline.
+        if !self.aborting || self.stall_reported || self.interrupt_attempt != attempt {
+            return;
+        }
+        self.stall_reported = true;
+        let what = clip(&self.foreground(), 60);
+        self.err(format!(
+            "{} — it may be trapping the interrupt. Esc sends another one; Ctrl-Q quits if you meant it.",
+            cancel::stalled(&what)
+        ));
     }
 
     /// Raw keystrokes for a child that holds the screen (ADR-0001 Q2).
@@ -646,6 +733,10 @@ impl BashTask {
         let _cmd = self.outstanding.pop_front();
         let interrupted = self.aborting;
         self.aborting = false;
+        // The ladder is over with this command: the next one starts at attempt 0,
+        // so an old deadline cannot match a new interrupt by coincidence.
+        self.interrupt_attempt = 0;
+        self.stall_reported = false;
         self.last_exit = Some(code);
         // Whatever screen the command was holding is gone with it, whether or not
         // the program ever said goodbye.
@@ -710,6 +801,8 @@ impl BashTask {
         self.outstanding.clear();
         self.ready = false;
         self.aborting = false;
+        self.interrupt_attempt = 0;
+        self.stall_reported = false;
         match &reason {
             ExitReason::Shutdown => {
                 self.note(format!(
@@ -827,6 +920,8 @@ impl BashSession {
             queue: VecDeque::new(),
             outstanding: VecDeque::new(),
             aborting: false,
+            interrupt_attempt: 0,
+            stall_reported: false,
             pending: Vec::new(),
             screen: ScreenWatch::new(),
             utf8: Vec::new(),
@@ -846,6 +941,7 @@ impl BashSession {
                 match cmd {
                     BashCmd::Submit(text) => task.submit(text),
                     BashCmd::Interrupt => task.interrupt(),
+                    BashCmd::InterruptStalled { attempt } => task.interrupt_stalled(attempt),
                     BashCmd::Keys(b) => task.write_keys(b),
                     BashCmd::Bytes(b) => task.on_bytes(b),
                     BashCmd::StreamEnd => task.stream_end(),
@@ -996,7 +1092,7 @@ mod tests {
         (s, rx)
     }
 
-    fn describe(ev: SessionEvent) -> String {
+    fn describe(ev: &SessionEvent) -> String {
         match ev {
             SessionEvent::BashOutput { chunk, .. } => format!("out {chunk}"),
             SessionEvent::System(t) => format!("system: {t}"),
@@ -1011,7 +1107,7 @@ mod tests {
     fn drain(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> Vec<String> {
         let mut out = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            out.push(describe(ev));
+            out.push(describe(&ev));
         }
         out
     }
@@ -1021,7 +1117,7 @@ mod tests {
             .await
             .expect("the bash session went silent")
             .expect("the bash session stream closed");
-        describe(ev)
+        describe(&ev)
     }
 
     /// What a finished command gave us: the raw bytes it wrote, its exit code, and
@@ -1056,10 +1152,14 @@ mod tests {
     /// Read until the shell reports the exit of the command just sent.
     async fn run_logged(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> Ran {
         let deadline = tokio::time::Instant::now() + NO_HANG;
-        let mut ran = Ran { out: String::new(), code: None, notes: Vec::new() };
+        let mut ran = Ran {
+            out: String::new(),
+            code: None,
+            notes: Vec::new(),
+        };
         loop {
             let line = match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(ev)) => describe(ev),
+                Ok(Some(ev)) => describe(&ev),
                 Ok(None) => panic!("the bash session stream closed: {:?}", ran.notes),
                 Err(_) => panic!(
                     "the shell never reported an exit. events so far: {:?}",
@@ -1082,9 +1182,7 @@ mod tests {
     }
 
     /// As [`run_logged`], keeping only the two answers most tests care about.
-    async fn run_command(
-        rx: &mut mpsc::UnboundedReceiver<SessionEvent>,
-    ) -> (String, Option<i32>) {
+    async fn run_command(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> (String, Option<i32>) {
         let ran = run_logged(rx).await;
         (ran.out, ran.code)
     }
@@ -1127,10 +1225,7 @@ mod tests {
         let target = "/tmp";
         s.send_text(format!("cd {target}")).unwrap();
         run_command(&mut rx).await;
-        assert!(
-            tmp.exists(),
-            "test precondition: {target} should exist"
-        );
+        assert!(tmp.exists(), "test precondition: {target} should exist");
 
         s.send_text("pwd".into()).unwrap();
         let (out, code) = run_command(&mut rx).await;
@@ -1202,10 +1297,7 @@ mod tests {
         let one = out.find("one").expect("stdout missing");
         let two = out.find("two").expect("stderr missing");
         let three = out.find("three").expect("later stdout missing");
-        assert!(
-            one < two && two < three,
-            "streams were reordered: {out:?}"
-        );
+        assert!(one < two && two < three, "streams were reordered: {out:?}");
     }
 
     /// `ls /nope` is the acceptance case that *stderr reaches the transcript*.
@@ -1284,6 +1376,143 @@ mod tests {
                 .all(|m| !m.contains("exit ") && !m.contains("interrupted")),
             "an idle Esc reported a command that never ran: {msgs:?}"
         );
+    }
+
+    /// The invisible half of the contract: an idle Esc must not even announce
+    /// itself. "cancelling…" with nothing cancelled is a claim about work in
+    /// flight that is not true, and the status row would carry that claim around
+    /// for the rest of the session.
+    ///
+    /// Shell *output* is not counted as noise — the prompt keeps arriving on its
+    /// own and has nothing to do with the keystroke. What must not appear is a
+    /// word from the session about a command that was never running, including a
+    /// stall report, which is why the window runs past `cancel::GRACE`.
+    #[tokio::test]
+    async fn esc_at_an_idle_prompt_says_nothing_at_all() {
+        let (mut s, mut rx) = bash(21);
+        s.send_text("echo first".to_string()).unwrap();
+        run_command(&mut rx).await;
+        assert_eq!(s.status(), SessionStatus::Idle);
+        drain(&mut rx);
+
+        s.abort().unwrap();
+        assert!(s.quiesce().await, "the Esc was handled");
+        let late =
+            crate::testing::collect_within(&mut rx, cancel::GRACE + Duration::from_secs(1), |ev| {
+                describe(ev)
+            })
+            .await;
+        let noise: Vec<&String> = late.iter().filter(|l| !l.starts_with("out ")).collect();
+        assert!(noise.is_empty(), "an idle Esc made noise: {late:?}");
+        assert_eq!(s.status(), SessionStatus::Idle, "and changed nothing");
+    }
+
+    /// **Acceptance: the word comes before the child does.** A `sleep 30` stops
+    /// fast but not instantly, and the user must not spend the gap wondering
+    /// whether Esc reached anything. So the contract is an *ordering*: the
+    /// acknowledgement precedes the exit line, and arrives inside a second of the
+    /// keystroke whether or not the shell has finished by then.
+    #[tokio::test]
+    async fn esc_says_cancelling_before_the_command_reports_itself_done() {
+        let (mut s, mut rx) = bash(22);
+        s.send_text("sleep 30".into()).unwrap();
+        wait_running(&mut s).await;
+        drain(&mut rx);
+
+        let started = std::time::Instant::now();
+        s.abort().unwrap();
+        // Well inside both the one-second bar and the grace, so whatever arrives
+        // here arrived because the session said it, not because the shell did.
+        let got =
+            crate::testing::collect_within(&mut rx, Duration::from_millis(800), |ev| describe(ev))
+                .await;
+        let ack = got
+            .iter()
+            .position(|l| l.starts_with("system: cancelling") && l.contains("sleep 30"));
+        assert!(
+            ack.is_some(),
+            "the keystroke was not acknowledged, by name: {got:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1), "Esc was slow");
+        // If the shell got this far inside the window, the acknowledgement still
+        // has to have come first. "Cancelled" arriving before "cancelling" is the
+        // silence this row exists to remove, arriving late instead of never.
+        if let Some(done) = got.iter().position(|l| l.contains("exit ")) {
+            assert!(
+                ack.unwrap() < done,
+                "the command reported itself done before the cancel was acknowledged: {got:?}"
+            );
+        }
+    }
+
+    /// **The escalation: a command that will not be interrupted.**
+    ///
+    /// `trap '' INT` hands the ignore disposition to the child, so the tty's
+    /// SIGINT arrives, is thrown away, and no exit marker ever comes back. From
+    /// here that is indistinguishable from a hang, which is exactly why the stall
+    /// has to be a sentence rather than a spinner — and why the session must not
+    /// "solve" it by killing the shell the command was running inside of.
+    #[tokio::test]
+    async fn a_command_that_traps_the_interrupt_is_reported_not_silently_wedged() {
+        let (mut s, mut rx) = bash(23);
+        s.send_text("trap '' INT; sleep 30".into()).unwrap();
+        wait_running(&mut s).await;
+
+        s.abort().unwrap();
+        assert!(s.quiesce().await, "the Esc was handled");
+        assert_eq!(s.status(), SessionStatus::Aborting);
+
+        // Not early: reporting a stall before the grace would cry wolf at a
+        // command that was still on its way out.
+        let early =
+            crate::testing::collect_within(&mut rx, Duration::from_millis(500), |ev| describe(ev))
+                .await;
+        assert!(
+            early.iter().all(|l| !l.contains("still running")),
+            "escalated before the grace was up: {early:?}"
+        );
+
+        let late =
+            crate::testing::collect_within(&mut rx, cancel::GRACE + Duration::from_secs(4), |ev| {
+                describe(ev)
+            })
+            .await;
+        assert!(
+            late.iter()
+                .any(|l| l.starts_with("error:") && l.contains("still running")),
+            "the stalled interrupt was silent: {late:?}"
+        );
+        assert!(
+            s.status().is_alive(),
+            "the escalation must not kill the shell: cwd, env and jobs are the reason this mode exists"
+        );
+
+        // And the mode is not wedged: a second Esc is a *retry*, not a keystroke
+        // swallowed by the first one's pending state.
+        drain(&mut rx);
+        s.abort().unwrap();
+        assert!(s.quiesce().await, "the second Esc was handled");
+        let again =
+            crate::testing::collect_within(&mut rx, Duration::from_millis(800), |ev| describe(ev))
+                .await;
+        assert!(
+            again
+                .iter()
+                .any(|l| l.contains("cancelling") && l.contains("again")),
+            "a second Esc was swallowed by the first: {again:?}"
+        );
+    }
+
+    /// Poll until the session says the command is in flight, so an interrupt is
+    /// never aimed at a shell that has not started the command yet.
+    async fn wait_running(s: &BashSession) {
+        for _ in 0..400 {
+            if s.status() == SessionStatus::Running {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the shell never reported the command running");
     }
 
     /// **Acceptance: `exit` -> a notice, and the next command works.**
@@ -1422,7 +1651,7 @@ mod tests {
             else {
                 continue;
             };
-            let line = describe(ev);
+            let line = describe(&ev);
             seen.push(line.clone());
             if line.contains("shell exited") {
                 assert!(
@@ -1487,7 +1716,7 @@ mod tests {
         let mut events = Vec::new();
         loop {
             let line = match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(ev)) => describe(ev),
+                Ok(Some(ev)) => describe(&ev),
                 Ok(None) => panic!("stream closed: {events:?}"),
                 Err(_) => panic!("no exit line; events: {events:?}"),
             };
@@ -1522,9 +1751,7 @@ mod tests {
         // "painted", so only an actual escape byte tells them apart.
         let painted = events
             .iter()
-            .position(|e| {
-                e.starts_with("out ") && e.contains("painted") && e.contains('\u{1b}')
-            })
+            .position(|e| e.starts_with("out ") && e.contains("painted") && e.contains('\u{1b}'))
             .unwrap_or_else(|| panic!("the paint never arrived: {events:?}"));
         let released = events
             .iter()
@@ -1552,10 +1779,8 @@ mod tests {
         let (mut s, mut rx) = bash(22);
         // Two separate writes: the first is a line (the transcript's business), the
         // second moves the cursor back up over it, which is the paint.
-        s.send_text(
-            "printf 'first-line\\n'; sleep 0.3; printf '\\033[2Aover-the-top'".into(),
-        )
-        .unwrap();
+        s.send_text("printf 'first-line\\n'; sleep 0.3; printf '\\033[2Aover-the-top'".into())
+            .unwrap();
         let events = until_exit(&mut rx).await;
 
         let took = events
@@ -1608,7 +1833,8 @@ mod tests {
     #[tokio::test]
     async fn raw_keys_reach_the_child_verbatim_and_the_shell_still_survives() {
         let (mut s, mut rx) = bash(24);
-        s.send_text("printf 'first-line\\n'; sleep 1.5".into()).unwrap();
+        s.send_text("printf 'first-line\\n'; sleep 1.5".into())
+            .unwrap();
         // Wait until the command is genuinely in flight, then type a keystroke
         // sequence: Esc, ':' , 'w', 'q', '!' and CR — the shape of `:wq!`.
         for _ in 0..200 {
@@ -1619,7 +1845,8 @@ mod tests {
         }
         assert_eq!(s.status(), SessionStatus::Running, "sleep is running");
 
-        s.send_bytes(vec![0x1b, b':', b'w', b'q', b'!', 0x0d]).unwrap();
+        s.send_bytes(vec![0x1b, b':', b'w', b'q', b'!', 0x0d])
+            .unwrap();
         let ran = run_logged(&mut rx).await;
         // The bytes were echoed by the line discipline: `:wq!` appearing in the
         // output is the witness that they went down the master verbatim, which is
@@ -1644,6 +1871,10 @@ mod tests {
         let ran = run_logged(&mut rx).await;
         assert_eq!(ran.code, Some(0), "{:?}", ran.notes);
         assert!(ran.out.contains("done-marker"), "{:?}", ran.out);
-        assert!(ran.notes.iter().any(|n| n.contains("exit 0")), "{:?}", ran.notes);
+        assert!(
+            ran.notes.iter().any(|n| n.contains("exit 0")),
+            "{:?}",
+            ran.notes
+        );
     }
 }
