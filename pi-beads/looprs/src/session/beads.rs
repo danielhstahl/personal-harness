@@ -994,6 +994,9 @@ mod tests {
             SessionEvent::Agent(_) => "agent".into(),
             SessionEvent::Exited { .. } => "session-down".into(),
             SessionEvent::BashOutput { .. } => "bash".into(),
+            // Only Bash mode ever takes a screen over; a beads session saying it did
+            // would be a bug worth seeing in the test output.
+            SessionEvent::ScreenHeld { active } => format!("screen:{active}"),
         }
     }
 

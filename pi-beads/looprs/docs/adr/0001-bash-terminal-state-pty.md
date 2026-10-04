@@ -301,39 +301,113 @@ the session writes `0x03` to the master (measured: 0.06 s to `interrupted (exit 
 a `sleep 30`, app alive, shell reused). That chord is gone from the app, so Ctrl-Q quits
 in every mode.
 
-## Known gap: full-screen programs do not work yet (measured, not guessed)
+## Amendment 3 — the screen-buffer path, as built (`looprs-4hv`)
 
-Rule 1 says passthrough, and the acceptance line further up this file claims "vim works
-(measured)". **That was measured on a raw pty spike, where the child's bytes went to a
-terminal. It is not true of the shipped path, and it is not true now.**
+The section this one replaces was titled "Known gap: full-screen programs do not work
+yet", and the measurement in it was right: vim's paint arrived in ~1 KB chunks with no
+linefeeds in them, the line-delimited transcript flush showed none of it, and the pane
+sat frozen on the previous frame. It is closed. What got built, and what was measured
+building it.
 
-`spikes/vim_fullscreen.py` (output in `spikes/results/vim-fullscreen.log`) drives the
-real TUI in a real PTY and types into vim. What happens:
+**The shape of it is rule 2, not rule 5.** Rule 2 says: while a foreground Bash command
+owns the screen, looprs copies the child's bytes verbatim and stops drawing. That is
+the whole mechanism — no emulator was written, because the child's own cursor addressing
+already targets the real terminal at the real size (rule 6). Rule 5's "literal copy for
+scrollback" deliberately does **not** apply to a held screen: a real terminal discards
+the alternate screen when the program leaves it, and rendering a second copy of the same
+paint above the viewport is how a full-screen program ends up smeared through scrollback.
+The two rules read side by side look like a contradiction; the resolution is that one is
+the display path and the other is not, and the display path wins while the child holds
+the screen.
 
-| observation | result |
+**Four pieces** (all in `src/screen.rs`, plus the gate in `main.rs`):
+
+1. `ScreenWatch` reads the shell's byte stream and says who owns the screen. Two
+   signals: the explicit one (`ESC[?1049h` / `?1047h` / `?47h`, and the `l` that
+   leaves), and the inferred one — cursor addressing (`CUU`, `CUP`, `ED` 2/3) in a
+   chunk with **no linefeeds**, which is the shape the earlier measurement recorded
+   for programs that never touch the alt screen. Colour never triggers it; neither
+   does a private mode set like `?25l` or `?2004h`, and a chunk that breaks lines is
+   left to the transcript.
+2. The **ordering rule**, which is not a detail. A `Takeover` is reported *before*
+   the bytes that switch screens, a `Release` *after* the bytes that switch back.
+   Invert either one and the failure is invisible: announce late and the `ESC[?1049h`
+   goes into the transcript instead of the terminal, so vim paints onto a screen
+   nobody switched; announce early and the leave byte is held back and the terminal
+   never comes out of the alt screen. The watcher holds an undecided escape-sequence
+   tail between reads rather than emit it, because half a switch in the transcript is
+   worse than no switch.
+3. `key_bytes` re-serialises a parsed `KeyEvent` back into the bytes the terminal
+   sent. This is the half the ticket said could not be separated from the `Esc`
+   mapping, and it is right: with the screen handed over, `Esc` has to be `0x1b`
+   (vim: leave insert mode) rather than the `0x03` a line command needs it to be.
+   The rule is *who owns the screen owns the keyboard*: `Esc` and every other key go
+   raw to the child while it holds, and go back to the app's own bindings the moment
+   it does not. Ctrl-C still means interrupt in both cases (it is forwarded, not
+   swallowed), and Ctrl-Q stays ours so a grabbed keyboard is never a locked app.
+4. The **re-anchor**. When the screen comes back the run loop stops the key stream,
+   resizes the `Terminal` to the real size — which recomputes the inline viewport,
+   clears it and resets ratatui's back buffer — and restarts the stream. That is
+   rule 4's "force a full repaint, do not trust the diff", done with `resize`
+   instead of dropping and rebuilding the `Terminal`. The key stream is stopped
+   across it for the same reason `main.rs` already stops it on a window resize: a
+   re-anchor reads the cursor position back, and the async reader would eat the
+   answer.
+
+**Four things that only showing up when you build it:**
+
+* **A resize during a held screen must not resize the viewport.** A full-screen child
+  is drawing on the real screen; `term.resize` queries the cursor and clears a region
+  we are not showing — onto the *child's* screen, mid-frame. So during passthrough a
+  resize goes to the pty only, and the app's own geometry is marked stale until the
+  screen comes back.
+* **A program that dies in the alt screen leaves the terminal there.** `SIGKILL`ed vim
+  sends no leave sequence, and a terminal stranded on the alternate screen shows a
+  dead program until the terminal is restarted. The command boundary pays the debt:
+  releasing a hold that was entered via alt emits `ESC[?1049l` on the way out.
+* **`--INSERT--` is terminfo, not vim.** The old spike checked for that string on
+  screen. With `TERM=xterm-256color` vim uses the terminal's own insert-mode
+  signalling and never writes it — measured: `i` on a bare pty emits 14 bytes of
+  bracketed-paste toggling and no mode string. A check written against a guessed
+  string fails with the feature working, and could pass with nothing displayed. The
+  spike now runs a **control**: the same keystrokes against a bare pty, and looprs
+  must show every marker the control actually drew; a marker the control never drew
+  is reported `n/a` rather than quietly dropped. That is the general shape for
+  "did the user see it" checks.
+* **Closing the control's pty hangs the closer.** `os.close(master)` on macOS, with a
+  pump thread blocked in `read()` on it, does not return (exit 124 under `timeout`,
+  the close the last line reached). The spike quits the child instead of closing the
+  end. Worth knowing before anyone writes a test harness that "cleans up properly".
+
+**Measured** (`spikes/fullscreen_e2e.py`, `spikes/vim_fullscreen.py`, logs committed
+under `spikes/results/`):
+
+| check | result |
 | --- | --- |
-| the shell is on a real tty (`stty size` = the window) | works |
-| vim starts, no "not to a terminal" warning | works |
-| vim's screen reaches the user | **nothing**: no `--INSERT--`, no `~` filler lines, no file written |
-| the app survives | yes; Ctrl-Q quits it normally |
+| vim's screen reaches the user (control drew the filename and `~` filler; looprs showed both) | pass |
+| a whole screen of paint arrives, not just the typed characters (control 118 normalised chars, looprs 360) | pass |
+| `Esc` then `:wq!` writes the file | pass |
+| the app never reported an interrupt during the vim session (Esc was `0x1b`, not `0x03`) | pass |
+| after vim, the shell still runs commands and they reach the screen | pass |
+| less: first screen as full as the bare one (line 039), scroll down past it, `g` back to 001 | pass |
+| a program that repaints in place with no alt screen is shown, and the screen returns on the command boundary | pass |
+| Ctrl-Q quits after each of them | pass |
+| the line-oriented path is unchanged (`spikes/bash_e2e.py`) | 20/20 |
 
-The cause is measurable, and it is our path, not vim's. Instrumenting the reader showed
-vim's full-screen paint arriving in ~1 KB chunks containing **zero linefeeds** (line-oriented
-output always ends in CRLF). The transcript flushes line by line: a partial line stays
-live until a `\n` arrives, and for a cursor-addressed program none ever does. So the pane
-sits frozen on whatever was there before, while the shell streams a screen's worth of bytes
-we cannot show.
+**What is still not true, stated plainly:**
 
-Two consequences to carry forward:
-
-* ADR-0001 Q8's "full-screen passthrough, screen-buffer path" is **not** implemented.
-  Until it is, Bash mode is a line-oriented shell transcript: superb for `git log`, `ls`,
-  `cd`, `grep`, `python -c`; not a terminal for `vim`, `less`, `htop`.
-* Bash mode maps Esc to `Cancel`, which is `0x03`. For a line command that is right
-  (ticket: "Esc/Ctrl-C interrupts"). For vim, Esc is the key that leaves insert mode, and
-  we send SIGINT instead. Raw keystroke passthrough and the Esc mapping are both part of
-  the same follow-on; neither can be fixed without the other.
-
-What is *not* the cause, ruled out by measurement: a big burst of ordinary output is fine.
-`seq 1 400` flushes, stays responsive, and the app quits clean. The problem is the absence
-of newlines, not the volume.
+* There is still **no VT emulator**. The child draws its own screen; looprs neither
+  knows nor shadows what is on it. Anything that requires knowing — mirroring the
+  child's screen into a pane alongside our own UI, showing two at once, re-rendering
+  the program's output after it exits — is still out of scope for this ADR.
+* While a full-screen program is up it has **the whole window**: the status row and
+  the input box are not visible. That is what handing over a terminal means, and it
+  is what the ticket asked for; `looprs-afw` (the viewport shape) does not change it.
+* The non-alt heuristic is exactly that — a heuristic over chunk shape. A program
+  that emits its cursor addressing in the same chunk as a linefeed is not detected
+  until a later chunk fits the shape, which may be one repaint later.
+* Mouse events and bracketed paste are not forwarded (`key_bytes` maps keys). A
+  full-screen program that needs the mouse gets keyboard-only input.
+* The takeover is per Bash session, and only teed while that session is the mode on
+  screen. A Bash child holding the screen while the user looks at Pi is not shown
+  and is not lost either: its bytes go to its own view.

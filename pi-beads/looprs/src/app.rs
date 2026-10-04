@@ -68,6 +68,17 @@ pub enum Msg {
         session: SessionId,
         reason: ExitReason,
     },
+    /// A full-screen program took the real terminal over, or gave it back
+    /// (ADR-0001 Q2 rule 2 — the screen-buffer path).
+    ///
+    /// While it is held *and* the holder is the mode on screen: nothing is drawn
+    /// and nothing is flushed, and that session's `BashOutput` chunks go to the
+    /// real terminal verbatim. The child's own cursor addressing *is* the
+    /// rendering; building one is the thing the ADR rejected.
+    ScreenHeld {
+        session: SessionId,
+        active: bool,
+    },
     /// A failure the human needs to see (spawn failure, `bd` failure, ...).
     /// `session: None` means it is harness-level (router/spawn), not a session's.
     Error {
@@ -115,6 +126,17 @@ pub enum UiCommand {
     },
     /// Esc. Routed by the router to the *active* session only.
     Cancel,
+    /// Raw keystrokes for a full-screen child that currently owns the terminal.
+    ///
+    /// A separate command from `Submit` because the bytes are the point: `Esc`
+    /// must arrive as `0x1b`, and `:wq!` + Enter must not arrive with a newline
+    /// added on the way. This is the half of the screen problem that the
+    /// "`Esc` means `0x03`" mapping cannot be separated from (looprs-4hv): one
+    /// without the other leaves vim reading interrupts where it expects keys.
+    Keys {
+        mode: TerminalType,
+        bytes: Vec<u8>,
+    },
     /// The real terminal changed shape.
     ///
     /// Not user intent — an environment fact — but the Router is the only thing
@@ -323,6 +345,20 @@ pub struct App {
     pub width: u16,
     pub dirty: bool,
     pub should_quit: bool,
+    /// The session whose child currently owns the real terminal screen, if any
+    /// (ADR-0001 Q2). `Some` for as long as a full-screen program holds it.
+    ///
+    /// Tracked here rather than asked of the session because drawing is this type's
+    /// job, and the run loop has to be able to ask "am I allowed to draw?" without
+    /// reaching into a backend.
+    screen: Option<SessionId>,
+    /// The screen came back and the inline viewport must be re-anchored before
+    /// anything is drawn. Set on release, consumed by the run loop in `main.rs`,
+    /// which is the only place that can stop the key stream, resize the
+    /// `Terminal` (a re-anchor reads the cursor position back) and restart it —
+    /// the same dance `main.rs` already does for a window resize, for the same
+    /// reason.
+    pub reanchor: bool,
     cmd_tx: mpsc::Sender<UiCommand>, // UI -> Router
 }
 
@@ -345,6 +381,8 @@ impl App {
             dirty: true,
             should_quit: false,
             spinner: 0,
+            screen: None,
+            reanchor: false,
             cmd_tx,
         }
     }
@@ -450,12 +488,24 @@ impl App {
                 self.on_pi(session, event);
             }
             Msg::BashOutput { session, chunk, .. } => {
-                // Raw passthrough into the owning view: `push_bash` strips the
-                // presentation but never re-wraps and never reaches markdown
-                // (ADR-0001 rule 1). `stream` is not consulted: a pty hands us one
-                // merged byte stream and `ByteStream::Merged` is what it says.
-                self.dirty = true;
-                self.view_mut(session).push_bash(&chunk);
+                // `stream` is not consulted: a pty hands us one merged byte
+                // stream and `ByteStream::Merged` is what it says.
+                if self.teed(session) {
+                    // The child owns this screen: its bytes go to the real
+                    // terminal verbatim and **not** into the transcript. The frame
+                    // is already on screen, and rendering a second copy of the
+                    // same paint above the viewport is how a full-screen program
+                    // ends up smeared through scrollback. For an alt-screen child
+                    // this is also precisely what a real terminal does — the
+                    // alternate screen is discarded on exit, not recalled.
+                    crate::screen::tee(chunk.as_bytes());
+                } else {
+                    // Line-oriented output: `push_bash` strips the presentation
+                    // but never re-wraps and never reaches markdown
+                    // (ADR-0001 rule 1).
+                    self.dirty = true;
+                    self.view_mut(session).push_bash(&chunk);
+                }
             }
             Msg::BeadStep { session, step } => {
                 self.dirty = true;
@@ -465,10 +515,36 @@ impl App {
                 // Q5 rule 3: death must seal. Unconditional, because the pump
                 // promises exactly one of these per session ever created.
                 self.dirty = true;
+                // A child that died holding the screen still gave it up — by dying.
+                // Nobody else can say so: the release normally comes from the
+                // child's own bytes, and there are not going to be any more of
+                // those.
+                if self.screen == Some(session) {
+                    self.screen = None;
+                    self.reanchor = true;
+                }
                 let view = self.view_mut(session);
                 view.seal();
                 view.set_status(SessionStatus::Dead);
                 view.push_note(MessageKind::System, format!("{session} ended ({reason:?})"));
+            }
+            Msg::ScreenHeld { session, active } => {
+                if active {
+                    self.screen = Some(session);
+                    // Nothing to draw while the child holds the screen, and the
+                    // frames we would have queued come back on release.
+                    self.dirty = false;
+                } else if self.screen == Some(session) {
+                    self.screen = None;
+                    // The real terminal is not showing what ratatui's diff thinks
+                    // it is showing: the child drew over it (or switched it, in
+                    // the alt-screen case, where switching back restores the main
+                    // screen but not our cursor). Re-anchor, then repaint from
+                    // scratch — trusting the diff here is the "screen is garbled
+                    // after exiting vim" bug ADR-0001 names.
+                    self.reanchor = true;
+                    self.dirty = true;
+                }
             }
             Msg::Error { session, text } => {
                 self.dirty = true;
@@ -484,6 +560,25 @@ impl App {
                 self.restore_input(session, text);
             }
         }
+    }
+
+    /// Is the **active** mode the one whose child currently owns the real screen?
+    ///
+    /// This is the gate the run loop asks before drawing anything. Answering it for
+    /// the *active* mode rather than for the holder in general matters: a Bash
+    /// child can hold the screen while the user looks at another mode, and teeing
+    /// its paint over that mode would be worse than not showing it.
+    pub fn passthrough(&self) -> bool {
+        self.screen.is_some_and(|s| s.mode == self.active)
+    }
+
+    /// Should *this* session's bytes go out to the real terminal? Both halves are
+    /// needed: the session is the one holding the screen, **and** that session is
+    /// the mode actually on it. Either half alone is a bug — the first ignored is
+    /// "Bash paints over the Pi view", the second is "a dead generation's bytes
+    /// overwrite what the current one owns".
+    fn teed(&self, session: SessionId) -> bool {
+        self.screen == Some(session) && self.passthrough()
     }
 
     /// Tell every live session the real terminal changed shape (ADR-0001 rule 6).
@@ -547,6 +642,21 @@ impl App {
                 }
                 _ => {}
             }
+        }
+
+        // The input half of ADR-0001 Q2: a program that owns the screen owns the
+        // keyboard for as long as it does. The keystroke goes back out as the bytes
+        // the terminal sent for it, which is what makes `Esc` be `Esc` (vim: leave
+        // insert mode) instead of the `0x03` that a line command needs Esc to be.
+        // Ctrl-C and Ctrl-Q are dealt with above, so the chords this path cannot
+        // take back are exactly the two that were never the child's to take.
+        if self.passthrough() {
+            if let Some(bytes) = crate::screen::key_bytes(k) {
+                let _ = self
+                    .cmd_tx
+                    .try_send(UiCommand::Keys { mode: self.active, bytes });
+            }
+            return;
         }
 
         if let Some(action) = self.input.handle_key(k) {
@@ -1261,5 +1371,211 @@ mod tests {
             text_of(&app, TerminalType::Pi).contains("queued from pi"),
             "and the text is still accounted for, in the session that owns it"
         );
+    }
+
+    // ---------------- the full-screen (ADR-0001 Q2) seam ----------------
+
+    fn bash_id() -> SessionId {
+        SessionId::new(TerminalType::Bash, 1)
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(code, mods))
+    }
+
+    /// **While a full-screen child holds the screen, the transcript is not the
+    /// display path.** The bytes go to the real terminal instead; keeping a copy
+    /// in the transcript as well is the same frame twice — once as the child drew
+    /// it, once re-rendered by us above the viewport.
+    #[test]
+    fn a_held_screen_goes_to_the_terminal_and_not_to_the_transcript() {
+        let (mut app, _rx) = app_with(TerminalType::Bash);
+        app.update(Msg::ScreenHeld {
+            session: bash_id(),
+            active: true,
+        });
+        assert!(
+            app.passthrough(),
+            "the active Bash session owns the screen"
+        );
+
+        app.update(Msg::BashOutput {
+            session: bash_id(),
+            stream: ByteStream::Merged,
+            chunk: "\u{1b}[?1049h\u{1b}[24;1H--INSERT--".into(),
+        });
+
+        let held_in_transcript = app
+            .view(TerminalType::Bash)
+            .map(|v| v.transcript.entries.len())
+            .unwrap_or(0);
+        assert_eq!(
+            held_in_transcript, 0,
+            "a program's screen is not scrollback material"
+        );
+    }
+
+    /// The holder is Bash, but the **user is looking at Pi**. Teeing Bash's paint
+    /// over the mode on screen would be worse than not showing it, so the bytes go
+    /// to the Bash view and are kept rather than smeared.
+    #[test]
+    fn a_held_screen_is_never_painted_over_the_mode_that_is_showing() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        app.update(Msg::ScreenHeld {
+            session: bash_id(),
+            active: true,
+        });
+        assert!(
+            !app.passthrough(),
+            "Bash owns the screen but is not the mode on it"
+        );
+
+        app.update(Msg::BashOutput {
+            session: bash_id(),
+            stream: ByteStream::Merged,
+            chunk: "painted while hidden".into(),
+        });
+        assert!(
+            text_of(&app, TerminalType::Bash).contains("painted while hidden"),
+            "kept in its own view instead of overwriting Pi"
+        );
+        assert!(app.view(TerminalType::Pi).is_none(), "Pi was not touched");
+    }
+
+    /// **Acceptance: Esc reaches a full-screen program as Esc.** In vim `Esc` is
+    /// the key that leaves insert mode; `0x03` is an interrupt, and sending that
+    /// instead is exactly why vim was unusable. The keystroke has to go down as
+    /// raw bytes and must not type into the input box.
+    #[tokio::test]
+    async fn esc_is_esc_inside_a_full_screen_program() {
+        let (mut app, mut rx) = app_with(TerminalType::Bash);
+        app.update(Msg::ScreenHeld {
+            session: bash_id(),
+            active: true,
+        });
+        app.update(Msg::Term(key(KeyCode::Esc, KeyModifiers::NONE)));
+
+        match rx.recv().await {
+            Some(UiCommand::Keys { mode, bytes }) => {
+                assert_eq!(mode, TerminalType::Bash);
+                assert_eq!(bytes, vec![0x1b], "one byte: Esc");
+            }
+            other => panic!(
+                "Esc inside a held screen must reach the child as a keystroke, got {other:?}"
+            ),
+        }
+        assert!(
+            app.input.text().is_empty(),
+            "and it did not go into the input box"
+        );
+    }
+
+    /// …and with no program holding the screen, Esc is still the interrupt a line
+    /// command needs. Both halves of the acceptance line, in the same app type,
+    /// separated by exactly one thing: who owns the screen.
+    #[tokio::test]
+    async fn esc_is_still_cancel_at_a_line_prompt() {
+        let (mut app, mut rx) = app_with(TerminalType::Bash);
+        app.update(Msg::Term(key(KeyCode::Esc, KeyModifiers::NONE)));
+        match rx.recv().await {
+            Some(UiCommand::Cancel) => {}
+            other => panic!("Esc at a prompt should still cancel, got {other:?}"),
+        }
+    }
+
+    /// **Acceptance: Ctrl-C interrupts in both cases.** Inside a held screen it
+    /// still routes as Cancel — which the Bash session writes to the master as
+    /// `0x03`, and the line discipline does the rest. It still must not quit.
+    #[tokio::test]
+    async fn ctrl_c_still_interrupts_inside_a_full_screen_program() {
+        let (mut app, mut rx) = app_with(TerminalType::Bash);
+        app.update(Msg::ScreenHeld {
+            session: bash_id(),
+            active: true,
+        });
+        app.update(Msg::Term(key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+
+        assert!(!app.should_quit, "Ctrl-C must not quit while vim is up");
+        match rx.recv().await {
+            Some(UiCommand::Cancel) => {}
+            other => panic!("Ctrl-C should still reach the shell as Cancel, got {other:?}"),
+        }
+    }
+
+    /// The way out of a program that took the keyboard: Ctrl-Q is ours even while
+    /// the screen is handed over. Without it a grabbed keyboard is a locked app.
+    #[test]
+    fn ctrl_q_quits_even_while_the_screen_is_held() {
+        let (mut app, _rx) = app_with(TerminalType::Bash);
+        app.update(Msg::ScreenHeld {
+            session: bash_id(),
+            active: true,
+        });
+        app.update(Msg::Term(key(KeyCode::Char('q'), KeyModifiers::CONTROL)));
+        assert!(app.should_quit, "Ctrl-Q stays ours");
+    }
+
+    /// A release asks for the viewport to be re-anchored; a takeover must not, or
+    /// the run loop would resize our viewport onto the child's screen.
+    #[test]
+    fn a_release_asks_to_re_anchor_and_a_takeover_does_not() {
+        let (mut app, _rx) = app_with(TerminalType::Bash);
+        app.update(Msg::ScreenHeld {
+            session: bash_id(),
+            active: true,
+        });
+        assert!(!app.reanchor, "taking the screen over is not a reason to resize");
+        app.update(Msg::ScreenHeld {
+            session: bash_id(),
+            active: false,
+        });
+        assert!(
+            app.reanchor,
+            "getting it back is: ratatui's diff no longer describes the screen"
+        );
+    }
+
+    /// A child that dies holding the screen still gives it up. Nothing can wait for
+    /// the release event here — the death is what cancelled the program that would
+    /// have sent it — so the death itself has to close the seam.
+    #[test]
+    fn a_child_dying_while_it_holds_the_screen_lets_go_of_it() {
+        let (mut app, _rx) = app_with(TerminalType::Bash);
+        app.update(Msg::ScreenHeld {
+            session: bash_id(),
+            active: true,
+        });
+        assert!(app.passthrough());
+
+        app.update(Msg::SessionDown {
+            session: bash_id(),
+            reason: ExitReason::Crashed { code: Some(137) },
+        });
+        assert!(
+            !app.passthrough(),
+            "a dead child cannot hold a screen; not releasing here wedges the UI dark"
+        );
+        assert!(app.reanchor, "and the viewport has to be rebuilt");
+    }
+
+    /// A release from some *other* session must not disturb a held screen. The
+    /// pairing is by session id, not by "somebody said inactive".
+    #[test]
+    fn a_release_from_another_session_does_not_take_the_screen_back() {
+        let (mut app, _rx) = app_with(TerminalType::Bash);
+        let other = SessionId::new(TerminalType::Bash, 2);
+        app.update(Msg::ScreenHeld {
+            session: bash_id(),
+            active: true,
+        });
+        app.update(Msg::ScreenHeld {
+            session: other,
+            active: false,
+        });
+        assert!(
+            app.passthrough(),
+            "a generation that never held the screen cannot release it"
+        );
+        assert!(!app.reanchor);
     }
 }

@@ -24,6 +24,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bash_e2e as e  # reuse the PTY driver, checks, and matching helpers
+from fullscreen_e2e import Bare  # a program on a bare pty: the control
+
 
 PROBE = "/tmp/looprs-vim-probe.txt"
 
@@ -78,18 +80,51 @@ def main():
     e.check("vim can write the file it was told to write", wrote)
     e.check("vim quit and the shell is back", d.proc.poll() is None)
 
-    # 4. The real question: what did the user SEE? vim's screen is cursor addressing,
-    #    a clear, and status lines. The transcript path strips cursor addressing, so
-    #    the frame cannot be reconstructed; measure how much survives.
+    # 4. The real question: what did the user SEE?
+    #
+    # Scored against a control rather than against a hardcoded list of strings,
+    # because which of these vim draws is a property of terminfo, not of vim: with
+    # TERM=xterm-256color it uses the terminal's own insert-mode signalling and
+    # never writes "--INSERT--" (measured: `i` on a bare pty emits 14 bytes of
+    # bracketed-paste toggling and no mode string). A check for it would fail with
+    # the feature working, and could pass with nothing displayed. So: run the same
+    # keystrokes against a bare pty, and require looprs to show every marker the
+    # control actually drew.
     screen = e.norm(d.text()[start:])
+    ctrl = Bare(["vim", "-u", "NONE", "-i", "NONE", "-n", PROBE + ".control"])
+    time.sleep(1.5)
+    ctrl.send(b"i")
+    time.sleep(0.4)
+    ctrl.send(b"control-text")
+    time.sleep(0.4)
+    base = e.norm(ctrl.text())
+    ctrl.send(b"\x1b")
+    time.sleep(0.3)
+    ctrl.send(b":q!\r")
+    time.sleep(1.0)
+    ctrl.quit()
+    if os.path.exists(PROBE + ".control"):
+        os.remove(PROBE + ".control")
+
     marks = {
-        "the filename appeared": "looprs-vim-probe" in screen,
-        "the insert-mode status line appeared": "--INSERT--" in screen,
-        "blank-line tildes appeared": "~" in screen,
+        "the filename appeared": "looprs-vim-probe",
+        "the insert-mode status line appeared": "--INSERT--",
+        "blank-line tildes appeared": "~",
     }
-    for name, ok in marks.items():
-        e.check(f"screen evidence: {name}", ok)
-    e.say(f"vim screen text captured (normalized, whitespace-free): {len(screen)} chars")
+    for name, needle in marks.items():
+        drawn_by_control = needle in base
+        if not drawn_by_control:
+            e.say(
+                f"n/a   screen evidence: {name}  -- the bare-pty control never drew "
+                "it here, so it is not a signal on this machine"
+            )
+            continue
+        e.check(f"screen evidence: {name} (the control drew it, looprs showed it)",
+                needle in screen)
+    e.say(
+        f"vim screen text captured (normalized, whitespace-free): {len(screen)} "
+        f"chars; control {len(base)} chars"
+    )
     e.say(f"first 200 chars of the vim stretch: {screen[:200]!r}")
 
     # 5. Is the app still usable afterwards? (A stuck alt-screen would show up here.)

@@ -1,5 +1,6 @@
 mod app;
 mod components;
+mod screen;
 mod services;
 mod session;
 mod state;
@@ -143,24 +144,63 @@ async fn run(term: &mut Term) -> Result<()> {
             Some(ev) = app_rx.recv() => app.update(ev),
             Some(Ok(ev)) = keys.next() => {
                 if let Event::Resize(w, h) = ev {
-                    drop(keys);                               // stop reading stdin
-                    if let Err(e) = term.resize(Rect::new(0, 0, w, h)) {
-                        // don't kill the session over a failed re-anchor
-                        tracing::warn!("resize failed: {e}");
-                    }
-                    keys = EventStream::new();                // resume
                     app.width = w;
-                    // …and the children get it too. A pty sized 80x24 while the
-                    // window is 180x50 wraps every program's output for a terminal
-                    // that is not there (ADR-0001 rule 6).
-                    app.forward_resize(h, w);
+                    if app.passthrough() {
+                        // The child owns the real screen. Resizing our inline
+                        // viewport now would query the cursor and clear a region
+                        // we are not showing — onto the *child's* screen, in the
+                        // middle of its frame. So the child gets the new size
+                        // (ADR-0001 rule 6: it wraps for the window it is really
+                        // shown in) and our own geometry waits to be rebuilt when
+                        // the screen comes back.
+                        app.reanchor = true;
+                        app.forward_resize(h, w);
+                    } else {
+                        drop(keys);                               // stop reading stdin
+                        if let Err(e) = term.resize(Rect::new(0, 0, w, h)) {
+                            // don't kill the session over a failed re-anchor
+                            tracing::warn!("resize failed: {e}");
+                        }
+                        keys = EventStream::new();                // resume
+                        // …and the children get it too. A pty sized 80x24 while the
+                        // window is 180x50 wraps every program's output for a terminal
+                        // that is not there (ADR-0001 rule 6).
+                        app.forward_resize(h, w);
+                    }
                 } else {
                     app.update(Msg::Term(ev));
                 }
             }
             _ = tick.tick() => {
                 app.update(Msg::Tick); //spinner only atm
-                if app.dirty {
+                if app.reanchor {
+                    // The full-screen child let go of the terminal. Re-anchor the
+                    // inline viewport at where the cursor actually is now and force
+                    // a full repaint of it: ratatui's diff still describes the
+                    // screen as it was before the child painted over it, and
+                    // trusting that is ADR-0001's "screen is garbled after exiting
+                    // vim" bug. Resizing to the real size recomputes the viewport,
+                    // clears it and resets the back buffer, which is the same job
+                    // as recreating the Terminal without dropping the borrow.
+                    //
+                    // The key stream is stopped across it because a re-anchor reads
+                    // the cursor position back, and the async reader would eat the
+                    // answer — exactly why the resize arm above does the same.
+                    let sz = term.size()?;
+                    drop(keys);
+                    if let Err(e) = term.resize(Rect::new(0, 0, sz.width, sz.height)) {
+                        tracing::warn!("re-anchor after the full-screen program failed: {e}");
+                    }
+                    keys = EventStream::new();
+                    app.reanchor = false;
+                    app.dirty = true;
+                }
+                // The gate: while a child holds the screen we draw nothing at all,
+                // and the bytes are going out from `App::update` instead. Drawing
+                // over a program that believes it owns the terminal is the bug this
+                // whole path exists to fix, so it is blocked here rather than
+                // trusted to be absent.
+                if app.dirty && !app.passthrough() {
                     // The per-frame sequence is flush -> insert_before -> draw, and
                     // only for the ACTIVE view (ADR-0002 Q5). A hidden view buffers;
                     // its backlog goes out as one burst when you switch to it.

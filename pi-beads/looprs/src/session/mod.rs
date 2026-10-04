@@ -206,6 +206,15 @@ pub enum SessionEvent {
     RestoreInput { text: String },
     /// A failure the human needs to see, attributable to this session.
     Error(String),
+    /// A full-screen program took the real terminal over, or gave it back
+    /// (ADR-0001 Q2 rule 2 — the screen-buffer path).
+    ///
+    /// While `active`, the UI must not draw and must not flush: the child believes
+    /// it owns the screen, and during that window it does. The session's
+    /// [`SessionEvent::BashOutput`] chunks are copied to the real terminal
+    /// verbatim instead of going through the transcript, because a held screen and
+    /// a rendered transcript of the same bytes is the same frame drawn twice.
+    ScreenHeld { active: bool },
     /// Lifecycle edge: the child is gone and no further events will follow.
     Exited { reason: ExitReason },
 }
@@ -365,6 +374,19 @@ pub trait Session: Send {
     /// ([`SwitchAway::DrainThenPark`]).
     fn set_active(&mut self, _active: bool) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Raw keystrokes, for a child that currently owns the screen
+    /// ([`SessionEvent::ScreenHeld`]).
+    ///
+    /// Distinct from [`Session::send_text`] in the way that matters: these bytes go
+    /// to the child exactly as typed, with no line appended and no interpretation.
+    /// A held program reads `0x1b` as `Esc` (vim: leave insert mode) and `0x0d` as
+    /// Enter; a line-oriented `send_text` would send neither. Only a shell on a
+    /// pty can honour this, so the default is a refusal rather than a silent
+    /// ignore — a mode that cannot take raw keys should say so.
+    fn send_bytes(&mut self, _bytes: Vec<u8>) -> anyhow::Result<()> {
+        anyhow::bail!("this session has no raw keyboard");
     }
 
     /// The real terminal changed shape. Bash forwards this to its pty so the

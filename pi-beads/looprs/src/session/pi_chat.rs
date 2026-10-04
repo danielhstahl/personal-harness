@@ -627,6 +627,9 @@ mod tests {
             SessionEvent::Exited { reason } => format!("down {reason:?}"),
             SessionEvent::BeadStep(s) => format!("step {s:?}"),
             SessionEvent::BashOutput { chunk, .. } => format!("bash {chunk}"),
+            // A pi chat session has no screen to take over; seeing this in test
+            // output would mean the event came from somewhere it should not have.
+            SessionEvent::ScreenHeld { active } => format!("screen:{active}"),
         }
     }
 

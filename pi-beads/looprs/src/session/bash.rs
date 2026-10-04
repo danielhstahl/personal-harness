@@ -39,6 +39,7 @@ use anyhow::{Result, anyhow};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::screen::{Piece, ScreenWatch};
 use crate::session::{
     ByteStream, ExitReason, Session, SessionConfig, SessionEvent, SessionId, SessionStatus, Spawned,
 };
@@ -176,6 +177,18 @@ impl Shell {
             .map_err(|e| anyhow!("the shell's pty rejected input: {e}"))
     }
 
+    /// Raw bytes to the master, verbatim, no newline appended.
+    ///
+    /// The difference from [`Shell::write_line`] is the whole point: a program in
+    /// the alt screen reads keystrokes, not lines, and a newline we added would be
+    /// an Enter the user never pressed.
+    fn write_raw(&mut self, bytes: &[u8]) -> Result<()> {
+        self.writer
+            .write_all(bytes)
+            .and_then(|_| self.writer.flush())
+            .map_err(|e| anyhow!("the shell's pty rejected input: {e}"))
+    }
+
     fn resize(&mut self, size: PtySize) {
         // A failed resize is not worth an error dialog: the shell keeps the old
         // size, which is degraded rather than broken.
@@ -245,6 +258,11 @@ enum BashCmd {
     /// SIGINT for the child's foreground process group. The command dies; the
     /// shell survives.
     Interrupt,
+    /// Raw keystrokes for a child that currently holds the screen
+    /// ([`ScreenWatch`]): written to the master exactly as typed, with no newline
+    /// and no interpretation. This is what makes `Esc` be `Esc` inside vim
+    /// instead of `0x03`.
+    Keys(Vec<u8>),
     /// Raw bytes off the pty master.
     Bytes(Vec<u8>),
     /// The reader hit EOF — the shell is gone or going.
@@ -289,6 +307,10 @@ struct BashTask {
     aborting: bool,
     /// Unconsumed marker bytes (a marker can straddle two reads).
     pending: Vec<u8>,
+    /// Who owns the real terminal screen, read out of the child's own bytes
+    /// (ADR-0001 Q2). The watcher is the single source of truth: `is_held()` is
+    /// the answer the whole app obeys.
+    screen: ScreenWatch,
     /// Bytes held back only because they may be the start of a multi-byte UTF-8
     /// sequence that a read boundary split in half.
     utf8: Vec<u8>,
@@ -423,6 +445,22 @@ impl BashTask {
         }
     }
 
+    /// Raw keystrokes for a child that holds the screen (ADR-0001 Q2).
+    ///
+    /// Written straight to the master with nothing added. No readiness queue: a
+    /// child can only hold the screen if its shell is up and running it.
+    fn write_keys(&mut self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Some(shell) = self.shell.as_mut() else {
+            return;
+        };
+        if let Err(e) = shell.write_raw(&bytes) {
+            self.err(format!("keystrokes did not reach the shell: {e:#}"));
+        }
+    }
+
     fn resize(&mut self, rows: u16, cols: u16) {
         if rows == 0 || cols == 0 {
             return;
@@ -483,6 +521,81 @@ impl BashTask {
         if bytes.is_empty() {
             return;
         }
+        // Everything goes through the screen watcher first. The order it hands the
+        // pieces back in is the contract: a takeover is announced *before* the
+        // bytes that switch screens (so the terminal sees `ESC[?1049h` instead of
+        // the transcript eating it) and a release *after* the bytes that switch
+        // back (so the main screen actually comes back).
+        let pieces = self.screen.observe(bytes);
+        for piece in pieces {
+            match piece {
+                Piece::Out(b) => self.emit_bytes(&b),
+                Piece::Change(change) => self.on_screen_change(change),
+            }
+        }
+    }
+
+    /// The screen changed hands. The session says so; the UI decides what that
+    /// means for its own drawing.
+    fn on_screen_change(&mut self, change: crate::screen::ScreenChange) {
+        match change {
+            crate::screen::ScreenChange::Takeover { alt } => {
+                let what = self.foreground();
+                self.note(format!(
+                    "`{}` took the screen ({}); looprs stops drawing until it gives it back",
+                    clip(&what, 60),
+                    if alt {
+                        "alt screen"
+                    } else {
+                        "cursor-addressed output"
+                    }
+                ));
+                self.emit(SessionEvent::ScreenHeld { active: true });
+            }
+            crate::screen::ScreenChange::Release => {
+                self.emit(SessionEvent::ScreenHeld { active: false });
+            }
+        }
+    }
+
+    /// The command currently in front of the shell, for a notice that has to name
+    /// something rather than say "a child".
+    fn foreground(&self) -> String {
+        self.outstanding
+            .front()
+            .cloned()
+            .unwrap_or_else(|| "the shell".to_string())
+    }
+
+    /// Take the screen back when a command ends without the child having said it
+    /// did — `vim` killed with `SIGKILL`, `less` closed by a signal, a program
+    /// that never emits a leave sequence.
+    ///
+    /// The watcher can only read a release out of bytes; the command boundary is
+    /// the other thing that certainly means the screen is free. Without this the UI
+    /// would keep teeing into a screen nobody owns and never redraw itself, which
+    /// looks exactly like the frozen pane this whole path replaced.
+    fn release_screen_at_command_end(&mut self) {
+        if !self.screen.is_held() {
+            return;
+        }
+        // Bytes the watcher was still deciding on belong to the screen that just
+        // ended, and an alt-screen leave the program died before paying is paid on
+        // its way out — otherwise the terminal stays on the dead program's screen
+        // and looprs redraws into a buffer nobody is looking at.
+        let owed = self.screen.force_release();
+        if !owed.is_empty() {
+            self.emit_bytes(&owed);
+        }
+        self.emit(SessionEvent::ScreenHeld { active: false });
+    }
+
+    /// The UTF-8-safe half of forwarding output: hold a split multi-byte sequence
+    /// for the next read, emit the rest.
+    fn emit_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
         let mut held = std::mem::take(&mut self.utf8);
         held.extend_from_slice(bytes);
         let (text, rest) = split_complete_utf8(held);
@@ -534,6 +647,9 @@ impl BashTask {
         let interrupted = self.aborting;
         self.aborting = false;
         self.last_exit = Some(code);
+        // Whatever screen the command was holding is gone with it, whether or not
+        // the program ever said goodbye.
+        self.release_screen_at_command_end();
         self.emit_exit(code, interrupted);
     }
 
@@ -556,6 +672,10 @@ impl BashTask {
     /// must not get is silence — the mode would look hung with the input box open
     /// and nothing behind it.
     fn stream_end(&mut self) {
+        // Say "screen is free" before anything else: the UI must stop teeing into
+        // a screen whose owner just died, and it cannot redraw while it thinks the
+        // child still holds it.
+        self.release_screen_at_command_end();
         let reason = match self.shell.as_mut() {
             None => return,
             Some(shell) => match shell.child.try_wait() {
@@ -708,6 +828,7 @@ impl BashSession {
             outstanding: VecDeque::new(),
             aborting: false,
             pending: Vec::new(),
+            screen: ScreenWatch::new(),
             utf8: Vec::new(),
             // An honest starting size; the app sends the real one on its first
             // resize (and `Shell::spawn` uses this for the initial pty).
@@ -725,6 +846,7 @@ impl BashSession {
                 match cmd {
                     BashCmd::Submit(text) => task.submit(text),
                     BashCmd::Interrupt => task.interrupt(),
+                    BashCmd::Keys(b) => task.write_keys(b),
                     BashCmd::Bytes(b) => task.on_bytes(b),
                     BashCmd::StreamEnd => task.stream_end(),
                     BashCmd::Resize { rows, cols } => task.resize(rows, cols),
@@ -818,6 +940,13 @@ impl Session for BashSession {
             .map_err(|_| anyhow!("bash session task is gone"))
     }
 
+    fn send_bytes(&mut self, bytes: Vec<u8>) -> Result<()> {
+        // Raw keystrokes for a full-screen child: verbatim to the master, no line.
+        self.cmd
+            .send(BashCmd::Keys(bytes))
+            .map_err(|_| anyhow!("bash session task is gone"))
+    }
+
     fn shutdown(&mut self) -> Result<()> {
         self.cmd
             .send(BashCmd::Shutdown)
@@ -873,6 +1002,7 @@ mod tests {
             SessionEvent::System(t) => format!("system: {t}"),
             SessionEvent::Error(t) => format!("error: {t}"),
             SessionEvent::Exited { reason } => format!("down {reason:?}"),
+            SessionEvent::ScreenHeld { active } => format!("screen {active}"),
             other => format!("{other:?}"),
         }
     }
@@ -1344,5 +1474,176 @@ mod tests {
         assert!(line.starts_with("error"), "{line}");
         assert!(line.contains("shell"), "{line}");
         assert_eq!(s.status(), SessionStatus::NotStarted);
+    }
+
+    /// Read every event until the command's exit line, keeping the stream order.
+    ///
+    /// Order is the thing this test needs: the screen takeover has to be reported
+    /// *before* the bytes that switch screens, and the release *after* the bytes
+    /// that switch back. Anything that flattens the stream into a set cannot see
+    /// the difference between those two and a bug.
+    async fn until_exit(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + NO_HANG;
+        let mut events = Vec::new();
+        loop {
+            let line = match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(ev)) => describe(ev),
+                Ok(None) => panic!("stream closed: {events:?}"),
+                Err(_) => panic!("no exit line; events: {events:?}"),
+            };
+            let done = exit_code_of(&line).is_some();
+            events.push(line);
+            if done {
+                return events;
+            }
+        }
+    }
+
+    /// **Acceptance: a full-screen program is handed the screen.**
+    ///
+    /// Driven with `printf` rather than real vim because what is being proved is
+    /// the session's own behaviour — announce the takeover, then the paint, then
+    /// the release — and `printf` emits the same alt-screen bytes vim does without
+    /// depending on vim's timing. That vim itself reaches the screen is proved in
+    /// the real terminal by `spikes/vim_fullscreen.py`.
+    #[tokio::test]
+    async fn a_full_screen_program_is_handed_the_screen_and_gives_it_back() {
+        let (mut s, mut rx) = bash(21);
+        s.send_text("printf '\\033[?1049h\\033[?25lpainted\\033[?1049l'".into())
+            .unwrap();
+        let events = until_exit(&mut rx).await;
+
+        let took = events
+            .iter()
+            .position(|e| e == "screen true")
+            .unwrap_or_else(|| panic!("the takeover was never reported: {events:?}"));
+        // The *program's* paint, not the echo of the command that printed it: the
+        // echo contains the literal characters `\033[?1049h…` and the word
+        // "painted", so only an actual escape byte tells them apart.
+        let painted = events
+            .iter()
+            .position(|e| {
+                e.starts_with("out ") && e.contains("painted") && e.contains('\u{1b}')
+            })
+            .unwrap_or_else(|| panic!("the paint never arrived: {events:?}"));
+        let released = events
+            .iter()
+            .position(|e| e == "screen false")
+            .unwrap_or_else(|| panic!("the release was never reported: {events:?}"));
+        assert!(
+            took < painted,
+            "the UI must be teeing before the bytes that switch the screen: {events:?}"
+        );
+        assert!(
+            painted < released,
+            "the leave bytes must reach the terminal before the release: {events:?}"
+        );
+        let joined = events.join("|");
+        assert_no_marker_bytes(&joined);
+        assert_eq!(s.status(), SessionStatus::Idle, "and the shell is fine");
+    }
+
+    /// The non-alt-screen case: a program that repaints in place without ever
+    /// switching screens (the shape ADR-0001's measurement found — cursor
+    /// addressing in a chunk with no linefeeds). The screen comes back at the
+    /// command boundary, because that program has no leave sequence to wait for.
+    #[tokio::test]
+    async fn a_repainting_program_takes_the_screen_and_loses_it_with_the_command() {
+        let (mut s, mut rx) = bash(22);
+        // Two separate writes: the first is a line (the transcript's business), the
+        // second moves the cursor back up over it, which is the paint.
+        s.send_text(
+            "printf 'first-line\\n'; sleep 0.3; printf '\\033[2Aover-the-top'".into(),
+        )
+        .unwrap();
+        let events = until_exit(&mut rx).await;
+
+        let took = events
+            .iter()
+            .position(|e| e == "screen true")
+            .expect("the repaint should take the screen");
+        let painted = events
+            .iter()
+            .rposition(|e| e.starts_with("out ") && e.contains("over-the-top"))
+            .expect("the repaint output never arrived");
+        let released = events
+            .iter()
+            .position(|e| e == "screen false")
+            .expect("the command boundary must release the screen");
+        assert!(took < painted, "announced before the paint: {events:?}");
+        assert!(
+            painted <= released,
+            "and released only once the command is over: {events:?}"
+        );
+    }
+
+    /// **Ordinary output must never trip the screen path.** If it did, `ls` would
+    /// suspend the UI and stop the transcript, which is a much worse bug than a
+    /// full-screen program that does not show.
+    #[tokio::test]
+    async fn ordinary_output_never_claims_the_screen() {
+        let (mut s, mut rx) = bash(23);
+        s.send_text("printf 'one\\ntwo\\nthree\\n'".into()).unwrap();
+        let events = until_exit(&mut rx).await;
+        assert!(
+            events.iter().all(|e| !e.starts_with("screen")),
+            "a plain three-line command took the screen: {events:?}"
+        );
+        // Colour is the common false-positive risk: `ls --color`, `git log`.
+        s.send_text("printf '\\033[31mred\\033[0m text with no newline'".into())
+            .unwrap();
+        let events = until_exit(&mut rx).await;
+        assert!(
+            events.iter().all(|e| !e.starts_with("screen")),
+            "an SGR-coloured chunk is still a line of output: {events:?}"
+        );
+    }
+
+    /// **Acceptance: raw keystrokes reach the child with nothing added.**
+    ///
+    /// `Esc` has to arrive as one `0x1b` byte, not `0x03` and not with a newline
+    /// on it: this is what lets a program in the alt screen read the keyboard.
+    /// Checked end to end on a real pty, because the line discipline's echo is the
+    /// only honest witness to what actually went down the master.
+    #[tokio::test]
+    async fn raw_keys_reach_the_child_verbatim_and_the_shell_still_survives() {
+        let (mut s, mut rx) = bash(24);
+        s.send_text("printf 'first-line\\n'; sleep 1.5".into()).unwrap();
+        // Wait until the command is genuinely in flight, then type a keystroke
+        // sequence: Esc, ':' , 'w', 'q', '!' and CR — the shape of `:wq!`.
+        for _ in 0..200 {
+            if s.status() == SessionStatus::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(s.status(), SessionStatus::Running, "sleep is running");
+
+        s.send_bytes(vec![0x1b, b':', b'w', b'q', b'!', 0x0d]).unwrap();
+        let ran = run_logged(&mut rx).await;
+        // The bytes were echoed by the line discipline: `:wq!` appearing in the
+        // output is the witness that they went down the master verbatim, which is
+        // the only thing a session-side test can honestly see. `first-line` proves
+        // the shell was alive to be typed at.
+        assert!(ran.out.contains("first-line"), "{:?}", ran.out);
+        assert!(
+            ran.out.contains(":wq!"),
+            "the keystrokes did not come back echoed, so they never reached the pty: {:?}",
+            ran.out
+        );
+        assert_eq!(s.status(), SessionStatus::Idle);
+    }
+
+    /// A held screen must not swallow the command boundary: the `exit 0` still has
+    /// to reach the transcript after the release, or the user sees no result at all.
+    #[tokio::test]
+    async fn the_command_result_is_still_said_after_a_screen_session() {
+        let (mut s, mut rx) = bash(25);
+        s.send_text("printf '\\033[?1049hscreen\\033[?1049l'; echo done-marker".into())
+            .unwrap();
+        let ran = run_logged(&mut rx).await;
+        assert_eq!(ran.code, Some(0), "{:?}", ran.notes);
+        assert!(ran.out.contains("done-marker"), "{:?}", ran.out);
+        assert!(ran.notes.iter().any(|n| n.contains("exit 0")), "{:?}", ran.notes);
     }
 }

@@ -1,0 +1,26 @@
+[  4.85s] PASS  baseline: vim on a bare pty can be driven to write the file (the control works)
+[  4.86s] spawned target/debug/looprs (pid 70082) in a 40x132 pty
+[  9.38s] PASS  vim starts under looprs without the 'not to a terminal' warning
+[ 10.41s] PASS  the typed text reaches the screen while the program holds it
+[ 10.41s] screen paint: baseline 118 chars, looprs 360 chars
+[ 10.42s] PASS  a whole screen of paint reaches the user, not just the typed characters
+[ 13.53s] PASS  Esc + `:wq!` writes the file (Esc reached vim as Esc, `:` as `:`)
+[ 13.53s] PASS  the app never reported an interrupt during the vim session (Esc was not 0x03)
+[ 13.53s] PASS  vim: the file name was drawn (baseline drew it, looprs showed it too)
+[ 13.53s] PASS  vim: the blank-line `~` filler was drawn (baseline drew it, looprs showed it too)
+[ 13.53s] PASS  vim: the typed text landed at the cursor (baseline drew it, looprs showed it too)
+[ 13.53s] n/a   vim: a status/ruler line was drawn (line/column text)  -- the bare pty never drew it either, so it is not a signal here (checking for it would prove nothing)
+[ 13.59s] PASS  after vim, the shell still runs commands and they reach the screen
+[ 13.69s] PASS  Ctrl-Q quits after vim
+[ 15.81s] baseline: less's first screen reaches line 039 (filler not drawn)
+[ 19.65s] PASS  less shows the top of the file
+[ 19.65s] PASS  less's own status line is on screen
+[ 19.65s] PASS  the first screen is as full as the bare one (reaches line 039)
+[ 21.16s] PASS  scrolling down reveals lines below the first screen (past 039)
+[ 22.67s] PASS  scrolling back to the top shows line 001 again
+[ 24.23s] PASS  quitting less leaves the shell usable and the screen ours
+[ 24.34s] PASS  Ctrl-Q quits after less
+[ 29.18s] PASS  a program that repaints in place is shown while it runs
+[ 29.24s] PASS  when it ends, the shell is usable again (the screen came back on the command boundary)
+[ 29.35s] PASS  Ctrl-Q quits after the repainting program
+[ 29.35s] 21/21 checks passed

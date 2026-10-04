@@ -7,3 +7,6 @@ looprs.log
 .beads-credential-key
 .beads/proxieddb/
 .beads
+
+# Python bytecode from the spike drivers (they import each other)
+__pycache__/

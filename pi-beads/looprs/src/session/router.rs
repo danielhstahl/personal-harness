@@ -76,6 +76,7 @@ pub fn wrap(id: SessionId, ev: SessionEvent) -> Msg {
             session: Some(id),
             text,
         },
+        SessionEvent::ScreenHeld { active } => Msg::ScreenHeld { session: id, active },
         SessionEvent::Exited { reason } => Msg::SessionDown {
             session: id,
             reason,
@@ -257,6 +258,28 @@ impl Router {
                             let _ = self.app_tx.send(Msg::Error {
                                 session: Some(id),
                                 text: format!("cancel: {e:#}"),
+                            });
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            UiCommand::Keys { mode, bytes } => {
+                // Keystrokes go to the mode they were typed into, and only while
+                // that mode is the one on screen — the same rule as `Submit`. A
+                // raw byte must never reach a session the user is not looking at.
+                if mode != self.active {
+                    tracing::debug!(?mode, active = ?self.active, "keys raced a switch; dropped");
+                    return Ok(());
+                }
+                match self.sessions.get_mut(&mode) {
+                    None => Ok(()),
+                    Some(m) => {
+                        let id = m.id;
+                        if let Err(e) = m.session.send_bytes(bytes) {
+                            let _ = self.app_tx.send(Msg::Error {
+                                session: Some(id),
+                                text: format!("keys: {e:#}"),
                             });
                         }
                         Ok(())
@@ -526,6 +549,7 @@ mod tests {
                     format!("restore[{session}]: {text}")
                 }
                 Msg::Term(_) | Msg::Tick => "ui".into(),
+                Msg::ScreenHeld { session, active } => format!("screen@{session}:{active}"),
             });
         }
         out
