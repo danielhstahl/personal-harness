@@ -46,7 +46,7 @@ use anyhow::{Result, anyhow};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::app::{PiEvent, parse};
-use crate::services::bd::{Bead, ready_beads_with};
+use crate::services::bd::{Bead, ready_with};
 use crate::services::pi::PiRpc;
 use crate::services::prompts::{PLANNER, WORKER, generate_prompt};
 use crate::session::{
@@ -520,7 +520,7 @@ impl BeadsLoop {
     /// spawn, wire up event forwarding, and prompt. Callers never see a pi child
     /// that is alive but unprompted.
     async fn work_next_bead(&mut self) -> Result<WorkerPass> {
-        let beads = ready_beads_with(&self.cfg.bd_bin)?;
+        let beads = ready_with(&self.cfg.bd_bin).await?;
         let Some(bead) = beads.first() else {
             return Ok(WorkerPass::Idle);
         };

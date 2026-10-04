@@ -38,12 +38,24 @@ pub enum PiFake {
 }
 
 /// How the fake `bd` behaves.
+///
+/// The read verbs (`ready`, `list`, `show`) answer from files the test can rewrite
+/// mid-run — that is what makes "the board changed under the loop" and "the worker
+/// settled but never closed the bead" testable at all.
 #[derive(Clone, Copy, Debug)]
 pub enum BdFake {
     /// Prints the current board JSON and exits 0.
     Ok,
     /// Prints nothing and exits 3.
     Fails,
+    /// Exits 0 with bytes that are not JSON at all.
+    Malformed,
+    /// Exits 0 printing nothing (the sneaky one: "empty output" must not read as
+    /// "empty board").
+    EmptyOutput,
+    /// Like [`BdFake::Ok`], plus `bd show <id> --json` answers from `show.json`
+    /// (set with [`Fakes::set_show`]) — the read the claim guard is built on.
+    ShowStatus,
 }
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -57,6 +69,7 @@ pub struct Fakes {
     pi_log: PathBuf,
     bd_log: PathBuf,
     board_file: PathBuf,
+    show_file: PathBuf,
 }
 
 impl Fakes {
@@ -71,6 +84,7 @@ impl Fakes {
         let pi_log = dir.join("pi.log");
         let bd_log = dir.join("bd.log");
         let board_file = dir.join("board.json");
+        let show_file = dir.join("show.json");
         let pi_bin = dir.join("pi");
         let bd_bin = dir.join("bd");
 
@@ -79,8 +93,14 @@ impl Fakes {
             _ => pi_script(&pi_log, pi),
         };
         write_script(&pi_bin, &script);
-        write_script(&bd_bin, &bd_script(&bd_log, &board_file, bd));
+        write_script(
+            &bd_bin,
+            &bd_script(&bd_log, &board_file, &show_file, bd),
+        );
         std::fs::write(&board_file, board).unwrap();
+        // No bead is known to `bd show` until a test says otherwise: an unset
+        // show file reads as "no such bead", which is the safe default.
+        std::fs::write(&show_file, "[]").unwrap();
 
         Self {
             dir,
@@ -89,12 +109,22 @@ impl Fakes {
             pi_log,
             bd_log,
             board_file,
+            show_file,
         }
     }
 
     /// Point the loop's fakes at a different board without restarting them.
     pub fn set_board(&self, board: &str) {
         std::fs::write(&self.board_file, board).unwrap();
+    }
+
+    /// What `bd show <id> --json` answers: a single bead object, or `[]`.
+    ///
+    /// This is the fake's lever for "the worker settled but never closed the bead",
+    /// which is the whole looprs-w7q hazard and is not expressible through the
+    /// `ready` board alone.
+    pub fn set_show(&self, bead: &str) {
+        std::fs::write(&self.show_file, bead).unwrap();
     }
 
     pub fn pi_bin(&self) -> &str {
@@ -203,6 +233,27 @@ impl Fakes {
             .lines()
             .filter(|l| l.starts_with("bd "))
             .count()
+    }
+
+    /// Every `bd` command line the fake received, in order.
+    pub fn bd_log(&self) -> Vec<String> {
+        self.read(&self.bd_log)
+            .lines()
+            .filter_map(|l| l.strip_prefix("bd ").map(str::to_string))
+            .collect()
+    }
+
+    /// Did the harness claim this bead, with the command it was supposed to use?
+    pub fn claimed(&self, id: &str) -> bool {
+        self.bd_log()
+            .iter()
+            .any(|l| l.contains(&format!("update {id} --claim")))
+    }
+
+    /// How many times this exact `bd` command line was run (for "the board is
+    /// queried once per decision, not once per question" style assertions).
+    pub fn bd_call_count(&self, cmd: &str) -> usize {
+        self.bd_log().iter().filter(|l| *l == cmd).count()
     }
 }
 
@@ -431,14 +482,49 @@ main()
     .to_string()
 }
 
-fn bd_script(log: &Path, board: &Path, mode: BdFake) -> String {
-    let tail = match mode {
-        BdFake::Ok => format!("cat {}\n", board.display()),
-        BdFake::Fails => "exit 3\n".to_string(),
+/// The fake `bd`: records every command line, then answers each verb from a file
+/// the test can rewrite.
+///
+/// Written in bash and file-driven for the same reason the rest of the fakes are:
+/// the assertions are about what the *harness* asked for, in what order, and a
+/// mock that only supports one verb cannot answer "did it claim before prompting?"
+fn bd_script(log: &Path, board: &Path, show: &Path, mode: BdFake) -> String {
+    // (read verb, `bd show`, write verb) per personality.
+    let (read_cmd, show_cmd, write_cmd): (String, String, String) = match mode {
+        BdFake::Fails => ("exit 3".into(), "exit 3".into(), "exit 3".into()),
+        BdFake::Malformed => (
+            "printf 'not json at all\\n'".into(),
+            "printf 'not json at all\\n'".into(),
+            "exit 0".into(),
+        ),
+        BdFake::EmptyOutput => ("true".into(), "true".into(), "exit 0".into()),
+        BdFake::Ok => (
+            format!("cat {}", board.display()),
+            "printf '[]\\n'".into(),
+            "exit 0".into(),
+        ),
+        BdFake::ShowStatus => (
+            format!("cat {}", board.display()),
+            format!("cat {}", show.display()),
+            "exit 0".into(),
+        ),
     };
     format!(
-        "#!/usr/bin/env bash\necho \"bd $*\" >>{log}\n{tail}",
-        log = log.display()
+        r#"#!/usr/bin/env bash
+set -u
+echo "bd $*" >>"{log}"
+verb="${{1:-}}"
+case "$verb" in
+  ready|list) {read_cmd} ;;
+  show) {show_cmd} ;;
+  update|create|close) {write_cmd} ;;
+  *) echo "fake bd: unsupported verb $verb" >&2; exit 2 ;;
+esac
+"#,
+        log = log.display(),
+        read_cmd = read_cmd,
+        show_cmd = show_cmd,
+        write_cmd = write_cmd,
     )
 }
 
