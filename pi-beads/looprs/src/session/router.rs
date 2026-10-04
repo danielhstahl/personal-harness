@@ -19,7 +19,7 @@
 //!       │   │  sessions: HashMap<TerminalType, Managed{ id, Box<dyn Session>, pump }>
 //!       │   │
 //!       │   │   pump(id, rx) ── SessionEvent ──wrap(id, .)──> Msg ──┐
-//!       │   │   pump(id, rx) ── SessionEvent ──wrap(id, .)──> Msg ──┤──> app_tx
+//!       │   │   pump(id, rx) ── SessionEvent ──wrap(id, .)──> Msg ──┼──> app_tx
 //!       │   │   pump(id, rx) ── SessionEvent ──wrap(id, .)──> Msg ──┘
 //!       │   └───────────────────────────────────────────────────────┘
 //!       ▼
@@ -34,18 +34,24 @@
 //! * Sessions never learn about the UI: they emit [`SessionEvent`]. [`wrap`] is the
 //!   one place that stamps provenance onto a [`Msg`].
 
-#![allow(dead_code)] // skeleton: not wired into main.rs until looprs-05j deletes this line
-
 use std::collections::HashMap;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 use crate::app::{Msg, UiCommand};
 use crate::session::{
-    ExitReason, Session, SessionConfig, SessionEvent, SessionId, SessionStatus, TerminalType,
+    ExitReason, Session, SessionConfig, SessionEvent, SessionFactory, SessionId, SessionStatus,
+    TerminalType, default_factory,
 };
+
+/// How long [`Router::shutdown_all`] waits for a session to say goodbye before it
+/// stops waiting. Exact numbers are looprs-ecr's; this is the placeholder that keeps
+/// quitting possible, which is the property.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// The single seam where a session's event becomes a UI message.
 ///
@@ -94,7 +100,7 @@ pub(crate) struct Managed {
 /// It is not the total number of children that is bounded (up to three may be
 /// alive; see the lifecycle table in ADR-0002 Q3), it is the number per state.
 pub struct Router {
-    cfg: SessionConfig,
+    factory: SessionFactory,
     /// Every `Msg` produced by a session goes here, into the UI loop.
     app_tx: mpsc::UnboundedSender<Msg>,
     active: TerminalType,
@@ -104,13 +110,24 @@ pub struct Router {
 }
 
 impl Router {
+    /// The production router: real backends from [`default_factory`].
     pub fn new(
         active: TerminalType,
         cfg: SessionConfig,
         app_tx: mpsc::UnboundedSender<Msg>,
     ) -> Self {
+        Self::with_factory(active, app_tx, default_factory(cfg))
+    }
+
+    /// As [`Router::new`], with the session constructor injected. Every lifecycle
+    /// test uses this to drive real policy with sessions whose behavior it controls.
+    pub fn with_factory(
+        active: TerminalType,
+        app_tx: mpsc::UnboundedSender<Msg>,
+        factory: SessionFactory,
+    ) -> Self {
         Self {
-            cfg,
+            factory,
             app_tx,
             active,
             sessions: HashMap::new(),
@@ -126,13 +143,28 @@ impl Router {
         self.sessions.get(&mode)
     }
 
+    /// The id of the session currently standing for `mode`, if any. The App needs
+    /// this to seed a view with the identity the Router issued rather than a
+    /// placeholder of its own.
+    pub fn id_of(&self, mode: TerminalType) -> Option<SessionId> {
+        self.sessions.get(&mode).map(|m| m.id)
+    }
+
     /// For the status row: which modes have a live child right now (looprs-guh).
     pub fn live_modes(&self) -> Vec<TerminalType> {
-        self.sessions
+        let mut live: Vec<TerminalType> = self
+            .sessions
             .iter()
             .filter(|(_, m)| m.session.status().is_alive())
             .map(|(mode, _)| *mode)
-            .collect()
+            .collect();
+        live.sort_by_key(|m| {
+            TerminalType::ALL
+                .iter()
+                .position(|x| x == m)
+                .unwrap_or(usize::MAX)
+        });
+        live
     }
 
     pub fn status_of(&self, mode: TerminalType) -> SessionStatus {
@@ -142,65 +174,242 @@ impl Router {
             .unwrap_or(SessionStatus::NotStarted)
     }
 
+    /// Bring up the session that is already active. App startup calls this before
+    /// [`Router::run`], so the beads loop self-starts exactly the way it always
+    /// did — just owned now, instead of hand-wired in `main`.
+    pub async fn boot(&mut self) -> Result<()> {
+        let mode = self.active;
+        self.ensure(mode)?;
+        if let Some(m) = self.sessions.get_mut(&mode) {
+            m.session.set_active(true)?;
+        }
+        Ok(())
+    }
+
     /// Handle one UI command. Called from the Router task, one at a time, in order.
     ///
-    /// Contract for the implementation (looprs-05j), none of which may block on a
-    /// child process:
+    /// The in-flight-command policy (looprs-05j, explicit rather than accidental):
     ///
-    /// * `Submit { mode, text }` — route by `mode`, because that is where the user
-    ///   *typed it*, i.e. declared intent. If `mode != self.active`, the switch
-    ///   raced the submit: **drop it** with a visible `Msg::System` ("switched
-    ///   modes; message not sent") rather than guessing. Never resurrect a session
-    ///   to satisfy a submit into a mode the user has since left.
-    /// * `SwitchMode { to }` — [`Router::switch_to`].
-    /// * `Cancel` (Esc) — `abort()` the **active** session only. Never fan out.
-    /// * `BeadsNext` — legacy shim for the App-driven beads advance; it goes away
-    ///   with looprs-msj, which moves the transition inside `BeadsSession`.
+    /// * `Submit` for a mode the user has already left is **dropped, visibly**. Not
+    ///   routed to the mode it was typed into — the user cannot see that mode any
+    ///   more, so a silent queue there is worse than a dropped one — and never by
+    ///   resurrecting a session to honor it.
+    /// * `SwitchMode` is never blocked behind a submit; the router serializes, so
+    ///   "Tab then Submit" and "Submit then Tab" each have exactly one answer.
+    /// * `Cancel` touches the **active** session only. Fanning one keypress out to
+    ///   every live session is the worst possible reading of Esc.
+    /// * Nothing here awaits a child process. `send_text`/`set_active`/`abort` are
+    ///   queue-and-return by contract, which is why Esc cannot queue behind a
+    ///   30-second model call.
     pub async fn handle(&mut self, cmd: UiCommand) -> Result<()> {
-        let _ = cmd;
-        Err(anyhow::anyhow!(
-            "Router::handle: not implemented yet (looprs-05j)"
-        ))
+        match cmd {
+            UiCommand::Submit { mode, text } => {
+                if mode != self.active {
+                    tracing::debug!(?mode, active = ?self.active, "submit raced a switch; dropped");
+                    let _ = self.app_tx.send(Msg::System {
+                        session: None,
+                        text: format!("switched modes; the {} message was not sent", mode.label()),
+                    });
+                    return Ok(());
+                }
+                let id = self.ensure(mode)?;
+                let session = &mut self.sessions.get_mut(&mode).expect("just ensured").session;
+                if let Err(e) = session.send_text(text) {
+                    // A stub backend refusing (`ctn`/`553`) or a child that will
+                    // not take it: the user pressed Enter, so the answer goes on
+                    // their screen, attributed.
+                    let _ = self.app_tx.send(Msg::Error {
+                        session: Some(id),
+                        text: format!("{}: {e:#}", mode.label()),
+                    });
+                }
+                Ok(())
+            }
+            UiCommand::SwitchMode { from, to } => {
+                if from != self.active {
+                    // The input box is authoritative about where the *keystroke*
+                    // came from, but the router is authoritative about what it is
+                    // showing. Ours wins; the difference is logged, not guessed at.
+                    tracing::debug!(?from, active = ?self.active, "stale switch `from`");
+                }
+                self.switch_to(to).await
+            }
+            UiCommand::Cancel => {
+                let mode = self.active;
+                match self.sessions.get_mut(&mode) {
+                    // Nothing to cancel. Silently: Esc means "stop the thing", and
+                    // there is no thing. An error here would train the user to
+                    // ignore errors, which is a worse outcome than a no-op.
+                    None => Ok(()),
+                    Some(m) => {
+                        let id = m.id;
+                        let session = &mut m.session;
+                        if let Err(e) = session.abort() {
+                            let _ = self.app_tx.send(Msg::Error {
+                                session: Some(id),
+                                text: format!("cancel: {e:#}"),
+                            });
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            UiCommand::BeadsNext => {
+                // Legacy shim: the App still says "the beads pass settled, take the
+                // next one". Note it is routed by the beads *mode*, never by the
+                // active mode — the settled event named the beads session, and
+                // whether a new pass may start is that session's parked-state
+                // decision (Q3), not ours. Goes away with looprs-msj.
+                let mode = TerminalType::Beeds;
+                if let Some(m) = self.sessions.get_mut(&mode) {
+                    let id = m.id;
+                    let session = &mut m.session;
+                    if let Err(e) = session.advance() {
+                        let _ = self.app_tx.send(Msg::Error {
+                            session: Some(id),
+                            text: format!("beads advance: {e:#}"),
+                        });
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Perform a mode switch per the per-mode policy (ADR-0002 Q3).
     ///
-    /// Order matters, and the *implementation* steps are:
-    ///
-    /// 1. `from.switch_away_policy()`:
-    ///    * `KeepRunning` (Pi, Bash) — do nothing to the child; `set_active(false)`
-    ///      only. Note the boxed session must **not** be dropped here: dropping is
-    ///      what kills the child, and keeping it warm is the whole point.
-    ///    * `DrainThenPark` (Beads) — `set_active(false)`; the pass already
-    ///      running finishes, and no *new* pass starts while hidden. No kill:
-    ///      a Tab must not throw away a run that is already paid for.
-    /// 2. `self.active = to`.
-    /// 3. Bring the target up lazily per its own rule: Bash and Pi create no child
-    ///    until the first submit; Beads owns a loop driver that spawns a worker
-    ///    only when the board has something ready.
-    /// 4. `to_session.set_active(true)`, and if it had parked because of the switch,
-    ///    resume it — but only from a parked state, so a re-entry can never
-    ///    double-spawn a worker.
-    /// 5. Emit one `Msg::System { session: Some(target) }` separator
-    ///      ("── switched to Pi ──") so a scrollback that later mixes modes is
-    ///      readable. This is the only cross-session write the router ever does.
+    /// Order matters:
+    /// 1. tell the session being left that it is no longer on screen — and **only**
+    ///    that. Both `KeepRunning` and `DrainThenPark` mean "do not kill it"; the
+    ///    difference is what the session does with the call. Dropping the `Box` is
+    ///    what kills a child, and a Tab must not do that.
+    /// 2. move the active pointer.
+    /// 3. bring the target up (creating it costs nothing: Bash and Pi spawn no
+    ///    child until the first submit, and Beads spawns one only if the board has
+    ///    something ready).
+    /// 4. tell the target it is now on screen — which is what resumes a parked
+    ///    beads loop, from its parked state and nowhere else.
+    /// 5. write one separator line into the target's transcript, so a scrollback
+    ///    that later mixes modes is readable. This is the only cross-session write
+    ///    the router ever does.
     pub async fn switch_to(&mut self, to: TerminalType) -> Result<()> {
-        let _ = to;
-        Err(anyhow::anyhow!(
-            "Router::switch_to: not implemented yet (looprs-05j)"
-        ))
+        let from = self.active;
+        if from == to {
+            return Ok(());
+        }
+        let policy = from.switch_away_policy();
+        if let Some(m) = self.sessions.get_mut(&from) {
+            if let Err(e) = m.session.set_active(false) {
+                tracing::warn!(mode = ?from, ?policy, "set_active(false) failed: {e:#}");
+            }
+        }
+        self.active = to;
+        if let Err(e) = self.ensure(to) {
+            let _ = self.app_tx.send(Msg::Error {
+                session: None,
+                text: format!("could not open {}: {e:#}", to.label()),
+            });
+            return Err(e);
+        }
+        if let Some(m) = self.sessions.get_mut(&to) {
+            if let Err(e) = m.session.set_active(true) {
+                tracing::warn!(mode = ?to, "set_active(true) failed: {e:#}");
+            }
+        }
+        let id = self.sessions[&to].id;
+        let _ = self.app_tx.send(Msg::System {
+            session: Some(id),
+            text: format!("── switched to {} ──", to.label()),
+        });
+        Ok(())
     }
 
     /// Teardown for app exit (ADR-0002 Q3, "on quit").
     ///
     /// Bounded and ordered: `shutdown()` each session (close stdin first so pi can
     /// dispose its runtime), then bound-wait for the `Exited` each one owes us, then
-    /// `pump.abort()` past the grace period. Never hangs on a wedged child — the
-    /// caller passes the deadline (looprs-ecr owns the exact numbers).
-    pub async fn shutdown_all(&mut self) -> Result<()> {
-        Err(anyhow::anyhow!(
-            "Router::shutdown_all: not implemented yet (looprs-ecr)"
-        ))
+    /// stop waiting past the grace period rather than hanging on a wedged child.
+    /// The sessions stay alive for the duration of the wait — dropping one early is
+    /// how a child gets orphaned.
+    pub async fn shutdown_all(&mut self, grace: Duration) -> Result<()> {
+        let mut leaving: Vec<(SessionId, Box<dyn Session>, JoinHandle<()>)> = Vec::new();
+        for (_, m) in self.sessions.drain() {
+            let Managed {
+                id,
+                mut session,
+                pump,
+            } = m;
+            if let Err(e) = session.shutdown() {
+                tracing::warn!("{id} shutdown failed: {e:#}");
+            }
+            leaving.push((id, session, pump));
+        }
+        for (id, _session, pump) in leaving {
+            if timeout(grace, pump).await.is_err() {
+                // Past the grace period we stop waiting. The pump's session has
+                // been told to die; turning that into a SIGKILL is looprs-ecr's
+                // job, hanging the exit on it is not.
+                tracing::warn!(
+                    "{id} did not report its exit within {grace:?}; abandoning its pump"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The Router task body: serve commands until the UI closes the channel, then
+    /// take every session with us.
+    pub async fn run(mut self, mut cmd_rx: mpsc::Receiver<UiCommand>) -> Result<()> {
+        while let Some(cmd) = cmd_rx.recv().await {
+            if let Err(e) = self.handle(cmd).await {
+                let _ = self.app_tx.send(Msg::Error {
+                    session: None,
+                    text: format!("router: {e:#}"),
+                });
+            }
+        }
+        self.shutdown_all(SHUTDOWN_GRACE).await
+    }
+
+    /// Make sure `mode` has a live session, and return its id.
+    ///
+    /// Lazy by design: this is the only place the router creates a session, so the
+    /// "spawns nothing until there is input / a reason" rule has one home. An
+    /// existing session is reused *unless* it is `Dead`, in which case the corpse is
+    /// retired first and the new generation gets a fresh id — which is what makes a
+    /// stale event distinguishable rather than merely unlikely.
+    fn ensure(&mut self, mode: TerminalType) -> Result<SessionId> {
+        if let Some(m) = self.sessions.get(&mode) {
+            if !matches!(m.session.status(), SessionStatus::Dead) {
+                return Ok(m.id);
+            }
+            // Retire the dead generation. The pump is cut first: after this point
+            // that incarnation has no path to the UI at all. Any trailing
+            // `SessionDown` it does not get to send is covered by the App's
+            // adopt-a-new-generation rule, which seals the old view regardless.
+            m.pump.abort();
+            self.sessions.remove(&mode);
+        }
+        let generation = self.next_gen;
+        self.next_gen += 1;
+        let spawned = (self.factory)(mode, generation)?;
+        let id = spawned.session.id();
+        if id.mode != mode {
+            return Err(anyhow!(
+                "session factory produced {id} for mode {}",
+                mode.label()
+            ));
+        }
+        let pump = self.pump(id, spawned.events);
+        self.sessions.insert(
+            mode,
+            Managed {
+                id,
+                session: spawned.session,
+                pump,
+            },
+        );
+        Ok(id)
     }
 
     /// Forward one session's events into the UI, with its id on every message.
@@ -242,15 +451,58 @@ impl Router {
 mod tests {
     use super::*;
     use crate::session::BeadStep;
+    use crate::testing::{FakeBackend, fake};
+
+    fn router_with(active: TerminalType) -> (Router, mpsc::UnboundedReceiver<Msg>, FakeBackend) {
+        let (tx, rx) = mpsc::unbounded_channel::<Msg>();
+        let backend = FakeBackend::new();
+        let router = Router::with_factory(active, tx, backend.factory());
+        (router, rx, backend)
+    }
+
+    /// Drain whatever has arrived so far, as stable strings.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<Msg>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            out.push(match m {
+                Msg::Agent { session, .. } => format!("agent@{session}"),
+                Msg::BashOutput { session, .. } => format!("bash@{session}"),
+                Msg::BeadStep { session, step } => format!("step@{session} {step:?}"),
+                Msg::SessionDown { session, reason } => format!("down@{session} {reason:?}"),
+                // The full `SessionId` is in the string on purpose: the staleness
+                // tests look for a specific incarnation, and a bare mode label would
+                // match every one of them.
+                Msg::Error { session, text } => format!(
+                    "error[{}]: {text}",
+                    session
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "harness".into())
+                ),
+                Msg::System { session, text } => format!(
+                    "system[{}]: {text}",
+                    session
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "harness".into())
+                ),
+                Msg::Term(_) | Msg::Tick => "ui".into(),
+            });
+        }
+        out
+    }
+
+    fn tab(from: TerminalType, to: TerminalType) -> UiCommand {
+        UiCommand::SwitchMode { from, to }
+    }
+
+    // ------------------------------ the envelope ------------------------------
 
     /// The envelope mapping, pinned variant by variant. If somebody later drops the
     /// session tag from a variant, this is the test that says why it is there.
     #[test]
     fn wrap_stamps_the_origin_on_every_session_message() {
         let id = SessionId::new(TerminalType::Beeds, 3);
-        let cfg = SessionConfig::default();
         let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
-        let router = Router::new(TerminalType::Beeds, cfg, tx);
+        let router = Router::new(TerminalType::Beeds, SessionConfig::default(), tx);
 
         // `Agent` is the variant looprs-msj is about: it must name its producer.
         let Msg::Agent { session, event } =
@@ -265,7 +517,6 @@ mod tests {
             session,
             stream,
             chunk,
-            ..
         } = wrap(
             id,
             SessionEvent::BashOutput {
@@ -304,7 +555,6 @@ mod tests {
         };
         assert_eq!(session, id);
         assert_eq!(reason, ExitReason::Shutdown);
-        // `router` is only here to prove pump()/wrap() are reachable from it.
         assert_eq!(router.active_mode(), TerminalType::Beeds);
     }
 
@@ -323,25 +573,13 @@ mod tests {
         // make this test flaky rather than wrong.
         handle.await.unwrap();
 
-        let msgs: Vec<Msg> = {
-            let mut v = Vec::new();
-            while let Ok(m) = rx.try_recv() {
-                v.push(m);
-            }
-            v
-        };
-        let down: Vec<&Msg> = msgs
+        let msgs = drain(&mut rx);
+        let downs: Vec<&String> = msgs
             .iter()
-            .filter(|m| matches!(m, Msg::SessionDown { session, .. } if *session == id))
+            .filter(|m| m.starts_with(&format!("down@{id}")))
             .collect();
-        assert_eq!(down.len(), 1, "exactly one SessionDown expected: {msgs:?}");
-        assert!(matches!(
-            down[0],
-            Msg::SessionDown {
-                reason: ExitReason::Unknown,
-                ..
-            }
-        ));
+        assert_eq!(downs.len(), 1, "exactly one SessionDown expected: {msgs:?}");
+        assert!(downs[0].contains("Unknown"));
     }
 
     /// And when the session *does* say Exited, the pump must not add a second one.
@@ -361,25 +599,474 @@ mod tests {
         drop(ev_tx);
         handle.await.unwrap();
 
-        let mut downs = 0;
-        while let Ok(m) = rx.try_recv() {
-            if matches!(m, Msg::SessionDown { .. }) {
-                downs += 1;
-            }
-        }
+        let downs = drain(&mut rx)
+            .iter()
+            .filter(|m| m.starts_with(&format!("down@{id}")))
+            .count();
         assert_eq!(downs, 1);
     }
 
     /// The structural invariant: `sessions` is keyed by `TerminalType`, so two
-    /// live sessions of the same state cannot both be registered.
+    /// live sessions of one state cannot both be registered.
     #[test]
     fn one_slot_per_terminal_state() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
-        let router = Router::new(TerminalType::Beeds, SessionConfig::default(), tx);
+        let (router, _rx, _b) = router_with(TerminalType::Beeds);
         assert!(router.sessions.is_empty());
         assert_eq!(
             router.status_of(TerminalType::Pi),
             SessionStatus::NotStarted
+        );
+    }
+
+    // ------------------------------- switching -------------------------------
+
+    /// A Tab is a view change, not a Cancel: the session being left is told it is
+    /// off-screen, and nothing is shut down. That holds for *both* policies —
+    /// `KeepRunning` and `DrainThenPark` differ in what the session does with the
+    /// call, never in whether it dies.
+    #[tokio::test]
+    async fn switching_away_never_shuts_a_session_down() {
+        let (mut router, mut rx, backend) = router_with(TerminalType::Beeds);
+        router.boot().await.unwrap();
+        assert!(!backend.was_called("shutdown"), "boot shuts nothing");
+
+        router
+            .handle(tab(TerminalType::Beeds, TerminalType::Pi))
+            .await
+            .unwrap();
+
+        let log = backend.log();
+        assert!(
+            log.iter()
+                .any(|c| c.starts_with("set_active false") && c.contains("Beeds")),
+            "the beads session was told it went off-screen: {log:?}"
+        );
+        assert!(
+            !backend.was_called("shutdown"),
+            "a Tab must not shut a session down: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|c| c.starts_with("set_active true") && c.contains("Pi")),
+            "the Pi session was brought up as the new active one: {log:?}"
+        );
+        assert_eq!(router.active_mode(), TerminalType::Pi);
+        let msgs = drain(&mut rx);
+        assert!(
+            msgs.iter().any(|m| m.contains("switched to Pi")),
+            "the switch is visible in the transcript: {msgs:?}"
+        );
+    }
+
+    /// Warm modes: switching back returns the *same* session, so nothing respawns
+    /// and there is no cold-start latency on return.
+    #[tokio::test]
+    async fn warm_modes_survive_a_switch_and_are_not_recreated() {
+        let (mut router, _rx, backend) = router_with(TerminalType::Pi);
+        router.boot().await.unwrap();
+        router
+            .handle(UiCommand::Submit {
+                mode: TerminalType::Pi,
+                text: "hello".into(),
+            })
+            .await
+            .unwrap();
+        let first = router.session(TerminalType::Pi).unwrap().id;
+        assert_eq!(backend.spawn_count(TerminalType::Pi), 1);
+
+        router
+            .handle(tab(TerminalType::Pi, TerminalType::Bash))
+            .await
+            .unwrap();
+        router
+            .handle(tab(TerminalType::Bash, TerminalType::Pi))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend.spawn_count(TerminalType::Pi),
+            1,
+            "a warm Pi session is kept, not respawned"
+        );
+        assert_eq!(
+            router.session(TerminalType::Pi).unwrap().id,
+            first,
+            "switching back returns the same session, not a new incarnation"
+        );
+    }
+
+    /// One session per terminal type, however hard the Tab key is thrashed.
+    #[tokio::test]
+    async fn thrashing_the_tab_key_cannot_produce_two_sessions_of_one_mode() {
+        let (mut router, _rx, backend) = router_with(TerminalType::Beeds);
+        router.boot().await.unwrap();
+        for _ in 0..6 {
+            for to in TerminalType::ALL {
+                let from = router.active_mode();
+                router.handle(tab(from, to)).await.unwrap();
+            }
+        }
+        assert_eq!(
+            router.sessions.len(),
+            3,
+            "the HashMap key is the one-per-mode invariant"
+        );
+        for mode in TerminalType::ALL {
+            assert_eq!(
+                backend.spawn_count(mode),
+                1,
+                "{mode:?} spawned more than once: {:?}",
+                backend.log()
+            );
+        }
+    }
+
+    /// Switching into a mode must not spawn a *process*; the session object is not
+    /// the child. (The Beads side of this — no worker until `bd ready` has
+    /// something — is pinned in `session::beads::tests`.)
+    #[tokio::test]
+    async fn switching_into_a_mode_builds_no_child() {
+        let (mut router, _rx, backend) = router_with(TerminalType::Beeds);
+        router.boot().await.unwrap();
+        router
+            .handle(tab(TerminalType::Beeds, TerminalType::Bash))
+            .await
+            .unwrap();
+        router
+            .handle(tab(TerminalType::Bash, TerminalType::Pi))
+            .await
+            .unwrap();
+
+        // Bash/Pi sessions exist but nothing was submitted, so no backend work ran.
+        assert!(router.session(TerminalType::Bash).is_some());
+        assert_eq!(backend.calls("send_text"), 0);
+        assert_eq!(router.status_of(TerminalType::Pi), SessionStatus::Idle);
+        assert!(
+            !router.status_of(TerminalType::Pi).is_busy(),
+            "a mode you have only looked at is not doing anything"
+        );
+    }
+
+    /// Submitting into a mode the user has since left is dropped, and says so. The
+    /// session for the abandoned mode is not conjured back to honor it.
+    #[tokio::test]
+    async fn a_submit_that_lost_the_race_with_a_switch_is_dropped_visibly() {
+        let (mut router, mut rx, backend) = router_with(TerminalType::Beeds);
+        router.boot().await.unwrap();
+
+        // The user Tabbed away; this submit, queued before the Tab, arrives after.
+        router
+            .handle(tab(TerminalType::Beeds, TerminalType::Bash))
+            .await
+            .unwrap();
+        drain(&mut rx);
+
+        router
+            .handle(UiCommand::Submit {
+                mode: TerminalType::Beeds,
+                text: "make tickets for X".into(),
+            })
+            .await
+            .unwrap();
+
+        let msgs = drain(&mut rx);
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("switched modes") && m.contains("not sent")),
+            "the dropped message is visible: {msgs:?}"
+        );
+        assert_eq!(
+            backend.calls("send_text"),
+            0,
+            "a submit into a mode the user left must not reach it: {:?}",
+            backend.log()
+        );
+    }
+
+    /// A submit into the mode the user *is* in is routed to that mode's session.
+    #[tokio::test]
+    async fn a_submit_goes_to_the_active_session() {
+        let (mut router, _rx, backend) = router_with(TerminalType::Pi);
+        router.boot().await.unwrap();
+        router
+            .handle(UiCommand::Submit {
+                mode: TerminalType::Pi,
+                text: "hello".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(backend.calls("send_text"), 1);
+        assert!(backend.log()[backend.log().len() - 1].contains("hello"));
+    }
+
+    /// Esc touches the active session only — never a fan-out to everything live.
+    #[tokio::test]
+    async fn cancel_reaches_the_active_session_only() {
+        let (mut router, mut rx, backend) = router_with(TerminalType::Beeds);
+        router.boot().await.unwrap();
+        // Put a Pi session alive too, so a fan-out would be visible.
+        router.switch_to(TerminalType::Pi).await.unwrap();
+        drain(&mut rx);
+
+        router.handle(UiCommand::Cancel).await.unwrap();
+
+        let log = backend.log();
+        assert_eq!(
+            log.iter()
+                .filter(|c| c.starts_with("abort") && c.contains("Pi"))
+                .count(),
+            1,
+            "the active (Pi) session was cancelled: {log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|c| c.starts_with("abort") && c.contains("Beeds")),
+            "the hidden beads session must not be cancelled by an Esc in Pi: {log:?}"
+        );
+        assert!(
+            drain(&mut rx).is_empty(),
+            "a successful cancel is not an error"
+        );
+    }
+
+    /// A `Cancel` with nothing live behind the active mode is a no-op, not an error.
+    #[tokio::test]
+    async fn cancel_with_no_session_is_a_silent_no_op() {
+        let (mut router, mut rx, _backend) = router_with(TerminalType::Pi);
+        // No boot: no sessions exist at all.
+        router.handle(UiCommand::Cancel).await.unwrap();
+        assert!(
+            drain(&mut rx).is_empty(),
+            "no session, no message: Esc had nothing to stop"
+        );
+    }
+
+    /// The legacy `BeadsNext` is routed by the beads *mode*, not by the active
+    /// mode: the settled event that triggered it named the beads session.
+    #[tokio::test]
+    async fn beads_next_is_routed_by_mode_not_by_what_is_on_screen() {
+        let (mut router, _rx, backend) = router_with(TerminalType::Pi);
+        router.boot().await.unwrap();
+        router.switch_to(TerminalType::Bash).await.unwrap();
+        // A beads session exists behind the Bash view (booting Pi created it via a
+        // later ensure, so create one here to stand in for "a beads pass is live").
+        router.ensure(TerminalType::Beeds).unwrap();
+        backend.clear_log();
+
+        router.handle(UiCommand::BeadsNext).await.unwrap();
+
+        let log = backend.log();
+        assert_eq!(
+            log.iter()
+                .filter(|c| c.starts_with("advance") && c.contains("Beeds"))
+                .count(),
+            1,
+            "the beads session got the advance while Bash was on screen: {log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|c| c.starts_with("advance") && c.contains("Bash")),
+            "the visible mode must not be advanced by a beads settle: {log:?}"
+        );
+    }
+
+    // ---------------------- generations and staleness ----------------------
+
+    /// The invariant the ADR calls "structural, not filtered": once a generation
+    /// is replaced its event stream has no route to the UI, because the pump that
+    /// could carry it has been aborted.
+    #[tokio::test]
+    async fn a_replaced_generation_cannot_reach_the_ui() {
+        let (mut router, mut rx, backend) = router_with(TerminalType::Pi);
+        router.boot().await.unwrap();
+        let old_id = router.session(TerminalType::Pi).unwrap().id;
+        let old_events = backend.events(old_id);
+
+        // The old generation dies; the next submit brings the mode back as a new one.
+        backend.set_status(old_id, SessionStatus::Dead);
+        router
+            .handle(UiCommand::Submit {
+                mode: TerminalType::Pi,
+                text: "second".into(),
+            })
+            .await
+            .unwrap();
+        let new_id = router.session(TerminalType::Pi).unwrap().id;
+        assert_ne!(old_id, new_id, "a respawn is a different thing");
+        drain(&mut rx); // clear everything up to the swap
+
+        // The corpse tries to speak.
+        old_events
+            .send(SessionEvent::Agent(crate::app::PiEvent::AgentSettled))
+            .ok();
+        old_events
+            .send(SessionEvent::System("I am still here".into()))
+            .ok();
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let msgs = drain(&mut rx);
+        assert!(
+            !msgs.iter().any(|m| m.contains(&old_id.to_string())),
+            "no event from the dead generation may reach the UI: {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("still here")),
+            "nor its text: {msgs:?}"
+        );
+
+        // Meanwhile the live generation still reaches us.
+        backend
+            .events(new_id)
+            .send(SessionEvent::System("alive".into()))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|m| m.contains("alive") && m.contains(&new_id.to_string())),
+            "the live generation still reaches the UI"
+        );
+    }
+
+    /// Generations come from one counter and nothing else issues them.
+    #[tokio::test]
+    async fn generations_are_monotonic_and_owned_by_the_router() {
+        let (mut router, _rx, backend) = router_with(TerminalType::Pi);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let id = router.ensure(TerminalType::Pi).unwrap();
+            seen.push(id.generation);
+            backend.set_status(id, SessionStatus::Dead);
+        }
+        assert_eq!(
+            seen.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "no generation reused: {seen:?}"
+        );
+    }
+
+    /// A live session is reused, never duplicated, by repeated `ensure`.
+    #[tokio::test]
+    async fn ensure_reuses_a_live_session() {
+        let (mut router, _rx, backend) = router_with(TerminalType::Bash);
+        let a = router.ensure(TerminalType::Bash).unwrap();
+        let b = router.ensure(TerminalType::Bash).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(backend.spawn_count(TerminalType::Bash), 1);
+    }
+
+    /// Guard rail for the factory contract: a session claiming to be a different
+    /// mode than the one asked for would misroute every event it produces, so it
+    /// is refused rather than filed away.
+    #[tokio::test]
+    async fn a_factory_that_lies_about_the_mode_is_refused() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
+        let mut router = Router::with_factory(TerminalType::Pi, tx, fake(TerminalType::Bash));
+        let err = router.ensure(TerminalType::Pi).unwrap_err();
+        assert!(err.to_string().contains("factory produced"), "{err}");
+        assert!(router.sessions.is_empty(), "a liar is not registered");
+    }
+
+    // ---------------------------- shutdown ----------------------------
+
+    /// Quitting shuts every live session down.
+    #[tokio::test]
+    async fn quitting_shuts_every_live_session_down() {
+        let (mut router, _rx, backend) = router_with(TerminalType::Beeds);
+        router.boot().await.unwrap();
+        router.switch_to(TerminalType::Pi).await.unwrap();
+        router.switch_to(TerminalType::Bash).await.unwrap();
+        assert_eq!(router.sessions.len(), 3);
+
+        router
+            .shutdown_all(Duration::from_millis(200))
+            .await
+            .unwrap();
+
+        for mode in TerminalType::ALL {
+            assert!(
+                backend
+                    .log()
+                    .iter()
+                    .any(|c| c.starts_with("shutdown") && c.contains(mode.label())),
+                "{mode:?} was not shut down: {:?}",
+                backend.log()
+            );
+        }
+        assert!(router.sessions.is_empty());
+    }
+
+    /// A session that never reports its exit must not be able to hang the exit.
+    #[tokio::test]
+    async fn a_wedged_session_cannot_prevent_quit() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
+        let silent = FakeBackend::new().with_silent_exit();
+        let mut router = Router::with_factory(TerminalType::Pi, tx, silent.factory());
+        router.boot().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let res = timeout(
+            Duration::from_millis(900),
+            router.shutdown_all(Duration::from_millis(50)),
+        )
+        .await;
+        assert!(res.is_ok(), "shutdown hung on a silent session");
+        assert!(started.elapsed() < Duration::from_millis(900));
+        assert!(silent.was_called("shutdown"));
+    }
+
+    /// `run()` serves commands until the UI hangs up, then leaves cleanly — the
+    /// body `main` spawns, tested as a unit.
+    #[tokio::test]
+    async fn run_serves_commands_and_then_leaves_cleanly() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>(16);
+        let (app_tx, mut app_rx) = mpsc::unbounded_channel::<Msg>();
+        let backend = FakeBackend::new();
+        let router = Router::with_factory(TerminalType::Pi, app_tx, backend.factory());
+        let task = tokio::spawn(router.run(cmd_rx));
+
+        cmd_tx
+            .send(tab(TerminalType::Pi, TerminalType::Bash))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            backend.log().iter().any(|c| c.contains("Bash")),
+            "the command was served: {:?}",
+            backend.log()
+        );
+
+        drop(cmd_tx); // the UI is gone
+        assert!(timeout(Duration::from_secs(5), task).await.is_ok());
+        assert!(
+            backend.log().iter().any(|c| c.starts_with("shutdown")),
+            "and its sessions went with it: {:?}",
+            backend.log()
+        );
+        assert!(
+            drain(&mut app_rx)
+                .iter()
+                .all(|m| !m.starts_with("error[harness]")),
+            "a clean exit produces no harness errors"
+        );
+    }
+
+    /// The status row (looprs-guh) reads liveness off the router; make sure that
+    /// view of the world is real.
+    #[tokio::test]
+    async fn live_modes_reports_which_sessions_have_a_live_child() {
+        let (mut router, _rx, backend) = router_with(TerminalType::Beeds);
+        router.boot().await.unwrap();
+        let beads = router.id_of(TerminalType::Beeds).unwrap();
+        assert_eq!(router.live_modes(), vec![TerminalType::Beeds]);
+
+        backend.set_status(beads, SessionStatus::Idle);
+        assert_eq!(router.live_modes(), vec![TerminalType::Beeds]);
+        backend.set_status(beads, SessionStatus::Dead);
+        assert!(
+            router.live_modes().is_empty(),
+            "a dead session is not 'live' for the status row"
         );
     }
 }

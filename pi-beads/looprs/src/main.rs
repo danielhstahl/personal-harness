@@ -30,14 +30,13 @@ const VIEWPORT_H: u16 = 10;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 use components::text_stream::LiveTextPreview;
+use components::tool::LiveToolPreview;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
-use crate::app::{BeadsLoop, ChatState};
-use crate::components::scrollback::Flusher;
-use crate::components::tool::LiveToolPreview;
-use crate::session::{SessionConfig, SessionId, TerminalType};
-use crate::state::state::{Entry, Transcript};
+use crate::session::router::{Router, SHUTDOWN_GRACE};
+use crate::session::{ChatState, SessionConfig, SessionStatus, TerminalType};
+use crate::state::state::Entry;
 
 fn init_logging() -> anyhow::Result<WorkerGuard> {
     //let dir = std::env::temp_dir(); // or a proper data dir, e.g. via the `dirs` crate
@@ -95,37 +94,39 @@ async fn run(term: &mut Term) -> Result<()> {
     // all terminal UI events and events originating outside the app
     // come from cmd_tx and are received on cmd_rx
     let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>(16);
-    // any app state changes come from app_tx and are recived from app_rx
+    // any app state changes come from app_tx and are received on app_rx
     let (app_tx, mut app_rx) = mpsc::unbounded_channel::<Msg>();
-    // beads_loop drives the beads-backed terminal state: it owns its pi child and
-    // reports state changes into the UI through app_tx.
-    //
-    // The explicit SessionId is the ADR-0002 envelope requirement: from here on,
-    // every Msg out of this loop says which session made it. looprs-05j replaces
-    // this hand-wiring with the Router, which owns all three sessions.
-    let mut bead_loop = BeadsLoop::new(
-        SessionId::new(TerminalType::Beeds, 0),
-        app_tx,
-        SessionConfig::default(),
-    );
-    let input_state = InputState::new();
-    let transcript = Transcript::new();
-    // Self-start: if the board already has ready beads this spawns *and prompts* a worker,
-    // otherwise it parks. Running this before the App is built means the input box opens
-    // in the correct state instead of flickering.
-    bead_loop.next().await;
-    let need_input = bead_loop.is_awaiting_input();
-    let mut app = App::new(
-        cmd_tx,
-        input_state,
-        need_input,
-        transcript,
-        term.size()?.width,
-    );
-    // bead_loop listens for new commands from the terminal on cmd_rx,
-    // but only those that pertain to bead_loop
-    bead_loop.listen_input(cmd_rx);
-    let mut flusher = Flusher::new();
+
+    let initial = TerminalType::Beeds;
+    // The Router owns every backend from here: one session per terminal state, and
+    // only this task's copy of `cmd_tx` can ask it for anything. The old shape —
+    // `BeadsLoop::new(...)` hand-wired here, with a Tab being a border-color change
+    // — is what looprs-05j replaces.
+    let mut router = Router::new(initial, SessionConfig::default(), app_tx.clone());
+    // Bring up the mode we open in *before* the App exists: the beads loop's first
+    // pass runs now, so the input box opens in the right state instead of
+    // flickering once the BeadStep message lands.
+    router.boot().await?;
+    // Sole owner of the sessions from here on. It never blocks on a child, so Esc
+    // cannot queue behind somebody's model call.
+    // The BeadStep that set the initial input gating was emitted before this App
+    // existed, so seed the view from the Router's own state rather than guessing.
+    let seed = router.id_of(initial).map(|id| {
+        (
+            id,
+            !matches!(router.status_of(initial), SessionStatus::Running),
+        )
+    });
+
+    let mut app = App::new(cmd_tx, InputState::new(), initial, term.size()?.width);
+    if let Some((id, awaiting)) = seed {
+        app.view_mut(id).awaiting_user = awaiting;
+    }
+
+    // Sole owner of the sessions from here on: nothing after this point may touch a
+    // backend except by sending the Router a command.
+    let router_task = tokio::spawn(router.run(cmd_rx));
+
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60 fps cap
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -150,9 +151,12 @@ async fn run(term: &mut Term) -> Result<()> {
             _ = tick.tick() => {
                 app.update(Msg::Tick); //spinner only atm
                 if app.dirty {
-                    let lines = flusher.drain(&app.transcript, app.width);  // reads transcript, mutates flusher
+                    // The per-frame sequence is flush -> insert_before -> draw, and
+                    // only for the ACTIVE view (ADR-0002 Q5). A hidden view buffers;
+                    // its backlog goes out as one burst when you switch to it.
+                    let lines = app.flush_active(app.width);
                     insert_lines(term, lines)?;
-                    term.draw(|f| view(&app,  &flusher, f))?;
+                    term.draw(|f| view(&app, f))?;
                     app.dirty = false;
                 }
             }
@@ -161,18 +165,24 @@ async fn run(term: &mut Term) -> Result<()> {
             break;
         }
     }
+
+    // Dropping the App closes `cmd_tx`, which is the Router's cue to shut every
+    // session down. Await it: the children are reaped on that path, and quitting
+    // before it finishes is how a session outlives the TUI.
+    drop(app);
+    let grace = SHUTDOWN_GRACE + Duration::from_secs(1);
+    if tokio::time::timeout(grace, router_task).await.is_err() {
+        tracing::warn!("router did not finish shutting its sessions down within {grace:?}");
+    }
     Ok(())
 }
 
 /// Pure function of state (the tail preview re-parses only the open block).
-fn view(app: &App, flusher: &Flusher, f: &mut Frame) {
-    /*let [preview, status, input] = Layout::vertical([
-        Constraint::Min(0),
-        Constraint::Length(1),
-        Constraint::Length(3),
-    ])
-    .areas(f.area());*/
-    let tools: Vec<&Entry> = app.transcript.open_tools().take(4).collect();
+fn view(app: &App, f: &mut Frame) {
+    let active = app.active_view();
+    let tools: Vec<&Entry> = active
+        .map(|v| v.transcript.open_tools().take(4).collect())
+        .unwrap_or_default();
     let [text_area, tool_area, _status, input] = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(tools.len() as u16),
@@ -181,16 +191,13 @@ fn view(app: &App, flusher: &Flusher, f: &mut Frame) {
     ])
     .areas(f.area());
 
-    if matches!(app.chat_state, ChatState::Chat) {
-        f.render_widget(
-            LiveTextPreview::new(app.spinner, &app.transcript, flusher),
-            text_area,
-        );
+    // What the live region shows is a property of the session on screen, not of any
+    // session that happens to be streaming.
+    if matches!(app.chat_state(), ChatState::Chat)
+        && let Some(view) = active
+    {
+        f.render_widget(LiveTextPreview::new(app.spinner, view), text_area);
     }
-
-    //let [preview, tool_area] =
-    //    Layout::vertical([Constraint::Min(0), Constraint::Length(tools.len() as u16)])
-    //        .areas(preview);
 
     for (i, e) in tools.iter().enumerate() {
         let row = Rect {
@@ -201,24 +208,7 @@ fn view(app: &App, flusher: &Flusher, f: &mut Frame) {
         f.render_widget(LiveToolPreview::new(e, app.spinner), row);
     }
     // input
-    if app.need_input {
+    if app.need_input() {
         app.input.render(f, input)
     }
 }
-/*
-fn spawn_agent(mut cmd_rx: mpsc::Receiver<UiCommand>, pi: PiRpc) {
-    tokio::spawn(async move {
-        while let Some(input) = cmd_rx.recv().await {
-            match input {
-                UiCommand::UserMessage(text) => {
-                    let res = pi.prompt(&text).await;
-                    match res {
-                        Ok(_v) => tracing::debug!("Success"),
-                        Err(e) => tracing::info!("This is err: {}", e),
-                    };
-                }
-                _ => {}
-            }
-        }
-    });
-}*/

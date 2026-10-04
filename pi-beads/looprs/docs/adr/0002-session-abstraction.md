@@ -276,3 +276,35 @@ Costs / risks:
   from the old paths needs the new import.
 * The variant is spelled `Beeds`; this ADR calls the mode "Beads". Renaming it was deliberately left
   out to keep this ticket type-only.
+
+## Amendments made while implementing looprs-05j (the router)
+
+Three things this ADR did not anticipate. Each is small, but the contract above is the
+contract, so they are recorded rather than slipped in.
+
+1. **`Session::advance()` was added** — the routing target for the legacy
+   `UiCommand::BeadsNext`. The Router routes it by *mode* (`Beeds`), never by the
+   active mode, because the settled event that triggered it named the beads session.
+   It is a wart on a generic trait and it should die with looprs-msj, which moves the
+   step machine inside `BeadsSession` where the decision belongs. Default is a no-op
+   so only the beads session answers it.
+2. **The per-view buffer cap is entry-granular, and the notice is inserted at the
+   render cursor, not at the head of the transcript.** Doing it the obvious way
+   (prepend, then shift) either re-emits lines the terminal already has or never
+   emits the notice at all. `Flusher::consumed()` and `Flusher::reseat()` exist to
+   make this safe: any cursor move must reset the per-entry cursor state, or
+   `drain_stream` slices the wrong text. The cap reserves room for its own notice
+   (`NOTICE_BUDGET`), otherwise the view lands at `limit + notice` and the cap is a
+   rounding error with an apology attached.
+3. **`SessionFactory` is injected.** The lifecycle rules — park, resume, one per
+   mode, "a replaced generation has no route to the UI" — are worth testing, and
+   testing them through three half-built child processes would test the fakes rather
+   than the Router. `default_factory(cfg)` is the real thing; tests hand the router
+   sessions whose behavior they control, and the beads backend keeps the repo's
+   process-level style (real pids, real reaping) in `session::beads::tests`.
+
+Also: `BeadsLoop` moved out of `app.rs` into `session/beads.rs` and now reports
+`SessionEvent` instead of `Msg`, which is what lets the Router own it; `ChatState`
+moved into `session::view` because it describes one session's live region, not the
+app's; and `App` holds `HashMap<TerminalType, SessionView>` with `need_input` /
+`chat_state` derived from the active view, as Q5 required.

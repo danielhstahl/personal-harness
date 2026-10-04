@@ -10,13 +10,56 @@
 //!
 //! So the pairing is the type. `SessionView` owns both halves, its `flusher` field
 //! is private, and there is no way to point it at somebody else's transcript.
+//!
+//! Everything the App used to keep globally — "is the live region streaming", "is a
+//! bead waiting on me", "what is this mode's last error" — lives here instead, per
+//! session. `App::need_input` and `App::chat_state` are *derived from the active
+//! view*, never from `input.mode`: a Beads pass that is running off-screen must not
+//! be able to hide the Pi input box, and a Pi answer must not be able to pause the
+//! beads loop.
 
 use ratatui::text::Line;
 
 use super::SessionId;
 use crate::components::scrollback::Flusher;
-use crate::session::SessionStatus;
-use crate::state::state::{MessageKind, Transcript};
+use crate::session::{BeadStep, SessionStatus};
+use crate::state::state::{Entry, MessageKind, Transcript};
+
+/// Default cap on how much text an *inactive* view will hold.
+///
+/// A view that is on screen drains every frame, so this only binds for a session
+/// nobody is looking at — which is exactly the unbounded case ADR-0002 names
+/// ("a `yes | sleep 1000000`-style shell … grows its transcript forever"). When a
+/// hidden session overruns the cap, old lines are dropped and one visible notice is
+/// inserted, so the loss is honest rather than silent.
+pub const DEFAULT_VIEW_BUFFER: usize = 256 * 1024;
+
+/// Room held back out of the cap for the eviction notice itself, so the view ends
+/// *at or under* the limit rather than limit-plus-a-line. Generous for any wording
+/// under 64 bytes ("… 4,294,967,295 bytes dropped (buffer cap) …" fits).
+const NOTICE_BUDGET: usize = 64;
+
+/// What the live (not-yet-final) region of one session is showing.
+///
+/// Per session rather than global: this decides whether the preview renders and
+/// whether the spinner ticks, and those are properties of *this* session's stream,
+/// not of whichever mode happens to be on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ChatState {
+    /// Nothing streaming.
+    #[default]
+    Stopped,
+    /// Prose streaming into the preview.
+    Chat,
+    /// A tool run is live.
+    Tool,
+}
+
+impl ChatState {
+    pub fn is_streaming(self) -> bool {
+        !matches!(self, Self::Stopped)
+    }
+}
 
 /// One terminal state's rendered history, plus the render cursor over it.
 ///
@@ -35,17 +78,43 @@ pub struct SessionView {
     /// Most recent error, kept so the status row can show it without digging
     /// through scrollback (looprs-guh).
     pub last_error: Option<String>,
+    /// What the live region shows for this session (was: a single global on `App`).
+    pub chat: ChatState,
+    /// This session wants typed input. Drives the input box (was: `App::need_input`).
+    ///
+    /// `true` by default: a mode nobody has used yet should accept input, and the
+    /// session will say otherwise the moment it starts work. Note the asymmetry that
+    /// matters — `false` here only ever means "this session is busy", so it must
+    /// never be set on the basis of the input mode.
+    pub awaiting_user: bool,
+    /// The beads machine's step, for the status row. `None` for every other mode.
+    /// Rendered, never re-derived (looprs-msj).
+    pub step: Option<BeadStep>,
+    /// Dropped-line bookkeeping for the buffer cap (see [`DEFAULT_VIEW_BUFFER`]).
+    dropped: usize,
+    limit: usize,
 }
 
 impl SessionView {
     /// Transcript and Flusher are created together and only ever used together.
     pub fn new(session: SessionId) -> Self {
+        Self::with_buffer(session, DEFAULT_VIEW_BUFFER)
+    }
+
+    /// As [`SessionView::new`], with an explicit buffer cap (0 = unbounded). Tests
+    /// use the small-cap form to exercise eviction without streaming 256 KiB.
+    pub fn with_buffer(session: SessionId, limit: usize) -> Self {
         Self {
             session,
             transcript: Transcript::new(),
             flusher: Flusher::new(),
             status: SessionStatus::NotStarted,
             last_error: None,
+            chat: ChatState::Stopped,
+            awaiting_user: true,
+            step: None,
+            dropped: 0,
+            limit,
         }
     }
 
@@ -78,12 +147,84 @@ impl SessionView {
     /// A finished, one-shot line (status notices, the mode-switch separator).
     pub fn push_note(&mut self, kind: MessageKind, text: String) {
         self.transcript.push_done(kind, text);
+        self.enforce_buffer();
+    }
+
+    /// A streaming delta from this session's backend.
+    pub fn push_delta(&mut self, kind: MessageKind, delta: &str) {
+        self.transcript.push_delta(kind, delta);
+        self.enforce_buffer();
     }
 
     /// A session-level error: recorded for the status row and shown.
     pub fn push_error(&mut self, text: String) {
         self.last_error = Some(text.clone());
         self.transcript.push_done(MessageKind::Error, text);
+        self.enforce_buffer();
+    }
+
+    /// Mirror of the owning session's liveness, plus the input gating that follows
+    /// from it: a session with no child must not leave the input box hidden.
+    pub fn set_status(&mut self, status: SessionStatus) {
+        self.status = status;
+        if !status.is_alive() {
+            self.awaiting_user = true;
+            self.chat = ChatState::Stopped;
+        }
+    }
+
+    /// The beads machine moved: record the step (status row) and gate input on it.
+    pub fn set_step(&mut self, step: BeadStep) {
+        self.awaiting_user = matches!(step, BeadStep::AwaitInput);
+        self.step = Some(step);
+    }
+
+    /// How many bytes of this view's output were dropped by the cap (status row).
+    pub fn dropped_bytes(&self) -> usize {
+        self.dropped
+    }
+
+    /// Cap the buffered transcript while this view is *not* on screen.
+    ///
+    /// Lossy on purpose — that is what a cap is — so the two things it must get
+    /// right are: say what was lost, and do not corrupt the render cursor. The
+    /// notice goes in *at* the cursor rather than at the head of the transcript, so
+    /// it is the next thing the terminal sees and the still-pending entries behind
+    /// it keep their order. The cursor is then reseat-ed, because its per-entry
+    /// state (scan/block/fence) belongs to whatever entry it was last reading.
+    ///
+    /// The notice's own size is reserved out of the cap: without that the view ends
+    /// at `limit + notice` and the cap is a rounding error with an apology note.
+    fn enforce_buffer(&mut self) {
+        if self.limit == 0 || self.transcript.byte_len() <= self.limit {
+            return;
+        }
+        let target = self.limit.saturating_sub(NOTICE_BUDGET);
+        let first = self.flusher.consumed();
+        let mut dropped = 0usize;
+        let mut removed = 0usize;
+        // Always keep one entry: an empty transcript with the cursor past the end is
+        // a state nothing downstream is written to expect.
+        while self.transcript.byte_len() > target && self.transcript.entries.len() > 1 {
+            dropped += self.transcript.entries.remove(0).text.len();
+            removed += 1;
+        }
+        if dropped == 0 {
+            return;
+        }
+        self.dropped += dropped;
+        // The eviction shifted the transcript; the cursor follows it, and the notice
+        // takes the cursor's slot so it is what gets written out next.
+        let at = first.saturating_sub(removed);
+        self.transcript.entries.insert(
+            at,
+            Entry {
+                kind: MessageKind::System,
+                text: format!("… {} bytes dropped (buffer cap) …", self.dropped),
+                done: true,
+            },
+        );
+        self.flusher.reseat(at);
     }
 }
 
@@ -177,5 +318,135 @@ mod tests {
         let mut v = view(TerminalType::Bash);
         v.push_error("shell exited (code 1)".into());
         assert_eq!(v.last_error.as_deref(), Some("shell exited (code 1)"));
+    }
+
+    /// Where `App::need_input` used to come from, now per session: the beads step
+    /// gates the input box, and only for the view that owns the beads machine.
+    #[test]
+    fn a_busy_step_hides_input_only_for_its_own_view() {
+        let mut beads = view(TerminalType::Beeds);
+        let pi = view(TerminalType::Pi);
+        assert!(beads.awaiting_user, "an untouched view accepts input");
+
+        beads.set_step(BeadStep::WorkTickets);
+        assert!(
+            !beads.awaiting_user,
+            "a working beads view must not take input"
+        );
+        assert!(
+            pi.awaiting_user,
+            "and that must not leak into the Pi view (that was the global-flag bug)"
+        );
+
+        beads.set_step(BeadStep::AwaitInput);
+        assert!(beads.awaiting_user);
+        assert_eq!(beads.step, Some(BeadStep::AwaitInput));
+    }
+
+    /// A dead session must not leave the input box hidden behind it.
+    #[test]
+    fn a_dead_view_gives_the_input_box_back() {
+        let mut v = view(TerminalType::Pi);
+        v.awaiting_user = false;
+        v.chat = ChatState::Chat;
+
+        v.set_status(SessionStatus::Dead);
+        assert!(
+            v.awaiting_user,
+            "a dead session cannot answer, so ask the human"
+        );
+        assert_eq!(v.chat, ChatState::Stopped);
+
+        // ...while a live-but-idle session keeps whatever gating it had.
+        let mut w = view(TerminalType::Bash);
+        w.awaiting_user = false;
+        w.set_status(SessionStatus::Idle);
+        assert!(!w.awaiting_user);
+    }
+
+    /// ADR-0002 "Consequences": buffered output while hidden must be capped, and
+    /// the loss must be visible rather than silent.
+    #[test]
+    fn an_inactive_view_caps_its_buffer_and_says_so() {
+        let mut v = SessionView::with_buffer(SessionId::new(TerminalType::Bash, 0), 128);
+        let mut emitted: Vec<String> = Vec::new();
+        for i in 0..8 {
+            v.push_note(MessageKind::System, format!("line {i} {}", "x".repeat(24)));
+            // Flushed every round, i.e. these are lines the terminal already has.
+            emitted.extend(v.flush(60).iter().map(|l| l.to_string()));
+        }
+        assert!(
+            v.transcript.byte_len() <= 128,
+            "buffer must stay at or under the cap: {}",
+            v.transcript.byte_len()
+        );
+        assert!(v.dropped_bytes() > 0, "the drop must be counted");
+        assert!(
+            emitted
+                .iter()
+                .any(|l| l.contains("bytes dropped") && l.contains(&v.dropped_bytes().to_string())),
+            "and the notice must reach the scrollback, with the amount: {emitted:?}"
+        );
+    }
+
+    /// The eviction moves the render cursor, and a cursor moved without being reset
+    /// re-emits or garbles output — which in a real terminal is unrecoverable. So:
+    /// after the cap kicks in, nothing already written comes back.
+    #[test]
+    fn eviction_never_re_emits_what_was_already_written() {
+        let mut v = SessionView::with_buffer(SessionId::new(TerminalType::Bash, 0), 128);
+        let mut seen: Vec<String> = Vec::new();
+        for i in 0..24 {
+            v.push_note(MessageKind::System, format!("unique line {i}"));
+            seen.extend(v.flush(60).iter().map(|l| l.to_string()));
+        }
+        assert!(
+            v.dropped_bytes() > 0,
+            "this test is about eviction happening"
+        );
+
+        let remaining: Vec<String> = v
+            .transcript
+            .entries
+            .iter()
+            .map(|e| e.text.clone())
+            .collect();
+        let after: Vec<String> = v.flush(60).iter().map(|l| l.to_string()).collect();
+        for line in &after {
+            let t = line.trim();
+            if t.is_empty() || t.contains("bytes dropped") {
+                continue;
+            }
+            assert!(
+                !seen.iter().any(|s| s.contains(t)),
+                "re-emitted a line the terminal already printed: {line:?}"
+            );
+            assert!(
+                remaining.iter().any(|e| e.contains(t)),
+                "emitted a line the view does not hold: {line:?}"
+            );
+        }
+    }
+
+    /// Losing bytes is fine; losing the ability to flush at all is not.
+    #[test]
+    fn the_view_keeps_flushing_after_eviction() {
+        let mut v = SessionView::with_buffer(SessionId::new(TerminalType::Bash, 0), 128);
+        for i in 0..12 {
+            v.push_note(
+                MessageKind::System,
+                format!("filler {i} {}", "y".repeat(20)),
+            );
+            let _ = v.flush(60);
+        }
+        assert!(v.dropped_bytes() > 0);
+        v.push_note(MessageKind::System, "after the eviction".into());
+        let out = v.flush(60);
+        assert!(
+            out.iter()
+                .any(|l| l.to_string().contains("after the eviction")),
+            "post-eviction content still reaches the terminal: {out:?}"
+        );
+        assert!(v.flush(60).is_empty(), "and only once");
     }
 }

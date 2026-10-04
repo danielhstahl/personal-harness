@@ -205,3 +205,204 @@ pub fn process_alive(pid: u32) -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
+
+// ---------------------------------------------------------------------------------
+// Fakes for the Router: a `Session` that records instead of spawning.
+//
+// The repo's test style is process-level (see the module docs), and the Beads backend
+// keeps that: `session::beads::tests` asserts on real pids. But the Router's rules —
+// one session per mode, park/resume, "a replaced generation has no route to the UI",
+// "a submit that lost the race is dropped" — are lifecycle rules, and asserting them
+// through three half-built child processes would test the fakes rather than the
+// Router. So these record what was asked, in order, and let a test hold the event
+// sender of a specific generation so it can make a *dead* one try to speak.
+// ---------------------------------------------------------------------------------
+
+use crate::session::{
+    Session, SessionEvent, SessionFactory, SessionId, SessionStatus, Spawned, TerminalType,
+};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
+
+#[derive(Default)]
+struct FakeInner {
+    log: Vec<String>,
+    senders: HashMap<SessionId, mpsc::UnboundedSender<SessionEvent>>,
+    status: HashMap<SessionId, SessionStatus>,
+    /// When true, `shutdown()` is recorded but the event stream is never closed,
+    /// so the owning pump never finishes: a wedged session.
+    silent_exit: bool,
+}
+
+/// A recorder shared by every fake session one test creates.
+#[derive(Clone, Default)]
+pub struct FakeBackend {
+    inner: Arc<Mutex<FakeInner>>,
+}
+
+impl FakeBackend {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `shutdown()` records but never ends the stream — the wedged-child case.
+    pub fn with_silent_exit(self) -> Self {
+        self.inner.lock().unwrap().silent_exit = true;
+        self
+    }
+
+    /// A factory that builds fakes for whatever mode the Router asks for.
+    pub fn factory(&self) -> SessionFactory {
+        self.factory_claiming(None)
+    }
+
+    /// As [`FakeBackend::factory`], but every session claims `Some(mode)` no matter
+    /// what was requested — for the "a lying factory is refused" test.
+    pub fn factory_claiming(&self, claimed: Option<TerminalType>) -> SessionFactory {
+        let me = self.clone();
+        Arc::new(move |mode: TerminalType, generation: u64| {
+            let id = SessionId::new(claimed.unwrap_or(mode), generation);
+            let (tx, rx) = mpsc::unbounded_channel::<SessionEvent>();
+            {
+                let mut st = me.inner.lock().unwrap();
+                st.log
+                    .push(format!("spawn {} #{generation}", id.mode.label()));
+                st.senders.insert(id, tx.clone());
+                st.status.entry(id).or_insert(SessionStatus::Idle);
+            }
+            Ok(Spawned {
+                session: Box::new(FakeSession {
+                    id,
+                    backend: me.clone(),
+                    events: tx,
+                }),
+                events: rx,
+            })
+        })
+    }
+
+    pub fn log(&self) -> Vec<String> {
+        self.inner.lock().unwrap().log.clone()
+    }
+
+    pub fn clear_log(&self) {
+        self.inner.lock().unwrap().log.clear();
+    }
+
+    pub fn calls(&self, verb: &str) -> usize {
+        self.log().iter().filter(|c| c.starts_with(verb)).count()
+    }
+
+    pub fn was_called(&self, verb: &str) -> bool {
+        self.calls(verb) > 0
+    }
+
+    pub fn spawn_count(&self, mode: TerminalType) -> usize {
+        self.log()
+            .iter()
+            .filter(|c| c.starts_with(&format!("spawn {}", mode.label())))
+            .count()
+    }
+
+    /// The event sender for one specific generation, so a test can make a *dead*
+    /// generation try to reach the UI.
+    pub fn events(&self, id: SessionId) -> mpsc::UnboundedSender<SessionEvent> {
+        self.inner
+            .lock()
+            .unwrap()
+            .senders
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no fake session {id} was created"))
+    }
+
+    pub fn set_status(&self, id: SessionId, status: SessionStatus) {
+        self.inner.lock().unwrap().status.insert(id, status);
+    }
+}
+
+/// A [`Session`] that does nothing but say what it was asked to do.
+struct FakeSession {
+    id: SessionId,
+    backend: FakeBackend,
+    events: mpsc::UnboundedSender<SessionEvent>,
+}
+
+impl Session for FakeSession {
+    fn id(&self) -> SessionId {
+        self.id
+    }
+
+    fn send_text(&mut self, text: String) -> anyhow::Result<()> {
+        self.backend.inner.lock().unwrap().log.push(format!(
+            "send_text {} #{}: {text}",
+            self.id.mode.label(),
+            self.id.generation
+        ));
+        Ok(())
+    }
+
+    fn abort(&mut self) -> anyhow::Result<()> {
+        self.backend.inner.lock().unwrap().log.push(format!(
+            "abort {} #{}",
+            self.id.mode.label(),
+            self.id.generation
+        ));
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> anyhow::Result<()> {
+        let silent = {
+            let mut st = self.backend.inner.lock().unwrap();
+            st.log.push(format!(
+                "shutdown {} #{}",
+                self.id.mode.label(),
+                self.id.generation
+            ));
+            st.silent_exit
+        };
+        if !silent {
+            // An orderly goodbye: the stream ends, so the pump completes.
+            let _ = self.events.send(SessionEvent::Exited {
+                reason: crate::session::ExitReason::Shutdown,
+            });
+        }
+        Ok(())
+    }
+
+    fn advance(&mut self) -> anyhow::Result<()> {
+        self.backend.inner.lock().unwrap().log.push(format!(
+            "advance {} #{}",
+            self.id.mode.label(),
+            self.id.generation
+        ));
+        Ok(())
+    }
+
+    fn set_active(&mut self, active: bool) -> anyhow::Result<()> {
+        self.backend.inner.lock().unwrap().log.push(format!(
+            "set_active {} {} #{}",
+            if active { "true" } else { "false" },
+            self.id.mode.label(),
+            self.id.generation
+        ));
+        Ok(())
+    }
+
+    fn status(&self) -> SessionStatus {
+        self.backend
+            .inner
+            .lock()
+            .unwrap()
+            .status
+            .get(&self.id)
+            .copied()
+            .unwrap_or(SessionStatus::Idle)
+    }
+}
+
+/// Standalone factory that always produces `claimed`, ignoring the requested mode.
+pub fn fake(claimed: TerminalType) -> SessionFactory {
+    FakeBackend::new().factory_claiming(Some(claimed))
+}

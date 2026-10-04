@@ -22,7 +22,7 @@ pub fn tool_line(e: &Entry, spinner: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ToolStateCategory {
     InProgress,
     Error,

@@ -1,6 +1,6 @@
 use crate::components::tool::ToolStateCategory;
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MessageKind {
     User,
     Thinking,
@@ -100,6 +100,13 @@ impl Transcript {
         self.entries
             .iter()
             .filter(|e| matches!(e.kind, MessageKind::Tool { .. }) && !e.done)
+    }
+
+    /// Total buffered text. The per-view cap (ADR-0002 "Consequences": buffered
+    /// output while hidden is unbounded) measures this so a chatty child that
+    /// nobody is looking at cannot grow the process forever.
+    pub fn byte_len(&self) -> usize {
+        self.entries.iter().map(|e| e.text.len()).sum()
     }
 
     pub fn finish_last(&mut self) {

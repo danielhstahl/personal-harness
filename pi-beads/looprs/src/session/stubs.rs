@@ -1,4 +1,4 @@
-//! Stub implementations of [`Session`].
+//! Stub implementations of [`Session`] — the two backends that are not built yet.
 //!
 //! They exist so the contract type-checks: each one proves that a `Box<dyn Session>`
 //! can be built from a `(SessionId, &SessionConfig)` and a
@@ -9,7 +9,8 @@
 //! anything.
 //!
 //! Each method names the ticket that owns its real implementation. Delete the
-//! corresponding stub when that ticket lands.
+//! corresponding stub when that ticket lands. The Beads backend is *not* here: it
+//! moved to [`super::beads`] when looprs-05j put the Router in charge of it.
 
 use anyhow::{Result, anyhow};
 use tokio::sync::mpsc;
@@ -19,61 +20,6 @@ use super::{Session, SessionConfig, SessionEvent, SessionId, SessionStatus, Spaw
 /// `Err` with the name of the missing implementation and the ticket that owns it.
 pub(crate) fn todo_method(what: &str, ticket: &str) -> Result<()> {
     Err(anyhow!("{what}: not implemented yet ({ticket})"))
-}
-
-/// The Beads terminal state: planner passes, worker passes, one fresh pi child per
-/// pass. Today that machine is `BeadsLoop` in `src/app.rs`; `looprs-msj` moves it
-/// behind this type so the loop is driven by its own step instead of by the UI's
-/// input mode.
-pub struct BeadsSession {
-    id: SessionId,
-    cfg: SessionConfig,
-    /// Kept so the shape is real: this is the sender the real implementation hands
-    /// its pi-event pump. Dropped when the struct drops, which is what closes the
-    /// router's stream.
-    events: mpsc::UnboundedSender<SessionEvent>,
-}
-
-impl BeadsSession {
-    pub fn start(id: SessionId, cfg: &SessionConfig) -> Result<Spawned> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        Ok(Spawned {
-            session: Box::new(Self {
-                id,
-                cfg: cfg.clone(),
-                events: tx,
-            }),
-            events: rx,
-        })
-    }
-}
-
-impl Session for BeadsSession {
-    fn id(&self) -> SessionId {
-        self.id
-    }
-    fn send_text(&mut self, _text: String) -> Result<()> {
-        // looprs-msj: a submit here is a planner instruction ("make tickets for
-        // this"), and the resulting pass must advance BeadStep by itself.
-        let _ = &self.cfg;
-        todo_method("BeadsSession::send_text", "looprs-msj")
-    }
-    fn abort(&mut self) -> Result<()> {
-        // looprs-5g7: abort the pi run AND park; an aborted worker must not be
-        // mistaken for agent_settled -> next bead.
-        todo_method("BeadsSession::abort", "looprs-5g7")
-    }
-    fn shutdown(&mut self) -> Result<()> {
-        // looprs-ecr: close pi's stdin, then bound-wait, then kill.
-        todo_method("BeadsSession::shutdown", "looprs-ecr")
-    }
-    fn set_active(&mut self, _active: bool) -> Result<()> {
-        // The only mode with real work to do here: stop starting passes while hidden.
-        todo_method("BeadsSession::set_active", "looprs-05j")
-    }
-    fn status(&self) -> SessionStatus {
-        SessionStatus::NotStarted
-    }
 }
 
 /// The Pi terminal state: one persistent, stateful `pi --mode rpc` chat session.
@@ -169,23 +115,19 @@ impl Session for BashSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::TerminalType;
+    use crate::session::{TerminalType, spawn};
 
-    /// The three stubs are swappable behind the trait object, which is the whole
+    /// Every backend is swappable behind the trait object, which is the whole
     /// claim of the abstraction: the router holds `Box<dyn Session>` and could not
-    /// tell them apart if it wanted to.
-    #[test]
-    fn all_three_backends_fit_the_same_handle() {
+    /// tell them apart if it wanted to. `spawn` covers the real Beads session too,
+    /// so this exercises all three modes through the one constructor.
+    #[tokio::test]
+    async fn every_backend_fits_the_same_handle() {
         let cfg = SessionConfig::default();
         let mut handles: Vec<Box<dyn Session>> = Vec::new();
         let mut receivers = Vec::new();
         for mode in TerminalType::ALL {
-            let spawned = match mode {
-                TerminalType::Beeds => BeadsSession::start(SessionId::new(mode, 7), &cfg),
-                TerminalType::Pi => PiChatSession::start(SessionId::new(mode, 7), &cfg),
-                TerminalType::Bash => BashSession::start(SessionId::new(mode, 7), &cfg),
-            }
-            .unwrap();
+            let spawned = spawn(mode, &cfg, 7).unwrap();
             handles.push(spawned.session);
             receivers.push(spawned.events);
         }
@@ -201,13 +143,11 @@ mod tests {
         }
     }
 
-    /// Stubs must refuse loudly, never quietly succeed.
+    /// Stubs must refuse loudly, never quietly succeed: an unimplemented backend
+    /// that returns `Ok` is how a wiring ticket ends up testing nothing.
     #[tokio::test]
     async fn stubs_refuse_rather_than_pretend() {
         let cfg = SessionConfig::default();
-        let mut beads = BeadsSession::start(SessionId::new(TerminalType::Beeds, 0), &cfg)
-            .unwrap()
-            .session;
         let mut pi = PiChatSession::start(SessionId::new(TerminalType::Pi, 0), &cfg)
             .unwrap()
             .session;
@@ -215,15 +155,15 @@ mod tests {
             .unwrap()
             .session;
 
-        for s in [&mut beads, &mut pi, &mut bash] {
-            assert!(s.send_text("hello".into()).is_err());
-            assert!(s.abort().is_err());
-            assert!(s.shutdown().is_err());
+        for s in [&mut pi, &mut bash] {
+            let text = s.send_text("hello".into()).unwrap_err().to_string();
+            assert!(text.contains("not implemented yet"), "{text}");
+            let abort = s.abort().unwrap_err().to_string();
+            assert!(abort.contains("looprs-5g7"), "{abort}");
         }
-        // set_active has a real default (no-op) for the KeepRunning modes, and a
-        // stubbed refusal for the one mode that has policy attached to it.
+        // set_active is the KeepRunning default: a no-op, not a refusal, because
+        // there is genuinely nothing for a warm session to do when it is shown.
         assert!(pi.set_active(true).is_ok());
         assert!(bash.set_active(false).is_ok());
-        assert!(beads.set_active(true).is_err());
     }
 }

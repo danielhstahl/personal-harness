@@ -2,9 +2,8 @@
 //!
 //! This is ADR-0002 made executable. Everything a later ticket needs to agree on — the
 //! [`Session`] trait, the [`SessionEvent`] / [`Msg`] envelope, the switch-lifecycle
-//! policy, the [`Router`] that owns the sessions, and the per-session [`SessionView`] —
-//! is declared here. **Types only: every implementation is a stub.** The doc comments
-//! are the contract; `docs/adr/0002-session-abstraction.md` carries the reasoning.
+//! policy, the [`Router`](router::Router) that owns the sessions, and the per-session
+//! [`SessionView`](view::SessionView) — is declared here.
 //!
 //! Three sentences that explain the whole design:
 //!
@@ -12,19 +11,22 @@
 //! 2. Every event carries the [`SessionId`] that produced it; the UI never guesses.
 //! 3. A `Tab` changes which session you are *looking at*; it never destroys work.
 
-// skeleton: this layer is not wired into main.rs until looprs-05j; until then most of
-// it is unreachable from `main`, which the dead_code lint reads as "unused".
-#![allow(dead_code)]
+#![allow(dead_code)] // some of this layer is contract surface for tickets that have not landed
 
+pub mod beads;
 pub mod router;
 pub mod stubs;
 pub mod view;
+
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
 use crate::app::PiEvent;
 
-pub use stubs::{BashSession, BeadsSession, PiChatSession};
+pub use beads::BeadsSession;
+pub use stubs::{BashSession, PiChatSession};
+pub use view::ChatState;
 
 /// The three terminal states. This is a *session* identity, not a widget property, so
 /// it lives here; `components::input` re-exports it for the input box that cycles it.
@@ -252,6 +254,22 @@ pub fn spawn(mode: TerminalType, cfg: &SessionConfig, generation: u64) -> anyhow
     }
 }
 
+/// How the Router constructs sessions, as a value.
+///
+/// Injectable rather than hard-wired because the router's lifecycle rules — park,
+/// resume, one per mode, no late events from a dead generation — are the part worth
+/// testing, and testing them needs sessions whose behavior the test controls. The
+/// repo's process-level test style survives: `default_factory` is the real thing,
+/// and a test can equally hand the router fakes backed by real child processes
+/// (see `crate::testing`).
+pub type SessionFactory =
+    Arc<dyn Fn(TerminalType, u64) -> anyhow::Result<Spawned> + Send + Sync + 'static>;
+
+/// The production factory: real backends behind [`spawn`].
+pub fn default_factory(cfg: SessionConfig) -> SessionFactory {
+    Arc::new(move |mode, generation| spawn(mode, &cfg, generation))
+}
+
 /// One live terminal state.
 ///
 /// Every method is **synchronous and non-blocking**, deliberately:
@@ -297,6 +315,19 @@ pub trait Session: Send {
         Ok(())
     }
 
+    /// Legacy hook for [`crate::app::UiCommand::BeadsNext`]: "your last unit of
+    /// work settled, take the next one".
+    ///
+    /// This should not exist on a generic `Session` — the decision belongs inside
+    /// the beads session, where its step lives — and it will not, after looprs-msj
+    /// moves that state machine home. Until then it is here rather than in a
+    /// downcast, because the Router routes by *mode* (`Beeds`) and must not have to
+    /// know a concrete backend type. Default: no-op, so only the beads session
+    /// answers.
+    fn advance(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Liveness for the status row and for input gating.
     fn status(&self) -> SessionStatus;
 
@@ -318,8 +349,10 @@ mod tests {
         assert_trait_object::<dyn Session>();
     }
 
-    #[test]
-    fn every_mode_spawns_a_session_with_its_own_id() {
+    // `#[tokio::test]` because the Beads backend starts a task as part of starting
+    // a session: a handle without a runtime is not a thing that can exist.
+    #[tokio::test]
+    async fn every_mode_spawns_a_session_with_its_own_id() {
         let cfg = SessionConfig {
             pi_bin: "true".into(),
             bd_bin: "true".into(),

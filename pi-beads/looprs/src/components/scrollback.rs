@@ -48,6 +48,25 @@ impl Flusher {
         }
     }
 
+    /// Move the cursor to `first` and discard its in-progress per-entry state.
+    ///
+    /// Mandatory whenever the index moves rather than advancing normally: `cur`
+    /// (scan/block/fence) is only meaningful for the entry `first` was reading, so
+    /// pointing it somewhere else without resetting would make `drain_stream` slice
+    /// the wrong text — the worst kind of bug, because it only shows up as garbled
+    /// scrollback long after the cause. Used by the per-view buffer cap.
+    pub fn reseat(&mut self, first: usize) {
+        self.first = first;
+        self.cur = Cursor::default();
+    }
+
+    /// Everything written to scrollback: `entries[..consumed]`. The per-view buffer
+    /// cap asks this so it can tell a line the terminal already has from one it has
+    /// not emitted yet — the first may be dropped, the second never may.
+    pub fn consumed(&self) -> usize {
+        self.first
+    }
+
     /// Everything that became final since the last call. Call once per frame, before drawing.
     pub fn drain(&mut self, t: &Transcript, term_width: u16) -> Vec<Line<'static>> {
         let w = content_width(term_width);
