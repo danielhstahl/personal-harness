@@ -1,6 +1,7 @@
 mod app;
 mod components;
 mod services;
+mod session;
 mod state;
 #[cfg(test)]
 mod testing;
@@ -32,9 +33,10 @@ use components::text_stream::LiveTextPreview;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
-use crate::app::{BeadsLoop, BeadsLoopConfig, ChatState};
+use crate::app::{BeadsLoop, ChatState};
 use crate::components::scrollback::Flusher;
 use crate::components::tool::LiveToolPreview;
+use crate::session::{SessionConfig, SessionId, TerminalType};
 use crate::state::state::{Entry, Transcript};
 
 fn init_logging() -> anyhow::Result<WorkerGuard> {
@@ -97,7 +99,15 @@ async fn run(term: &mut Term) -> Result<()> {
     let (app_tx, mut app_rx) = mpsc::unbounded_channel::<Msg>();
     // beads_loop drives the beads-backed terminal state: it owns its pi child and
     // reports state changes into the UI through app_tx.
-    let mut bead_loop = BeadsLoop::new(app_tx, BeadsLoopConfig::default());
+    //
+    // The explicit SessionId is the ADR-0002 envelope requirement: from here on,
+    // every Msg out of this loop says which session made it. looprs-05j replaces
+    // this hand-wiring with the Router, which owns all three sessions.
+    let mut bead_loop = BeadsLoop::new(
+        SessionId::new(TerminalType::Beeds, 0),
+        app_tx,
+        SessionConfig::default(),
+    );
     let input_state = InputState::new();
     let transcript = Transcript::new();
     // Self-start: if the board already has ready beads this spawns *and prompts* a worker,

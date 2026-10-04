@@ -6,10 +6,11 @@
 //! *types* land in `Unknown`, so additive protocol changes are harmless. Renamed/removed fields
 //! show up as parse errors; log them loudly (see `parse`).
 
-use crate::components::input::{InputAction, InputState, TerminalType};
+use crate::components::input::{InputAction, InputState};
 use crate::services::bd::{Bead, ready_beads_with};
 use crate::services::pi::PiRpc;
 use crate::services::prompts::{PLANNER, WORKER, generate_prompt};
+use crate::session::{ByteStream, ExitReason, SessionConfig, SessionId, TerminalType};
 use crate::state::state::{MessageKind, Transcript};
 use anyhow::{Result, anyhow};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -17,24 +18,96 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc::{self, Receiver, UnboundedReceiver, UnboundedSender};
 
+pub use crate::session::BeadStep;
+
+/// Everything that can change the UI.
+///
+/// ADR-0002 Q2, the part that matters: **every message that came from a session is
+/// tagged with the `SessionId` that produced it.** The App must never infer
+/// provenance from `self.input.mode` — the mode is what the user last Tabbed to,
+/// and it changes independently of what is running. Provenance-in-the-envelope is
+/// what makes looprs-msj unrepeatable.
+///
+/// The rule in one line: **input mode is authoritative for intent (where my
+/// keystrokes go); the envelope is authoritative for origin (who made this).**
+///
+/// Construct these through `session::router::wrap`, never by hand: `wrap` is the
+/// only place that has a `SessionId` to attach.
+#[derive(Debug)]
 pub enum Msg {
+    /// Raw terminal input. The only message with no origin, because it *is* the user.
     Term(Event),
-    Agent(PiEvent),
-    BeadStep(BeadStep),
-    /// A loop-level failure the human needs to see (spawn failure, `bd` failure, ...).
-    Error(String),
-    /// A loop-level status line ("working looprs-1", "board empty, awaiting input").
-    System(String),
+    /// A pi protocol event, from the session named in `session`.
+    Agent {
+        // Provenance: unread until looprs-05j routes Msg into per-session
+        // views (and looprs-msj keys the beads transition off it). Declared now so
+        // no one can build these variants without saying who made them.
+        #[allow(dead_code)]
+        session: SessionId,
+        event: PiEvent,
+    },
+    /// Shell output (ADR-0001). `stream` is `Merged` for a pty; `chunk` is a read
+    /// buffer, not a line — do not re-split it.
+    BashOutput {
+        // Provenance: unread until looprs-05j routes Msg into per-session
+        // views (and looprs-msj keys the beads transition off it). Declared now so
+        // no one can build these variants without saying who made them.
+        #[allow(dead_code)]
+        session: SessionId,
+        stream: ByteStream,
+        chunk: String,
+    },
+    /// The beads machine moved. Rendered, never re-derived.
+    BeadStep {
+        #[allow(dead_code)] // consumer: looprs-05j's per-session view
+        session: SessionId,
+        step: BeadStep,
+    },
+    /// A session's child is gone. Guaranteed exactly once per session, so the
+    /// receiver can always seal that session's transcript.
+    SessionDown {
+        // Provenance: unread until looprs-05j routes Msg into per-session
+        // views (and looprs-msj keys the beads transition off it). Declared now so
+        // no one can build these variants without saying who made them.
+        #[allow(dead_code)]
+        session: SessionId,
+        reason: ExitReason,
+    },
+    /// A failure the human needs to see (spawn failure, `bd` failure, ...).
+    /// `session: None` means it is harness-level (router/spawn), not a session's.
+    Error {
+        #[allow(dead_code)] // consumer: looprs-05j (route it to the right view / status row)
+        session: Option<SessionId>,
+        text: String,
+    },
+    /// A status line ("working looprs-1", "board empty, awaiting input").
+    System {
+        #[allow(dead_code)] // consumer: looprs-05j (route it to the right view / status row)
+        session: Option<SessionId>,
+        text: String,
+    },
     Tick,
 }
 
-///add more (eg change terminal)
+/// UI -> session layer. Every variant says which terminal state it is *for*.
 #[derive(Debug)]
 pub enum UiCommand {
-    UserMessage(String),
-    UserBeadMessage(String),
-    BeadsNext,
+    /// Enter in the input box. `mode` is where the text was typed: declared
+    /// intent, and legitimate routing input. (Contrast with `Msg`, where the tag
+    /// is origin and the input mode must not be consulted.)
+    Submit { mode: TerminalType, text: String },
+    /// Tab. Drives the per-mode switch-away policy (ADR-0002 Q3).
+    SwitchMode {
+        #[allow(dead_code)] // consumer: looprs-05j's switch policy
+        from: TerminalType,
+        #[allow(dead_code)] // consumer: looprs-05j's switch policy
+        to: TerminalType,
+    },
+    /// Esc. Routed by the router to the *active* session only.
     Cancel,
+    /// Legacy: the App asks the beads loop to advance. Goes away with looprs-msj,
+    /// which moves that transition inside `BeadsSession` where it belongs.
+    BeadsNext,
 }
 
 fn print_json_value_to_string(v: &Value) -> String {
@@ -265,24 +338,41 @@ impl App {
                 self.on_key(k);
             }
             Msg::Term(_) => {}
-            Msg::Agent(ev) => {
+            Msg::Agent { session, event } => {
                 self.dirty = true;
-                self.on_pi(ev);
+                self.on_pi(session, event);
             }
-            Msg::BeadStep(bead) => {
+            Msg::BashOutput {
+                session,
+                stream,
+                chunk,
+            } => {
+                // Not rendered yet: looprs-553 owns the Bash display path (raw
+                // passthrough + an escape-stripped copy, never markdown).
+                let _ = (session, stream, chunk);
+            }
+            Msg::BeadStep { session: _, step } => {
                 self.dirty = true;
-                match bead {
+                match step {
                     BeadStep::AwaitInput => self.need_input = true,
                     BeadStep::CreateTickets => self.need_input = false,
                     BeadStep::WorkTickets => self.need_input = false,
                 }
             }
-            Msg::Error(text) => {
+            Msg::SessionDown { session, reason } => {
+                // looprs-05j/looprs-ecr: apply to *that* session's SessionView —
+                // `view.seal()` so its flusher never stalls on an entry that will
+                // never be closed, and mark status Dead. A no-op here on purpose:
+                // with one shared transcript today, sealing on every pass boundary
+                // would be visible churn in another ticket's scope.
+                let _ = (session, reason);
+            }
+            Msg::Error { session: _, text } => {
                 self.dirty = true;
                 self.chat_state = ChatState::Chat; // make sure the line is on screen
                 self.transcript.push_done(MessageKind::Error, text);
             }
-            Msg::System(text) => {
+            Msg::System { session: _, text } => {
                 self.dirty = true;
                 self.chat_state = ChatState::Chat;
                 self.transcript.push_done(MessageKind::System, text);
@@ -303,20 +393,30 @@ impl App {
                     self.chat_state = ChatState::Chat;
                     match mode {
                         TerminalType::Beeds => {
-                            let _ = self
-                                .cmd_tx
-                                .try_send(UiCommand::UserBeadMessage(text.clone()));
+                            let _ = self.cmd_tx.try_send(UiCommand::Submit {
+                                mode,
+                                text: text.clone(),
+                            });
                         }
                         TerminalType::Pi => {
-                            let _ = self.cmd_tx.try_send(UiCommand::UserMessage(text.clone()));
+                            // Still unconsumed until looprs-ctn; it is now at least
+                            // addressed to a session that can answer it.
+                            let _ = self.cmd_tx.try_send(UiCommand::Submit {
+                                mode,
+                                text: text.clone(),
+                            });
                         }
                         TerminalType::Bash => {
                             // Not implemented yet (looprs-553). The shell itself is a real pty,
                             // not a piped `bash -i`, and Ctrl-C is forwarded to it rather than
                             // quitting looprs -- see docs/adr/0001-bash-terminal-state-pty.md.
+                            let _ = &text;
                         }
                     }
                     self.transcript.push_done(MessageKind::User, text);
+                }
+                InputAction::SwitchMode { from, to } => {
+                    let _ = self.cmd_tx.try_send(UiCommand::SwitchMode { from, to });
                 }
                 InputAction::Cancel => {
                     let _ = self.cmd_tx.try_send(UiCommand::Cancel);
@@ -325,7 +425,16 @@ impl App {
         }
     }
 
-    pub fn on_pi(&mut self, ev: PiEvent) {
+    /// `session` is threaded through and deliberately unused for now.
+    ///
+    /// The `matches!(self.input.mode, ...)` below is looprs-msj: the beads
+    /// transition must key off `session` (and the beads session's own step), not
+    /// off whatever the input box is showing. Fixed there, with the tests that were
+    /// specified; left alone here so this ticket stays type-only.
+    pub fn on_pi(&mut self, session: SessionId, ev: PiEvent) {
+        // Nothing reads `session` yet. That is exactly looprs-msj's bug and its fix:
+        // the beads transition must key off this id, not off `self.input.mode`.
+        let _ = session;
         self.dirty = true; // gate this per-arm if you want to skip no-op events
         let t = &mut self.transcript;
         match ev {
@@ -364,6 +473,7 @@ impl App {
                 if matches!(self.input.mode, TerminalType::Beeds) {
                     //no await
                     //self.bd_loop.next();
+                    tracing::debug!("Agent Settled, going to BeedsNext");
                     let _ = self.cmd_tx.send(UiCommand::BeadsNext);
                 };
             }
@@ -382,36 +492,18 @@ pub struct PiLoop {
     pi_rx: Option<(PiRpc, UnboundedReceiver<Value>)>,
     pi_step: PiStep,
 }
-#[derive(Clone)]
-pub enum BeadStep {
-    AwaitInput,
-    CreateTickets,
-    WorkTickets,
-}
+
+/// The beads terminal state, as a `BeadsLoop`. `session::stubs::BeadsSession` is
+/// the type this becomes when looprs-msj moves the machine behind `dyn Session`;
+/// until then this struct is the concrete thing main.rs drives.
 pub struct BeadsLoop {
+    /// This loop's identity, stamped on every `Msg` it emits (ADR-0002 Q2).
+    id: SessionId,
     /// The pi session currently driven by the loop. `None` whenever the loop is parked.
     pi_rx: Option<PiRpc>,
     ev_tx: UnboundedSender<Msg>,
-    cfg: BeadsLoopConfig,
+    cfg: SessionConfig,
     bead_step: BeadStep,
-}
-
-/// Which executables drive the beads loop. Injectable so tests can run fake `pi` / `bd`
-/// binaries and assert exactly what got spawned and what was sent to it.
-#[derive(Clone, Debug)]
-pub struct BeadsLoopConfig {
-    pub pi_bin: String,
-    pub bd_bin: String,
-}
-
-impl Default for BeadsLoopConfig {
-    fn default() -> Self {
-        // Env overrides exist for wrapper scripts (a shimmed `pi`, a remote `bd`).
-        Self {
-            pi_bin: std::env::var("LOOPRS_PI_BIN").unwrap_or_else(|_| "pi".to_string()),
-            bd_bin: std::env::var("LOOPRS_BD_BIN").unwrap_or_else(|_| "bd".to_string()),
-        }
-    }
 }
 
 /// What a worker pass did.
@@ -428,8 +520,9 @@ impl BeadsLoop {
     /// constructed-but-unstarted loop can never be holding an idle, unprompted
     /// pi child (the bug this replaces: `new()` used to spawn a session nobody
     /// ever prompted, and nothing else would ever prompt it).
-    pub fn new(ev_tx: UnboundedSender<Msg>, cfg: BeadsLoopConfig) -> Self {
+    pub fn new(id: SessionId, ev_tx: UnboundedSender<Msg>, cfg: SessionConfig) -> Self {
         Self {
+            id,
             pi_rx: None,
             ev_tx,
             cfg,
@@ -437,9 +530,12 @@ impl BeadsLoop {
         }
     }
 
-    fn set_step(&mut self, s: BeadStep) {
+    pub fn set_step(&mut self, s: BeadStep) {
         self.bead_step = s.clone(); // keep the field private
-        let _ = self.ev_tx.send(Msg::BeadStep(s));
+        let _ = self.ev_tx.send(Msg::BeadStep {
+            session: self.id,
+            step: s,
+        });
     }
 
     pub fn get_step(&self) -> &BeadStep {
@@ -507,11 +603,16 @@ impl BeadsLoop {
     /// Pipe a pi event stream into the UI until the child's stdout closes.
     fn forward_pi_events(&self, mut ev_rx: mpsc::UnboundedReceiver<Value>) {
         let tx = self.ev_tx.clone();
+        let sid = self.id;
         tokio::spawn(async move {
             while let Some(v) = ev_rx.recv().await {
-                tracing::debug!("Receiving information {}", v);
                 if let Some(ev) = parse(&v)
-                    && tx.send(Msg::Agent(ev)).is_err()
+                    && tx
+                        .send(Msg::Agent {
+                            session: sid,
+                            event: ev,
+                        })
+                        .is_err()
                 {
                     break;
                 }
@@ -520,11 +621,17 @@ impl BeadsLoop {
     }
 
     fn report_error(&self, text: String) {
-        let _ = self.ev_tx.send(Msg::Error(text));
+        let _ = self.ev_tx.send(Msg::Error {
+            session: Some(self.id),
+            text,
+        });
     }
 
     fn report_system(&self, text: String) {
-        let _ = self.ev_tx.send(Msg::System(text));
+        let _ = self.ev_tx.send(Msg::System {
+            session: Some(self.id),
+            text,
+        });
     }
 
     //listens for input from cmd OR for a trigger
@@ -533,7 +640,10 @@ impl BeadsLoop {
             while let Some(input) = cmd_rx.recv().await {
                 tracing::debug!("Recieved input on cmd_rx: {:?}", input);
                 match input {
-                    UiCommand::UserBeadMessage(text) => {
+                    UiCommand::Submit {
+                        mode: TerminalType::Beeds,
+                        text,
+                    } => {
                         if let Err(e) = self.launch_create_tickets(&text).await {
                             tracing::error!("planner pass failed: {e:#}");
                             self.report_error(format!("planner: {e:#}"));
@@ -541,6 +651,8 @@ impl BeadsLoop {
                         }
                     }
                     UiCommand::BeadsNext => self.next().await,
+                    // Not ours: Pi/Bash submits and mode switches belong to the
+                    // router the moment looprs-05j gives us one.
                     _ => {}
                 }
             }
@@ -613,11 +725,13 @@ mod tests {
 
     fn loop_with(fakes: &Fakes) -> (BeadsLoop, UnboundedReceiver<Msg>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let cfg = BeadsLoopConfig {
+        let cfg = SessionConfig {
             pi_bin: fakes.pi_bin().to_string(),
             bd_bin: fakes.bd_bin().to_string(),
+            ..Default::default()
         };
-        (BeadsLoop::new(tx, cfg), rx)
+        let id = SessionId::new(TerminalType::Beeds, 0);
+        (BeadsLoop::new(id, tx, cfg), rx)
     }
 
     /// Snapshot of what the loop told the UI, as stable strings.
@@ -625,12 +739,23 @@ mod tests {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
             out.push(match m {
-                Msg::BeadStep(BeadStep::AwaitInput) => "step:await".into(),
-                Msg::BeadStep(BeadStep::CreateTickets) => "step:plan".into(),
-                Msg::BeadStep(BeadStep::WorkTickets) => "step:work".into(),
-                Msg::Error(t) => format!("error: {t}"),
-                Msg::System(t) => format!("system: {t}"),
-                Msg::Agent(_) => "agent".into(),
+                Msg::BeadStep {
+                    step: BeadStep::AwaitInput,
+                    ..
+                } => "step:await".into(),
+                Msg::BeadStep {
+                    step: BeadStep::CreateTickets,
+                    ..
+                } => "step:plan".into(),
+                Msg::BeadStep {
+                    step: BeadStep::WorkTickets,
+                    ..
+                } => "step:work".into(),
+                Msg::Error { text, .. } => format!("error: {text}"),
+                Msg::System { text, .. } => format!("system: {text}"),
+                Msg::Agent { .. } => "agent".into(),
+                Msg::SessionDown { .. } => "session-down".into(),
+                Msg::BashOutput { .. } => "bash".into(),
                 Msg::Term(_) | Msg::Tick => "ui".into(),
             });
         }
