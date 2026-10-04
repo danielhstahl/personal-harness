@@ -14,6 +14,7 @@
 #![allow(dead_code)] // some of this layer is contract surface for tickets that have not landed
 
 pub mod beads;
+pub mod pi_chat;
 pub mod router;
 pub mod stubs;
 pub mod view;
@@ -25,7 +26,8 @@ use tokio::sync::mpsc;
 use crate::app::PiEvent;
 
 pub use beads::BeadsSession;
-pub use stubs::{BashSession, PiChatSession};
+pub use pi_chat::PiChatSession;
+pub use stubs::BashSession;
 pub use view::ChatState;
 
 /// The three terminal states. This is a *session* identity, not a widget property, so
@@ -193,6 +195,15 @@ pub enum SessionEvent {
     BeadStep(BeadStep),
     /// A status line for the transcript ("working looprs-1", "board empty, ...").
     System(String),
+    /// Text that belongs back in the user's input box rather than in the transcript.
+    ///
+    /// Only one thing produces it today: Pi's interactive `Esc`, which pulls the
+    /// queued steering/follow-up messages out of the child (`clear_queue`) before
+    /// aborting so the user gets their own words back instead of losing them
+    /// (looprs-ctn). A session cannot write the box itself — the box is UI state,
+    /// and a session has no handle on it — so the round trip is an event like any
+    /// other, and it names its producer so a Pi cancel can never fill the Beads box.
+    RestoreInput { text: String },
     /// A failure the human needs to see, attributable to this session.
     Error(String),
     /// Lifecycle edge: the child is gone and no further events will follow.

@@ -48,6 +48,22 @@ impl InputState {
             mode: TerminalType::Beeds,
         }
     }
+
+    /// What is in the box right now.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Put text back in the box, from the app side rather than the keyboard —
+    /// Pi's `Esc` handing back the messages it had queued.
+    ///
+    /// Newlines are folded to single spaces: this box is single-line, and folding is
+    /// the difference between restoring the text and restoring something that
+    /// submits itself. The message boundaries are not lost — they are already in
+    /// the transcript.
+    pub fn set_text(&mut self, text: String) {
+        self.text = text.replace('\n', " ").trim_start().to_string();
+    }
     pub fn handle_key(&mut self, k: KeyEvent) -> Option<InputAction> {
         match k.code {
             KeyCode::Enter => {

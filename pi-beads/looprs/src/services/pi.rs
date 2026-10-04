@@ -39,10 +39,41 @@ fn error_response(id: &str, msg: &str) -> Value {
 }
 
 pub struct PiRpc {
-    _child: Child, // kill_on_drop: pi dies with the TUI
-    out_tx: mpsc::UnboundedSender<String>,
+    child: Child, // kill_on_drop: pi dies with the TUI
+    /// `None` once stdin has been deliberately closed for shutdown. An `Option` rather
+    /// than a bare sender because "close pi's stdin" *is* "stop feeding the writer
+    /// task", and the writer's exit is what drops the handle.
+    out_tx: Option<mpsc::UnboundedSender<String>>,
     pending: Pending,
     next_id: AtomicU64,
+}
+
+/// `data.disposition` of a command response, defaulting to `"started"`.
+///
+/// Defaults to "started" rather than "handled" because stalling on a phantom run is
+/// easier to spot than silently dropping a real one (see [`PiRpc::prompt`]).
+pub fn disposition_of(resp: &Value) -> String {
+    resp["data"]["disposition"]
+        .as_str()
+        .unwrap_or("started")
+        .to_string()
+}
+
+/// Did the command succeed? `success` is only ever `true` or absent-false on a
+/// well-formed response; anything else counts as a refusal.
+pub fn succeeded(resp: &Value) -> bool {
+    resp["success"].as_bool() == Some(true)
+}
+
+/// The text pi pulled out of its own queue in a `clear_queue` response, in the order
+/// it would have been processed: steering first, then follow-ups.
+pub fn queued_text(resp: &Value) -> Vec<String> {
+    ["steering", "followUp"]
+        .iter()
+        .flat_map(|k| resp["data"][k].as_array().cloned().unwrap_or_default())
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .filter(|s| !s.trim().is_empty())
+        .collect()
 }
 
 impl PiRpc {
@@ -123,8 +154,8 @@ impl PiRpc {
 
         Ok((
             Self {
-                _child: child,
-                out_tx,
+                child,
+                out_tx: Some(out_tx),
                 pending,
                 next_id: AtomicU64::new(1),
             },
@@ -134,30 +165,42 @@ impl PiRpc {
 
     /// Fire-and-forget (abort, steer, replying to an extension UI request).
     pub fn send(&self, cmd: Value) -> Result<()> {
-        self.out_tx.send(cmd.to_string())?;
+        let tx = self
+            .out_tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("pi stdin is closed"))?;
+        tx.send(cmd.to_string())?;
         Ok(())
+    }
+
+    /// Close pi's stdin without signalling anything else.
+    ///
+    /// This is the orderly shutdown lever (ADR-0002 Q1): the writer task sees its
+    /// channel close, drops the handle, and pi reads EOF and disposes its runtime.
+    /// Idempotent.
+    pub fn close_stdin(&mut self) {
+        drop(self.out_tx.take());
+    }
+
+    /// Non-blocking: has the child exited, and with what status? `None` = still
+    /// running. (Status, not a bare code: "killed by a signal" has no code, and
+    /// that is the difference between `137` and "unknown" in a crash report.)
+    pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        Ok(self.child.try_wait()?)
+    }
+
+    /// Await the child's exit. Also drops stdin, which is the polite EOF we want
+    /// before waiting. Callers bound this; it has no timeout of its own.
+    pub async fn wait(&mut self) -> Result<std::process::ExitStatus> {
+        Ok(self.child.wait().await?)
     }
 
     /// Send with a correlation id and await the matching `response`.
     /// Returns Err when pi reports `success: false`, when the child is already gone,
     /// or if the response never comes because the stream ended.
-    pub async fn request(&self, mut cmd: Value) -> Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
-        cmd["id"] = json!(id);
-        let (tx, rx) = oneshot::channel();
-        {
-            // Register (or refuse) while holding the lock so the EOF drain can't miss us.
-            let mut st = self.pending.lock().unwrap();
-            if st.exited {
-                return Err(anyhow!("pi process has already exited"));
-            }
-            st.txs.insert(id.clone(), tx);
-        }
-        self.out_tx.send(cmd.to_string())?;
-        let resp = rx
-            .await
-            .map_err(|_| anyhow!("response {id} cancelled before it was answered"))?;
-        if resp["success"].as_bool() != Some(true) {
+    pub async fn request(&self, cmd: Value) -> Result<Value> {
+        let resp = self.request_raw(cmd).await?;
+        if !succeeded(&resp) {
             let msg = resp["error"].as_str().unwrap_or("unknown error");
             return Err(anyhow!("pi rpc error: {msg}"));
         }
@@ -172,17 +215,37 @@ impl PiRpc {
         let resp = self
             .request(json!({ "type": "prompt", "message": message }))
             .await?;
-        Ok(resp["data"]["disposition"]
-            .as_str()
-            .unwrap_or("started")
-            .to_string())
+        Ok(disposition_of(&resp))
     }
 
+    /// Send a command and await its `response` record *without* interpreting it.
+    ///
+    /// `request` collapses `success: false` into an `Err`, which is right for a
+    /// prompt but wrong for commands whose "no" is information the caller wants to
+    /// branch on — `steer` refused because the run just settled, `clear_queue`
+    /// answered empty, and so on. Err here means only "no answer will ever come"
+    /// (pi is gone, or the caller's own cancellation).
+    pub async fn request_raw(&self, mut cmd: Value) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
+        cmd["id"] = json!(id);
+        let (tx, rx) = oneshot::channel();
+        {
+            // Register (or refuse) while holding the lock so the EOF drain can't miss us.
+            let mut st = self.pending.lock().unwrap();
+            if st.exited {
+                return Err(anyhow!("pi process has already exited"));
+            }
+            st.txs.insert(id.clone(), tx);
+        }
+        self.send(cmd)?;
+        rx.await
+            .map_err(|_| anyhow!("response {id} cancelled before it was answered"))
+    }
     pub fn abort(&self) -> Result<()> {
         self.send(json!({ "type": "abort" }))
     }
     pub async fn kill(&mut self) -> Result<()> {
-        self._child.kill().await?;
+        self.child.kill().await?;
         Ok(())
     }
 }

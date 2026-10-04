@@ -218,7 +218,8 @@ interleaved, *wrong*.
 | `session/mod.rs` | `TerminalType` (moved here from `components/input`), `SessionId`, `ByteStream`, `SessionStatus`, `ExitReason`, `SessionEvent`, `BeadStep` (moved here), `SwitchAway` + `switch_away_policy()`, `SessionConfig`, `Session` trait, `spawn()` | **done — this is the contract** | — |
 | `session/router.rs` | `Router`, `Managed`, `wrap()` and `pump()` (implemented), `handle()` / `switch_to()` / `shutdown_all()` | stubs `Err(… not implemented)` | looprs-05j, looprs-ecr |
 | `session/view.rs` | `SessionView`: `flush`, `preview`, `seal`, `push_note`, `push_error` | **done**; adopting it in `App`/`main` is the wiring | looprs-05j, looprs-afw |
-| `session/stubs.rs` | `BeadsSession`, `PiChatSession`, `BashSession` | every operation refuses, naming its ticket | msj / ctn / 553 |
+| `session/stubs.rs` | `BashSession` | every operation refuses, naming its ticket | 553 |
+| `session/pi_chat.rs` | `PiChatSession` — one persistent `pi --mode rpc` child, steer-while-running, Esc = `clear_queue`+`abort`+restore, respawn after a dead child | **done — looprs-ctn** | — |
 | `src/app.rs` | `Msg` envelope applied; `UiCommand::Submit`/`SwitchMode`; `BeadsLoop` stamps its `SessionId` | wired, behavior unchanged | msj (`on_pi`), 05j (per-view state) |
 | `components/input.rs` | `Tab` now emits `SwitchMode` | wired | 05j |
 
@@ -308,3 +309,49 @@ Also: `BeadsLoop` moved out of `app.rs` into `session/beads.rs` and now reports
 moved into `session::view` because it describes one session's live region, not the
 app's; and `App` holds `HashMap<TerminalType, SessionView>` with `need_input` /
 `chat_state` derived from the active view, as Q5 required.
+
+## Amendments made while implementing looprs-ctn (the Pi chat session)
+
+1. **`SessionEvent::RestoreInput { text }` and `Msg::RestoreInput { session, text }
+   were added.** pi's interactive `Esc` recipe is `clear_queue` **then** `abort`,
+   and the text `clear_queue` returns belongs in the user's input box — which is UI
+   state a session has no handle on. A session cannot write the box, so the round
+   trip is an event like every other one it makes. It carries the `SessionId` for
+   the usual reason: a Pi cancel must not be able to type into the Beads box. Two
+   rules the App applies (`App::restore_input`): the box is filled only while that
+   session's mode is the one on screen (keyed on `active`, never on `input.mode`,
+   so "event handling never reads the input mode" still holds), and a restore never
+   overwrites text the user typed in the meantime — the restore is asynchronous and
+   their keystrokes are newer. The displaced text goes to the transcript rather than
+   into the void, because silently dropping it is the failure the recipe exists to
+   prevent. The single-line box folds newlines to spaces; the message boundaries are
+   not lost, they are in the transcript.
+
+2. **The "follow-up while running" question the ticket left open is answered: input
+   is not gated, and the follow-up goes in as `steer`.** Gating the box during a Pi
+   run would make the mode that exists to be *talked to* the one that will not take
+   feedback. pi rejects a plain `prompt` while streaming unless a
+   `streamingBehavior` is named, so `send_text` routes on the session's own running
+   flag — `steer` mid-run, `prompt` otherwise — and if a `steer` turns out to have
+   raced the end of its run it is re-sent as a fresh prompt rather than dropped.
+   Two send attempts, never more, so a pi that will not take it cannot turn one
+   Enter into a resend loop. (Verified against real `pi --mode rpc`: `steer`/`clear_queue`
+   responses carry `data.disposition` and `data.steering`/`data.followUp` exactly
+   as assumed, and `abort` on an idle session answers immediately and harmlessly.)
+
+3. **A Pi child's death is reported by whichever path notices it first, and the
+   session then respawns itself under the same `SessionId`.** The two paths are the
+   stream end (the forwarder's `StreamEnd`, tagged with the child's serial so a
+   notice from an already-replaced child is ignored) and a failed send (the corpse
+   is discovered by the write, or by `try_wait` on a refusal). Both emit exactly
+   one `SessionEvent::Exited`, so the App's "always seal" rule fires promptly
+   either way. This does bend one sentence of Q2 — "the last thing that session
+   reports" — because a respawned Pi session keeps its id and keeps talking after
+   that `Exited`. It is still safe, and the reason is the serial: the dead child's
+   forwarder cannot clobber the live one, the App seals on the death it was told
+   about, and if the Router *does* bump the generation (its status mirror said
+   `Dead` before the session's own respawn) the adopt-a-new-generation rule in
+   `view_mut` covers that path instead. The alternative — making the send path
+   refuse until the Router noticed — trades a delivered message for a purer
+   sentence.
+

@@ -31,6 +31,10 @@ pub enum PiFake {
     Rejects,
     /// Exits immediately, so the pipes close before anything is answered.
     DiesImmediately,
+    /// A stateful chat child: streams a turn, remembers the conversation it was
+    /// given, and holds each run open until [`Fakes::settle`] (see
+    /// [`chat_pi_script`]). This is the one the Pi terminal state tests drive.
+    Chat,
 }
 
 /// How the fake `bd` behaves.
@@ -70,7 +74,11 @@ impl Fakes {
         let pi_bin = dir.join("pi");
         let bd_bin = dir.join("bd");
 
-        write_script(&pi_bin, &pi_script(&pi_log, pi));
+        let script = match pi {
+            PiFake::Chat => chat_pi_script(),
+            _ => pi_script(&pi_log, pi),
+        };
+        write_script(&pi_bin, &script);
         write_script(&bd_bin, &bd_script(&bd_log, &board_file, bd));
         std::fs::write(&board_file, board).unwrap();
 
@@ -122,6 +130,55 @@ impl Fakes {
             .collect()
     }
 
+    /// Every command the fake `pi` received, in the order it received it, as
+    /// `"<verb> <rest>"` lines. Order is the whole point of several tests: Esc has
+    /// to `clear_queue` *before* it `abort`s, a follow-up has to arrive as
+    /// `steer` and not as a second `prompt`.
+    pub fn pi_commands(&self) -> Vec<String> {
+        self.read(&self.pi_log)
+            .lines()
+            .filter_map(|l| {
+                let rest = l.strip_prefix("recv ")?;
+                Some(rest.to_string())
+            })
+            .collect()
+    }
+
+    /// Just the verbs, in order: `["prompt", "steer", "clear_queue", "abort"]`.
+    pub fn pi_verbs(&self) -> Vec<String> {
+        self.pi_commands()
+            .iter()
+            .map(|c| c.split(' ').next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// Touch the trigger that lets the chat fake finish the run it is holding open.
+    ///
+    /// Without this there is no way for a test to do anything *during* a run, and
+    /// "during a run" is where steer, Esc and crash recovery all live.
+    pub fn settle(&self) {
+        std::fs::write(self.dir.join("settle"), b"").unwrap();
+    }
+
+    /// Wait until the fake `pi` has written `needle` at the start of a log line.
+    /// Polls, because a test that sleeps is a test that is wrong half the time.
+    pub async fn wait_for_log_line(&self, needle: &str) {
+        for _ in 0..400 {
+            if self
+                .read(&self.pi_log)
+                .lines()
+                .any(|l| l.starts_with(needle) || l.contains(&format!("recv {needle}")))
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "fake pi never logged {needle:?}; log was:\n{}",
+            self.read(&self.pi_log)
+        );
+    }
+
     pub fn bd_calls(&self) -> usize {
         self.read(&self.bd_log)
             .lines()
@@ -132,6 +189,16 @@ impl Fakes {
 
 impl Drop for Fakes {
     fn drop(&mut self) {
+        // Kill every child we recorded before deleting the scratch dir. A fake that
+        // outlives its test is a fake that turns up in somebody else's process
+        // count assertion, and the chat fake holds runs open on purpose.
+        for pid in self.pi_pids() {
+            let _ = Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -151,6 +218,9 @@ fn pi_script(log: &Path, mode: PiFake) -> String {
     let log = log.display();
     let head = format!("#!/usr/bin/env bash\nset -u\nLOG={log}\n");
     match mode {
+        // The chat fake is a different program entirely (see `chat_pi_script`);
+        // `Fakes::new` never routes here for it.
+        PiFake::Chat => unreachable!("the chat fake is built by chat_pi_script"),
         PiFake::DiesImmediately => format!("{head}echo \"spawn pid=$$\" >>\"$LOG\"\nexit 1\n"),
         PiFake::Started | PiFake::Handled | PiFake::Rejects => {
             let reply = match mode {
@@ -184,6 +254,164 @@ done
     }
 }
 
+/// A stateful fake `pi --mode rpc`, in python because it needs real concurrency:
+/// it must keep reading commands *while* a run is in flight, which is exactly when
+/// a test wants to `steer`, `Esc`, or `kill -9` it.
+///
+/// Three properties the Pi terminal state tests depend on, and nothing else:
+///
+/// * **It remembers.** Every prompt lands in this process's own memory, and the
+///   answer to turn N quotes turns 1..N-1. A client that spawned a child per
+///   message would get an empty `<memory=>` on turn 2, which is the persistence
+///   claim under test, falsifiable.
+/// * **A run is held open** until the test touches `settle` next to this script,
+///   so the test can act *during* a run rather than after it.
+/// * **`abort` stops the held run** and settles it, the way pi unwinds.
+///
+/// It logs one line per command (`recv <verb> <args>`) so command *order* is
+/// assertable — `clear_queue` before `abort` is not a detail.
+fn chat_pi_script() -> String {
+    r###"#!/usr/bin/env python3
+import json, os, sys, threading, time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+LOG = os.path.join(HERE, "pi.log")
+SETTLE = os.path.join(HERE, "settle")
+# A run never stays open forever: a test that forgets to settle is a hung test.
+MAX_HOLD = float(os.environ.get("LOOPRS_FAKE_HOLD", "20"))
+
+out_lock = threading.Lock()
+log_lock = threading.Lock()
+st_lock = threading.Lock()
+
+memory = []        # prompts this process has seen == its only context
+queued = []        # steering / follow-up text, in queue order
+state = {"turns": 0}
+
+
+def log(msg):
+    with log_lock:
+        with open(LOG, "a") as f:
+            f.write(msg + "\n")
+
+
+def emit(obj):
+    with out_lock:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+
+
+def response(rid, command, data=None, success=True, error=None):
+    rec = {"type": "response", "command": command, "success": success}
+    if rid is not None:
+        rec["id"] = rid
+    if data is not None:
+        rec["data"] = data
+    if error is not None:
+        rec["error"] = error
+    emit(rec)
+
+
+def run_turn(n, user_text, answer, aborted):
+    """Stream one assistant turn the way pi does, then hold it open."""
+    emit({"type": "agent_start"})
+    emit({"type": "turn_start"})
+    emit({"type": "message_start", "message": {"role": "user", "content": user_text}})
+    emit({"type": "message_end", "message": {"role": "user", "content": user_text}})
+    emit({"type": "message_start", "message": {"role": "assistant", "content": []}})
+    emit({"type": "message_update", "assistantMessageEvent":
+          {"type": "text_delta", "contentIndex": 0, "delta": answer}})
+    emit({"type": "message_update", "assistantMessageEvent":
+          {"type": "text_end", "contentIndex": 0, "content": answer}})
+    emit({"type": "message_end", "message": {"role": "assistant", "content": []}})
+    emit({"type": "turn_end", "message": {"role": "assistant"}, "toolResults": []})
+
+    deadline = time.time() + MAX_HOLD
+    while time.time() < deadline:
+        if aborted["hit"]:
+            break
+        if os.path.exists(SETTLE):
+            try:
+                os.remove(SETTLE)
+            except OSError:
+                pass
+            break
+        time.sleep(0.01)
+
+    emit({"type": "agent_end", "messages": [], "willRetry": False})
+    emit({"type": "agent_settled"})
+    log("aborted turn %d" % n if aborted["hit"] else "settled turn %d" % n)
+
+
+def main():
+    log("spawn pid=%d args=%s" % (os.getpid(), " ".join(sys.argv[1:])))
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            cmd = json.loads(line)
+        except ValueError:
+            continue
+        kind = cmd.get("type")
+        rid = cmd.get("id")
+        msg = cmd.get("message", "")
+        log("recv %s %s" % (kind, msg))
+
+        if kind == "prompt":
+            # Also logged in the pre-existing "prompt <text>" shape so the shared
+            # `pi_prompts()` reader works for both fakes.
+            log("prompt " + msg)
+            with st_lock:
+                prior = list(memory)
+                memory.append(msg)
+                state["turns"] += 1
+                n = state["turns"]
+            # The answer's memory is the whole trick: it can only be non-empty if
+            # the same child process that heard turn 1 is still here.
+            answer = "reply %d <memory=%s>" % (n, "|".join(prior))
+            response(rid, "prompt", {"disposition": "started"})
+            aborted = {"hit": False}
+            t = threading.Thread(target=run_turn, args=(n, msg, answer, aborted), daemon=True)
+            t.start()
+            live.append(aborted)
+        elif kind == "steer":
+            with st_lock:
+                queued.append(msg)
+            response(rid, "steer", {"disposition": "queued"})
+        elif kind == "follow_up":
+            with st_lock:
+                queued.append(msg)
+            response(rid, "follow_up", {"disposition": "queued"})
+        elif kind == "clear_queue":
+            with st_lock:
+                taken = list(queued)
+                del queued[:]
+            response(rid, "clear_queue", {"steering": taken, "followUp": []})
+        elif kind == "abort":
+            # Tell every open run to unwind, then answer like pi does: abort waits
+            # for the session to become idle.
+            for a in list(live):
+                a["hit"] = True
+            del live[:]
+            response(rid, "abort")
+        elif kind == "get_state":
+            response(rid, "get_state", {"isStreaming": len(live) > 0,
+                                        "messageCount": len(memory)})
+        else:
+            response(rid, kind, success=False,
+                     error="fake pi: unknown command %r" % kind)
+
+
+live = []
+main()
+"###
+    .to_string()
+}
+
 fn bd_script(log: &Path, board: &Path, mode: BdFake) -> String {
     let tail = match mode {
         BdFake::Ok => format!("cat {}\n", board.display()),
@@ -204,6 +432,16 @@ pub fn process_alive(pid: u32) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Stop a process dead, from outside. This is the ticket's "kill the pi child out
+/// from under the app": the app is not cooperating, and the child just goes away.
+pub fn kill_pid(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 // ---------------------------------------------------------------------------------

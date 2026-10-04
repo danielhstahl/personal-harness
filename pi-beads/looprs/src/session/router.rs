@@ -71,6 +71,7 @@ pub fn wrap(id: SessionId, ev: SessionEvent) -> Msg {
             session: Some(id),
             text,
         },
+        SessionEvent::RestoreInput { text } => Msg::RestoreInput { session: id, text },
         SessionEvent::Error(text) => Msg::Error {
             session: Some(id),
             text,
@@ -484,6 +485,9 @@ mod tests {
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "harness".into())
                 ),
+                Msg::RestoreInput { session, text } => {
+                    format!("restore[{session}]: {text}")
+                }
                 Msg::Term(_) | Msg::Tick => "ui".into(),
             });
         }
@@ -555,6 +559,23 @@ mod tests {
         };
         assert_eq!(session, id);
         assert_eq!(reason, ExitReason::Shutdown);
+
+        // Esc's queued-text restore is tagged too: a Pi cancel must not be able to
+        // type into another mode's input box.
+        let Msg::RestoreInput {
+            session: s3,
+            text: t3,
+        } = wrap(
+            id,
+            SessionEvent::RestoreInput {
+                text: "queued".into(),
+            },
+        )
+        else {
+            panic!("RestoreInput must map to Msg::RestoreInput");
+        };
+        assert_eq!(s3, id);
+        assert_eq!(t3, "queued");
         assert_eq!(router.active_mode(), TerminalType::Beeds);
     }
 

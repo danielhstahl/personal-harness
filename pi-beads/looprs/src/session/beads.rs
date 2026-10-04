@@ -467,6 +467,7 @@ mod tests {
                 SessionEvent::BeadStep(BeadStep::WorkTickets) => "step:work".into(),
                 SessionEvent::Error(text) => format!("error: {text}"),
                 SessionEvent::System(text) => format!("system: {text}"),
+                SessionEvent::RestoreInput { text } => format!("restore: {text}"),
                 SessionEvent::Agent(_) => "agent".into(),
                 SessionEvent::Exited { .. } => "session-down".into(),
                 SessionEvent::BashOutput { .. } => "bash".into(),

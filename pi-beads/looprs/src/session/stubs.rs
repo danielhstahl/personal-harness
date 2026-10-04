@@ -1,4 +1,4 @@
-//! Stub implementations of [`Session`] — the two backends that are not built yet.
+//! Stub implementations of [`Session`] — the backend that is not built yet.
 //!
 //! They exist so the contract type-checks: each one proves that a `Box<dyn Session>`
 //! can be built from a `(SessionId, &SessionConfig)` and a
@@ -10,7 +10,8 @@
 //!
 //! Each method names the ticket that owns its real implementation. Delete the
 //! corresponding stub when that ticket lands. The Beads backend is *not* here: it
-//! moved to [`super::beads`] when looprs-05j put the Router in charge of it.
+//! moved to [`super::beads`] when looprs-05j put the Router in charge of it, and
+//! the Pi chat backend moved to [`super::pi_chat`] when looprs-ctn built it.
 
 use anyhow::{Result, anyhow};
 use tokio::sync::mpsc;
@@ -20,50 +21,6 @@ use super::{Session, SessionConfig, SessionEvent, SessionId, SessionStatus, Spaw
 /// `Err` with the name of the missing implementation and the ticket that owns it.
 pub(crate) fn todo_method(what: &str, ticket: &str) -> Result<()> {
     Err(anyhow!("{what}: not implemented yet ({ticket})"))
-}
-
-/// The Pi terminal state: one persistent, stateful `pi --mode rpc` chat session.
-/// Owned by looprs-ctn.
-pub struct PiChatSession {
-    id: SessionId,
-    cfg: SessionConfig,
-    events: mpsc::UnboundedSender<SessionEvent>,
-}
-
-impl PiChatSession {
-    pub fn start(id: SessionId, cfg: &SessionConfig) -> Result<Spawned> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        Ok(Spawned {
-            session: Box::new(Self {
-                id,
-                cfg: cfg.clone(),
-                events: tx,
-            }),
-            events: rx,
-        })
-    }
-}
-
-impl Session for PiChatSession {
-    fn id(&self) -> SessionId {
-        self.id
-    }
-    fn send_text(&mut self, _text: String) -> Result<()> {
-        // looprs-ctn: spawn-once-reuse; steer/follow_up while a run is in flight.
-        let _ = &self.cfg;
-        todo_method("PiChatSession::send_text", "looprs-ctn")
-    }
-    fn abort(&mut self) -> Result<()> {
-        // looprs-5g7: clear_queue, then {"type":"abort"}, and hand the returned
-        // queued text back for the input buffer.
-        todo_method("PiChatSession::abort", "looprs-5g7")
-    }
-    fn shutdown(&mut self) -> Result<()> {
-        todo_method("PiChatSession::shutdown", "looprs-ecr")
-    }
-    fn status(&self) -> SessionStatus {
-        SessionStatus::NotStarted
-    }
 }
 
 /// The Bash terminal state: one long-lived shell on its own pty (ADR-0001).
@@ -148,22 +105,16 @@ mod tests {
     #[tokio::test]
     async fn stubs_refuse_rather_than_pretend() {
         let cfg = SessionConfig::default();
-        let mut pi = PiChatSession::start(SessionId::new(TerminalType::Pi, 0), &cfg)
-            .unwrap()
-            .session;
         let mut bash = BashSession::start(SessionId::new(TerminalType::Bash, 0), &cfg)
             .unwrap()
             .session;
 
-        for s in [&mut pi, &mut bash] {
-            let text = s.send_text("hello".into()).unwrap_err().to_string();
-            assert!(text.contains("not implemented yet"), "{text}");
-            let abort = s.abort().unwrap_err().to_string();
-            assert!(abort.contains("looprs-5g7"), "{abort}");
-        }
+        let text = bash.send_text("hello".into()).unwrap_err().to_string();
+        assert!(text.contains("not implemented yet"), "{text}");
+        let abort = bash.abort().unwrap_err().to_string();
+        assert!(abort.contains("looprs-5g7"), "{abort}");
         // set_active is the KeepRunning default: a no-op, not a refusal, because
         // there is genuinely nothing for a warm session to do when it is shown.
-        assert!(pi.set_active(true).is_ok());
         assert!(bash.set_active(false).is_ok());
     }
 }

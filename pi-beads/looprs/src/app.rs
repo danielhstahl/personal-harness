@@ -79,6 +79,17 @@ pub enum Msg {
         session: Option<SessionId>,
         text: String,
     },
+    /// Text the user's input box should take back, from the session that was holding
+    /// it. Produced by Pi's interactive `Esc`: the queued steering/follow-up text
+    /// is pulled out of the child before the abort and handed back here rather than
+    /// being spent on a turn the user just cancelled.
+    ///
+    /// Tagged with the session that made it, like everything else: a Pi cancel must
+    /// not be able to type into the Beads box.
+    RestoreInput {
+        session: SessionId,
+        text: String,
+    },
     Tick,
 }
 
@@ -459,7 +470,35 @@ impl App {
                 self.target_view(session)
                     .push_note(MessageKind::System, text);
             }
+            Msg::RestoreInput { session, text } => {
+                self.dirty = true;
+                self.restore_input(session, text);
+            }
         }
+    }
+
+    /// Hand text back to the input box (Esc's queued-message restore).
+    ///
+    /// Two guards, both about not losing what the user has:
+    ///
+    /// * it goes to the box only while that session's mode is the one on screen —
+    ///   keyed on `active` rather than `input.mode` so event handling still never
+    ///   reads the input mode (ADR-0002 Q2), and the two are moved together by
+    ///   the one Tab handler anyway;
+    /// * it never overwrites text the user typed in the meantime. The restore is
+    ///   asynchronous; their keystrokes are newer than it is. Those words are not
+    ///   thrown away either — they go to the transcript where they can be
+    ///   re-typed, because "silently dropped" is the failure this whole recipe
+    ///   exists to prevent.
+    pub fn restore_input(&mut self, session: SessionId, text: String) {
+        if session.mode == self.active && self.input.text().trim().is_empty() {
+            self.input.set_text(text);
+            return;
+        }
+        self.view_mut(session).push_note(
+            MessageKind::System,
+            format!("not restored to the input box: {text}"),
+        );
     }
 
     fn on_key(&mut self, k: crossterm::event::KeyEvent) {
@@ -837,7 +876,7 @@ mod tests {
         assert!(text_of(&app, TerminalType::Pi).contains("hi"));
     }
 
-    /// The local echo must not change which generation a view tracks. It matters
+    /// **A local echo does not steal the view's session identity.** It matters
     /// because `view_mut` seals on adoption: if echoing used a placeholder id, a
     /// submit into a live session would seal that session's open entry (and flip its
     /// status) from the *user's* keystroke rather than from the session's death.
@@ -865,5 +904,181 @@ mod tests {
         );
         assert_eq!(v.transcript.entries.len(), before.1 + 1);
         assert_eq!(v.transcript.entries[0].text, "streaming");
+    }
+
+    // ---------------------- the Pi terminal state, from the UI side ----------------------
+
+    /// **A Pi run must never move the beads machine** (looprs-ctn, re-verifying
+    /// looprs-msj). The two are separate sessions with separate processes, and the
+    /// only thing that decides whether a settle means "advance the loop" is who
+    /// produced it.
+    #[tokio::test]
+    async fn a_pi_run_never_moves_the_beads_machine() {
+        let (mut app, mut rx) = app_with(TerminalType::Pi);
+
+        app.update(Msg::Agent {
+            session: pi_id(),
+            event: PiEvent::MessageUpdate {
+                assistant_message_event: AssistantEvent::TextDelta {
+                    content_index: 0,
+                    delta: "a chat answer".into(),
+                },
+            },
+        });
+        app.update(Msg::Agent {
+            session: pi_id(),
+            event: PiEvent::AgentSettled,
+        });
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a Pi settle must not ask anyone to advance a beads pass"
+        );
+        assert!(
+            app.view(TerminalType::Beeds).is_none(),
+            "and must not create one"
+        );
+        assert!(
+            text_of(&app, TerminalType::Beeds).chars().count() == 0,
+            "nothing of the Pi chat belongs in the beads view"
+        );
+
+        // The contrast, so it is clear the rule is about the *producer* and not an
+        // accident of ordering: the same settle from the beads session does advance.
+        app.update(Msg::Agent {
+            session: beads_id(),
+            event: PiEvent::AgentSettled,
+        });
+        assert!(
+            matches!(rx.try_recv(), Ok(UiCommand::BeadsNext)),
+            "only the beads session's settle is a step in the beads machine"
+        );
+    }
+
+    /// **Pi's copy of the user's own message stays out of the transcript** — the
+    /// echo made on submit is the one and only copy. Two copies of the same line is
+    /// worse than none, and pi sends one for every message we send.
+    #[test]
+    fn pi_copies_of_the_user_message_never_reach_the_transcript() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        app.echo_local(TerminalType::Pi, "my name is Dan".into());
+        let after_echo = app.view(TerminalType::Pi).unwrap().transcript.entries.len();
+
+        for role in ["user", "toolResult"] {
+            app.update(Msg::Agent {
+                session: pi_id(),
+                event: PiEvent::MessageStart {
+                    message: WireMessage {
+                        role: role.to_string(),
+                    },
+                },
+            });
+            app.update(Msg::Agent {
+                session: pi_id(),
+                event: PiEvent::MessageEnd {
+                    message: WireMessage {
+                        role: role.to_string(),
+                    },
+                },
+            });
+        }
+
+        let v = app.view(TerminalType::Pi).unwrap();
+        assert_eq!(
+            v.transcript.entries.len(),
+            after_echo,
+            "not one of pi's non-assistant messages added a line: {:?}",
+            v.transcript
+                .entries
+                .iter()
+                .map(|e| &e.text)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            text_of(&app, TerminalType::Pi),
+            "my name is Dan",
+            "the local echo is still the only copy"
+        );
+
+        // The assistant's own end-of-message is *not* suppressed: it closes the
+        // streaming entry, which is what lets it flush at all.
+        app.update(Msg::Agent {
+            session: pi_id(),
+            event: PiEvent::MessageUpdate {
+                assistant_message_event: AssistantEvent::TextDelta {
+                    content_index: 0,
+                    delta: "hello".into(),
+                },
+            },
+        });
+        app.update(Msg::Agent {
+            session: pi_id(),
+            event: PiEvent::MessageEnd {
+                message: WireMessage {
+                    role: "assistant".to_string(),
+                },
+            },
+        });
+        assert!(
+            !app.flush_active(60).is_empty(),
+            "a closed answer must flush"
+        );
+    }
+
+    /// **Esc's restore lands in the box** — the whole point of pulling the queued
+    /// text out of pi before aborting.
+    #[test]
+    fn esc_restore_puts_the_queued_text_back_in_the_box() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        app.update(Msg::RestoreInput {
+            session: pi_id(),
+            text: "and also this".into(),
+        });
+        assert_eq!(app.input.text(), "and also this");
+    }
+
+    /// The restore is asynchronous; the user's own typing is newer than it is, and
+    /// wins. The text is not thrown away either — it goes to the transcript, where
+    /// it can be re-typed, because silently dropping it is the very failure this
+    /// recipe exists to prevent.
+    #[test]
+    fn esc_restore_never_eats_what_the_user_typed_in_the_meantime() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        for c in "no wait".chars() {
+            app.update(Msg::Term(Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            ))));
+        }
+
+        app.update(Msg::RestoreInput {
+            session: pi_id(),
+            text: "and also this".into(),
+        });
+
+        assert_eq!(app.input.text(), "no wait", "the user's text survives");
+        assert!(
+            text_of(&app, TerminalType::Pi).contains("and also this"),
+            "and the restored text is visible rather than lost"
+        );
+    }
+
+    /// A Pi cancel cannot type into the Beads box: the restore is tagged with the
+    /// session that made it, and only the mode on screen gets the keystroke.
+    #[test]
+    fn a_pi_cancel_cannot_type_into_another_modes_box() {
+        let (mut app, _rx) = app_with(TerminalType::Beeds);
+        app.update(Msg::RestoreInput {
+            session: pi_id(),
+            text: "queued from pi".into(),
+        });
+        assert!(
+            app.input.text().is_empty(),
+            "the beads box is untouched by a Pi Esc"
+        );
+        assert!(
+            text_of(&app, TerminalType::Pi).contains("queued from pi"),
+            "and the text is still accounted for, in the session that owns it"
+        );
     }
 }
