@@ -3,7 +3,7 @@
 One entry point, no network, no model calls, no real `bd` database.
 
 ```bash
-cargo test              # the behaviour: 208 tests, ~20s
+cargo test              # the behaviour: 307 tests, ~20s
 ./scripts/check.sh      # the gate + the behaviour: fmt, clippy -D warnings, tests
 cargo test -- --ignored # the two static gate checks, from inside cargo
 ```
@@ -119,6 +119,39 @@ The scenarios the chore (looprs-6ol) listed, each with the tests that carry it.
 - `session::beads::tests::the_active_ticket_is_published_when_taken_and_when_released`
 - `session::beads::tests::the_worker_is_told_its_ticket_not_invited_to_go_shopping`
 - pure: `session::beads::tests::the_claim_guard_skips_refuses_and_works_in_that_order_pure`
+
+### Out-of-band notification (the completion edge)
+
+Turn it on with `LOOPRS_NTFY_URL` + `LOOPRS_NTFY_TOPIC`; with either missing the
+notifier is `Noop` and nothing leaves the terminal.
+
+**One `notify` call exists in the binary**, in the `PassOutcome::Closed` arm of
+`BeadsTask::worker_settled`. Not on `agent_settled`: that event says the worker
+stopped talking, and a pass that closed nothing, an aborted pass and a *planner's*
+pass are the same bytes. The five no-rows below are the whole reason for the
+placement, and `RecordingNotifier` (`src/testing.rs`) is what makes "nothing was
+announced" assertable instead of unfalsifiable.
+
+| ending | announced |
+| --- | --- |
+| the board says closed | `session::beads::tests::a_closed_ticket_is_announced_once_with_the_title_it_was_claimed_under` |
+| settled, ticket still open | `…::a_ticket_that_was_never_closed_announces_nothing` |
+| `Esc` cancelled the pass | `…::a_pass_the_user_cancelled_announces_nothing` |
+| the planner's settle | `…::a_planner_settling_announces_nothing_even_though_its_plan_worked` |
+| worker left it `blocked` | `…::a_ticket_its_worker_handed_to_a_human_announces_nothing` |
+| `bd` unreadable after the pass | asserted inside `…::an_unreadable_board_after_a_pass_is_unverifiable_not_a_verdict` |
+| a default `SessionConfig` | `session::tests::the_default_config_carries_the_silent_sink` — the line that keeps the suite off the network by construction |
+
+The ntfy wire format itself is checked against a loopback listener, under
+`--ignored` (it binds a port, and the retry test costs `RETRY_AFTER` of wall clock):
+`cargo test --bin looprs -- --ignored`.
+
+- `services::notification::tests::the_post_puts_the_message_in_the_body_and_the_chrome_in_the_headers`
+  — message in the body, chrome in `Title` / `Priority` / `Tags`, topic in the path
+- `services::notification::tests::a_refused_post_is_tried_a_bounded_number_of_times_and_then_stops`
+  — exactly `POST_ATTEMPTS` connections, then a log line and no error upward
+- `services::notification::tests::the_environment_switches_the_real_sink_on_and_off`
+  — `main`'s own call, exercised
 
 ### Pi multi-turn persistence (looprs-ctn)
 

@@ -354,6 +354,21 @@ pub struct SessionConfig {
     pub bd_bin: String,
     /// The shell BashSession spawns. `$SHELL` if set, else `/bin/bash`.
     pub shell_bin: String,
+    /// Where a finished ticket is announced, out of band
+    /// ([`services::notification`](crate::services::notification)).
+    ///
+    /// Carried here rather than passed as another argument because this is already
+    /// the one value that reaches every session through the factory, and because it
+    /// is a *sink*: the loop that produces the fact must not get to choose where it
+    /// goes, and it must not be able to block on it. `notify` is a queue send; the
+    /// network lives in the sink's own task.
+    ///
+    /// The default is [`Noop`](crate::services::notification::Noop) and **not**
+    /// the configured notifier, deliberately: the default config is what ~300 tests
+    /// build, so a default that read the environment would make "no test ever
+    /// touched the network" a matter of luck. `main` is the only place that calls
+    /// [`notifier_from_env`](crate::services::notification::notifier_from_env).
+    pub notifier: Arc<dyn crate::services::notification::Notifier>,
 }
 
 impl Default for SessionConfig {
@@ -362,6 +377,7 @@ impl Default for SessionConfig {
             pi_bin: std::env::var("LOOPRS_PI_BIN").unwrap_or_else(|_| "pi".to_string()),
             bd_bin: std::env::var("LOOPRS_BD_BIN").unwrap_or_else(|_| "bd".to_string()),
             shell_bin: default_shell_bin(),
+            notifier: Arc::new(crate::services::notification::Noop),
         }
     }
 }
@@ -536,6 +552,33 @@ mod tests {
         assert_trait_object::<dyn Session>();
     }
 
+    /// **A default config cannot reach the network.**
+    ///
+    /// Roughly every test in this crate builds one of these, so this is the line
+    /// that keeps "the suite never opened a socket to ntfy" a property of the type
+    /// rather than a fact about whoever last set `LOOPRS_NTFY_URL`. `main` opts in
+    /// to the real sink explicitly (see `main::run`); nothing else does.
+    ///
+    /// Checked through `Debug` because the trait is deliberately not downcastable:
+    /// a session that could ask which sink it holds is a session that could choose
+    /// to skip it.
+    #[test]
+    fn the_default_config_carries_the_silent_sink() {
+        use crate::services::notification::Notifier;
+        let cfg = SessionConfig::default();
+        let shown = format!("{:?}", cfg.notifier);
+        assert!(
+            shown.contains("Noop"),
+            "a default config must carry the silent sink, got {shown}"
+        );
+        // And using it is inert — compiles, sends, and fails nothing.
+        let n: &dyn Notifier = cfg.notifier.as_ref();
+        n.notify(crate::services::notification::BeadDone {
+            id: "looprs-x".into(),
+            title: "silent".into(),
+        });
+    }
+
     // `#[tokio::test]` because the Beads backend starts a task as part of starting
     // a session: a handle without a runtime is not a thing that can exist.
     #[tokio::test]
@@ -544,6 +587,7 @@ mod tests {
             pi_bin: "true".into(),
             bd_bin: "true".into(),
             shell_bin: "true".into(),
+            notifier: Arc::new(crate::services::notification::Noop),
         };
         for (generation, mode) in TerminalType::ALL.into_iter().enumerate() {
             let spawned = spawn(mode, &cfg, generation as u64).expect("stub spawn must not fail");

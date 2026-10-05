@@ -60,6 +60,45 @@ pub enum BdFake {
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
+/// A notifier that remembers instead of posting.
+///
+/// The third sink `services::notification` names (production `Ntfy`, default
+/// `Noop`, and this). It exists so the *completion edge itself* is assertable: that
+/// a closed ticket announced exactly one `BeadDone` carrying its id and title, and —
+/// the half that matters more — that an aborted pass, an un-closed ticket, an
+/// unreadable board and a planner's settle announced **nothing**. Those four all
+/// look like completion to anything watching `agent_settled`, which is exactly why
+/// the producer sits where it does.
+///
+/// It is `Clone` over a shared `Arc`, so the test and the loop under test hold the
+/// same recording.
+#[derive(Clone, Debug, Default)]
+pub struct RecordingNotifier {
+    done: Arc<Mutex<Vec<crate::services::notification::BeadDone>>>,
+}
+
+impl crate::services::notification::Notifier for RecordingNotifier {
+    fn notify(&self, done: crate::services::notification::BeadDone) {
+        self.done.lock().unwrap().push(done);
+    }
+}
+
+impl RecordingNotifier {
+    /// Every completion announced so far, in order.
+    pub fn completions(&self) -> Vec<crate::services::notification::BeadDone> {
+        self.done.lock().unwrap().clone()
+    }
+
+    /// Just the ids, for the assertion that only cares *which* tickets spoke.
+    pub fn completed_ids(&self) -> Vec<String> {
+        self.completions().into_iter().map(|d| d.id).collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.done.lock().unwrap().is_empty()
+    }
+}
+
 /// A scratch dir holding the fake binaries plus their recording logs.
 /// Removing the dir on drop keeps test runs from leaving debris.
 pub struct Fakes {
@@ -70,6 +109,9 @@ pub struct Fakes {
     bd_log: PathBuf,
     board_file: PathBuf,
     show_file: PathBuf,
+    /// The sink the loop under test was handed, so a test can read completions off
+    /// the same `Fakes` it reads `bd`'s log from.
+    pub notifier: RecordingNotifier,
 }
 
 impl Fakes {
@@ -114,6 +156,7 @@ impl Fakes {
             bd_log,
             board_file,
             show_file,
+            notifier: RecordingNotifier::default(),
         }
     }
 

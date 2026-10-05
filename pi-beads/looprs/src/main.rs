@@ -32,6 +32,7 @@ use components::tool::LiveToolPreview;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
+use crate::services::notification;
 use crate::session::router::{Router, SHUTDOWN_GRACE};
 use crate::session::{ChatState, SessionConfig, TerminalType};
 use crate::state::transcript::Entry;
@@ -128,7 +129,19 @@ async fn run(
     // only this task's copy of `cmd_tx` can ask it for anything. The old shape —
     // `BeadsLoop::new(...)` hand-wired here, with a Tab being a border-color change
     // — is what looprs-05j replaces.
-    let mut router = Router::new(initial, SessionConfig::default(), app_tx.clone());
+    // Out-of-band notification: a ticket this harness finished reaches a human who
+    // is not looking at this terminal. Built here, once, before the Router, so the
+    // poster task outlives every session — a beads session gets respawned per
+    // generation and parked on Tab, and a notifier that died and returned along
+    // with it would drop the announcement that was timed worst. This is the only
+    // place the real sink is built: `SessionConfig::default()` carries `Noop`,
+    // which is what keeps ~300 tests off the network by construction rather than
+    // by nobody remembering to unset `LOOPRS_NTFY_URL`.
+    let cfg = SessionConfig {
+        notifier: notification::notifier_from_env(),
+        ..SessionConfig::default()
+    };
+    let mut router = Router::new(initial, cfg, app_tx.clone());
     // The run loop keeps **no** sender of its own. This is not tidiness: the exit
     // drain ends when `app_rx` closes, and `app_rx` closes when the last sender
     // is gone. A copy held here is a sender that never goes away, so the drain
