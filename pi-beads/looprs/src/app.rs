@@ -6,13 +6,13 @@
 //! *types* land in `Unknown`, so additive protocol changes are harmless. Renamed/removed fields
 //! show up as parse errors; log them loudly (see `parse`).
 
-use crate::components::input::{InputAction, InputState};
+use crate::components::input::{InputAction, InputState, inner_width};
 use crate::session::view::SessionView;
 use crate::session::{
     ActiveBead, ByteStream, ChatState, ExitReason, SessionId, SessionStatus, TerminalType,
 };
 use crate::state::transcript::MessageKind;
-use crate::viewport::{self, INPUT_BORDER_ROWS};
+use crate::viewport::{self};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::text::Line;
 use serde::Deserialize;
@@ -709,9 +709,7 @@ impl App {
     /// preview want the same rows, and past the cap the box scrolls to the caret
     /// rather than winning the argument.
     pub fn input_rows(&self, width: u16) -> u16 {
-        let inner = (width as usize)
-            .saturating_sub(INPUT_BORDER_ROWS as usize)
-            .max(1);
+        let inner = inner_width(width);
         viewport::input_rows(self.input.display_lines(inner).len() as u16)
     }
 
@@ -1115,7 +1113,12 @@ impl App {
             return;
         }
 
-        if let Some(action) = self.input.handle_key(k) {
+        // The box needs the width it is going to be drawn at: a wrapped row is the
+        // only "line" a message has below the one the user is on, so `Up` and
+        // `Home` are meaningless without the wrapping. Same width the height policy
+        // measures with, from the same function.
+        let inner = inner_width(self.width);
+        if let Some(action) = self.input.handle_key(k, inner) {
             match action {
                 InputAction::Submit { text, mode } => {
                     // The shell echoes what it reads — through the pty, into our
@@ -1255,7 +1258,7 @@ mod tests {
         let width = 22u16; // inner width 20
         for n in 0usize..=200 {
             app.input.set_text("x".repeat(n));
-            let inner = (width as usize) - INPUT_BORDER_ROWS as usize;
+            let inner = inner_width(width);
             let wrapped = app.input.display_lines(inner).len() as u16;
             assert_eq!(
                 app.input_rows(width),
@@ -1270,6 +1273,61 @@ mod tests {
         assert_eq!(app.input_rows(width), viewport::MIN_INPUT_ROWS + 1);
         app.input.set_text("x".repeat(200)); // ten rows wanted, the cap wins
         assert_eq!(app.input_rows(width), viewport::MAX_INPUT_ROWS);
+    }
+
+    /// **The arrow keys belong to the box, not to a session.** A `Left` that
+    /// leaked down the command channel would arrive in the shell as `ESC [ D` — a
+    /// history search, or half an escape sequence handed to whatever program is
+    /// running. Nothing goes out; the caret moves and the text is untouched.
+    #[test]
+    fn arrow_keys_are_consumed_by_the_box_and_reach_no_session() {
+        let (mut app, mut rx) = app_with(TerminalType::Pi);
+        for c in "ab cd".chars() {
+            app.update(Msg::Term(key(KeyCode::Char(c), KeyModifiers::NONE)));
+        }
+        for code in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::BackTab,
+            KeyCode::Delete,
+        ] {
+            app.update(Msg::Term(key(code, KeyModifiers::NONE)));
+        }
+        assert_eq!(
+            app.input.text(),
+            "ab cd\n",
+            "the keys edited the box (Shift-Tab broke the line) and lost nothing"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "not one keystroke went out to a session"
+        );
+    }
+
+    /// The multi-line box is still one message on the wire: a newline in the
+    /// middle changes nothing about what `Enter` means.
+    #[test]
+    fn a_two_line_box_submits_one_command_with_both_lines_in_it() {
+        let (mut app, mut rx) = app_with(TerminalType::Pi);
+        for c in "first".chars() {
+            app.update(Msg::Term(key(KeyCode::Char(c), KeyModifiers::NONE)));
+        }
+        app.update(Msg::Term(key(KeyCode::BackTab, KeyModifiers::NONE)));
+        for c in "second".chars() {
+            app.update(Msg::Term(key(KeyCode::Char(c), KeyModifiers::NONE)));
+        }
+        app.update(Msg::Term(key(KeyCode::Enter, KeyModifiers::NONE)));
+        match rx.try_recv() {
+            Ok(UiCommand::Submit { mode, text }) => {
+                assert_eq!(mode, TerminalType::Pi);
+                assert_eq!(text, "first\nsecond");
+            }
+            other => panic!("expected exactly one Submit, got {other:?}"),
+        }
     }
 
     /// The one place "is the box showing?" and "how tall is it?" become a single
