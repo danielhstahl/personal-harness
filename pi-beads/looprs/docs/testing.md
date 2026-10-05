@@ -3,7 +3,7 @@
 One entry point, no network, no model calls, no real `bd` database.
 
 ```bash
-cargo test              # the behaviour: 307 tests, ~20s
+cargo test              # the behaviour: 314 tests, ~20s
 ./scripts/check.sh      # the gate + the behaviour: fmt, clippy -D warnings, tests
 cargo test -- --ignored # the two static gate checks, from inside cargo
 ```
@@ -285,6 +285,42 @@ were passing on transcript prose rather than on the row.
 order. A terminal's line model cannot be recovered from this byte stream, for the
 reason above. Those live in `status.rs`'s width tests and `main.rs`'s
 `TestBackend` tests, where every cell can be checked exactly.
+
+### Token counts on the row
+
+`↑in ↓out` on the row, plus a `cache N` detail, read straight off pi's own
+`usage` record.
+
+| claim | where |
+| --- | --- |
+| the wire shape parses as pi writes it — camelCase, every field independently optional, **absent ≠ zero** | `app::tests::the_wire_usage_record_parses_as_pi_writes_it` |
+| the same shape through a real child's stdout, not a hand-written string | `session::pi_chat::tests::the_wire_usage_record_survives_the_real_pipes` |
+| only an assistant `message_end` adds; a `user` / `toolResult` message and a usage-less message add nothing | `app::tests::every_assistant_message_adds_and_nothing_else_does` |
+| the beads window opens on a claim and **survives the release** | `app::tests::the_beads_window_opens_on_a_claim_and_survives_the_release` |
+| a respawned generation owes nothing for the dead one's run | `app::tests::a_new_generation_starts_the_window_at_nothing` |
+| nothing reported prints nothing, rather than `↑0 ↓0` | `app::tests::the_row_prints_the_window_it_is_handed` |
+| the cache detail surrenders its columns before the in/out pair does | `components::status::tests::the_cache_detail_gives_way_before_the_in_out_pair` |
+| the formats stay narrow: `999`, `12.3k`, `1.24M` | `components::status::tests::token_counts_stay_compact_at_every_order_of_magnitude` |
+
+**Why usage is read only from `message_end`.** pi reports `usage` on every
+`message_update` too, and that figure is **cumulative for the message still
+streaming** — the chat fixture emits it that way on purpose, with a half-built
+output count on the delta and the full count at `text_end`. Folding the streaming
+copies into a total double counts them, and grows the number with the length of the
+stream. `message_end` lands once per API call, which is as live as the row needs
+and cannot be counted twice.
+
+**The window, per mode.** Pi chat: the whole session. Beads: the current ticket,
+cleared when a new claim is published. Three deliberate non-clears — releasing a
+claim (the row keeps answering "what did that ticket cost"), `Esc` (a cancelled
+pass spent what it spent; a total that drops on a keystroke is a total nobody
+trusts), and the planner (it holds no claim, so its spend lands in the window of
+the first bead that follows it rather than being zeroed away).
+
+**Dropped bytes are gone from the row.** They were ADR-0002's scrollback-integrity
+signal for the buffer cap, and that signal still exists where the loss happens: the
+view inserts a `… N bytes dropped (buffer cap) …` notice into the transcript
+itself (`session::view::tests`). The row spends the room on cost instead.
 
 
 ---

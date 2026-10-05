@@ -16,11 +16,11 @@
 //! time until it fits ([`fit`]). The ladder, from first gone to last:
 //!
 //! ```text
-//! ^C quit · the bead's title · warm children · bytes dropped · Tab switch
+//! ^C quit · the bead's title · warm children · cache <tokens> · Tab switch
 //! · which bead and how long a *background* run is on
 //! · bg: <mode> <verb>            ← ADR-0002's reason for this row
-//! · Esc cancel · how long this run has been going · which bead
-//! · what it is doing · THE ERROR · which mode
+//! · Esc cancel · how long this run has been going · what it cost (↑in ↓out)
+//! · which bead · what it is doing · THE ERROR · which mode
 //! ```
 //!
 //! Three deliberate calls inside that order:
@@ -32,8 +32,12 @@
 //! * **a busy background session outranks `Esc cancel`.** The hint describes a key
 //!   you can re-learn in a second; the background entry describes money and a
 //!   process you cannot otherwise see.
-//! * **`Tab switch` outranks the byte-drop notice** and everything else hint-shaped,
-//!   because a mode you cannot leave is worse than a notice you cannot see.
+//! * **what it cost outranks how long it took, and the cache detail pays for that
+//!   pair first.** `↑in ↓out` is the number a loop that spends money while nobody
+//!   watches can actually act on; elapsed is nice to know. `cache …` only says
+//!   where some of those tokens came from, so it is worth room when there is room
+//!   and the first thing handed back when there is not — and it can never be the
+//!   reason the in/out pair is missing.
 //!
 //! [`SEP`] costs three columns, which is why the row drops *whole* segments rather
 //! than trimming each one: a fragment of everything tells you less than a whole of
@@ -54,6 +58,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
+use crate::session::view::Tokens;
 use crate::session::{ActiveBead, BeadStep, SessionStatus, TerminalType};
 use crate::theme::styles::mode_color;
 use crate::utils::render::FRAMES;
@@ -71,7 +76,9 @@ mod keep {
     pub const HINT_QUIT: u8 = 1;
     pub const BEAD_TITLE: u8 = 2;
     pub const WARM_CHILDREN: u8 = 3;
-    pub const DROPPED_BYTES: u8 = 4;
+    /// `cache 1.2M` — the most expendable of the cost facts. Worth a look when
+    /// the row has room; the first thing it gives back when it does not.
+    pub const TOKEN_CACHE: u8 = 4;
     pub const HINT_SWITCH: u8 = 5;
     /// Which bead a background run is on, and for how long. Lower than the
     /// background head, so it goes first and the head can never lose its detail
@@ -81,12 +88,16 @@ mod keep {
     pub const BACKGROUND: u8 = 7;
     pub const HINT_CANCEL: u8 = 8;
     pub const ELAPSED: u8 = 9;
-    pub const BEAD_ID: u8 = 10;
-    pub const VERB: u8 = 11;
+    /// `↑ 12.3k ↓ 4.1k`. Outranks elapsed — for a loop that spends money while
+    /// nobody watches, what it cost is the more actionable half of the pair — and
+    /// ranks under the bead id, because "which ticket" beats "how much".
+    pub const TOKENS: u8 = 10;
+    pub const BEAD_ID: u8 = 11;
+    pub const VERB: u8 = 12;
     /// Never dropped — shortened instead (`Cut::Short`).
-    pub const ERROR: u8 = 12;
+    pub const ERROR: u8 = 13;
     /// Never cut at all, except by the last-resort clip.
-    pub const MODE: u8 = 13;
+    pub const MODE: u8 = 14;
 }
 
 /// How a segment gives up its columns when the row runs out of them.
@@ -253,8 +264,10 @@ pub struct Status<'a> {
     /// mode: the honest content is "a process is resident here", which a list
     /// says once.
     pub warm: Vec<TerminalType>,
-    /// Bytes this view dropped to stay inside its buffer cap.
-    pub dropped_bytes: usize,
+    /// Tokens this view's window has spent — see
+    /// [`Tokens`] and [`SessionView::tokens`](crate::session::view::SessionView::tokens)
+    /// for what the window covers per mode.
+    pub tokens: Tokens,
     /// The row's own animation phase. `App` advances it off the frame tick, at
     /// the row's pace rather than the panel's.
     pub spinner: usize,
@@ -347,13 +360,31 @@ fn segments(s: &Status<'_>) -> Vec<Seg> {
         }
     }
 
-    // Output this view threw away to stay inside its cap.
-    if s.dropped_bytes > 0 {
+    // What this session has spent. Tokens rather than dollars: the number a loop
+    // that runs unwatched can act on is how much it burned, and the pair reads at
+    // a glance. `is_empty` covers "nothing reported yet" — an absent `usage` must
+    // not come out as `↑0 ↓0`, which would read as a free run rather than an
+    // unmeasured one.
+    if !s.tokens.is_empty() {
         segs.push(Seg::new(
-            format!("~{} dropped", fmt_bytes(s.dropped_bytes)),
+            format!(
+                "\u{2191}{} \u{2193}{}",
+                fmt_tokens(s.tokens.input),
+                fmt_tokens(s.tokens.output)
+            ),
             Style::new().fg(Color::Yellow),
-            keep::DROPPED_BYTES,
+            keep::TOKENS,
         ));
+        // Cache tokens get their own segment because `input` does not include them,
+        // and on a long run they are most of the total. Showing `input` alone is
+        // how a run of almost-all cache reads looks cheap.
+        if s.tokens.cache > 0 {
+            segs.push(Seg::new(
+                format!("cache {}", fmt_tokens(s.tokens.cache)),
+                dim(),
+                keep::TOKEN_CACHE,
+            ));
+        }
     }
 
     // Warm children: resident, idle, and invisible without this.
@@ -590,15 +621,20 @@ pub fn fmt_elapsed(d: Duration) -> String {
 }
 
 /// Byte counts the way the row has room for them: `512B`, `9.1KiB`, `1.4MiB`.
-fn fmt_bytes(n: usize) -> String {
-    const KIB: usize = 1024;
-    const MIB: usize = 1024 * 1024;
-    if n < KIB {
-        format!("{n}B")
-    } else if n < MIB {
-        format!("{}.{:01}KiB", n / KIB, (n % KIB) * 10 / KIB)
+/// Token counts, compact and decimal (tokens are not powers of 1024).
+///
+/// Bounded width is the whole point: `999`, `12.3k`, `1.24M` keep the row's
+/// arithmetic stable at every order of magnitude, so a nine-figure run cannot push
+/// the bead id off the screen by itself.
+fn fmt_tokens(n: u64) -> String {
+    const K: u64 = 1_000;
+    const M: u64 = 1_000_000;
+    if n < K {
+        format!("{n}")
+    } else if n < M {
+        format!("{}.{:01}k", n / K, (n % K) * 10 / K)
     } else {
-        format!("{}.{:01}MiB", n / MIB, (n % MIB) * 10 / MIB)
+        format!("{}.{:02}M", n / M, (n % M) * 100 / M)
     }
 }
 
@@ -637,7 +673,7 @@ mod tests {
             active: sess(mode, status),
             background: vec![],
             warm: vec![],
-            dropped_bytes: 0,
+            tokens: Tokens::default(),
             spinner: 0,
         }
     }
@@ -846,7 +882,11 @@ mod tests {
             active,
             background: vec![bg],
             warm: vec![TerminalType::Bash],
-            dropped_bytes: 3 * 1024 * 1024 + 700 * 1024,
+            tokens: Tokens {
+                input: 1_234_567,
+                output: 42_100,
+                cache: 8_400_000,
+            },
             spinner: 3,
         };
         for width in 1u16..=120 {
@@ -887,7 +927,11 @@ mod tests {
             active,
             background: vec![sess(TerminalType::Pi, SessionStatus::Running)],
             warm: vec![],
-            dropped_bytes: 4096,
+            tokens: Tokens {
+                input: 4_096,
+                output: 512,
+                cache: 900_000,
+            },
             spinner: 0,
         };
         let (txt, w) = render(&s, 40);
@@ -1008,14 +1052,88 @@ mod tests {
         assert!(aborting.contains("Esc cancel"), "{aborting:?}");
     }
 
+    /// **Tokens appear only when they were reported.**
+    ///
+    /// The "stays out" half is the load-bearing one. pi's `usage` is an optional
+    /// record, so `↑0 ↓0` would read as "this run was free" when the truth is
+    /// "this run was never measured". The row keeps silent instead of guessing.
     #[test]
-    fn a_dropped_byte_notice_appears_only_when_bytes_were_dropped() {
-        let mut s = plain(TerminalType::Bash, SessionStatus::Idle);
+    fn tokens_are_shown_only_when_they_were_reported() {
+        let mut s = plain(TerminalType::Pi, SessionStatus::Running);
         let (txt, _) = render(&s, 100);
-        assert!(!txt.contains("dropped"), "{txt:?}");
-        s.dropped_bytes = 4096 + 205;
+        assert!(!txt.contains('\u{2191}'), "{txt:?}");
+        assert!(!txt.contains("cache"), "{txt:?}");
+
+        s.tokens = Tokens {
+            input: 4096 + 205,
+            output: 812,
+            cache: 0,
+        };
         let (txt, _) = render(&s, 100);
-        assert!(txt.contains("4.2KiB dropped"), "{txt:?}");
+        assert!(txt.contains("\u{2191}4.3k \u{2193}812"), "{txt:?}");
+        assert!(!txt.contains("cache"), "no cache reported: {txt:?}");
+
+        s.tokens.cache = 1_800_000;
+        let (txt, _) = render(&s, 100);
+        assert!(txt.contains("cache 1.80M"), "{txt:?}");
+    }
+
+    /// The two cost facts surrender at different widths, by design: the cache
+    /// detail is paid for the in/out pair before the pair gives anything up.
+    ///
+    /// Asserted by *finding* the surrender width rather than hard-coding one, so
+    /// the test says what it means ("cache went first") and does not rot the next
+    /// time a segment changes length.
+    #[test]
+    fn the_cache_detail_gives_way_before_the_in_out_pair() {
+        let b = bead();
+        let active = Sess {
+            mode: TerminalType::Beeds,
+            status: SessionStatus::Running,
+            step: Some(BeadStep::WorkTickets),
+            bead: Some(&b),
+            elapsed: Some(Duration::from_secs(42)),
+            error: None,
+        };
+        let s = Status {
+            active,
+            background: vec![sess(TerminalType::Pi, SessionStatus::Running)],
+            warm: vec![TerminalType::Bash],
+            tokens: Tokens {
+                input: 1_234_567,
+                output: 42_100,
+                cache: 9_100_000,
+            },
+            spinner: 0,
+        };
+
+        // The row's natural width: everything fits at that and above.
+        let full = render(&s, 300).1 as u16;
+        assert!(
+            render(&s, 300).0.contains("cache 9.10M"),
+            "and the cache detail is in it: {:?}",
+            render(&s, 300).0
+        );
+
+        // The first width at which the cache segment is gone.
+        let cache_gone = (1..=full)
+            .rev()
+            .find(|w| !render(&s, *w).0.contains("cache"))
+            .expect("the cache segment survived every width");
+
+        // …and at that width the pair is still on screen: it is strictly better
+        // kept than the cache detail, which is the ordering this test exists to pin.
+        let (txt, w) = render(&s, cache_gone);
+        assert!(w <= cache_gone as usize, "{w} > {cache_gone}");
+        assert!(
+            txt.contains('\u{2191}') && txt.contains('\u{2193}'),
+            "in/out should outlive the cache detail: {txt:?}"
+        );
+        // And of course the answers the row exists to give are all still there.
+        assert!(
+            txt.contains("Beeds") && txt.contains("working") && txt.contains("looprs-guh"),
+            "{txt:?}"
+        );
     }
 
     // ────────────────────────── the number formats ──────────────────────────
@@ -1039,12 +1157,16 @@ mod tests {
     }
 
     #[test]
-    fn byte_counts_stay_in_five_columns() {
-        assert_eq!(fmt_bytes(0), "0B");
-        assert_eq!(fmt_bytes(512), "512B");
-        assert_eq!(fmt_bytes(1024), "1.0KiB");
-        assert_eq!(fmt_bytes(1024 * 1024), "1.0MiB");
-        assert_eq!(fmt_bytes(3 * 1024 * 1024), "3.0MiB");
+    fn token_counts_stay_compact_at_every_order_of_magnitude() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(7), "7");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_000), "1.0k");
+        assert_eq!(fmt_tokens(12_345), "12.3k");
+        assert_eq!(fmt_tokens(999_999), "999.9k");
+        assert_eq!(fmt_tokens(1_000_000), "1.00M");
+        assert_eq!(fmt_tokens(8_400_000), "8.40M");
+        assert_eq!(fmt_tokens(123_456_789), "123.45M");
     }
 }
 
@@ -1077,7 +1199,7 @@ mod peek {
                     },
                     background: vec![],
                     warm: vec![],
-                    dropped_bytes: 0,
+                    tokens: Tokens::default(),
                     spinner: 0,
                 },
             ),
@@ -1094,7 +1216,7 @@ mod peek {
                     },
                     background: vec![],
                     warm: vec![TerminalType::Pi],
-                    dropped_bytes: 0,
+                    tokens: Tokens::default(),
                     spinner: 4,
                 },
             ),
@@ -1118,7 +1240,7 @@ mod peek {
                         error: None,
                     }],
                     warm: vec![TerminalType::Bash],
-                    dropped_bytes: 0,
+                    tokens: Tokens::default(),
                     spinner: 2,
                 },
             ),
@@ -1135,7 +1257,11 @@ mod peek {
                     },
                     background: vec![],
                     warm: vec![TerminalType::Pi, TerminalType::Beeds],
-                    dropped_bytes: 12_900,
+                    tokens: Tokens {
+                        input: 12_900,
+                        output: 3_100,
+                        cache: 1_800_000,
+                    },
                     spinner: 7,
                 },
             ),
@@ -1152,7 +1278,7 @@ mod peek {
                     },
                     background: vec![],
                     warm: vec![],
-                    dropped_bytes: 0,
+                    tokens: Tokens::default(),
                     spinner: 0,
                 },
             ),

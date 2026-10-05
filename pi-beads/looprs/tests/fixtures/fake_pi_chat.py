@@ -75,6 +75,30 @@ def response(rid, command, data=None, success=True, error=None):
     emit(rec)
 
 
+def usage(n, out_scale=1.0):
+    """Deterministic per-turn token accounting, in pi's wire shape.
+
+    Scaled by the turn number so a two-turn test can assert the SUM of the turns
+    rather than one message's number -- a double count lands somewhere else.
+
+    `cacheRead` is deliberately the largest of the four: that is the honest shape
+    of a long run, and it is the number the status row must keep OUT of `input`
+    (Anthropic-style accounting excludes it, so folding it in is how a mostly-cache
+    run looks cheap).
+
+    Emitted on `message_update` as well as `message_end`, because pi really does:
+    the streaming copy is CUMULATIVE for the message still being built. A client
+    that folded those into a total would double count, which is why the harness
+    reads usage only from the authoritative `message_end`.
+    """
+    return {
+        "input": 100 * n,
+        "output": int(40 * n * out_scale),
+        "cacheRead": 900 * n,
+        "cacheWrite": 25 * n,
+    }
+
+
 def run_turn(n, user_text, answer, aborted):
     """Stream one assistant turn the way pi does, then hold it open."""
     emit({"type": "agent_start"})
@@ -82,11 +106,14 @@ def run_turn(n, user_text, answer, aborted):
     emit({"type": "message_start", "message": {"role": "user", "content": user_text}})
     emit({"type": "message_end", "message": {"role": "user", "content": user_text}})
     emit({"type": "message_start", "message": {"role": "assistant", "content": []}})
-    emit({"type": "message_update", "assistantMessageEvent":
+    # The streaming half: `usage` here is cumulative for THIS message, and the
+    # output figure is only half-built at the delta and complete by the text_end.
+    emit({"type": "message_update", "usage": usage(n, 0.5), "assistantMessageEvent":
           {"type": "text_delta", "contentIndex": 0, "delta": answer}})
-    emit({"type": "message_update", "assistantMessageEvent":
+    emit({"type": "message_update", "usage": usage(n), "assistantMessageEvent":
           {"type": "text_end", "contentIndex": 0, "content": answer}})
-    emit({"type": "message_end", "message": {"role": "assistant", "content": []}})
+    emit({"type": "message_end",
+          "message": {"role": "assistant", "content": [], "usage": usage(n)}})
     emit({"type": "turn_end", "message": {"role": "assistant"}, "toolResults": []})
 
     deadline = time.time() + MAX_HOLD

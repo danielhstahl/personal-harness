@@ -849,6 +849,42 @@ mod tests {
         assert_eq!(s.status(), SessionStatus::Idle, "settled, still warm");
     }
 
+    /// **pi's `usage` record survives the real pipes.**
+    ///
+    /// The fake emits pi's actual wire shape — camelCase, plus a *cumulative*
+    /// copy on every `message_update` alongside the authoritative one on
+    /// `message_end` — so this checks the serde mapping against bytes that came
+    /// through a real stdout rather than a hand-written string. Turn 1 is
+    /// `input 100 / output 40 / cacheRead 900 / cacheWrite 25`, and the event on
+    /// its way to the App (the only thing allowed to make a running total) says
+    /// exactly that.
+    #[tokio::test]
+    async fn the_wire_usage_record_survives_the_real_pipes() {
+        let f = fakes("usage");
+        let (mut s, mut rx) = pi_chat(&f, 1);
+
+        let first = send_and_settle(&mut s, &f, &mut rx, "first turn").await;
+        for want in [
+            "input: 100",
+            "output: 40",
+            "cache_read: 900",
+            "cache_write: 25",
+        ] {
+            assert!(first.has(want), "{want} never arrived: {:?}", first.lines);
+        }
+
+        // Turn 2 is scaled by the turn number, so the numbers moved — proof the
+        // assertions are reading the record and not one constant they were handed.
+        let second = send_and_settle(&mut s, &f, &mut rx, "second turn").await;
+        assert!(second.has("input: 200"), "{:?}", second.lines);
+        assert!(second.has("output: 80"), "{:?}", second.lines);
+        assert!(
+            !second.has("input: 100"),
+            "turn 1 is not still on the wire: {:?}",
+            second.lines
+        );
+    }
+
     /// Follow-ups while a run is in flight go in as `steer`, not as a second
     /// `prompt`: pi rejects a plain prompt mid-run, so this routing *is* the price
     /// of leaving the input box open while the answer streams.

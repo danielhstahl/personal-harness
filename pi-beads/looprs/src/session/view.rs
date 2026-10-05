@@ -65,6 +65,49 @@ impl ChatState {
     }
 }
 
+/// What this view's token window has spent.
+///
+/// The *window* is what differs by mode, because the question differs — see
+/// [`SessionView::tokens`]. The numbers come straight off pi's `usage` record,
+/// folded in once per assistant message.
+///
+/// Cache tokens are carried separately rather than folded into `input`, because on
+/// Anthropic-style accounting `input` **excludes** them — and on a long run the
+/// cache buckets are where most of the tokens go. Fold them in and the row reports
+/// a number quietly smaller than the work that was done; leave them out and a run
+/// that is 90% cache reads looks free. They get their own segment, which is also
+/// the first one the width ladder gives back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tokens {
+    pub input: u64,
+    pub output: u64,
+    /// `cacheRead` + `cacheWrite`, summed at the door: the row shows them as one
+    /// number and nothing upstream wants the split.
+    pub cache: u64,
+}
+
+impl Tokens {
+    /// Fold one assistant message's usage into the window.
+    ///
+    /// Called from the *authoritative* `message_end` only. pi also reports `usage`
+    /// on every `message_update`, and that figure is **cumulative for the message
+    /// still streaming** — folding it in per delta grows the total with the square
+    /// of the message length, and it looks plausible right up until it doesn't.
+    /// `message_end` lands once per API call, which is every bit as live as the row
+    /// needs and impossible to double-count.
+    pub fn add(&mut self, u: &crate::app::Usage) {
+        self.input += u.input;
+        self.output += u.output;
+        self.cache += u.cache_read + u.cache_write;
+    }
+
+    /// Nothing reported yet — which is not the same fact as "zero spent", per
+    /// [`crate::app::Usage`]'s optionality. The row shows no segment for it.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// One terminal state's rendered history, plus the render cursor over it.
 ///
 /// `App` holds `HashMap<TerminalType, SessionView>`. Events are applied to the
@@ -102,6 +145,26 @@ pub struct SessionView {
     /// The beads machine's step, for the status row. `None` for every other mode.
     /// Rendered, never re-derived (looprs-msj).
     pub step: Option<BeadStep>,
+    /// Tokens this view's window has spent, for the status row.
+    ///
+    /// **Pi chat: the whole session** — every turn this warm child has answered.
+    /// **Beads: the current ticket** — [`App`](crate::app::App) clears it when a
+    /// new claim is published, so the row answers "what is this bead costing",
+    /// which is the question a loop that spends money unwatched actually wants
+    /// answered.
+    ///
+    /// Three things the window deliberately does *not* do:
+    ///
+    /// * **it does not roll back on `Esc`.** A cancelled pass spent what it spent;
+    ///   cancelling does not un-buy it, and a number that went down on a keystroke
+    ///   would be a number nobody could trust;
+    /// * **it does not clear when a claim is released** (`ActiveBead: None`), so
+    ///   the row keeps showing what that ticket cost after its pass ended, until
+    ///   the next claim opens a fresh window;
+    /// * **it does not zero out the planner.** A planner pass holds no claim, so
+    ///   its spend lands in the window of the first bead that follows it — which
+    ///   is the work it planned, and beats throwing away a pass that cost money.
+    pub tokens: Tokens,
     /// Dropped-line bookkeeping for the buffer cap (see [`DEFAULT_VIEW_BUFFER`]).
     dropped: usize,
     limit: usize,
@@ -129,6 +192,7 @@ impl SessionView {
             chat: ChatState::Stopped,
             step: None,
             active_bead: None,
+            tokens: Tokens::default(),
             dropped: 0,
             limit,
             bash_strip: ControlStripper::default(),
@@ -288,11 +352,14 @@ impl SessionView {
         self.step = Some(step);
     }
 
-    /// How many bytes of this view's output were dropped by the cap (status row).
+    /// How many bytes of this view's output the cap has dropped.
     ///
-    /// The counter is what makes an eviction honest rather than invisible; the row
-    /// shows it as `~N dropped` (looprs-guh) and the tests here assert both the
-    /// count and the message that quotes it.
+    /// The counter is what makes an eviction honest rather than invisible, and the
+    /// honesty lives in the transcript itself: [`Self::enforce_buffer`] inserts a
+    /// visible `… N bytes dropped (buffer cap) …` notice when it evicts. The
+    /// status row's own `~N dropped` segment is gone — the row now spends that
+    /// room on token counts — so nothing in the shipped binary reads this.
+    #[allow(dead_code)] // test seam: `view::tests` asserts the count and the notice that quotes it
     pub fn dropped_bytes(&self) -> usize {
         self.dropped
     }

@@ -349,6 +349,36 @@ pub enum PiEvent {
 #[derive(Debug, Deserialize)]
 pub struct WireMessage {
     pub role: String, // "user" | "assistant" | "toolResult" ...; content left undeclared for now
+    /// The message's token accounting (`usage` on the wire).
+    ///
+    /// **`None` means "not reported", never "zero spent".** A `user` message's
+    /// `message_end` carries no usage, and some providers report nothing at all —
+    /// reading that as zero would put a confidently wrong number on the row.
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+/// One assistant message's token accounting, as pi reports it.
+///
+/// Field names mirror pi's own `Usage` (`@earendil-works/pi-ai`, `types.d.ts`);
+/// the wire is camelCase. Every field is `#[serde(default)]` because providers omit
+/// pieces independently, and a partial record is still worth counting for what it
+/// does carry.
+///
+/// What is deliberately **not** modelled: `cost`, and the `cacheWrite1h` /
+/// `reasoning` splits. The row shows tokens, and a field with no reader is a
+/// dead-code allowance that answers nothing.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Usage {
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_write: u64,
 }
 
 /// The nested `assistantMessageEvent` of `message_update` (delta-only on the wire).
@@ -596,6 +626,11 @@ impl App {
             // ticket. Leaving a stale claim on the row would have the UI naming a
             // bead no live process owns.
             v.active_bead = None;
+            // Nor is it holding the previous one's bill. A respawned child is a new
+            // session, and `↑ in / ↓ out` means "this session", so it starts at
+            // nothing — carrying a dead child's total over would make a plain
+            // respawn read like a runaway.
+            v.tokens = Default::default();
         }
         v
     }
@@ -692,10 +727,7 @@ impl App {
             active: self.sess(self.active),
             background: self.busy_background(),
             warm: self.warm_modes(),
-            dropped_bytes: self
-                .view(self.active)
-                .map(SessionView::dropped_bytes)
-                .unwrap_or(0),
+            tokens: self.view(self.active).map(|v| v.tokens).unwrap_or_default(),
             spinner: self.row_spinner,
         }
         .line(width)
@@ -870,7 +902,15 @@ impl App {
                 // the status row (looprs-guh) reads this field, and nothing here
                 // decides what to *do* with it.
                 self.dirty = true;
-                self.view_mut(session).active_bead = bead;
+                let v = self.view_mut(session);
+                // Taking a claim opens a fresh token window: from here the row
+                // answers "what is *this ticket* costing". Releasing one (None)
+                // deliberately leaves the total alone, so the number survives the
+                // pass it describes.
+                if bead.is_some() {
+                    v.tokens = Default::default();
+                }
+                v.active_bead = bead;
             }
             Msg::SessionDown { session, reason } => {
                 // Q5 rule 3: death must seal. Unconditional, because the pump
@@ -1132,6 +1172,14 @@ fn apply_pi(view: &mut SessionView, ev: PiEvent) {
         // user messages are already echoed locally on submit; ignore pi's copy
         PiEvent::MessageEnd { message } if message.role == "assistant" => {
             view.transcript.finish_last();
+            // The authoritative per-message accounting, folded into this view's
+            // window. Only ever here, and never from `message_update`'s `usage`,
+            // because that figure is cumulative for the message still streaming —
+            // see [`Tokens::add`]. One `message_end` per API call is every bit as
+            // live as the row needs, and cannot be double counted.
+            if let Some(u) = message.usage {
+                view.tokens.add(&u);
+            }
         }
         PiEvent::ToolExecutionStart {
             tool_call_id,
@@ -1166,6 +1214,7 @@ fn apply_pi(view: &mut SessionView, ev: PiEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::view::Tokens;
     use crate::session::{BeadStep, SessionStatus};
 
     fn app_with(active: TerminalType) -> (App, mpsc::Receiver<UiCommand>) {
@@ -1219,6 +1268,209 @@ mod tests {
                     .join("|")
             })
             .unwrap_or_default()
+    }
+
+    // ─────────────────── the token window (the row's cost facts) ───────────────────
+    //
+    // `↑in ↓out` is a *window*, not a global counter, and which window a mode
+    // gets is the design (see `SessionView::tokens`). Every number here was handed
+    // to the App by a `Msg`, so none of it depends on a child, a provider, or a
+    // fixture's arithmetic.
+
+    fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) -> Usage {
+        Usage {
+            input,
+            output,
+            cache_read,
+            cache_write,
+        }
+    }
+
+    fn ended(session: SessionId, role: &str, u: Option<Usage>) -> Msg {
+        Msg::Agent {
+            session,
+            event: PiEvent::MessageEnd {
+                message: WireMessage {
+                    role: role.to_string(),
+                    usage: u,
+                },
+            },
+        }
+    }
+
+    fn claim(id: &str) -> Msg {
+        Msg::ActiveBead {
+            session: beads_id(),
+            bead: Some(ActiveBead {
+                id: id.to_string(),
+                title: format!("ticket {id}"),
+            }),
+        }
+    }
+
+    fn beads_tokens(app: &App) -> Tokens {
+        app.view(TerminalType::Beeds).unwrap().tokens
+    }
+
+    fn pi_tokens(app: &App) -> Tokens {
+        app.view(TerminalType::Pi).unwrap().tokens
+    }
+
+    /// The window adds every assistant message's usage, and nothing else adds.
+    ///
+    /// The two no-rows carry the weight. A `user` message's `message_end` is not
+    /// assistant work, and an assistant message that reported **nothing** is not a
+    /// message that cost nothing: `None` must never be counted as zero.
+    #[test]
+    fn every_assistant_message_adds_and_nothing_else_does() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        app.update(ended(pi_id(), "assistant", Some(usage(100, 40, 900, 25))));
+        app.update(ended(pi_id(), "assistant", Some(usage(200, 80, 1800, 50))));
+        let t = pi_tokens(&app);
+        assert_eq!((t.input, t.output, t.cache), (300, 120, 2775), "{t:?}");
+
+        app.update(ended(pi_id(), "user", Some(usage(999, 999, 999, 999))));
+        app.update(ended(pi_id(), "toolResult", Some(usage(9, 9, 9, 9))));
+        app.update(ended(pi_id(), "assistant", None));
+        assert_eq!(pi_tokens(&app), t, "not one of those moved the total");
+    }
+
+    /// A claim opens a fresh window; releasing one deliberately does not close it.
+    ///
+    /// "What is this ticket costing" is only answerable if the number restarts at
+    /// the claim, and it is only *worth* anything after the pass if it survives the
+    /// release that follows it.
+    #[test]
+    fn the_beads_window_opens_on_a_claim_and_survives_the_release() {
+        let (mut app, _rx) = app_with(TerminalType::Beeds);
+        app.update(ended(beads_id(), "assistant", Some(usage(10, 5, 20, 1))));
+        assert_eq!(
+            beads_tokens(&app).input,
+            10,
+            "unclaimed spend sits in the window"
+        );
+
+        app.update(claim("A"));
+        assert!(beads_tokens(&app).is_empty(), "ticket A starts at nothing");
+        app.update(ended(beads_id(), "assistant", Some(usage(70, 30, 600, 10))));
+        let a = beads_tokens(&app);
+        assert_eq!((a.input, a.output, a.cache), (70, 30, 610), "{a:?}");
+
+        // Released, still on show: the row answers what A cost.
+        app.update(Msg::ActiveBead {
+            session: beads_id(),
+            bead: None,
+        });
+        assert_eq!(beads_tokens(&app), a, "a release is not a reset");
+
+        // And B never inherits A's bill.
+        app.update(claim("B"));
+        assert!(beads_tokens(&app).is_empty(), "B is a fresh window");
+    }
+
+    /// A respawned child starts at nothing.
+    ///
+    /// The row means "this session", and a new generation *is* a new session —
+    /// carrying the dead child's total over would make an ordinary respawn read
+    /// like a runaway on the one number the user watches for that.
+    #[test]
+    fn a_new_generation_starts_the_window_at_nothing() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        app.update(ended(pi_id(), "assistant", Some(usage(500, 200, 4000, 90))));
+        assert!(!pi_tokens(&app).is_empty());
+
+        let gen2 = SessionId::new(TerminalType::Pi, 2);
+        app.update(Msg::SessionStatus {
+            session: gen2,
+            status: SessionStatus::Idle,
+        });
+        assert!(
+            pi_tokens(&app).is_empty(),
+            "the new incarnation owes nothing for the old one's run"
+        );
+    }
+
+    /// The wire shape, parsed from bytes shaped like pi's own.
+    ///
+    /// camelCase on the wire; every field independently optional. `message_update`
+    /// carries a **cumulative** `usage` that this harness deliberately does not
+    /// model — the test pins that it still parses, and that nothing on the
+    /// streaming path can fold it into a total twice.
+    #[test]
+    fn the_wire_usage_record_parses_as_pi_writes_it() {
+        let full: PiEvent = serde_json::from_str(
+            r#"{"type":"message_end","message":{"role":"assistant","usage":{"input":1234,"output":56,"cacheRead":9000,"cacheWrite":25}}}"#,
+        )
+        .expect("a full usage record parses");
+        let PiEvent::MessageEnd { message } = full else {
+            panic!("expected message_end");
+        };
+        let u = message.usage.expect("usage present");
+        assert_eq!(
+            (u.input, u.output, u.cache_read, u.cache_write),
+            (1234, 56, 9000, 25),
+            "camelCase mapped: {u:?}"
+        );
+
+        // A provider that reports only two of the four still lands; the rest are
+        // zero-because-absent, which the window treats as "nothing to add".
+        let part: PiEvent = serde_json::from_str(
+            r#"{"type":"message_end","message":{"role":"assistant","usage":{"input":7,"output":3}}}"#,
+        )
+        .expect("a partial usage record parses");
+        let PiEvent::MessageEnd { message } = part else {
+            panic!("expected message_end");
+        };
+        let u = message.usage.expect("usage present");
+        assert_eq!(
+            (u.input, u.output, u.cache_read, u.cache_write),
+            (7, 3, 0, 0)
+        );
+
+        // No usage at all is `None` — never a zero-cost message.
+        let none: PiEvent = serde_json::from_str(
+            r#"{"type":"message_end","message":{"role":"user","content":"hi"}}"#,
+        )
+        .expect("a usage-less message_end parses");
+        let PiEvent::MessageEnd { message } = none else {
+            panic!("expected message_end");
+        };
+        assert!(
+            message.usage.is_none(),
+            "absent is absent: {:?}",
+            message.usage
+        );
+
+        // The streaming event's cumulative `usage` is not a modelled field, and
+        // must not become one silently: it parses, and lands in the same variant.
+        let upd: PiEvent = serde_json::from_str(concat!(
+            r#"{"type":"message_update","usage":{"input":100,"output":20,"cacheRead":900,"cacheWrite":25},"#,
+            r#""assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"hi"}}"#,
+        ))
+        .expect("message_update parses with its cumulative usage alongside");
+        assert!(matches!(upd, PiEvent::MessageUpdate { .. }));
+    }
+
+    /// The row's cost facts come out of the view that owns them — and the empty
+    /// window prints nothing rather than `↑0 ↓0`.
+    #[test]
+    fn the_row_prints_the_window_it_is_handed() {
+        let (mut app, _rx) = app_with(TerminalType::Beeds);
+        let empty = app.status_line(120).to_string();
+        assert!(
+            !empty.contains('\u{2191}'),
+            "nothing reported, nothing printed: {empty:?}"
+        );
+
+        app.update(claim("A"));
+        app.update(ended(
+            beads_id(),
+            "assistant",
+            Some(usage(12_345, 678, 90_000, 0)),
+        ));
+        let row = app.status_line(120).to_string();
+        assert!(row.contains("\u{2191}12.3k \u{2193}678"), "{row:?}");
+        assert!(row.contains("cache 90.0k"), "{row:?}");
     }
 
     /// The fix for the whole "I tabbed away and the other session wrecked this
@@ -1657,6 +1909,7 @@ mod tests {
                 event: PiEvent::MessageStart {
                     message: WireMessage {
                         role: role.to_string(),
+                        usage: None,
                     },
                 },
             });
@@ -1665,6 +1918,7 @@ mod tests {
                 event: PiEvent::MessageEnd {
                     message: WireMessage {
                         role: role.to_string(),
+                        usage: None,
                     },
                 },
             });
@@ -1703,6 +1957,7 @@ mod tests {
             event: PiEvent::MessageEnd {
                 message: WireMessage {
                     role: "assistant".to_string(),
+                    usage: None,
                 },
             },
         });
