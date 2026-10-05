@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
     // its chrome plus one row — instead of the constant 10 it used to be. From
     // here on the frame decides the shape; see `viewport`.
     let rows = crossterm::terminal::size().map(|(_, r)| r).unwrap_or(24);
-    let boot_h = viewport::desired_height(initial, rows, 0, 0);
+    let boot_h = viewport::desired_height(initial, rows, 0, 0, viewport::MIN_INPUT_ROWS);
     let mut live = viewport::LiveView::with_anchor(
         CrosstermBackend::new(io::stdout()),
         boot_h,
@@ -279,11 +279,18 @@ async fn run(
                     let lines = app.flush_active(app.width);
                     let preview = app.preview_active(app.width);
                     let tools = app.live_tool_rows();
+                    // Computed once and handed to both the height policy and the
+                    // frame, for the same reason `preview` is: the rows the box
+                    // asked for and the rows it is drawn with must be one number,
+                    // or the box grows a row of blank space (or loses a row of
+                    // typed text) every time the two disagree.
+                    let input = app.input_rows(app.width);
                     let want = viewport::desired_height(
                         app.active,
                         live.rows()?,
                         preview.len(),
                         tools,
+                        input,
                     );
                     // Rebuilding an inline viewport reads the cursor position
                     // back, and the async key reader would eat the answer — the
@@ -306,7 +313,7 @@ async fn run(
                     // before it has swapped buffers or flushed anything, so there
                     // is nothing inconsistent to recover from: leave `dirty` set
                     // and the next frame tries again.
-                    if let Err(e) = live.draw(|f| view(&app, f, &preview)) {
+                    if let Err(e) = live.draw(|f| view(&app, f, &preview, input)) {
                         tracing::warn!("frame not drawn: {e}");
                     } else {
                         app.dirty = false;
@@ -427,7 +434,11 @@ async fn drain_sessions(
 /// `preview` is the active view's live tail, rendered once by the caller and shared
 /// with the height policy so the number that sized this frame and the lines drawn
 /// into it are the same value, not two renders that might disagree.
-fn view(app: &App, f: &mut Frame, preview: &[Line<'static>]) {
+///
+/// `input_rows` is shared for the same reason: it is the height the box asked for
+/// when the frame was sized, so the box is drawn into the rows it was promised and
+/// not into a re-derived guess.
+fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
     let active = app.active_view();
     let tools: Vec<&Entry> = active
         .map(|v| {
@@ -438,7 +449,7 @@ fn view(app: &App, f: &mut Frame, preview: &[Line<'static>]) {
         })
         .unwrap_or_default();
     let [text_area, tool_area, status_area, input] =
-        viewport::frame_areas(f.area(), tools.len() as u16);
+        viewport::frame_areas(f.area(), tools.len() as u16, input_rows);
 
     // What the live region shows is a property of the session on screen, not of any
     // session that happens to be streaming.
@@ -512,9 +523,15 @@ mod tests {
     }
 
     fn paint(app: &App, h: u16) -> Vec<String> {
+        paint_with(app, h, viewport::MIN_INPUT_ROWS)
+    }
+
+    /// As [`paint`], with the box given `input_rows` — the same value the height
+    /// policy was asked to size the frame for.
+    fn paint_with(app: &App, h: u16, input_rows: u16) -> Vec<String> {
         let backend = TestBackend::new(60, h);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| view(app, f, &[])).unwrap();
+        term.draw(|f| view(app, f, &[], input_rows)).unwrap();
         rows(term.backend())
     }
 
@@ -524,7 +541,8 @@ mod tests {
     #[test]
     fn the_status_row_is_painted_into_the_band_the_layout_reserved_for_it() {
         let app = app(TerminalType::Beeds, true);
-        let [_, _, status, _] = viewport::frame_areas(Rect::new(0, 0, 60, 12), 0);
+        let [_, _, status, _] =
+            viewport::frame_areas(Rect::new(0, 0, 60, 12), 0, viewport::MIN_INPUT_ROWS);
         let screen = paint(&app, 12);
         let row = &screen[status.y as usize];
         assert_eq!(status.height, 1);
@@ -532,6 +550,32 @@ mod tests {
             row.contains("Beeds") && row.contains("not started"),
             "the reserved row came back empty: {screen:?}"
         );
+    }
+
+    /// The wiring, not just the arithmetic: `view` must spend the `input_rows` it
+    /// was handed, so a long message is actually painted across the rows the policy
+    /// gave the box — with the status row keeping its place directly above it.
+    #[test]
+    fn the_box_is_painted_over_the_rows_the_policy_gave_it() {
+        let mut app = app(TerminalType::Pi, true);
+        app.input
+            .set_text(format!("{} THE-END", "word ".repeat(20)));
+        let want = app.input_rows(60);
+        let h = viewport::desired_height(TerminalType::Pi, 40, 0, 0, want);
+        let [_, _, status, input] = viewport::frame_areas(Rect::new(0, 0, 60, h), 0, want);
+        assert!(
+            input.height > viewport::MIN_INPUT_ROWS,
+            "the box did not grow: {input:?}"
+        );
+
+        let screen = paint_with(&app, h, want);
+        let band: String = screen[input.y as usize..input.bottom() as usize].concat();
+        assert!(
+            band.contains("THE-END"),
+            "the tail of the message never reached the box: {screen:?}"
+        );
+        assert_eq!(status.bottom(), input.top());
+        assert!(screen[status.y as usize].contains("Pi"), "{screen:?}");
     }
 
     /// The row is there when there is no input box to share the frame with. A
@@ -548,7 +592,8 @@ mod tests {
             session: SessionId::new(TerminalType::Beeds, 1),
             status: SessionStatus::Running,
         });
-        let [_, _, status, input] = viewport::frame_areas(Rect::new(0, 0, 60, 12), 0);
+        let [_, _, status, input] =
+            viewport::frame_areas(Rect::new(0, 0, 60, 12), 0, viewport::MIN_INPUT_ROWS);
         let screen = paint(&app, 12);
         assert!(screen[status.y as usize].contains("working"), "{screen:?}");
         // …and the box really is gone, so the row is not being confused with it.
@@ -569,7 +614,8 @@ mod tests {
             text: "spawn failed: bash not found on PATH".into(),
         });
         for h in 5u16..=20 {
-            let [_, _, status, _] = viewport::frame_areas(Rect::new(0, 0, 60, h), 0);
+            let [_, _, status, _] =
+                viewport::frame_areas(Rect::new(0, 0, 60, h), 0, viewport::MIN_INPUT_ROWS);
             let screen = paint(&app, h);
             let band = &screen[status.y as usize];
             assert!(band.contains("Bash"), "h={h}: {screen:?}");

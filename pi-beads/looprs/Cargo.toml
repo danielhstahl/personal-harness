@@ -22,6 +22,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 # trips a future-incompat lint inside nix's own build script; that is a dependency
 # warning, not ours (see ADR-0001 "Costs / follow-ups").
 portable-pty = "0.9.0"
+reqwest = "0.13.5"
 
 [dev-dependencies]
 # examples/spike_bash.rs (the ADR-0001 spike) uses portable-pty, which is now a

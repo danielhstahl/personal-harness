@@ -12,6 +12,7 @@ use crate::session::{
     ActiveBead, ByteStream, ChatState, ExitReason, SessionId, SessionStatus, TerminalType,
 };
 use crate::state::transcript::MessageKind;
+use crate::viewport::{self, INPUT_BORDER_ROWS};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::text::Line;
 use serde::Deserialize;
@@ -655,6 +656,23 @@ impl App {
             .unwrap_or(0)
     }
 
+    /// How many rows the input box wants this frame, at `width`.
+    ///
+    /// It grows with the text instead of cutting it off at one line, which is the
+    /// difference between typing into a box and typing into a slot. The count comes
+    /// from the *same* wrapping the box draws with
+    /// ([`InputState::display_lines`]), so the height policy and the pixels cannot
+    /// disagree — the same reason [`Self::preview_active`] is the only way to the
+    /// live text. Capped by [`viewport::MAX_INPUT_ROWS`]: the box and the live
+    /// preview want the same rows, and past the cap the box scrolls to the caret
+    /// rather than winning the argument.
+    pub fn input_rows(&self, width: u16) -> u16 {
+        let inner = (width as usize)
+            .saturating_sub(INPUT_BORDER_ROWS as usize)
+            .max(1);
+        viewport::input_rows(self.input.display_lines(inner).len() as u16)
+    }
+
     /// The status row for this frame (looprs-guh).
     ///
     /// `App`'s job here is to *gather*, not to decide: every fact comes off a view
@@ -1146,6 +1164,33 @@ mod tests {
     fn app_with(active: TerminalType) -> (App, mpsc::Receiver<UiCommand>) {
         let (tx, rx) = mpsc::channel::<UiCommand>(16);
         (App::new(tx, InputState::new(), active, 80), rx)
+    }
+
+    /// The wiring between the box and the height policy: what the app asks the frame
+    /// for *is* what the box's own wrapping needs, capped. If those two drift the
+    /// box gets cut off, or the pane grows a band of blank space nobody can
+    /// explain from a screenshot.
+    #[test]
+    fn the_app_asks_for_the_rows_the_box_actually_wraps_into() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let width = 22u16; // inner width 20
+        for n in 0usize..=200 {
+            app.input.set_text("x".repeat(n));
+            let inner = (width as usize) - INPUT_BORDER_ROWS as usize;
+            let wrapped = app.input.display_lines(inner).len() as u16;
+            assert_eq!(
+                app.input_rows(width),
+                viewport::input_rows(wrapped),
+                "{n} characters typed"
+            );
+        }
+        // Grows with the text, then stops at the cap.
+        app.input.set_text("x".to_string());
+        assert_eq!(app.input_rows(width), viewport::MIN_INPUT_ROWS);
+        app.input.set_text("x".repeat(40)); // two rows of 20 cells
+        assert_eq!(app.input_rows(width), viewport::MIN_INPUT_ROWS + 1);
+        app.input.set_text("x".repeat(200)); // ten rows wanted, the cap wins
+        assert_eq!(app.input_rows(width), viewport::MAX_INPUT_ROWS);
     }
 
     fn beads_id() -> SessionId {

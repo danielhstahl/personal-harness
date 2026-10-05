@@ -14,9 +14,9 @@
 //!
 //! # The policy
 //!
-//! `desired_height(mode, term_rows, preview_rows, tool_rows)` — the live region is
-//! exactly as tall as its chrome plus the live text that wants to be on screen,
-//! clamped at both ends:
+//! `desired_height(mode, term_rows, preview_rows, tool_rows, input_rows)` — the
+//! live region is exactly as tall as its chrome plus the live text that wants to
+//! be on screen, clamped at both ends:
 //!
 //! * **floor** — the chrome plus one row of live text. A frame that cannot show
 //!   its input box is broken, so the floor wins over the ceiling on a six-row
@@ -26,6 +26,11 @@
 //!   grows to the whole screen and makes scrollback jump": the margin keeps some
 //!   scrollback *visible* so the live region reads as a pane inside a transcript,
 //!   and the cap keeps a 100-row window from becoming one giant preview.
+//! * **the input box is chrome that grows** — `input_rows` is how tall the box
+//!   wants to be for the text typed into it, and it is spent before the live text
+//!   gets anything, because a box the user cannot see the end of is worse than a
+//!   short preview. It is capped at [`MAX_INPUT_ROWS`] so a long paste cannot eat
+//!   the pane, and past the cap the box scrolls to the caret instead of growing.
 //! * **per mode** — Pi and the beads loop are prose, and grow. Bash is capped at
 //!   one preview row on purpose: complete lines of shell output go straight to the
 //!   scrollback as the transcript's own lines (ADR-0001 rule 1), so the live
@@ -114,8 +119,26 @@ use crate::teardown::LiveAnchor;
 /// in the height policy — the two must be one constant or the frame grows a row of
 /// blank space that nobody can explain.
 pub const STATUS_ROWS: u16 = 1;
-/// The input box, borders included.
-pub const INPUT_ROWS: u16 = 3;
+/// The input box's two border rows. Its text lives between them, so a box showing
+/// `n` rows of text costs the frame `n + INPUT_BORDER_ROWS` rows.
+pub const INPUT_BORDER_ROWS: u16 = 2;
+/// The least text the box ever shows. An empty box is still a box with a caret in
+/// it, and this is also what gets reserved when the box is not drawn at all.
+pub const MIN_INPUT_TEXT_ROWS: u16 = 1;
+/// The most text the box is allowed to show at once.
+///
+/// The cap is load-bearing, not cosmetics: the input box and the live preview
+/// compete for the *same* rows, so an uncapped box turns a long paste into a pane
+/// that is all question and no answer. Past the cap the box scrolls to keep the
+/// caret visible rather than growing (see
+/// [`crate::components::input::InputState::display_lines`]).
+pub const MAX_INPUT_TEXT_ROWS: u16 = 6;
+/// The box height for one line of text — what an empty box costs, what gets
+/// reserved when the box is not drawn at all, and what a policy call that is not
+/// interested in the typed text passes as `input_rows`.
+pub const MIN_INPUT_ROWS: u16 = INPUT_BORDER_ROWS + MIN_INPUT_TEXT_ROWS;
+/// The tallest the input box can ever be.
+pub const MAX_INPUT_ROWS: u16 = INPUT_BORDER_ROWS + MAX_INPUT_TEXT_ROWS;
 /// Concurrent tool calls shown at once (was: `tools.take(4)` in `main::view`).
 pub const MAX_TOOL_ROWS: u16 = 4;
 /// A live region is never shorter than this much text, so "streaming" is visible
@@ -131,9 +154,24 @@ pub const KEEP_SCROLLBACK_ROWS: u16 = 3;
 /// preview; it is the scrollback above, which is where finished text lives.
 pub const MAX_LIVE_ROWS: u16 = 40;
 
+/// A requested input-box height, clamped into the range the frame supports.
+///
+/// Every entry point that takes an `input_rows` runs it through this, so
+/// [`desired_height`] and [`frame_areas`] cannot be handed two different answers
+/// for the same request — the failure mode the "one arithmetic" rule below exists
+/// to prevent.
+fn clamped_input_rows(rows: u16) -> u16 {
+    rows.clamp(MIN_INPUT_ROWS, MAX_INPUT_ROWS)
+}
+
+/// The box rows for `text_rows` of wrapped input text.
+pub fn input_rows(text_rows: u16) -> u16 {
+    clamped_input_rows(INPUT_BORDER_ROWS.saturating_add(text_rows))
+}
+
 /// Rows of the frame that are not live preview text.
-pub fn chrome_rows(tool_rows: u16) -> u16 {
-    STATUS_ROWS + INPUT_ROWS + tool_rows.min(MAX_TOOL_ROWS)
+pub fn chrome_rows(tool_rows: u16, input_rows: u16) -> u16 {
+    STATUS_ROWS + clamped_input_rows(input_rows) + tool_rows.min(MAX_TOOL_ROWS)
 }
 
 /// How much live text this mode may ever show, before the screen is consulted.
@@ -153,13 +191,32 @@ pub const fn preview_limit(mode: TerminalType) -> usize {
 /// frames taken mid-resize: the screen minus the keep-visible margin, the absolute
 /// [`MAX_LIVE_ROWS`] cap, and the mode's own ceiling (a mode that only ever shows
 /// one live row cannot fill a fifty-row window).
-pub fn max_live(mode: TerminalType, term_rows: u16) -> u16 {
+pub fn max_live(mode: TerminalType, term_rows: u16, input_rows: u16) -> u16 {
     let text = preview_limit(mode).min(u16::MAX as usize) as u16;
-    let mode_cap = chrome_rows(0).saturating_add(text);
+    let mode_cap = chrome_rows(0, input_rows).saturating_add(text);
     term_rows
         .saturating_sub(KEEP_SCROLLBACK_ROWS)
         .min(MAX_LIVE_ROWS)
         .min(mode_cap)
+}
+
+/// How the two variable bands resolve themselves against a frame this tall.
+///
+/// Both the height policy and the layout go through this, with the same numbers, so
+/// "who gives way when the screen is short" is decided in exactly one place. The
+/// priority is the box first: the input box is taken at its requested height and
+/// the tool rows are cut down to whatever is left, because a preview row you are
+/// not typing into is worth less than a row of the question you are.
+///
+/// Feeding this the height the policy chose makes it return that same resolution —
+/// `chrome + live` is always at least `STATUS + input + tools + MIN_PREVIEW_ROWS`,
+/// so the tool clamp cannot bite below what the policy already granted.
+pub fn bands(tool_rows: u16, input_rows: u16, frame_rows: u16) -> (u16, u16) {
+    let input = clamped_input_rows(input_rows);
+    let tools = tool_rows
+        .min(MAX_TOOL_ROWS)
+        .min(frame_rows.saturating_sub(STATUS_ROWS + input + MIN_PREVIEW_ROWS));
+    (tools, input)
 }
 
 /// The height the live region wants this frame.
@@ -172,23 +229,25 @@ pub fn desired_height(
     term_rows: u16,
     preview_rows: usize,
     tool_rows: u16,
+    input_rows: u16,
 ) -> u16 {
     if term_rows == 0 {
         return 0;
     }
 
-    // A wall of concurrent tool calls must not push the status row or the input
-    // box off the screen, so the tool rows are the first thing given back.
-    let tools = tool_rows
-        .min(MAX_TOOL_ROWS)
-        .min(term_rows.saturating_sub(STATUS_ROWS + INPUT_ROWS + MIN_PREVIEW_ROWS));
-    let chrome = chrome_rows(tools);
+    // The box grows with what has been typed, so its share of the frame is not a
+    // constant any more and has to be paid for here, before the live text gets the
+    // rest. A wall of concurrent tool calls must not push the status row or the
+    // input box off the screen, so the tool rows are still the first thing given
+    // back — the box the user is typing into outranks a preview row.
+    let (tools, input) = bands(tool_rows, input_rows, term_rows);
+    let chrome = chrome_rows(tools, input);
 
     // The smallest honest frame: its chrome, plus a line of live text.
     let floor = (chrome + MIN_PREVIEW_ROWS).min(term_rows);
     // Never below that floor: on a short window, eating the keep-visible margin
     // beats an input box that is not on screen.
-    let ceiling = max_live(mode, term_rows).max(floor).min(term_rows);
+    let ceiling = max_live(mode, term_rows, input).max(floor).min(term_rows);
 
     let live = preview_rows
         .min(preview_limit(mode))
@@ -202,14 +261,20 @@ pub fn desired_height(
 /// `desired_height` adds the chrome up, and this spends it back out. Anything that
 /// makes the two disagree shows up as blank rows inside the live region, which is
 /// a bug nobody can trace from a screenshot.
-pub fn frame_areas(area: Rect, tool_rows: u16) -> [Rect; 4] {
+pub fn frame_areas(area: Rect, tool_rows: u16, input_rows: u16) -> [Rect; 4] {
     use ratatui::layout::{Constraint, Layout};
-    let tools = tool_rows.min(MAX_TOOL_ROWS);
+    // Resolved against *this* area rather than the terminal: the same arithmetic as
+    // the policy, one priority order, and it cannot run the fixed bands past the
+    // bottom edge when the area is smaller than the frame that was asked for (a
+    // `fit` that deferred, a height that changed under us). The box keeps its rows
+    // and the tool wall gives way; the live text band is `Min(0)` and absorbs the
+    // rest.
+    let (tools, input) = bands(tool_rows, input_rows, area.height);
     Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(tools),
         Constraint::Length(STATUS_ROWS),
-        Constraint::Length(INPUT_ROWS),
+        Constraint::Length(input),
     ])
     .areas(area)
 }
@@ -533,9 +598,13 @@ mod tests {
     /// when tool rows eat the rest.
     #[test]
     fn a_long_answer_uses_much_more_than_the_old_ten_rows() {
-        let got = desired_height(TerminalType::Pi, 50, 36, 0);
+        let got = desired_height(TerminalType::Pi, 50, 36, 0, MIN_INPUT_ROWS);
         assert!(got > 10, "36 lines of answer in a 50-row terminal: {got}");
-        assert_eq!(got, chrome_rows(0) + 36, "exactly its chrome plus its text");
+        assert_eq!(
+            got,
+            chrome_rows(0, MIN_INPUT_ROWS) + 36,
+            "exactly its chrome plus its text"
+        );
     }
 
     /// Short output does not reserve the moon: the region is the size of what it
@@ -543,12 +612,12 @@ mod tests {
     #[test]
     fn a_short_answer_does_not_reserve_more_than_it_has() {
         assert_eq!(
-            desired_height(TerminalType::Pi, 50, 1, 0),
-            chrome_rows(0) + 1
+            desired_height(TerminalType::Pi, 50, 1, 0, MIN_INPUT_ROWS),
+            chrome_rows(0, MIN_INPUT_ROWS) + 1
         );
         assert_eq!(
-            desired_height(TerminalType::Pi, 50, 5, 0),
-            chrome_rows(0) + 5
+            desired_height(TerminalType::Pi, 50, 5, 0, MIN_INPUT_ROWS),
+            chrome_rows(0, MIN_INPUT_ROWS) + 5
         );
     }
 
@@ -561,8 +630,8 @@ mod tests {
     fn bash_keeps_one_live_row_and_says_why() {
         for preview in [0, 1, 9, 400] {
             assert_eq!(
-                desired_height(TerminalType::Bash, 50, preview, 0),
-                chrome_rows(0) + BASH_PREVIEW_ROWS as u16,
+                desired_height(TerminalType::Bash, 50, preview, 0, MIN_INPUT_ROWS),
+                chrome_rows(0, MIN_INPUT_ROWS) + BASH_PREVIEW_ROWS as u16,
                 "bash preview rows={preview}"
             );
         }
@@ -580,28 +649,34 @@ mod tests {
             for term_rows in 0u16..=120 {
                 for preview in [0usize, 1, 3, 9, 17, 44, 500] {
                     for tools in [0u16, 1, 4, 9] {
-                        let h = desired_height(mode, term_rows, preview, tools);
-                        assert!(
-                            h <= term_rows,
-                            "{mode:?} rows={term_rows} preview={preview} tools={tools}: {h} > screen"
-                        );
-                        let chrome = chrome_rows(tools.min(
-                            term_rows.saturating_sub(STATUS_ROWS + INPUT_ROWS + MIN_PREVIEW_ROWS),
-                        ));
-                        if term_rows >= chrome + MIN_PREVIEW_ROWS {
+                        for input in [MIN_INPUT_ROWS, MAX_INPUT_ROWS] {
+                            let h = desired_height(mode, term_rows, preview, tools, input);
                             assert!(
-                                h >= chrome + MIN_PREVIEW_ROWS,
-                                "{mode:?} rows={term_rows} preview={preview} tools={tools}: \
-                                 the frame lost its own chrome ({h} < {})",
-                                chrome + MIN_PREVIEW_ROWS
+                                h <= term_rows,
+                                "{mode:?} rows={term_rows} preview={preview} \
+                                 tools={tools} input={input}: {h} > screen"
+                            );
+                            let (want_tools, want_input) = bands(tools, input, term_rows);
+                            let chrome = chrome_rows(want_tools, want_input);
+                            if term_rows >= chrome + MIN_PREVIEW_ROWS {
+                                assert!(
+                                    h >= chrome + MIN_PREVIEW_ROWS,
+                                    "{mode:?} rows={term_rows} preview={preview} \
+                                     tools={tools} input={input}: the frame lost its own \
+                                     chrome ({h} < {})",
+                                    chrome + MIN_PREVIEW_ROWS
+                                );
+                            }
+                            // The keep-visible margin holds whenever the frame can
+                            // afford both it and its chrome.
+                            let room = term_rows
+                                .saturating_sub(KEEP_SCROLLBACK_ROWS)
+                                .max(chrome + MIN_PREVIEW_ROWS);
+                            assert!(
+                                h <= room,
+                                "{mode:?} rows={term_rows} input={input}: {h} ate the margin"
                             );
                         }
-                        // The keep-visible margin holds whenever the frame can
-                        // afford both it and its chrome.
-                        let room = term_rows
-                            .saturating_sub(KEEP_SCROLLBACK_ROWS)
-                            .max(chrome + MIN_PREVIEW_ROWS);
-                        assert!(h <= room, "{mode:?} rows={term_rows}: {h} ate the margin");
                     }
                 }
             }
@@ -612,12 +687,12 @@ mod tests {
     /// window does not turn into one enormous preview with no transcript in sight.
     #[test]
     fn a_tall_terminal_is_capped_rather_than_filled() {
-        let h = desired_height(TerminalType::Pi, 120, 500, 0);
+        let h = desired_height(TerminalType::Pi, 120, 500, 0, MIN_INPUT_ROWS);
         assert_eq!(h, MAX_LIVE_ROWS);
         assert!(h < 120 - KEEP_SCROLLBACK_ROWS);
         // And on a window shorter than the cap, the screen is what bounds it.
         assert_eq!(
-            desired_height(TerminalType::Pi, 20, 500, 0),
+            desired_height(TerminalType::Pi, 20, 500, 0, MIN_INPUT_ROWS),
             20 - KEEP_SCROLLBACK_ROWS
         );
     }
@@ -630,7 +705,7 @@ mod tests {
             for term_rows in [12u16, 24, 50, 90] {
                 let mut last = 0u16;
                 for preview in 0usize..60 {
-                    let h = desired_height(mode, term_rows, preview, 2);
+                    let h = desired_height(mode, term_rows, preview, 2, MIN_INPUT_ROWS);
                     assert!(
                         h >= last,
                         "{mode:?} rows={term_rows}: preview {preview} shrank the region \
@@ -651,45 +726,192 @@ mod tests {
     fn a_wall_of_tools_gives_rows_back_before_the_chrome_goes() {
         // Plenty of screen: four tool rows cost four rows of text.
         assert_eq!(
-            desired_height(TerminalType::Pi, 50, 4, 4),
-            chrome_rows(4) + 4
+            desired_height(TerminalType::Pi, 50, 4, 4, MIN_INPUT_ROWS),
+            chrome_rows(4, MIN_INPUT_ROWS) + 4
         );
-        assert_eq!(chrome_rows(4) - chrome_rows(0), MAX_TOOL_ROWS);
+        assert_eq!(
+            chrome_rows(4, MIN_INPUT_ROWS) - chrome_rows(0, MIN_INPUT_ROWS),
+            MAX_TOOL_ROWS
+        );
         // More tools than we show: capped, not stacked.
-        assert_eq!(chrome_rows(9), chrome_rows(4));
+        assert_eq!(
+            chrome_rows(9, MIN_INPUT_ROWS),
+            chrome_rows(4, MIN_INPUT_ROWS)
+        );
         // A short screen with a tool wall: tools shrink until the chrome fits.
-        let h = desired_height(TerminalType::Pi, 5, 9, 4);
+        let h = desired_height(TerminalType::Pi, 5, 9, 4, MIN_INPUT_ROWS);
         assert_eq!(
             h, 5,
             "the frame fills the tiny screen without overflowing it"
         );
-        assert!(h >= STATUS_ROWS + INPUT_ROWS + MIN_PREVIEW_ROWS);
+        assert!(h >= STATUS_ROWS + MIN_INPUT_ROWS + MIN_PREVIEW_ROWS);
+    }
+
+    /// The other side of that trade: the box the user is typing into outranks a
+    /// preview row, so a long message takes its rows *first* and the tool wall
+    /// shrinks to pay for them. Nobody loses the input box.
+    #[test]
+    fn a_growing_input_box_takes_its_rows_before_the_preview_does() {
+        let tall = input_rows(MAX_INPUT_TEXT_ROWS);
+        assert_eq!(tall, MAX_INPUT_ROWS);
+        let one_line = desired_height(TerminalType::Pi, 30, 10, 4, MIN_INPUT_ROWS);
+        let long_input = desired_height(TerminalType::Pi, 30, 10, 4, tall);
+        assert_eq!(
+            long_input,
+            one_line + (tall - MIN_INPUT_ROWS),
+            "every row the box asked for came out of the frame, not off the box"
+        );
+        // The frame got taller, it did not overflow, and the box is intact.
+        assert!(long_input <= 30);
+        let [_, _, _, box_area] = frame_areas(Rect::new(0, 0, W as u16, long_input), 4, tall);
+        assert_eq!(box_area.height, tall, "the box got every row it asked for");
+    }
+
+    /// The cap is the point: past it the box does not keep growing, and the frame
+    /// stops getting taller with it.
+    #[test]
+    fn the_input_box_stops_growing_at_its_cap() {
+        assert_eq!(input_rows(0), MIN_INPUT_ROWS);
+        for rows in MIN_INPUT_TEXT_ROWS..=MAX_INPUT_TEXT_ROWS {
+            assert_eq!(
+                input_rows(rows),
+                INPUT_BORDER_ROWS + rows,
+                "text rows={rows}"
+            );
+        }
+        for rows in [MAX_INPUT_TEXT_ROWS + 1, 40, u16::MAX] {
+            assert_eq!(input_rows(rows), MAX_INPUT_ROWS, "input text rows={rows}");
+        }
+        // ...and the frame agrees: 40 rows of typed text and 7 rows of typed text
+        // ask for exactly the same amount of screen.
+        assert_eq!(
+            desired_height(TerminalType::Pi, 50, 3, 0, input_rows(7)),
+            desired_height(TerminalType::Pi, 50, 3, 0, input_rows(40))
+        );
+    }
+
+    /// A tall input box must not be able to squeeze the live text out of the frame,
+    /// and must not be able to push itself off the bottom of it either: with the box
+    /// at its maximum, the box keeps every row it asked for and the live text keeps
+    /// its floor.
+    #[test]
+    fn a_tall_input_box_keeps_its_rows_without_losing_the_live_texts_floor() {
+        let tall = MAX_INPUT_ROWS;
+        let chrome_at_max = tall + STATUS_ROWS;
+        for term_rows in chrome_at_max + MIN_PREVIEW_ROWS..=60u16 {
+            let h = desired_height(TerminalType::Pi, term_rows, 500, MAX_TOOL_ROWS, tall);
+            assert!(h <= term_rows, "rows={term_rows}: {h} > screen");
+            let [text, tools, status, input] =
+                frame_areas(Rect::new(0, 0, W as u16, h), MAX_TOOL_ROWS, tall);
+            assert_eq!(
+                input.height, tall,
+                "rows={term_rows}: the box was cut short of its cap"
+            );
+            assert_eq!(status.height, STATUS_ROWS);
+            assert!(
+                text.height >= MIN_PREVIEW_ROWS,
+                "rows={term_rows}: the live text lost its floor ({} rows) \
+                 [tools={} input={}]",
+                text.height,
+                tools.height,
+                input.height
+            );
+            assert!(tools.height <= MAX_TOOL_ROWS, "rows={term_rows}: {tools:?}");
+        }
     }
 
     /// `desired_height` and `frame_areas` must be the same arithmetic seen from two
     /// ends, or the live region grows a band of blank space nobody can explain.
+    /// Checked against the height the policy actually chose, for the whole table.
     #[test]
     fn the_policy_and_the_layout_spend_one_height() {
-        for tools in 0u16..=6 {
-            for total in chrome_rows(tools.min(MAX_TOOL_ROWS))..=60u16 {
-                let area = Rect::new(0, 0, W as u16, total);
-                let [text, tool_band, status, input] = frame_areas(area, tools);
-                assert_eq!(tool_band.height, tools.min(MAX_TOOL_ROWS));
-                assert_eq!(status.height, STATUS_ROWS);
-                assert_eq!(input.height, INPUT_ROWS);
+        for mode in TerminalType::ALL {
+            for term_rows in 1u16..=90 {
+                for preview in [0usize, 1, 5, 20, 300] {
+                    for tools in [0u16, 1, 4, 9] {
+                        for input in [MIN_INPUT_ROWS, MAX_INPUT_ROWS] {
+                            let (want_tools, want_input) = bands(tools, input, term_rows);
+                            let h = desired_height(mode, term_rows, preview, tools, input);
+                            let [text, tool_band, status, box_band] =
+                                frame_areas(Rect::new(0, 0, W as u16, h), tools, input);
+
+                            // Where the frame can afford its own chrome, every band
+                            // gets exactly the rows the policy counted. Where it
+                            // cannot (a one-row terminal), the layout is free to
+                            // cut — the tiling below is all anyone can promise.
+                            let afford = want_tools + want_input + STATUS_ROWS;
+                            if h >= afford {
+                                assert_eq!(
+                                    box_band.height, want_input,
+                                    "{mode:?} rows={term_rows} preview={preview} tools={tools}: \
+                                     the box was not paid what the policy counted"
+                                );
+                                assert_eq!(
+                                    tool_band.height, want_tools,
+                                    "{mode:?} rows={term_rows} preview={preview}: the tool band \
+                                     spent rows the policy did not grant it"
+                                );
+                            } else {
+                                assert!(
+                                    box_band.bottom() <= h && tool_band.bottom() <= h,
+                                    "{mode:?} rows={term_rows}: a band ran off the frame"
+                                );
+                            }
+                            assert_eq!(status.height, STATUS_ROWS.min(h));
+                            assert_eq!(
+                                text.height as u32
+                                    + tool_band.height as u32
+                                    + status.height as u32
+                                    + box_band.height as u32,
+                                h as u32,
+                                "{mode:?} rows={term_rows} preview={preview} tools={tools} \
+                                 input={input}: the bands do not tile the frame"
+                            );
+                            // And they tile it in order, with no gaps or overlaps.
+                            assert_eq!(text.bottom(), tool_band.top());
+                            assert_eq!(tool_band.bottom(), status.top());
+                            assert_eq!(status.bottom(), box_band.top());
+                            assert_eq!(box_band.bottom(), h);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The layout never spends more on the fixed bands than the area holds: a frame
+    /// drawn into a viewport that has not been reshaped yet (a `fit` that deferred)
+    /// must clip the box rather than push it off the bottom edge.
+    #[test]
+    fn frame_areas_clamps_the_box_to_the_area_it_was_given() {
+        for total in 0u16..MAX_INPUT_ROWS {
+            let [_, _, _, box_band] =
+                frame_areas(Rect::new(0, 0, W as u16, total), 0, MAX_INPUT_ROWS);
+            assert!(
+                box_band.bottom() <= total,
+                "rows={total}: the input box runs off the frame ({}..{})",
+                box_band.top(),
+                box_band.bottom()
+            );
+        }
+    }
+
+    /// The input box never comes out of a frame shorter than it asked for, at any
+    /// width or with any amount of text in it: it is the band the user is typing
+    /// into, so the tool wall gives way rather than the box being cut.
+    #[test]
+    fn the_box_is_always_paid_in_full_when_the_frame_can_afford_it() {
+        for total in 1u16..=90 {
+            for tools in [0u16, 1, 4, 9] {
+                let [_, tool_band, _, box_band] =
+                    frame_areas(Rect::new(0, 0, W as u16, total), tools, MAX_INPUT_ROWS);
                 assert_eq!(
-                    text.height as u32
-                        + tool_band.height as u32
-                        + status.height as u32
-                        + input.height as u32,
-                    total as u32,
-                    "tools={tools} total={total}: the bands do not tile the frame"
+                    box_band.height,
+                    MAX_INPUT_ROWS.min(total.saturating_sub(STATUS_ROWS)),
+                    "rows={total} tools={tools}: the box was cut before the tool wall was"
                 );
-                // And they tile it in order, with no gaps or overlaps.
-                assert_eq!(text.bottom(), tool_band.top());
-                assert_eq!(tool_band.bottom(), status.top());
-                assert_eq!(status.bottom(), input.top());
-                assert_eq!(input.bottom(), area.bottom());
+                assert!(tool_band.height <= MAX_TOOL_ROWS);
+                assert!(box_band.bottom() <= total, "rows={total}: box off the edge");
             }
         }
     }
@@ -697,11 +919,21 @@ mod tests {
     /// The chrome constants the policy adds up are the constants the layout spends.
     #[test]
     fn chrome_is_one_number_not_two() {
-        assert_eq!(chrome_rows(0), STATUS_ROWS + INPUT_ROWS);
-        assert_eq!(chrome_rows(2), STATUS_ROWS + INPUT_ROWS + 2);
+        assert_eq!(chrome_rows(0, MIN_INPUT_ROWS), STATUS_ROWS + MIN_INPUT_ROWS);
         assert_eq!(
-            chrome_rows(u16::MAX),
-            STATUS_ROWS + INPUT_ROWS + MAX_TOOL_ROWS
+            chrome_rows(2, MIN_INPUT_ROWS),
+            STATUS_ROWS + MIN_INPUT_ROWS + 2
+        );
+        assert_eq!(
+            chrome_rows(u16::MAX, MIN_INPUT_ROWS),
+            STATUS_ROWS + MIN_INPUT_ROWS + MAX_TOOL_ROWS
+        );
+        // And with the box grown, the same addition holds.
+        assert_eq!(chrome_rows(0, MAX_INPUT_ROWS), STATUS_ROWS + MAX_INPUT_ROWS);
+        assert_eq!(
+            chrome_rows(0, u16::MAX),
+            STATUS_ROWS + MAX_INPUT_ROWS,
+            "the box cannot ask for more than the cap"
         );
     }
 
@@ -712,7 +944,9 @@ mod tests {
         for mode in TerminalType::ALL {
             for preview in [0usize, 7] {
                 for tools in [0u16, 4] {
-                    assert_eq!(desired_height(mode, 0, preview, tools), 0);
+                    for input in [MIN_INPUT_ROWS, MAX_INPUT_ROWS] {
+                        assert_eq!(desired_height(mode, 0, preview, tools, input), 0);
+                    }
                 }
             }
         }
@@ -1098,7 +1332,7 @@ mod tests {
             flushed.extend(new.iter().cloned());
 
             let rows = live.rows().unwrap();
-            let want = desired_height(mode, rows, preview, 0);
+            let want = desired_height(mode, rows, preview, 0, MIN_INPUT_ROWS);
             let _ = live.fit(want).unwrap();
             if !new.is_empty() {
                 let lines: Vec<Line<'static>> = new.iter().map(|l| Line::from(l.clone())).collect();
