@@ -23,7 +23,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 use std::io::{self, Stdout};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
@@ -33,7 +33,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use crate::session::router::{Router, SHUTDOWN_GRACE};
-use crate::session::{ChatState, SessionConfig, SessionStatus, TerminalType};
+use crate::session::{ChatState, SessionConfig, TerminalType};
 use crate::state::transcript::Entry;
 use crate::teardown::{LiveAnchor, Teardown, install_panic_hook};
 
@@ -142,14 +142,14 @@ async fn run(
     router.boot().await?;
     // Sole owner of the sessions from here on. It never blocks on a child, so Esc
     // cannot queue behind somebody's model call.
-    // The BeadStep that set the initial input gating was emitted before this App
-    // existed, so seed the view from the Router's own state rather than guessing.
-    let seed = router.id_of(initial).map(|id| {
-        (
-            id,
-            !matches!(router.status_of(initial), SessionStatus::Running),
-        )
-    });
+    // The liveness edges fired during `boot()` arrived before this App existed, so
+    // prime the open mode's view from the Router's own mirror. The status row and
+    // the keyboard rule both read that view, and neither should have to guess what
+    // state the session came up in — one `set_status` here is the same write the
+    // missing message would have made.
+    let boot = router
+        .id_of(initial)
+        .map(|id| (id, router.status_of(initial)));
 
     let mut app = App::new(
         cmd_tx,
@@ -157,8 +157,8 @@ async fn run(
         initial,
         live.screen_size()?.width,
     );
-    if let Some((id, awaiting)) = seed {
-        app.view_mut(id).awaiting_user = awaiting;
+    if let Some((id, status)) = boot {
+        app.view_mut(id).set_status(status, Instant::now());
     }
     // Tell the sessions the size they are being shown at before anyone runs a
     // command. A Bash shell spawned later still inherits this: `BashTask::resize`
@@ -513,11 +513,18 @@ mod tests {
             .collect()
     }
 
+    /// A rendered-able app whose active mode is `busy` iff `need_input` is false.
+    ///
+    /// Busy-ness is spelled `Running` because that is what the keyboard rule reads
+    /// — see the mode x liveness table in `session::view`. Which means a *Bash*
+    /// app cannot be built without an input box from here, and no test wants to:
+    /// Bash is the mode that is always open.
     fn app(mode: TerminalType, need_input: bool) -> App {
         let (tx, _rx) = mpsc::channel::<UiCommand>(4);
         let mut app = App::new(tx, InputState::new(), mode, 60);
         if !need_input {
-            app.view_mut(SessionId::new(mode, 1)).awaiting_user = false;
+            app.view_mut(SessionId::new(mode, 1))
+                .set_status(SessionStatus::Running, Instant::now());
         }
         app
     }

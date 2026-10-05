@@ -95,10 +95,10 @@ pub enum Msg {
         session: SessionId,
         step: BeadStep,
     },
-    /// A session's liveness changed (looprs-guh). Mirrored, never acted on: the
-    /// status row answers from it, and the only consequence here is the one
-    /// `SessionView::set_status` already encodes — a dead session hands the input
-    /// box back.
+    /// A session's liveness changed (looprs-guh). Mirrored, and nothing else: the
+    /// status row answers from it, and the only consequence is the one the view
+    /// derives — a session that is not working has its keyboard back, and a dead
+    /// one certainly does (see [`SessionView::accepts_input`]).
     ///
     /// This is not `App::chat_state`, and the two must not be conflated: `chat`
     /// says *the live region has text arriving*, this says *a child exists and what
@@ -613,8 +613,15 @@ impl App {
 
     /// Does the **active** session want typed input? (Was: a global `need_input`.)
     /// No view yet means yes: a mode nobody has opened is idle by definition.
+    ///
+    /// This only picks *which* view to ask. The rule — Bash always, the agentic
+    /// modes only while they are not working — is [`SessionView::accepts_input`],
+    /// and keeping it there is what stops the box and the view disagreeing about
+    /// whose keyboard this is.
     pub fn need_input(&self) -> bool {
-        self.active_view().map(|v| v.awaiting_user).unwrap_or(true)
+        self.active_view()
+            .map(|v| v.accepts_input())
+            .unwrap_or(true)
     }
 
     /// What the live region of the **active** session shows.
@@ -1246,15 +1253,17 @@ mod tests {
     }
 
     /// `need_input` follows the ACTIVE view, not the beads machine: a beads pass
-    /// working off-screen must not hide the Pi input box, and vice versa.
+    /// working off-screen must not hide the Pi input box, and vice versa. The box
+    /// opens and closes on the *view's* derived state, never on whichever mode is
+    /// making noise.
     #[test]
     fn need_input_is_derived_from_the_active_view() {
         let (mut app, _rx) = app_with(TerminalType::Beeds);
         assert!(app.need_input(), "no view yet => ask the human");
 
-        app.update(Msg::BeadStep {
+        app.update(Msg::SessionStatus {
             session: beads_id(),
-            step: BeadStep::WorkTickets,
+            status: SessionStatus::Running,
         });
         assert!(!app.need_input(), "beads is working, so the box is hidden");
 
@@ -1268,7 +1277,41 @@ mod tests {
         app.active = TerminalType::Beeds;
         assert!(
             !app.need_input(),
-            "and coming back must not resurrect a box the beads machine already hid"
+            "and coming back must not resurrect a box the beads run already closed"
+        );
+    }
+
+    /// The other half of the keyboard rule as the App sees it: no matter how many
+    /// agents are working, the Bash view answers yes. This is the whole reason the
+    /// user is never locked out of the harness.
+    #[test]
+    fn bash_takes_input_while_every_agent_is_working() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        app.update(Msg::SessionStatus {
+            session: pi_id(),
+            status: SessionStatus::Running,
+        });
+        app.update(Msg::BeadStep {
+            session: beads_id(),
+            step: BeadStep::WorkTickets,
+        });
+        app.update(Msg::SessionStatus {
+            session: beads_id(),
+            status: SessionStatus::Running,
+        });
+        app.update(Msg::BashOutput {
+            session: SessionId::new(TerminalType::Bash, 1),
+            stream: ByteStream::Merged,
+            chunk: "$ ".into(),
+        });
+
+        assert!(!app.need_input(), "Pi is mid-run");
+        app.active = TerminalType::Beeds;
+        assert!(!app.need_input(), "and so is beads");
+        app.active = TerminalType::Bash;
+        assert!(
+            app.need_input(),
+            "and the shell is open regardless of what the agents are doing"
         );
     }
 
@@ -1332,7 +1375,7 @@ mod tests {
         let v = app.view(TerminalType::Beeds).unwrap();
         assert_eq!(v.status, SessionStatus::Dead);
         assert!(
-            v.awaiting_user,
+            v.accepts_input(),
             "a dead session must not hide the input box"
         );
     }

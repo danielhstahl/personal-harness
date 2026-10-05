@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::text::Line;
 
-use super::SessionId;
+use super::{SessionId, TerminalType};
 use crate::components::scrollback::Flusher;
 use crate::session::ActiveBead;
 use crate::session::{BeadStep, SessionStatus};
@@ -92,13 +92,6 @@ pub struct SessionView {
     pub last_error: Option<String>,
     /// What the live region shows for this session (was: a single global on `App`).
     pub chat: ChatState,
-    /// This session wants typed input. Drives the input box (was: `App::need_input`).
-    ///
-    /// `true` by default: a mode nobody has used yet should accept input, and the
-    /// session will say otherwise the moment it starts work. Note the asymmetry that
-    /// matters — `false` here only ever means "this session is busy", so it must
-    /// never be set on the basis of the input mode.
-    pub awaiting_user: bool,
     /// The ticket the beads loop holds right now (looprs-w7q). `None` for every
     /// other mode, and for beads between passes.
     ///
@@ -134,7 +127,6 @@ impl SessionView {
             run_started: None,
             last_error: None,
             chat: ChatState::Stopped,
-            awaiting_user: true,
             step: None,
             active_bead: None,
             dropped: 0,
@@ -207,26 +199,59 @@ impl SessionView {
         self.enforce_buffer();
     }
 
-    /// Mirror of the owning session's liveness, plus the input gating that follows
-    /// from it: a session with no child must not leave the input box hidden.
+    /// Mirror the owning session's liveness, and wind the run clock.
     ///
-    /// Also the one place the run clock is wound: entering a busy state starts it if
-    /// it is not already running, leaving one stops it. Idempotent in both
-    /// directions, so a session that publishes `Running` twice (a mirror refresh,
-    /// a duplicate edge) does not restart the age the row is showing.
+    /// The run clock is *this run*, not *this session*: the clock starts on the way
+    /// into a busy state and is cleared on the way out, so a session that goes idle
+    /// and busy again starts a new clock rather than inheriting an age hours old.
+    /// Writing it only when busy-ness actually *changes* is what makes both halves
+    /// idempotent — a session that publishes `Running` twice (a mirror refresh, a
+    /// duplicate edge) leaves the age the row is showing alone, and `Idle → Dead`
+    /// has nothing left to clear.
+    ///
+    /// This no longer touches the input box. Input availability is *derived* in
+    /// [`Self::accepts_input`] from the mode plus this same status, so a liveness
+    /// edge carries no opinion about the keyboard and there is nothing here left to
+    /// keep in step with anything.
     pub fn set_status(&mut self, status: SessionStatus, now: Instant) {
-        let was_busy = self.status.is_busy();
-        self.status = status;
-        if status.is_busy() {
-            if !was_busy {
-                self.run_started = Some(now);
-            }
-        } else {
-            self.run_started = None;
+        if status.is_busy() != self.status.is_busy() {
+            self.run_started = status.is_busy().then_some(now);
         }
+        // A child that is gone cannot still be streaming into the live region, so
+        // stop the preview rather than spinning a spinner over dead text.
+        // (`seal()` closes the transcript itself; this closes the *preview* of it.)
         if !status.is_alive() {
-            self.awaiting_user = true;
             self.chat = ChatState::Stopped;
+        }
+        self.status = status;
+    }
+
+    /// May this mode take typed input right now?
+    ///
+    /// One rule, and it is the whole rule: **an agentic mode owns the keyboard
+    /// while it works; Bash never owns it.** So during a pi run or a beads pass
+    /// the user still has a terminal — exactly one of them, the Bash one — and no
+    /// agent ever has a box competing with the run it is in the middle of.
+    ///
+    /// Derived rather than stored, and that is the point. This used to be a field
+    /// written from three places — `set_status` on death, `set_step` on every
+    /// beads transition, and the boot seed in `main.rs` — which meant "can I type
+    /// here?" had three potential answers depending on which message landed last,
+    /// and `set_status` had to carry the arithmetic to reconcile them. Computed
+    /// here, there is one source of truth, and two useful consequences come free
+    /// with no special case: a session that never started, and a session whose
+    /// child died, are both "not busy", so neither can hold the keyboard hostage.
+    pub fn accepts_input(&self) -> bool {
+        match self.session.mode {
+            // A shell is never mid-turn from our point of view. Its command may
+            // have been running for an hour and the user can still type into it
+            // (Ctrl-C is the shell's, not ours); this is the mode that stays open
+            // while the agents are working.
+            TerminalType::Bash => true,
+            // The agentic modes own the keyboard for the duration of a turn —
+            // including the `Aborting` window, where the turn is still unwinding
+            // and is still an agentic workflow occurring.
+            TerminalType::Pi | TerminalType::Beeds => !self.status.is_busy(),
         }
     }
 
@@ -247,13 +272,19 @@ impl SessionView {
         )
     }
 
-    /// The beads machine moved: record the step (status row) and gate input on it.
+    /// The beads machine moved: record the step, for the status row.
     ///
-    /// The gate is [`BeadStep::awaits_user`], the same predicate the beads session
-    /// uses, so "the loop is waiting" and "the box may open" cannot drift apart
-    /// even though two different types are asking.
+    /// This used to gate the input box as well, on [`BeadStep::awaits_user`]. That
+    /// second gate is gone because it was a copy of a fact already on the wire: the
+    /// beads loop publishes `Idle` for precisely the state `AwaitInput` describes
+    /// — "started, no worker up, waiting for a human" (`BeadsTask::status`) — so
+    /// the step and the liveness mirror are one sentence said twice, and
+    /// [`Self::accepts_input`] reads the copy every mode has rather than keeping a
+    /// second lock that can rust out of sync with the first.
+    ///
+    /// The step still lives here because the row renders it and must not re-derive
+    /// it (looprs-msj). It is a label now, not a lock.
     pub fn set_step(&mut self, step: BeadStep) {
-        self.awaiting_user = step.awaits_user();
         self.step = Some(step);
     }
 
@@ -313,7 +344,6 @@ impl SessionView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::TerminalType;
 
     fn view(mode: TerminalType) -> SessionView {
         SessionView::new(SessionId::new(mode, 0))
@@ -402,48 +432,143 @@ mod tests {
         assert_eq!(v.last_error.as_deref(), Some("shell exited (code 1)"));
     }
 
-    /// Where `App::need_input` used to come from, now per session: the beads step
-    /// gates the input box, and only for the view that owns the beads machine.
+    /// **The whole keyboard table**: mode x liveness -> may the user type here?
+    ///
+    /// Enumerated rather than spot-checked, because this is the one place the
+    /// "only Bash while the agents run" rule lives and a table is the only form
+    /// that shows a missing cell. Read the Bash column as the reason the mode
+    /// exists: the terminal is never taken away.
     #[test]
-    fn a_busy_step_hides_input_only_for_its_own_view() {
-        let mut beads = view(TerminalType::Beeds);
-        let pi = view(TerminalType::Pi);
-        assert!(beads.awaiting_user, "an untouched view accepts input");
+    fn the_keyboard_table_is_mode_times_liveness() {
+        use SessionStatus::*;
+        let table = [
+            //  mode,            liveness,     accepts input
+            (TerminalType::Bash, NotStarted, true),
+            (TerminalType::Bash, Idle, true),
+            (TerminalType::Bash, Running, true),
+            (TerminalType::Bash, Aborting, true),
+            (TerminalType::Bash, Dead, true),
+            (TerminalType::Pi, NotStarted, true),
+            (TerminalType::Pi, Idle, true),
+            (TerminalType::Pi, Running, false),
+            (TerminalType::Pi, Aborting, false),
+            (TerminalType::Pi, Dead, true),
+            (TerminalType::Beeds, NotStarted, true),
+            (TerminalType::Beeds, Idle, true),
+            (TerminalType::Beeds, Running, false),
+            (TerminalType::Beeds, Aborting, false),
+            (TerminalType::Beeds, Dead, true),
+        ];
 
-        beads.set_step(BeadStep::WorkTickets);
-        assert!(
-            !beads.awaiting_user,
-            "a working beads view must not take input"
+        assert_eq!(
+            table.len(),
+            TerminalType::ALL.len() * 5,
+            "one row per mode per liveness state"
         );
-        assert!(
-            pi.awaiting_user,
-            "and that must not leak into the Pi view (that was the global-flag bug)"
-        );
-
-        beads.set_step(BeadStep::AwaitInput);
-        assert!(beads.awaiting_user);
-        assert_eq!(beads.step, Some(BeadStep::AwaitInput));
+        for (mode, status, want) in table {
+            let mut v = view(mode);
+            v.set_status(status, Instant::now());
+            assert_eq!(v.accepts_input(), want, "{mode:?} while {status:?}");
+        }
     }
 
-    /// A dead session must not leave the input box hidden behind it.
+    /// The scenario the rule was written for, end to end: the pi run and the beads
+    /// pass are both going, the user is not locked out — they are in Bash.
+    #[test]
+    fn with_pi_and_beads_both_running_bash_is_still_there() {
+        let now = Instant::now();
+        let mut pi = view(TerminalType::Pi);
+        let mut beads = view(TerminalType::Beeds);
+        let mut bash = view(TerminalType::Bash);
+
+        pi.set_status(SessionStatus::Running, now);
+        beads.set_step(BeadStep::WorkTickets);
+        beads.set_status(SessionStatus::Running, now);
+        bash.set_status(SessionStatus::Running, now); // `make test` in the other pane
+
+        assert!(!pi.accepts_input() && !beads.accepts_input());
+        assert!(
+            bash.accepts_input(),
+            "the agentic modes are locked, but the shell never is"
+        );
+    }
+
+    /// The beads step no longer takes the keyboard either way. It is render-only:
+    /// the loop's `Idle` *is* "waiting for a human", so gating on the step as
+    /// well was a second lock on the same door — and a second lock is a second
+    /// thing that can be left engaged after the door opens.
+    #[test]
+    fn the_step_is_a_label_not_a_lock() {
+        let mut beads = view(TerminalType::Beeds);
+
+        beads.set_step(BeadStep::WorkTickets);
+        assert_eq!(
+            beads.step,
+            Some(BeadStep::WorkTickets),
+            "the row still gets the step it renders"
+        );
+        assert!(
+            beads.accepts_input(),
+            "a step with no busy liveness behind it is not a run"
+        );
+
+        beads.set_status(SessionStatus::Idle, Instant::now());
+        beads.set_step(BeadStep::AwaitInput);
+        assert!(beads.accepts_input(), "and the human's turn still opens it");
+    }
+
+    /// A dead session must not leave the input box hidden behind it — the case the
+    /// old `if !status.is_alive() { awaiting_user = true }` existed for. It needs
+    /// no special case now: `Dead` is not `is_busy()`, so the derived rule opens
+    /// the box on its own. What death *does* still have to do is stop the preview.
     #[test]
     fn a_dead_view_gives_the_input_box_back() {
         let mut v = view(TerminalType::Pi);
-        v.awaiting_user = false;
+        v.set_status(SessionStatus::Running, Instant::now());
         v.chat = ChatState::Chat;
+        assert!(!v.accepts_input(), "mid-run the box is closed");
 
         v.set_status(SessionStatus::Dead, Instant::now());
         assert!(
-            v.awaiting_user,
+            v.accepts_input(),
             "a dead session cannot answer, so ask the human"
         );
-        assert_eq!(v.chat, ChatState::Stopped);
+        assert_eq!(
+            v.chat,
+            ChatState::Stopped,
+            "and the live preview stops with the child, not after it"
+        );
+    }
 
-        // ...while a live-but-idle session keeps whatever gating it had.
-        let mut w = view(TerminalType::Bash);
-        w.awaiting_user = false;
-        w.set_status(SessionStatus::Idle, Instant::now());
-        assert!(!w.awaiting_user);
+    /// The run clock is *this run*. Entering busy starts it, leaving clears it, and
+    /// a repeated edge changes neither — otherwise a duplicate `Running` publish
+    /// would silently restart the age the status row is showing.
+    #[test]
+    fn the_run_clock_winds_on_the_edge_not_on_the_value() {
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(30);
+        let mut v = view(TerminalType::Pi);
+
+        v.set_status(SessionStatus::Running, t0);
+        assert_eq!(v.run_elapsed(later), Some(Duration::from_secs(30)));
+
+        // Same state again, later: the age does not restart.
+        v.set_status(SessionStatus::Running, later);
+        assert_eq!(v.run_elapsed(later), Some(Duration::from_secs(30)));
+
+        // Idle is not a run at all, and leaves no clock behind for the next one.
+        v.set_status(SessionStatus::Idle, later);
+        assert_eq!(v.run_elapsed(later), None);
+
+        // And the next run starts from its own instant, not from t0.
+        let t1 = later + Duration::from_secs(60);
+        v.set_status(SessionStatus::Running, t1);
+        assert_eq!(v.run_elapsed(t1), Some(Duration::ZERO));
+
+        // Through Aborting (busy both sides) the clock is held, not reset.
+        let t2 = t1 + Duration::from_secs(5);
+        v.set_status(SessionStatus::Aborting, t2);
+        assert_eq!(v.run_elapsed(t2), Some(Duration::from_secs(5)));
     }
 
     /// ADR-0002 "Consequences": buffered output while hidden must be capped, and
