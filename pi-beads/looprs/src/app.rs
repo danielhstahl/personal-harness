@@ -715,6 +715,29 @@ impl App {
         viewport::input_rows(self.input.display_lines(inner).len() as u16)
     }
 
+    /// How many rows the input band gets this frame: the box's own height, or
+    /// [`crate::viewport::NO_INPUT_ROWS`] when the active session is not taking
+    /// input.
+    ///
+    /// This is the one place the two decisions the frame makes about the box —
+    /// "is it showing?" and "how tall is it?" — are folded into a single number,
+    /// because they are asked by two different callers: the height policy budgets
+    /// these rows, and `main::view` draws the box into them. If they were two
+    /// separate questions, a mode that hid the box could keep its three reserved
+    /// rows (the status row hanging above a band of blank screen) or, worse, a
+    /// hidden box's rows could be handed out twice.
+    ///
+    /// A hidden box is granted *nothing*: `frame_areas` then puts the status row on
+    /// the bottom edge of the live region, which is where a status row belongs when
+    /// there is nothing under it.
+    pub fn input_band(&self, width: u16) -> u16 {
+        if self.need_input() {
+            self.input_rows(width)
+        } else {
+            crate::viewport::NO_INPUT_ROWS
+        }
+    }
+
     /// The status row for this frame (looprs-guh).
     ///
     /// `App`'s job here is to *gather*, not to decide: every fact comes off a view
@@ -1247,6 +1270,40 @@ mod tests {
         assert_eq!(app.input_rows(width), viewport::MIN_INPUT_ROWS + 1);
         app.input.set_text("x".repeat(200)); // ten rows wanted, the cap wins
         assert_eq!(app.input_rows(width), viewport::MAX_INPUT_ROWS);
+    }
+
+    /// The one place "is the box showing?" and "how tall is it?" become a single
+    /// number, so the height policy and the drawn box cannot each make their own
+    /// mind up. Hidden means *zero rows granted*, not a box drawn somewhere else:
+    /// that is what lets the status row sit on the bottom edge of the live region
+    /// instead of hanging above a band nothing is drawn into.
+    #[test]
+    fn the_input_band_is_the_box_when_it_shows_and_nothing_when_it_is_hidden() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        app.input.set_text("a question to type".to_string());
+        assert!(app.need_input(), "nothing running: the box is open");
+        assert_eq!(
+            app.input_band(60),
+            app.input_rows(60),
+            "a showing box is budgeted its measured height"
+        );
+
+        app.view_mut(pi_id())
+            .set_status(SessionStatus::Running, Instant::now());
+        assert!(!app.need_input(), "Pi is mid-run: the box is hidden");
+        assert_eq!(
+            app.input_band(60),
+            viewport::NO_INPUT_ROWS,
+            "a hidden box must be granted nothing, not its old height"
+        );
+
+        // Bash always takes the keyboard, so its band is always the box — even
+        // while a command is running (it is the human's shell).
+        let (mut bash, _rx) = app_with(TerminalType::Bash);
+        bash.view_mut(crate::session::SessionId::new(TerminalType::Bash, 1))
+            .set_status(SessionStatus::Running, Instant::now());
+        assert!(bash.need_input(), "bash is always open");
+        assert_eq!(bash.input_band(60), bash.input_rows(60));
     }
 
     fn beads_id() -> SessionId {

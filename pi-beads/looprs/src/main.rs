@@ -296,8 +296,12 @@ async fn run(
                     // frame, for the same reason `preview` is: the rows the box
                     // asked for and the rows it is drawn with must be one number,
                     // or the box grows a row of blank space (or loses a row of
-                    // typed text) every time the two disagree.
-                    let input = app.input_rows(app.width);
+                    // typed text) every time the two disagree. This is also where
+                    // a hidden box costs nothing: `input_band` returns zero rows
+                    // for a session that has taken the keyboard, so the status row
+                    // ends the live region instead of hanging above three blank
+                    // rows where no box was drawn.
+                    let input = app.input_band(app.width);
                     let want = viewport::desired_height(
                         app.active,
                         live.rows()?,
@@ -449,8 +453,9 @@ async fn drain_sessions(
 /// into it are the same value, not two renders that might disagree.
 ///
 /// `input_rows` is shared for the same reason: it is the height the box asked for
-/// when the frame was sized, so the box is drawn into the rows it was promised and
-/// not into a re-derived guess.
+/// when the frame was sized — or [`viewport::NO_INPUT_ROWS`] when the active
+/// session is not taking input — so the box is drawn into the rows it was promised
+/// and not into a re-derived guess.
 fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
     let active = app.active_view();
     let tools: Vec<&Entry> = active
@@ -490,8 +495,10 @@ fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
         status_area,
     );
 
-    // input
-    if app.need_input() {
+    // input. `App::input_band` — the value `input_rows` was built from — is zero
+    // for a session that has taken the keyboard, so the box is never drawn when it
+    // is not wanted, and never drawn outside the band the height policy paid for.
+    if app.need_input() && !input.is_empty() {
         app.input.render(f, input)
     }
 }
@@ -621,6 +628,75 @@ mod tests {
         assert!(
             box_rows.iter().all(|r| r.trim().is_empty()),
             "the input box was drawn when it should not have been: {screen:?}"
+        );
+    }
+
+    /// The frame the run loop actually builds while the session holds the keyboard:
+    /// the box's band is granted nothing (`App::input_band`), so the status row is
+    /// the live region's last row instead of hanging above three rows of blank
+    /// screen where a box would have been. Every row under it has to be gone, not
+    /// just empty — an empty band still pushes the row up.
+    #[test]
+    fn a_hidden_box_leaves_the_status_row_on_the_last_row_of_the_screen() {
+        let mut app = app(TerminalType::Beeds, false);
+        app.update(Msg::BeadStep {
+            session: SessionId::new(TerminalType::Beeds, 1),
+            step: BeadStep::WorkTickets,
+        });
+        app.update(Msg::SessionStatus {
+            session: SessionId::new(TerminalType::Beeds, 1),
+            status: SessionStatus::Running,
+        });
+        let band = app.input_band(60);
+        assert_eq!(
+            band,
+            viewport::NO_INPUT_ROWS,
+            "a session that took the keyboard asks for no box rows"
+        );
+
+        let h = viewport::desired_height(TerminalType::Beeds, 40, 1, 0, band);
+        let [_, _, status, input] = viewport::frame_areas(Rect::new(0, 0, 60, h), 0, band);
+        assert_eq!(input.height, 0, "the hidden box kept rows: {input:?}");
+        assert_eq!(status.bottom(), h, "the status row does not end the frame");
+
+        let screen = paint_with(&app, h, band);
+        assert_eq!(screen.len(), h as usize);
+        assert!(
+            screen[h as usize - 1].contains("working"),
+            "the bottom row is not the status row: {screen:?}"
+        );
+        // The frame ends where the status row ends: there is no band of blank rows
+        // under it to push it up.
+        assert_eq!(
+            screen.len(),
+            status.bottom() as usize,
+            "rows are left under the status row: {screen:?}"
+        );
+    }
+
+    /// …and hiding it is not permanent: the moment the session hands the keyboard
+    /// back the box's rows come back with it, so the status row only hugs the
+    /// bottom while there is genuinely nothing under it.
+    #[test]
+    fn the_status_row_gives_the_rows_back_when_the_box_reopens() {
+        let mut app = app(TerminalType::Beeds, false);
+        let id = SessionId::new(TerminalType::Beeds, 1);
+        app.view_mut(id)
+            .set_status(SessionStatus::Running, Instant::now());
+        assert_eq!(app.input_band(60), viewport::NO_INPUT_ROWS);
+
+        app.view_mut(id)
+            .set_status(SessionStatus::Idle, Instant::now());
+        assert!(app.need_input(), "idle: the box is open again");
+        let band = app.input_band(60);
+        assert_eq!(band, app.input_rows(60), "the box did not come back whole");
+        let h = viewport::desired_height(TerminalType::Beeds, 40, 1, 0, band);
+        let [_, _, status, input] = viewport::frame_areas(Rect::new(0, 0, 60, h), 0, band);
+        assert_eq!(input.height, band);
+        assert_eq!(status.bottom(), input.top());
+        assert!(
+            status.bottom() < h,
+            "the row should not be at the bottom now"
         );
     }
 

@@ -31,6 +31,9 @@
 //!   gets anything, because a box the user cannot see the end of is worse than a
 //!   short preview. It is capped at [`MAX_INPUT_ROWS`] so a long paste cannot eat
 //!   the pane, and past the cap the box scrolls to the caret instead of growing.
+//!   A frame whose mode has hidden the box passes [`NO_INPUT_ROWS`] instead, which
+//!   grants the band nothing: the status row then ends the live region, instead of
+//!   hanging three rows above a band of blank screen where a box would have been.
 //! * **per mode** — Pi and the beads loop are prose, and grow. Bash is capped at
 //!   one preview row on purpose: complete lines of shell output go straight to the
 //!   scrollback as the transcript's own lines (ADR-0001 rule 1), so the live
@@ -133,10 +136,20 @@ pub const MIN_INPUT_TEXT_ROWS: u16 = 1;
 /// caret visible rather than growing (see
 /// [`crate::components::input::InputState::display_lines`]).
 pub const MAX_INPUT_TEXT_ROWS: u16 = 6;
-/// The box height for one line of text — what an empty box costs, what gets
-/// reserved when the box is not drawn at all, and what a policy call that is not
-/// interested in the typed text passes as `input_rows`.
+/// The box height for one line of text — what an empty box costs, and what a
+/// policy call that is not interested in the typed text passes as `input_rows`
+/// when the box is on screen.
 pub const MIN_INPUT_ROWS: u16 = INPUT_BORDER_ROWS + MIN_INPUT_TEXT_ROWS;
+/// No box at all: the input band is granted zero rows, so the status row comes
+/// down and sits on the bottom edge of the live region.
+///
+/// A mode that hides the box (an agentic session that has taken the keyboard —
+/// see [`crate::session::view::SessionView::accepts_input`]) passes this for the
+/// same reason a mode that shows it passes its measured height: the box's rows are
+/// the frame's to spend, and "how tall is the box" is one question with one
+/// answer per frame. Reserving three rows for a box nobody drew left the status
+/// row floating above a band of blank screen.
+pub const NO_INPUT_ROWS: u16 = 0;
 /// The tallest the input box can ever be.
 pub const MAX_INPUT_ROWS: u16 = INPUT_BORDER_ROWS + MAX_INPUT_TEXT_ROWS;
 /// Concurrent tool calls shown at once (was: `tools.take(4)` in `main::view`).
@@ -160,7 +173,17 @@ pub const MAX_LIVE_ROWS: u16 = 40;
 /// [`desired_height`] and [`frame_areas`] cannot be handed two different answers
 /// for the same request — the failure mode the "one arithmetic" rule below exists
 /// to prevent.
+///
+/// [`NO_INPUT_ROWS`] (`0`) is the one value that bypasses the clamp, because it is
+/// not "a small box", it is "no box": the band is granted nothing rather than
+/// being rounded up to a box that will not be drawn. Note this makes `0` special
+/// in a way no other value is — a caller who means "one-line box, I did not
+/// measure" must pass [`MIN_INPUT_ROWS`], which is what
+/// [`crate::App::input_rows`] returns for empty text.
 fn clamped_input_rows(rows: u16) -> u16 {
+    if rows == NO_INPUT_ROWS {
+        return NO_INPUT_ROWS;
+    }
     rows.clamp(MIN_INPUT_ROWS, MAX_INPUT_ROWS)
 }
 
@@ -649,7 +672,9 @@ mod tests {
             for term_rows in 0u16..=120 {
                 for preview in [0usize, 1, 3, 9, 17, 44, 500] {
                     for tools in [0u16, 1, 4, 9] {
-                        for input in [MIN_INPUT_ROWS, MAX_INPUT_ROWS] {
+                        // `NO_INPUT_ROWS` is in the table too: a mode with the box
+                        // hidden has to fit the same way one with it showing.
+                        for input in [MIN_INPUT_ROWS, MAX_INPUT_ROWS, NO_INPUT_ROWS] {
                             let h = desired_height(mode, term_rows, preview, tools, input);
                             assert!(
                                 h <= term_rows,
@@ -829,7 +854,7 @@ mod tests {
             for term_rows in 1u16..=90 {
                 for preview in [0usize, 1, 5, 20, 300] {
                     for tools in [0u16, 1, 4, 9] {
-                        for input in [MIN_INPUT_ROWS, MAX_INPUT_ROWS] {
+                        for input in [MIN_INPUT_ROWS, MAX_INPUT_ROWS, NO_INPUT_ROWS] {
                             let (want_tools, want_input) = bands(tools, input, term_rows);
                             let h = desired_height(mode, term_rows, preview, tools, input);
                             let [text, tool_band, status, box_band] =
@@ -935,6 +960,95 @@ mod tests {
             STATUS_ROWS + MAX_INPUT_ROWS,
             "the box cannot ask for more than the cap"
         );
+    }
+
+    /// `0` means **no box**, not "an empty box": an empty box is still a box, and
+    /// `input_rows` can never produce the hidden value because it adds the borders
+    /// before clamping. Hiding the band takes the named constant, and any request
+    /// that is merely too short still gets rounded up to a real box.
+    #[test]
+    fn a_hidden_band_is_no_rows_while_an_empty_box_is_still_a_box() {
+        assert_eq!(NO_INPUT_ROWS, 0);
+        assert_eq!(input_rows(0), MIN_INPUT_ROWS, "empty text is still a box");
+        assert_eq!(chrome_rows(0, NO_INPUT_ROWS), STATUS_ROWS);
+        assert_eq!(bands(0, NO_INPUT_ROWS, 60), (0, 0));
+        // A too-short request is a box, so it is rounded up — only `0` hides.
+        assert_eq!(chrome_rows(0, 1), STATUS_ROWS + MIN_INPUT_ROWS);
+    }
+
+    /// The bug this pins: a mode that hides the box (an agentic session that has
+    /// taken the keyboard) still had its three rows reserved, so the status row sat
+    /// above a band of blank screen instead of finishing the frame. With
+    /// [`NO_INPUT_ROWS`] the box band is granted nothing and the status row is the
+    /// live region's last row — at every terminal size, with any tool wall, and for
+    /// every mode.
+    #[test]
+    fn a_hidden_input_box_leaves_the_status_row_on_the_bottom_edge() {
+        for mode in TerminalType::ALL {
+            for term_rows in 1u16..=60 {
+                for preview in [0usize, 1, 5, 40] {
+                    for tools in [0u16, 1, 4, 9] {
+                        let h = desired_height(mode, term_rows, preview, tools, NO_INPUT_ROWS);
+                        let [_, tool_band, status, box_band] =
+                            frame_areas(Rect::new(0, 0, W as u16, h), tools, NO_INPUT_ROWS);
+                        let tag =
+                            format!("{mode:?} rows={term_rows} preview={preview} tools={tools}");
+                        assert_eq!(
+                            box_band.height, 0,
+                            "{tag}: a hidden box still took {} rows",
+                            box_band.height
+                        );
+                        assert_eq!(
+                            box_band.top(),
+                            h,
+                            "{tag}: the band is not empty at the bottom"
+                        );
+                        assert_eq!(status.height, STATUS_ROWS.min(h), "{tag}");
+                        assert_eq!(
+                            status.bottom(),
+                            h,
+                            "{tag}: the status row does not end the frame: {status:?}"
+                        );
+                        assert!(tool_band.height <= MAX_TOOL_ROWS, "{tag}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Hiding the box gives back exactly the rows the box would have taken, and can
+    /// never make the pane taller — the freed rows are the frame's to spend, and
+    /// the only thing they were ever paying for was a box that is not drawn.
+    #[test]
+    fn hiding_the_box_gives_its_rows_back_without_stealing_anything_else() {
+        for tools in [0u16, 1, 4] {
+            assert_eq!(
+                chrome_rows(tools, MIN_INPUT_ROWS) - chrome_rows(tools, NO_INPUT_ROWS),
+                MIN_INPUT_ROWS,
+                "tools={tools}: the hidden band is not the box's rows exactly"
+            );
+            // A stream that fits inside the frame: the whole box comes back.
+            let shown = desired_height(TerminalType::Pi, 60, 5, tools, MIN_INPUT_ROWS);
+            let hidden = desired_height(TerminalType::Pi, 60, 5, tools, NO_INPUT_ROWS);
+            assert_eq!(shown - hidden, MIN_INPUT_ROWS, "tools={tools}");
+            // And across the whole screen-size range, hidden is never the taller one.
+            for term_rows in 1u16..=90 {
+                for preview in [0usize, 3, 40, 500] {
+                    assert!(
+                        desired_height(TerminalType::Pi, term_rows, preview, tools, NO_INPUT_ROWS)
+                            <= desired_height(
+                                TerminalType::Pi,
+                                term_rows,
+                                preview,
+                                tools,
+                                MIN_INPUT_ROWS
+                            ),
+                        "tools={tools} rows={term_rows} preview={preview}: \
+                         hiding the box made the pane taller"
+                    );
+                }
+            }
+        }
     }
 
     /// Total function: nothing this computes may panic on a zero-row terminal,
