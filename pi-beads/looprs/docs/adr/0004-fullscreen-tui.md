@@ -716,6 +716,68 @@ inline pane:
   point of ADR-0001 amendment 4's cut: the child gets the frame's screen and the
   app's screen is never lost.
 
+## Landed — `pdl.6`, the scrollback store, as built
+
+R14's mandatory provenance is one struct, `state::scrollback::DisplayRow`, and
+each field exists because a later ticket asks a question of it that nothing else
+can answer:
+
+| field | what it answers | who asks it |
+| --- | --- | --- |
+| `entry` | which `Transcript` entry the row was rendered from. Re-based when the view buffer compacts (`entries_evicted`) — the one way it can go stale, and the one way it is kept honest | pdl.9: a selection must not cross a mode boundary, and a card's chrome is not a row at all, so there is nothing there to select |
+| `logical` | which logical line within that entry — the run of rows ending in a hard newline, i.e. the unit the *source* wrote, as opposed to the rows our wrap cut it into | pdl.10: where one pasted paragraph ends |
+| `start` | byte offset of this row's first character within that logical line's rendered text (`0` on a line's first row) | pdl.9: the character a cell range maps to, when the selection starts mid-wrap |
+| `end: RowEnd` | `Hard` — the source had a newline here; `Soft` — this is our wrap's continuation | pdl.10: soft joins insert **nothing** (the space the wrap broke on is already gone), hard joins insert exactly one `\n`. Implemented as `paste_text`, tested as `joining_rows_follows_the_hard_soft_rule` |
+| `cells: CellMap` | the row's clusters laid out in cells: `CellSpan { cell, cells, start, end }`, in *cluster* units, not bytes or code points | pdl.9: snap a cell range to character boundaries, so a copy never carries half a CJK glyph or half a ZWJ family |
+
+The pdl.5 decision ("decode SGR, keep the styles") is honoured the way that
+decision asked to be honoured rather than half-implemented: `line` is a ratatui
+`Line` with its spans, the row paints styled, and the copy path never sees any
+of it. `styles_render_and_are_never_copied` is that rule as a test — the same
+row that paints yellow lands in `paste_text` as plain text.
+
+**The scroll state** rides in the same struct: `offset` (rows hanging between
+the bottom of the view and the tail), `pinned` (`offset == 0`, cached and
+written only by `set_offset` so the two cannot disagree), `pending` (rows that
+arrived while unpinned — the "N new" number and nothing else), `width`, and a
+`max_rows` cap whose `dropped` count makes the trim a counted thing instead of
+an invisible one (pdl.7 reads it). There is deliberately **no absolute scroll
+position**: every question the frame asks is relative to the tail, which is the
+only end of this content that moves.
+
+**The re-wrap is anchored on content, not on the row index.** `rewrap` records
+the row the view is resting on as a `ContentAnchor { entry, logical, byte }`
+before the re-render and finds it after, so a window drag keeps the sentence
+under the reader's eye instead of jumping the text. When the anchor's entry has
+been trimmed away the store *holds* rather than inventing a position
+(`rewrap_with_lost_content_holds_rather_than_inventing_a_position`): a guessed
+position is a lie about where the user was.
+
+**The "N new" affordance is an overlay, not a row**, for exactly the reason R21
+gives for the copy toast. An affordance that reserves a row reshapes the text
+below it on every arrival — the thing the user stopped to read would jump each
+time the count ticks. `NewRowsPill` covers cells on the band's bottom row, the
+row the tail would be on, and is gone at a count of zero (`shows_new`).
+
+**What the next tickets inherit in code, not only in rules.**
+
+| call | who calls it |
+| --- | --- |
+| `window(visible)` — the slice the offset says | `TranscriptBand` draws that and nothing else; it takes `&[DisplayRow]` now, so the band has no second, shallower copy of the transcript to keep track of |
+| `scroll_by(delta, visible)` — positive is toward the tail | pdl.8's wheel passes a flick-sized delta; pdl.13's keys pass a page; both are the same call, which is what keeps wheel and keyboard from drifting apart |
+| `scroll_to_tail()` | the one action the pill names |
+| `entries_evicted(removed, notice_at)` | pdl.7's file route starts from rows whose provenance is still true; the test that a byte trim cannot break it is `eviction_leaves_no_row_the_transcript_cannot_re_render` |
+| `paste_text(rows)` | pdl.10's copy path; the hard/soft rule is already in it, so the ticket cannot forget the rule by forgetting to write it |
+
+**Measured.** `src/state/scrollback.rs` is 1077 lines (store plus tests). Unit
+tests 437 → 471. `MAX_DISPLAY_LINES` is gone, `SessionView::display: Vec<Line>`
+is `scrollback: Scrollback`, and `App::transcript()` became `App::scrollback()`
+plus `App::transcript_window(visible)`. The run loop's flush still happens in
+the branch that draws, and still with the width that frame will draw at — what
+changed is that its output goes into a store with an offset instead of a vector
+that is always shown from the end. One new real-pty spike:
+`spikes/scrollback_e2e.py`, **23/23**.
+
 ## Proof
 
 A decision ticket's proof is the measurements it leans on and the fact that they can be re-run:

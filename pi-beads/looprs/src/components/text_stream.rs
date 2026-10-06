@@ -1,13 +1,14 @@
+use crate::state::scrollback::DisplayRow;
 use crate::utils::render::FRAMES;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
-/// The frame's transcript band: what the session has finished saying, plus the
-/// live tail of what it is saying now, pinned to the **bottom** of the space the
-/// band was given.
+/// The frame's transcript band: the window the scroll store opened onto, plus the
+/// live tail of what the session is saying now, pinned to the **bottom** of the
+/// space the band was given.
 ///
 /// Bottom-pinned because that is what the band replaced. Until the full-screen
 /// frame (looprs-pdl.4) the settled lines were printed into the terminal's own
@@ -17,20 +18,20 @@ use ratatui::widgets::{Paragraph, Widget};
 /// and the row that says what the session is doing, and reads as if the session
 /// had stopped.
 ///
-/// The two halves are passed in separately rather than pre-joined because the
-/// frame decides *whether* the live half shows at all: a tool card or a
-/// compaction owns the bottom row while it runs, and a session that is not
-/// streaming has no live tail. Joining them one level up, from the same two calls
-/// that size the band, is what keeps the band showing the same thing that was
-/// laid out — the invariant [`App::preview_active`] exists to hold
-/// (ADR-0002 Q5).
+/// It now takes *store rows* rather than lines because the store is what decides
+/// which rows are on the screen: `Scrollback::window(visible)` answers with the
+/// slice the offset says, and this widget draws that slice and nothing else. The
+/// rows' provenance and cell map are not read here — they are read by the
+/// selection path (looprs-pdl.9) — but passing the row rather than its `Line`
+/// keeps the band from having a second, shallower copy of the transcript to keep
+/// track of.
 ///
-/// The band never scrolls: the tail of the settled lines that does not fit is
-/// dropped from the *view*, not from the store, and scrolling the band is
-/// looprs-pdl.6's job (offset, pin-to-tail, re-wrap on resize). What this
-/// widget owns is one thing only — the newest line is on the bottom row.
+/// Scrolling itself is not here. This widget lays out what it is handed and never
+/// moves it: the offset, the pin and the re-wrap are
+/// [`crate::state::scrollback::Scrollback`]'s, and what this widget owns is one
+/// thing only — the newest row of what it was given is on the bottom row.
 pub struct TranscriptBand<'a> {
-    settled: &'a [Line<'static>],
+    settled: &'a [DisplayRow],
     live: &'a [Line<'static>],
     spinner: usize,
     streaming: bool,
@@ -38,7 +39,7 @@ pub struct TranscriptBand<'a> {
 
 impl<'a> TranscriptBand<'a> {
     pub fn new(
-        settled: &'a [Line<'static>],
+        settled: &'a [DisplayRow],
         live: &'a [Line<'static>],
         spinner: usize,
         streaming: bool,
@@ -59,66 +60,130 @@ impl Widget for TranscriptBand<'_> {
         }
         let rows = area.height as usize;
         // The live tail wins what it needs first — it is the newest thing there
-        // is — and the settled lines take the rest from their end, which is the
+        // is — and the settled rows take the rest from their end, which is the
         // newest end of those.
-        let live = tail(self.live, rows);
-        let room = rows - live.len();
-        let settled = tail(self.settled, room);
+        let live = self.live.len().min(rows);
+        let room = rows - live;
+        let settled = self.settled.len().min(room);
+        let live_slice = &self.live[self.live.len() - live..];
+        let settled_slice = &self.settled[self.settled.len() - settled..];
 
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows);
-        // Pad above rather than below: that is what pins the content down. The
-        // three parts are exactly `rows` because `settled` was cut to whatever
-        // the live tail left room for.
-        lines.extend(std::iter::repeat_n(
-            Line::default(),
-            rows - live.len() - settled.len(),
-        ));
-        lines.extend(settled);
-        lines.extend(live);
+        // Start where the block has to start for its *last* row to land on the
+        // band's bottom edge; whatever is left over above is padding, and that
+        // is what pins the content down.
+        let mut y = area.top() as usize + rows - (settled + live);
+        for row in settled_slice {
+            (&row.line).render(one_row(area, y), buf);
+            y += 1;
+        }
+        for line in live_slice {
+            line.render(one_row(area, y), buf);
+            y += 1;
+        }
         // A streaming session with nothing to show yet still shows that it is
         // streaming: an empty band over a working child is the "is it hung?"
-        // question, and the spinner is the answer.
-        let blank = self.streaming
-            && lines
-                .iter()
-                .all(|l| l.spans.iter().all(|s| s.content.trim().is_empty()));
-        if blank {
+        // question, and the spinner is the answer. "Nothing to show" means
+        // nothing but blanks, which is the same test the old band made — settled
+        // rows that are only separators say as little as no rows at all.
+        let said_anything = settled_slice
+            .iter()
+            .any(|r| !r.to_string().trim().is_empty())
+            || live_slice.iter().any(|l| !l.to_string().trim().is_empty());
+        if self.streaming && !said_anything {
             let frame = FRAMES[self.spinner % FRAMES.len()];
-            lines[rows - 1] = Line::styled(frame, Style::new().cyan());
+            Line::styled(frame, Style::new().cyan())
+                .render(one_row(area, area.top() as usize + rows - 1), buf);
         }
-        Paragraph::new(lines).render(area, buf);
     }
 }
 
-/// The last `n` lines, cheaply: only what is returned gets cloned.
-fn tail(lines: &[Line<'static>], n: usize) -> Vec<Line<'static>> {
-    if lines.len() <= n {
-        return lines.to_vec();
+/// The single buffer row at `y`, full width of the band.
+fn one_row(area: Rect, y: usize) -> Rect {
+    Rect {
+        x: area.x,
+        y: y as u16,
+        width: area.width,
+        height: 1,
     }
-    lines[lines.len() - n..].to_vec()
+}
+
+/// The "N new" affordance: a pill on the band's bottom row, right-aligned,
+/// saying that the tail has moved and what single action gets you back to it.
+///
+/// An **overlay**, not a row. Reserving a row for it would re-shape the band on
+/// every arrival — the text the user stopped to read would jump by a row each
+/// time the count ticked, which is the same failure ADR-0004 R21 prices for the
+/// copy toast ("a toast that adds a row is a reshape"). Covering a few cells in
+/// the corner for as long as the count stands is the cheaper lie, and the pill
+/// says the number so the covered cells are accounted for.
+pub struct NewRowsPill(pub usize);
+
+impl Widget for NewRowsPill {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if self.0 == 0 || area.is_empty() {
+            return;
+        }
+        // Widest possible text is a last resort: clip rather than wrap, because a
+        // wrapped pill is a pill that pushed the transcript around.
+        let text = format!("\u{25b2} {} new \u{00b7} End for the tail", self.0);
+        let w = (text.chars().count() as u16 + 2).min(area.width);
+        if w < 3 {
+            return;
+        }
+        let slot = Rect {
+            x: area.right().saturating_sub(w),
+            y: area.bottom().saturating_sub(1),
+            width: w,
+            height: 1,
+        };
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {text} ")
+                .chars()
+                .take(w as usize)
+                .collect::<String>(),
+            Style::new().black().bg(ratatui::style::Color::Yellow),
+        )))
+        .render(slot, buf);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::scrollback::RenderedRow;
+    use crate::state::scrollback::{RowEnd, rows_from_rendered};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn paint(lines: &[Line<'static>], live: &[Line<'static>], h: u16) -> Vec<String> {
-        paint_streaming(lines, live, !live.is_empty(), h)
+    /// Store rows out of plain text, through the store's own builder, so the band
+    /// is tested against the type it really draws.
+    fn rows(texts: &[&str]) -> Vec<DisplayRow> {
+        rows_from_rendered(
+            texts
+                .iter()
+                .map(|t| RenderedRow {
+                    entry: 0,
+                    end: RowEnd::Hard,
+                    line: Line::from(t.to_string()),
+                })
+                .collect(),
+        )
     }
 
-    fn paint_streaming(
-        lines: &[Line<'static>],
+    fn lines(texts: &[&str]) -> Vec<Line<'static>> {
+        texts.iter().map(|t| Line::from(t.to_string())).collect()
+    }
+
+    fn screen(
+        settled: &[DisplayRow],
         live: &[Line<'static>],
         streaming: bool,
         h: u16,
     ) -> Vec<String> {
         let backend = TestBackend::new(20, h);
         let mut term = Terminal::new(backend).unwrap();
-        let settled = lines.to_vec();
         term.draw(|f| {
-            f.render_widget(TranscriptBand::new(&settled, live, 0, streaming), f.area());
+            f.render_widget(TranscriptBand::new(settled, live, 0, streaming), f.area());
         })
         .unwrap();
         let w = term.backend().buffer().area.width as usize;
@@ -136,15 +201,15 @@ mod tests {
             .collect()
     }
 
-    fn l(s: &str) -> Line<'static> {
-        Line::from(s.to_string())
+    fn paint(settled: &[&str], live: &[&str], h: u16) -> Vec<String> {
+        screen(&rows(settled), &lines(live), !live.is_empty(), h)
     }
 
     /// The whole point of the band: the newest line is on the bottom row, with
     /// the blank space above it rather than below.
     #[test]
     fn the_newest_line_is_on_the_bottom_row() {
-        let rows = paint(&[l("one"), l("two")], &[l("live")], 5);
+        let rows = paint(&["one", "two"], &["live"], 5);
         assert_eq!(rows[4], "live");
         assert_eq!(rows[3], "two");
         assert_eq!(rows[2], "one");
@@ -155,8 +220,8 @@ mod tests {
     /// that fall off — never the newest.
     #[test]
     fn what_does_not_fit_falls_off_the_front_not_the_back() {
-        let settled: Vec<Line<'static>> = (0..10).map(|i| l(&format!("s{i}"))).collect();
-        let rows = paint(&settled, &[l("live")], 3);
+        let texts = ["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9"];
+        let rows = paint(&texts, &["live"], 3);
         assert_eq!(rows[2], "live");
         assert_eq!(rows[1], "s9");
         assert_eq!(rows[0], "s8");
@@ -166,7 +231,7 @@ mod tests {
     /// takes only what it needs, and the settled lines keep the rest.
     #[test]
     fn a_long_live_tail_gives_the_band_back_what_it_cannot_use() {
-        let rows = paint(&[l("s1"), l("s2")], &[l("a"), l("b"), l("c")], 3);
+        let rows = paint(&["s1", "s2"], &["a", "b", "c"], 3);
         assert_eq!(rows, vec!["a", "b", "c"]);
     }
 
@@ -174,7 +239,7 @@ mod tests {
     /// is where the newest thing would be.
     #[test]
     fn a_streaming_session_with_no_text_shows_the_spinner_at_the_bottom() {
-        let rows = paint_streaming(&[], &[], true, 3);
+        let rows = screen(&[], &[], true, 3);
         let bottom = &rows[2];
         assert!(
             FRAMES.contains(&bottom.as_str()),
@@ -183,25 +248,22 @@ mod tests {
         assert!(rows[0].is_empty() && rows[1].is_empty());
     }
 
+    /// …and blanks are the same as nothing: a transcript of separators over a
+    /// working child still says "working".
+    #[test]
+    fn blanks_over_a_working_child_still_show_the_spinner() {
+        let rows = screen(&rows(&["", ""]), &[], true, 3);
+        assert!(
+            FRAMES.contains(&rows[2].as_str()),
+            "blank content hid the spinner: {rows:?}"
+        );
+    }
+
     /// Not streaming and nothing to show is an empty band, not a spinner: the
     /// spinner means "working", and a session at rest does not.
     #[test]
     fn a_session_at_rest_shows_no_spinner() {
-        let backend = TestBackend::new(10, 3);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| {
-            f.render_widget(TranscriptBand::new(&[], &[], 0, false), f.area());
-        })
-        .unwrap();
-        let rows: Vec<String> = (0..3)
-            .map(|y| {
-                (0..10)
-                    .map(|x| term.backend().buffer()[(x, y)].symbol())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect();
+        let rows = screen(&[], &[], false, 3);
         assert!(rows.iter().all(|r| r.is_empty()), "{rows:?}");
     }
 
@@ -212,7 +274,10 @@ mod tests {
         let backend = TestBackend::new(10, 1);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| {
-            f.render_widget(TranscriptBand::new(&[l("x")], &[], 0, false), Rect::ZERO);
+            f.render_widget(
+                TranscriptBand::new(&rows(&["x"]), &[], 0, false),
+                Rect::ZERO,
+            );
         })
         .unwrap();
     }

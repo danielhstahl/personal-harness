@@ -26,9 +26,10 @@ use std::time::{Duration, Instant};
 use ratatui::text::Line;
 
 use super::{SessionId, TerminalType};
-use crate::components::scrollback::Flusher;
+use crate::components::scrollback::{Flusher, RenderedRow};
 use crate::session::ActiveBead;
 use crate::session::{BeadStep, SessionStatus};
+use crate::state::scrollback::Scrollback;
 use crate::state::transcript::{Entry, MessageKind, Transcript};
 use crate::theme::styles::{restyle, style_for};
 use crate::utils::shelltext::LineResolver;
@@ -41,24 +42,6 @@ use crate::utils::shelltext::LineResolver;
 /// hidden session overruns the cap, old lines are dropped and one visible notice is
 /// inserted, so the loss is honest rather than silent.
 pub const DEFAULT_VIEW_BUFFER: usize = 256 * 1024;
-
-/// How many rendered transcript lines a view keeps for the frame's band.
-///
-/// This is a *render cache*, not the store: the store is
-/// [`DEFAULT_VIEW_BUFFER`] bytes of text per view, and it is what the frame
-/// shows already-laid-out lines from. The cap exists so the cache cannot be the
-/// thing that grows without bound on a long run — rendered lines are
-/// multi-span, styled, and worth several bytes of allocation per cell of text.
-/// Past the cap the oldest lines fall off the front, which is the same shape as
-/// what a scrollback does.
-///
-/// Choosing it is a trade between memory and how far a user can scroll back
-/// without the transcript having scrolled out of the cache; the honest answer is
-/// that both halves of that are looprs-pdl.6's (the scroll offset) and
-/// looprs-pdl.7's (the budget) to settle. `4096` is "several screens' worth at
-/// every window size we support", which is the requirement this ticket has for
-/// it.
-pub const MAX_DISPLAY_LINES: usize = 4096;
 
 /// Room held back out of the cap for the eviction notice itself, so the view ends
 /// *at or under* the limit rather than limit-plus-a-line. Generous for any wording
@@ -152,17 +135,19 @@ pub struct SessionView {
     pub transcript: Transcript,
     /// Private on purpose: this cursor is only valid for `self.transcript`.
     flusher: Flusher,
-    /// The rendered transcript, as the frame's band draws it.
+    /// The scrollable store: every rendered row this view has produced, plus the
+    /// offset, the pin and the "N new" count over them.
     ///
-    /// Written only by [`Self::flush`], which is the only thing that has seen the
-    /// flusher's output — so "a line appears in the band exactly once" follows
-    /// from the same monotonic-cursor property that "a line reaches the
-    /// scrollback exactly once" used to. Read only by
-    /// [`App::transcript`](crate::app::App::transcript), for the band.
+    /// Written only through [`Self::flush`] and [`Self::rewrap`], which are the
+    /// only two things that have seen the flusher's output — so "a line appears
+    /// in the band exactly once" still follows from the monotonic-cursor property
+    /// that made "a line reaches the scrollback exactly once" true, and a resize
+    /// cannot leave the store wrapped for two different widths.
     ///
-    /// Bounded by [`MAX_DISPLAY_LINES`]; the text it was rendered from is
-    /// separately bounded by [`DEFAULT_VIEW_BUFFER`].
-    display: Vec<Line<'static>>,
+    /// Bounded by [`crate::state::scrollback::DEFAULT_MAX_ROWS`] rendered rows;
+    /// the text it was rendered from is separately bounded by
+    /// [`DEFAULT_VIEW_BUFFER`].
+    scrollback: Scrollback,
     /// Liveness mirror of the owning session, for the status row (looprs-guh).
     pub status: SessionStatus,
     /// When the **current run** started, for `run_elapsed`.
@@ -236,7 +221,7 @@ impl SessionView {
             session,
             transcript: Transcript::new(),
             flusher: Flusher::new(),
-            display: Vec::new(),
+            scrollback: Scrollback::new(0),
             status: SessionStatus::NotStarted,
             run_started: None,
             last_error: None,
@@ -289,40 +274,70 @@ impl SessionView {
         }
     }
 
-    /// Lines that became final since the last call. Call once per frame, for the
+    /// Rows that became final since the last call. Call once per frame, for the
     /// active view only; each one is also appended to
-    /// [`Self::display`](SessionView::display), which is what the frame's
+    /// [`Self::scrollback`](SessionView::scrollback), which is what the frame's
     /// transcript band draws.
     ///
     /// Invariant preserved here: monotonic. Every finalized line of this transcript
     /// is returned exactly once, ever — and, for the same reason, appears in the
-    /// display exactly once. The flusher is the only door to either, which is what
+    /// store exactly once. The flusher is the only door to either, which is what
     /// makes "the band shows each line exactly once" a property of the type rather
     /// than of the caller.
-    pub fn flush(&mut self, width: u16) -> Vec<Line<'static>> {
-        let lines = self.flusher.drain(&self.transcript, width);
-        self.append_display(&lines);
-        lines
-    }
-
-    /// Every rendered line this view has produced, oldest first, capped at
-    /// [`MAX_DISPLAY_LINES`].
     ///
-    /// The frame takes the *tail* of this and pins it to the bottom of the
-    /// transcript band; nothing else reads it.
-    pub fn display(&self) -> &[Line<'static>] {
-        &self.display
+    /// The width is not an incidental argument: it is the geometry the stored rows
+    /// are wrapped for. A call at a new width re-wraps the whole store first
+    /// ([`Self::rewrap`]) before anything new goes in, because a store that is
+    /// half one width and half another renders as text that stops making sense at
+    /// the seam — which is why this is one door and not two.
+    pub fn flush(&mut self, width: u16) -> Vec<RenderedRow> {
+        let rows = self.flusher.drain_rows(&self.transcript, width);
+        let out = rows.clone();
+        if self.scrollback.width() != width {
+            // Every stored row is wrapped for a window that no longer exists. The
+            // rows just drained are already right for the new width, but they
+            // are a tail on a body of old ones, so the whole store is made
+            // again — including this tail, which is why it is not pushed here.
+            self.rewrap(width);
+        } else {
+            self.scrollback.push(rows);
+        }
+        out
     }
 
-    fn append_display(&mut self, lines: &[Line<'static>]) {
-        if lines.is_empty() {
+    /// This view's scrollable store.
+    pub fn scrollback(&self) -> &Scrollback {
+        &self.scrollback
+    }
+
+    /// Mutable access to the scroll state (offset, pin) — the scroll keys drive
+    /// the store through here so nothing else can move the view.
+    pub fn scrollback_mut(&mut self) -> &mut Scrollback {
+        &mut self.scrollback
+    }
+
+    /// Re-render every stored row at `width`, keeping the view anchored to the
+    /// content it was showing rather than to the row index it happened to be at.
+    ///
+    /// The rows are a *projection* of the entries, and the only honest way to
+    /// re-wrap a projection is to make it again from what it projects: the
+    /// flusher is reseeded to entry 0 and drained at the new width, which leaves
+    /// its cursor exactly where the per-frame drains would have left it, so
+    /// nothing is emitted twice and nothing is dropped.
+    ///
+    /// The cost is one full markdown pass over the retained transcript per width
+    /// change — bounded by the view's buffer cap, and coalesced to at most one
+    /// per frame by the draw path that calls it. A resize is a drag in practice,
+    /// and paying one re-render per frame for a scrollback that stays where the
+    /// user was looking is the trade ADR-0004 signed up for when it made the
+    /// transcript ours to scroll.
+    pub fn rewrap(&mut self, width: u16) {
+        if self.scrollback.width() == width {
             return;
         }
-        self.display.extend(lines.iter().cloned());
-        let over = self.display.len().saturating_sub(MAX_DISPLAY_LINES);
-        if over > 0 {
-            self.display.drain(..over);
-        }
+        self.flusher.reseat(0);
+        let rows = self.flusher.drain_rows(&self.transcript, width);
+        self.scrollback.rewrap(width, rows);
     }
 
     /// The not-yet-final tail, for the live preview region.
@@ -540,6 +555,11 @@ impl SessionView {
             },
         );
         self.flusher.reseat(at);
+        // The store indexes rows by entry, and the entries just moved underneath
+        // it. Rows rendered from a gone entry cannot be re-rendered, so they go
+        // now rather than vanishing on the next resize; the survivors get
+        // renumbered so `entry` keeps naming the right thing.
+        self.scrollback.entries_evicted(removed, at);
     }
 }
 
@@ -592,7 +612,7 @@ mod tests {
         v.seal();
         let after = v.flush(60);
         assert!(
-            after.iter().any(|l| !l.spans.is_empty()),
+            after.iter().any(|l| !l.line.spans.is_empty()),
             "sealing must release the tail: {after:?}"
         );
         assert!(v.flush(60).is_empty(), "and only once");
@@ -922,5 +942,124 @@ mod tests {
             "post-eviction content still reaches the terminal: {out:?}"
         );
         assert!(v.flush(60).is_empty(), "and only once");
+    }
+
+    // ─────────── the store behind the scrollback (looprs-pdl.6) ───────────
+
+    /// **Provenance stays truthful across a trim.** Every row on the screen has
+    /// to be re-renderable from the entry it names. If the byte trim cut
+    /// entries out from under the store, rows would address the wrong entry —
+    /// the scrollback showing text no entry can produce, which is the sort of
+    /// corruption that only appears after a long session.
+    #[test]
+    fn eviction_leaves_no_row_the_transcript_cannot_re_render() {
+        let mut v = SessionView::with_buffer(SessionId::new(TerminalType::Bash, 0), 256);
+        for i in 0..40 {
+            v.push_note(
+                MessageKind::System,
+                format!("line {i} of a long transcript that will be trimmed away"),
+            );
+            v.flush(60);
+        }
+        assert!(v.dropped_bytes() > 0, "the trim ran");
+        let entries = &v.transcript.entries;
+        assert!(
+            entries.len() < 40,
+            "some entries were dropped: {}",
+            entries.len()
+        );
+        for row in v.scrollback().rows() {
+            assert!(
+                row.entry < entries.len(),
+                "a row outlives the entry it names: {:?}",
+                row.line
+            );
+            let text = row.to_string();
+            let body = text.trim_start_matches(['•', '●', '◌', ' ']).trim();
+            if body.is_empty() || body.contains("bytes dropped") {
+                continue;
+            }
+            assert!(
+                entries[row.entry].text.contains(body),
+                "row {text:?} is not text the entry it names can re-render: {:?}",
+                entries[row.entry].text
+            );
+        }
+    }
+
+    /// **A re-wrap makes the rows again.** The dangerous reading of "the store
+    /// is keyed to a width" is that a resize appends the re-wrapped copy on top
+    /// of the old one; the whole transcript would then be doubled.
+    #[test]
+    fn a_rewrap_makes_the_rows_again_rather_than_adding_to_them() {
+        let mut v = view(TerminalType::Pi);
+        v.push_note(
+            MessageKind::Answer,
+            "MARKER the answer is long enough to wrap in a narrow window and so takes several rows at forty columns but noticeably fewer at eighty columns".into(),
+        );
+        let wide_rows = v.flush(80);
+        assert!(!wide_rows.is_empty(), "the answer rendered");
+        let at_wide = v.scrollback().len();
+
+        // A resize with nothing new to say: the store is made again at 40.
+        assert!(
+            v.flush(40).is_empty(),
+            "nothing was finalised since the last flush"
+        );
+        let at_narrow = v.scrollback().len();
+        assert_eq!(v.scrollback().width(), 40, "the store is wrapped for 40");
+        assert!(
+            at_narrow > at_wide,
+            "a narrower window takes more rows: {at_wide} -> {at_narrow}"
+        );
+
+        let all: String = v
+            .scrollback()
+            .rows()
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
+        assert_eq!(
+            all.matches("MARKER").count(),
+            1,
+            "the re-wrap left a second copy behind: {all:?}"
+        );
+    }
+
+    /// The store lags the tail exactly as far as the user scrolled, and no
+    /// further: `pending` is the count of rows that arrived since, not the
+    /// distance to the bottom.
+    #[test]
+    fn rows_that_arrive_off_the_tail_count_themselves_and_do_not_move_the_view() {
+        let mut v = view(TerminalType::Pi);
+        for i in 0..30 {
+            v.push_note(MessageKind::System, format!("settled {i}"));
+            v.flush(60);
+        }
+        let band = 10usize;
+        v.scrollback_mut().scroll_by(-(band as isize), band);
+        let held = v
+            .scrollback()
+            .window(band)
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>();
+        v.push_note(MessageKind::System, "late".into());
+        v.flush(60);
+        assert_eq!(
+            v.scrollback()
+                .window(band)
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>(),
+            held,
+            "the view held while the tail moved away"
+        );
+        assert_eq!(v.scrollback().pending(), 2, "the line and its separator");
+        assert_eq!(
+            v.scrollback().offset(),
+            band + 2,
+            "and the gap grew by that"
+        );
     }
 }

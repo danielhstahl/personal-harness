@@ -1,31 +1,63 @@
 // scrollback.rs
 use crate::{
     components::card::card_line,
+    state::scrollback::RowEnd,
     state::transcript::{Entry, MessageKind, Transcript},
     theme::styles::{content_width, restyle, style_for},
-    utils::{md, shelltext::spanned},
+    utils::{
+        md::{self, Wrapped},
+        shelltext::spanned,
+    },
 };
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 
-fn render_simple(e: &Entry, w: u16) -> Vec<Line<'static>> {
-    let mut lines = match &e.kind {
+/// One finalized line, as the flusher hands it to the scrollback store.
+///
+/// The store needs more than the pixels: it needs to know **which entry** the row
+/// came from (selection must not cross a mode boundary, and must not select a
+/// card's chrome) and whether the row **ends a logical line or continues one**
+/// (ADR-0004 R14: a soft-wrapped pair joins with nothing, a hard pair with
+/// exactly one `\n`). The renderer is the only thing that ever knows either, so
+/// this is the type that carries them out of here.
+#[derive(Clone, Debug)]
+pub struct RenderedRow {
+    /// Index of the transcript entry this row was rendered from.
+    pub entry: usize,
+    /// Hard newline vs. our soft wrap.
+    pub end: RowEnd,
+    pub line: Line<'static>,
+}
+
+/// The row's plain text — what the screen got, minus the styling. Every caller
+/// that reads a flush back (mostly tests) reads it through here.
+impl std::fmt::Display for RenderedRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&crate::utils::render::plain(&self.line))
+    }
+}
+
+fn render_simple(e: &Entry, w: u16) -> Vec<Wrapped> {
+    let mut rows = match &e.kind {
         MessageKind::User => md::wrap(
             vec![Span::raw(e.text.clone())],
             w as usize,
             "❯ ".into(),
             "  ".into(),
         ),
-        MessageKind::Error => vec![Line::styled(
+        MessageKind::Error => vec![Wrapped::hard(Line::styled(
             format!("error: {}", e.text),
             Style::new().red(),
-        )],
-        MessageKind::System => vec![Line::styled(format!("• {}", e.text), Style::new().yellow())],
+        ))],
+        MessageKind::System => vec![Wrapped::hard(Line::styled(
+            format!("• {}", e.text),
+            Style::new().yellow(),
+        ))],
         _ => unreachable!("streamed kinds use drain_stream"),
     };
-    lines.push(Line::default()); // blank line after each entry
-    lines
+    rows.push(Wrapped::hard(Line::default())); // blank line after each entry
+    rows
 }
 
 pub struct Flusher {
@@ -67,12 +99,19 @@ impl Flusher {
         self.first
     }
 
-    /// Everything that became final since the last call. Call once per frame, before drawing.
-    pub fn drain(&mut self, t: &Transcript, term_width: u16) -> Vec<Line<'static>> {
+    /// Everything that became final since the last call, with provenance. Call
+    /// once per frame, before drawing.
+    ///
+    /// The markdown/fence/raw logic is the one the inline scrollback always had:
+    /// what this adds is the entry index the loop is already standing on and the
+    /// hard/soft end the wrap already chose, because the store that consumes
+    /// this cannot recover either from the pixels. `drain`-shaped callers use
+    /// `.map(|r| r.line)`.
+    pub fn drain_rows(&mut self, t: &Transcript, term_width: u16) -> Vec<RenderedRow> {
         let w = content_width(term_width);
         let mut out = Vec::new();
         while let Some(e) = t.entries.get(self.first) {
-            let lines = if e.kind.is_raw() {
+            let rows = if e.kind.is_raw() {
                 // Shell output: verbatim lines, no markdown, no re-wrap
                 // (ADR-0001 rule 1). Complete lines go out as they arrive; the
                 // partial tail stays in the live region.
@@ -89,11 +128,17 @@ impl Flusher {
                 // band uses, so the scrollback copy and the live copy cannot
                 // disagree about what the card said. Spinner frame is irrelevant
                 // once finished.
-                vec![card_line(e, 0)]
+                vec![Wrapped::hard(card_line(e, 0))]
             } else {
                 render_simple(e, w) // User / Error
             };
-            out.extend(lines.into_iter().map(|l| restyle(l, style_for(&e.kind))));
+            let entry = self.first;
+            let style = style_for(&e.kind);
+            out.extend(rows.into_iter().map(|r| RenderedRow {
+                entry,
+                end: if r.soft { RowEnd::Soft } else { RowEnd::Hard },
+                line: restyle(r.line, style),
+            }));
             if !e.done {
                 break;
             }
@@ -145,21 +190,26 @@ impl Cursor {
     /// resolved (control-free, tab-free, overwrites applied) and the styles are
     /// byte ranges into it, so this function's whole job is to cut both at the
     /// line boundaries it is already standing on.
-    fn drain_raw(&mut self, e: &Entry) -> Vec<Line<'static>> {
+    fn drain_raw(&mut self, e: &Entry) -> Vec<Wrapped> {
         let mut out = Vec::new();
         while let Some(nl) = e.text[self.scan..].find('\n') {
             let end = self.scan + nl;
-            out.push(spanned(&e.text, &e.styles, self.scan, end));
+            out.push(Wrapped::hard(spanned(&e.text, &e.styles, self.scan, end)));
             self.scan = end + 1;
         }
         if e.done && self.scan < e.text.len() {
-            out.push(spanned(&e.text, &e.styles, self.scan, e.text.len()));
+            out.push(Wrapped::hard(spanned(
+                &e.text,
+                &e.styles,
+                self.scan,
+                e.text.len(),
+            )));
             self.scan = e.text.len();
         }
         out
     }
 
-    fn drain_stream(&mut self, e: &Entry, w: u16) -> Vec<Line<'static>> {
+    fn drain_stream(&mut self, e: &Entry, w: u16) -> Vec<Wrapped> {
         let mut out = Vec::new();
         while let Some(nl) = e.text[self.scan..].find('\n') {
             let (start, end) = (self.scan, self.scan + nl);
@@ -185,19 +235,19 @@ impl Cursor {
         end: usize,
         next: usize,
         w: u16,
-        out: &mut Vec<Line<'static>>,
+        out: &mut Vec<Wrapped>,
     ) {
         let line = text[start..end].trim_end_matches('\r');
         if let Some((marker, hl)) = self.fence.as_mut() {
             if line.trim_start().starts_with(marker.as_str()) {
                 self.fence = None;
-                out.push(Line::default());
+                out.push(Wrapped::hard(Line::default()));
             } else {
-                out.push(md::code_line(hl, line));
+                out.push(Wrapped::hard(md::code_line(hl, line)));
             }
         } else if let Some(marker) = fence_marker(line) {
             self.flush_block(text, start, w, out);
-            out.push(md::code_header(lang_of(line)));
+            out.push(Wrapped::hard(md::code_header(lang_of(line))));
             self.fence = Some((marker.into(), md::highlighter().start(lang_of(line))));
         } else if line.trim().is_empty() {
             self.flush_block(text, start, w, out);
@@ -207,11 +257,11 @@ impl Cursor {
         self.block = next;
     }
 
-    fn flush_block(&self, text: &str, end: usize, w: u16, out: &mut Vec<Line<'static>>) {
+    fn flush_block(&self, text: &str, end: usize, w: u16, out: &mut Vec<Wrapped>) {
         let src = &text[self.block..end];
         if !src.trim().is_empty() {
-            out.extend(md::render_markdown(src, w));
-            out.push(Line::default());
+            out.extend(md::render_markdown_tracked(src, w));
+            out.push(Wrapped::hard(Line::default()));
         }
     }
 }

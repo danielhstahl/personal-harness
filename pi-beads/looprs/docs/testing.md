@@ -38,6 +38,21 @@ The one warning that is not ours: `nix v0.28.0` future-incompatibility, pulled i
 [ADR-0001](adr/0001-bash-terminal-state-pty.md) rather than silenced, because the
 gate's claim is "everything except this one named thing is clean".
 
+**Known flakes, named so a green run is not mistaken for the only honest one.**
+Four of the `session::bash` tests drive a real pty and wait on real timing —
+`esc_says_cancelling_before_the_command_reports_itself_done`,
+`esc_interrupts_a_running_command_without_killing_the_shell`,
+`a_command_that_traps_the_interrupt_is_reported_not_silently_wedged` and
+`a_full_screen_program_is_handed_the_screen_and_gives_it_back`. Under the full
+suite's CPU contention they fail intermittently and pass on a re-run. Measured
+this way on the *pre*-*-scrollback binary at `195e3c0` as well as on later work
+— 2 failures in one run, 1 in the next, 0 the third, with no change in between
+— so it is the harness's tolerance, not a regression. If one fails, re-run it
+in isolation (`cargo test --bin looprs session::bash::tests::<name>`); it has
+passed in isolation every time it has been asked. Tightening the tolerance rather
+than the sleep is someone's chore: these four are the suite's only non-hermetic
+tests.
+
 ### Dead-code allows
 
 `clippy`/`rustc` report items nothing reaches as dead. This crate does not silence
@@ -434,6 +449,43 @@ and is forbidden to ask. The honest shape is to read them at **startup** with `D
 round trip at boot, where a round trip is affordable — and restore that on the way out. The
 `child` scenario prints what is left behind (`tee'd modes still on at exit: [...]`) so the gap
 stays measured; see [ADR-0006](adr/0006-terminal-mode-ledger.md).
+
+### In-app scrollback (looprs-pdl.6)
+
+**What it proves:** the transcript is a *store* now rather than a print stream,
+and the four things the rest of the epic leans on are true of it at every layer:
+a display row knows which entry it came from and whether it ends in a hard
+newline or a soft wrap; a pinned view follows the tail and an unpinned one
+holds; the "N new" affordance says what is unseen and how to get back to it; and
+a resize re-wraps against the content the view was resting on rather than the
+row index it happened to be at.
+
+| Layer | Where | What it pins |
+| --- | --- | --- |
+| the store | `state::scrollback::tests` | pinned by default and output follows (`pinned_is_the_default_and_new_output_follows`), one row up unpins (`scrolling_up_one_row_unpins`), off the tail it holds and counts (`unpinned_holds_its_content_and_counts_what_arrived`), the very bottom re-pins and clears the count (`reaching_the_very_bottom_re_pins_and_clears_the_count`), the top clamp (`cannot_scroll_past_the_top_of_the_content`), provenance per row (`every_row_carries_its_provenance`), the paste join (`joining_rows_follows_the_hard_soft_rule`), the cell map across CJK, combining marks and a ZWJ family (`the_cell_map_never_splits_a_cluster`, `a_combining_mark_belongs_to_its_base`), styles kept on the row and never copied (`styles_render_and_are_never_copied`), re-wrap under a pin and against a content anchor (`rewrap_keeps_a_pinned_view_pinned`, `rewrap_anchors_on_content_not_on_row_index`), a re-wrap whose anchor was trimmed away holding rather than inventing a position (`rewrap_with_lost_content_holds_rather_than_inventing_a_position`), the row cap and eviction renumbering (`the_row_cap_drops_the_oldest_and_says_so`, `eviction_drops_gone_entries_and_renumbers_the_rest`) |
+| the flush | `session::view::tests` | the store's width follows the flush and a re-wrap *makes* the rows rather than adding to them (`a_rewrap_makes_the_rows_again_rather_than_adding_to_them`), no row outlives the entry that can re-render it (`eviction_leaves_no_row_the_transcript_cannot_re_render`), arrivals off the tail are counted and do not move the view (`rows_that_arrive_off_the_tail_count_themselves_and_do_not_move_the_view`) |
+| the plumbing | `app::tests` | a page is the band the frame lays out, from the same function and not a second arithmetic (`a_page_is_the_band_the_frame_lays_out`), scrolling is neither a round trip nor the box's (`scrolling_is_not_a_round_trip_and_not_a_keystroke_anyones_else`), a transcript shorter than the band has nowhere to scroll to and cannot unpin (`with_nothing_above_the_band_there_is_nowhere_to_scroll`), a resize re-wraps without doubling content (`a_resize_rewraps_the_store_without_doubling_or_losing_content`) |
+| the paint | `main::tests` (ratatui `TestBackend`) | the live tail shows only while the view follows the tail (`the_live_tail_shows_only_while_the_view_follows_the_tail`), the pill appears off the tail and only then, on the band's bottom row (`the_new_rows_pill_shows_while_off_the_tail_and_only_then`), a resize keeps the resting line on the screen (`a_resize_keeps_the_line_the_user_was_looking_at_on_screen`) |
+| the real pty | `spikes/scrollback_e2e.py` | 23 checks: `ESC[5~`/`ESC[6~`/`ESC[H`/`ESC[F` decode to the four keys the app matches on through a real pty with a real bash, the pill is legible on the band's bottom row, a held band does not move by one row across two arrivals, and the app survives a resize taken with the transcript scrolled up |
+
+```sh
+cargo build
+python3 spikes/scrollback_e2e.py | tee spikes/results/scrollback-e2e.log
+```
+
+**What the spike could not settle, and says so instead of skipping quietly.** Two
+things. First, this harness has no reflowing emulator, so "the text the user was
+looking at stayed on the screen across a resize" is *not* claimed from the wire;
+it is claimed from the painted test above, where the screen model is ratatui's
+own buffer. Second, and worth more than a footnote: with the app **idle**, a
+resize produces **zero bytes** out of the app over 2 seconds — the spike prints
+the count on every run — and the pre-pdl.6 binary at `195e3c0` measures the
+same, so the scrollback work neither fixed nor broke it. A window drag on a
+quiet session leaves the old frame until something else makes the app draw. The
+app is not ignorant of the new size (its next drawn frame adopts it; the frame
+reads the window at draw time), but the draw is gated on `app.dirty` in the run
+loop. That is `looprs-pdl.15`, filed from this measurement so the next one
+starts here.
 
 ## The mouse and the clipboard, measured before they are built (looprs-pdl.2)
 

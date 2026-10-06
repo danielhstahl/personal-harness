@@ -8,19 +8,34 @@
 
 use crate::components::compaction::{CompactionState, token_delta};
 use crate::components::input::{InputAction, InputState, inner_width};
+use crate::components::scrollback::RenderedRow;
 use crate::session::view::SessionView;
 use crate::session::{
     ActiveBead, ByteStream, ChatState, ExitReason, SessionId, SessionStatus, TerminalType,
 };
+use crate::state::scrollback::{DisplayRow, Scrollback};
 use crate::state::transcript::MessageKind;
 use crate::viewport::{self};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::layout::Rect;
 use ratatui::text::Line;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// The store of a mode that was never opened.
+///
+/// `Scrollback` is not cheap to build per call and `new_rows` / `pinned` answer by
+/// reference, so the empty answer is built once. A mode with no view has said
+/// nothing, is at its tail, and has nothing pending — which is what a default
+/// `Scrollback` says, exactly.
+fn empty_scrollback() -> &'static Scrollback {
+    static EMPTY: OnceLock<Scrollback> = OnceLock::new();
+    EMPTY.get_or_init(|| Scrollback::new(0))
+}
 
 pub use crate::session::BeadStep;
 
@@ -585,6 +600,17 @@ pub struct App {
     pub active: TerminalType,
     pub spinner: usize,
     pub width: u16,
+    /// The window's height, tracked alongside [`Self::width`] for one reason: the
+    /// scrollback needs a page, and a page is the transcript band, and the band
+    /// is a function of the whole window (`viewport::frame_areas`).
+    ///
+    /// Nothing in the frame's geometry is *decided* here — the frame still reads
+    /// its own area at draw time. This is the same number one frame earlier, which
+    /// is what a keystroke needs and what a stale `ESC[6n` used to be invented
+    /// for. It is not a second opinion about the screen: every write of it comes
+    /// from a resize event or from the startup size, the same two sources the
+    /// frame's own area comes from.
+    pub height: u16,
     pub dirty: bool,
     pub should_quit: bool,
     /// The session whose child currently owns the real terminal screen, if any
@@ -654,6 +680,7 @@ impl App {
         mut input: InputState,
         active: TerminalType,
         width: u16,
+        height: u16,
     ) -> Self {
         // The box and the view must open on the same mode: they are the same fact
         // seen from two sides, and a mismatch here would route keystrokes to a mode
@@ -665,6 +692,7 @@ impl App {
             views: HashMap::new(),
             active,
             width,
+            height,
             dirty: true,
             should_quit: false,
             spinner: 0,
@@ -743,7 +771,11 @@ impl App {
 
     /// The per-frame flush, for the active view only (Q5 rule 4: inactive views
     /// buffer, and their backlog goes out as one burst when they become active).
-    pub fn flush_active(&mut self, width: u16) -> Vec<Line<'static>> {
+    ///
+    /// Returns the rows that just became final; they are already in the store
+    /// ([`Self::scrollback`]) by the time this returns, so the return value is
+    /// for the caller that wants to know what arrived, not for the display.
+    pub fn flush_active(&mut self, width: u16) -> Vec<RenderedRow> {
         match self.views.get_mut(&self.active) {
             Some(v) => v.flush(width),
             None => Vec::new(),
@@ -767,17 +799,77 @@ impl App {
     /// The active session's settled transcript, bottom-of-the-list-last.
     ///
     /// This is the content of the frame's transcript band: every line the session
-    /// finished saying, already rendered at the width it was rendered at. It is
-    /// what used to be printed into the terminal's own scrollback by
-    /// `insert_before`, and the reason the frame can show it at all is that it is
-    /// now ours — the same lines, held in the view that produced them, so a
-    /// session's transcript cannot leak into another mode's band
-    /// (ADR-0002 Q5).
+    /// finished saying, already rendered at the width it was rendered at, in the
+    /// store the transcript now is. The live tail is *not* in here; that comes
+    /// from [`Self::preview_active`], and the band is the two of them joined in
+    /// that order.
+    pub fn scrollback(&self) -> &Scrollback {
+        match self.active_view() {
+            Some(v) => v.scrollback(),
+            None => empty_scrollback(),
+        }
+    }
+
+    /// The rows to draw in a transcript band `visible` rows tall.
     ///
-    /// The live tail is *not* in here; that comes from [`Self::preview_active`],
-    /// and the band is the two of them joined in that order.
-    pub fn transcript(&self) -> &[Line<'static>] {
-        self.active_view().map(|v| v.display()).unwrap_or(&[])
+    /// This is the whole of the scroll offset's effect on the screen: the frame
+    /// asks for a window, the store answers with the rows the offset says, and
+    /// the band draws them. When pinned that is the tail; when not, it is the
+    /// stretch of history the user stopped on.
+    pub fn transcript_window(&self, visible: usize) -> &[DisplayRow] {
+        self.active_view()
+            .map(|v| v.scrollback().window(visible))
+            .unwrap_or(&[])
+    }
+
+    /// Rows that arrived while the user was off the tail — the "N new"
+    /// affordance's whole data source, and zero whenever the view is pinned.
+    pub fn new_rows(&self) -> usize {
+        self.scrollback().pending()
+    }
+
+    /// Is the active view following the tail?
+    pub fn pinned(&self) -> bool {
+        self.scrollback().is_pinned()
+    }
+
+    /// Move the active view: positive toward the tail, negative into history.
+    pub fn scroll_active(&mut self, delta: isize) {
+        let visible = self.transcript_band_rows();
+        if let Some(v) = self.views.get_mut(&self.active) {
+            v.scrollback_mut().scroll_by(delta, visible);
+        }
+    }
+
+    /// Snap the active view back to the tail — the one action the "N new"
+    /// affordance names.
+    pub fn tail_active(&mut self) {
+        if let Some(v) = self.views.get_mut(&self.active) {
+            v.scrollback_mut().scroll_to_tail();
+        }
+    }
+
+    /// The top of the transcript.
+    pub fn top_active(&mut self) {
+        let visible = self.transcript_band_rows();
+        if let Some(v) = self.views.get_mut(&self.active) {
+            v.scrollback_mut().scroll_to_top(visible);
+        }
+    }
+
+    /// The transcript band's height at the current window size: a "page" of
+    /// scrollback.
+    ///
+    /// Read out of [`viewport::frame_areas`] rather than re-derived, so the page
+    /// a scroll key moves is the band the frame actually lays out — the same
+    /// reason `input_rows` and `preview_active` are taken once and handed down.
+    pub fn transcript_band_rows(&self) -> usize {
+        let [text, ..] = viewport::frame_areas(
+            Rect::new(0, 0, self.width, self.height),
+            self.live_card_rows(),
+            self.input_band(self.width),
+        );
+        text.height as usize
     }
 
     /// The real window changed shape (`Event::Resize`).
@@ -796,6 +888,7 @@ impl App {
     /// the flag is set here rather than trusting a later diff.
     pub fn set_window(&mut self, cols: u16, rows: u16) {
         self.width = cols;
+        self.height = rows;
         self.forward_resize(rows, cols);
         self.dirty = true;
         if self.passthrough() {
@@ -995,8 +1088,9 @@ impl App {
                 }
                 self.on_tick(Instant::now());
             }
-            Msg::Term(Event::Resize(w, _)) => {
+            Msg::Term(Event::Resize(w, h)) => {
                 self.width = w;
+                self.height = h;
                 self.dirty = true;
             }
             Msg::Term(Event::Key(k)) if k.kind == KeyEventKind::Press => {
@@ -1317,6 +1411,38 @@ impl App {
             return;
         }
 
+        // The scrollback keys (looprs-pdl.6). Chosen because nothing else in
+        // this app claims them: `InputState::handle_key` ignores all four, so
+        // taking them here moves no keystroke off the box, and a program that
+        // holds the screen already got them back above. `End` is the single
+        // action the "N new" affordance names, and `Home` is its mirror.
+        //
+        // The *semantics* — one row up unpins, the bottom re-pins, the view
+        // holds while new output arrives — are the store's, not here: this is
+        // the plumbing from a keystroke to `Scrollback`. The chord table,
+        // including whatever `Home`/`End` should mean once there is a Ctrl-C
+        // nobody has stolen, is looprs-pdl.13's to settle.
+        let page = self.transcript_band_rows().max(1) as isize;
+        match k.code {
+            KeyCode::PageUp => {
+                self.scroll_active(-page);
+                return;
+            }
+            KeyCode::PageDown => {
+                self.scroll_active(page);
+                return;
+            }
+            KeyCode::Home => {
+                self.top_active();
+                return;
+            }
+            KeyCode::End => {
+                self.tail_active();
+                return;
+            }
+            _ => {}
+        }
+
         // The box needs the width it is going to be drawn at: a wrapped row is the
         // only "line" a message has below the one the user is on, so `Up` and
         // `Home` are meaningless without the wrapping. Same width the height policy
@@ -1501,7 +1627,7 @@ mod tests {
 
     fn app_with(active: TerminalType) -> (App, mpsc::Receiver<UiCommand>) {
         let (tx, rx) = mpsc::channel::<UiCommand>(16);
-        (App::new(tx, InputState::new(), active, 80), rx)
+        (App::new(tx, InputState::new(), active, 80, 24), rx)
     }
 
     /// The wiring between the box and the height policy: what the app asks the frame
@@ -2666,7 +2792,7 @@ mod tests {
     fn bash_output_lands_in_its_own_view_verbatim() {
         let mut app = {
             let (tx, _rx) = mpsc::channel::<UiCommand>(16);
-            App::new(tx, InputState::new(), TerminalType::Beeds, 80)
+            App::new(tx, InputState::new(), TerminalType::Beeds, 80, 24)
         };
         let bash = SessionId::new(TerminalType::Bash, 1);
         let chunk = "first line\nsecond line, with no trailing newline";
@@ -3247,7 +3373,7 @@ mod tests {
     #[test]
     fn a_fresh_app_with_no_sessions_at_all_renders_a_sane_row() {
         let (tx, _rx) = mpsc::channel::<UiCommand>(1);
-        let app = App::new(tx, InputState::new(), TerminalType::Beeds, 40);
+        let app = App::new(tx, InputState::new(), TerminalType::Beeds, 40, 24);
         let txt = row(&app, 40);
         assert!(txt.contains("Beeds"), "{txt:?}");
         assert!(txt.contains("not started"), "{txt:?}");
@@ -3274,5 +3400,223 @@ mod tests {
         };
         let txt = row(&other, 100);
         assert!(!txt.contains("database is locked"), "{txt:?}");
+    }
+
+    // ─────────── the scrollback store drives the band (looprs-pdl.6) ───────────
+
+    /// `n` settled lines in the active view, flushed at `width`.
+    ///
+    /// Each `System` entry renders as itself plus its separator, so `n` entries
+    /// are `2n` store rows — which is what makes "is there history above the
+    /// band" a fact the tests can rely on rather than guess at.
+    fn settle(app: &mut App, n: usize, width: u16) {
+        for i in 0..n {
+            app.update(Msg::System {
+                session: None,
+                text: format!("settled {i}"),
+            });
+        }
+        app.flush_active(width);
+    }
+
+    fn shown(app: &App, rows: usize) -> Vec<String> {
+        app.transcript_window(rows)
+            .iter()
+            .map(|r| r.to_string())
+            .collect()
+    }
+
+    /// Pinned, the band shows the tail; a page up shows older rows and hides it.
+    #[test]
+    fn a_page_up_pages_the_transcript_and_leaves_the_tail() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle(&mut app, 20, 80);
+        let band = app.transcript_band_rows();
+        assert!(band > 1, "the band has rows to show: {band}");
+        assert!(
+            app.scrollback().len() > band,
+            "there is history above this band to scroll into: band={band} rows={}",
+            app.scrollback().len()
+        );
+
+        let tail = shown(&app, band);
+        assert!(
+            tail.iter().any(|l| l.contains("settled 19")),
+            "the newest line is not on screen while pinned: {tail:?}"
+        );
+        assert!(
+            !tail.iter().any(|l| l.contains("settled 0")),
+            "the head of the transcript is off the top while pinned: {tail:?}"
+        );
+
+        app.update(Msg::Term(key(KeyCode::PageUp, KeyModifiers::NONE)));
+        assert!(!app.pinned(), "one page up is off the tail");
+        let hist = shown(&app, band);
+        assert!(
+            hist.iter().any(|l| l.contains("settled 0")),
+            "a page of history reached the head of the transcript: {hist:?}"
+        );
+        assert!(
+            !hist.iter().any(|l| l.contains("settled 19")),
+            "and the tail is not on screen any more: {hist:?}"
+        );
+    }
+
+    /// A page up with nothing above the band cannot scroll into blank space, so
+    /// it cannot unpin either: "pinned" is not a mode the app can be in without
+    /// the content agreeing.
+    #[test]
+    fn with_nothing_above_the_band_there_is_nowhere_to_scroll() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle(&mut app, 2, 80);
+        app.update(Msg::Term(key(KeyCode::PageUp, KeyModifiers::NONE)));
+        assert!(
+            app.pinned(),
+            "a transcript shorter than the band cannot be scrolled up"
+        );
+        assert_eq!(app.scrollback().offset(), 0);
+    }
+
+    /// The half of the contract that is not about the keystroke at all: while the
+    /// user is off the tail, new output must not move what they are reading, and
+    /// must be *counted* so the UI can say the view is not up to date.
+    #[test]
+    fn output_that_arrives_while_scrolled_up_is_held_back_and_counted() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle(&mut app, 12, 80);
+        let band = app.transcript_band_rows();
+        app.update(Msg::Term(key(KeyCode::PageUp, KeyModifiers::NONE)));
+        let before = shown(&app, band);
+
+        app.update(Msg::System {
+            session: None,
+            text: "arrived while you were reading".into(),
+        });
+        app.flush_active(80);
+
+        assert_eq!(shown(&app, band), before, "the view held");
+        assert_eq!(
+            app.new_rows(),
+            2,
+            "the entry and its separator, both unseen"
+        );
+        assert!(!app.pinned());
+    }
+
+    /// `End` is the one action the pill names, and it answers the count: back at
+    /// the tail, nothing is pending, because the user is looking at it.
+    #[test]
+    fn end_returns_to_the_tail_and_answers_the_count() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle(&mut app, 12, 80);
+        app.update(Msg::Term(key(KeyCode::PageUp, KeyModifiers::NONE)));
+        app.update(Msg::System {
+            session: None,
+            text: "arrived while you were reading".into(),
+        });
+        app.flush_active(80);
+        assert_eq!(app.new_rows(), 2);
+
+        app.update(Msg::Term(key(KeyCode::End, KeyModifiers::NONE)));
+        assert!(app.pinned(), "the bottom of the content is the tail");
+        assert_eq!(app.new_rows(), 0, "and nothing is unseen any more");
+        let tail = shown(&app, app.transcript_band_rows());
+        assert!(
+            tail.iter()
+                .any(|l| l.contains("arrived while you were reading")),
+            "the tail is what the band shows: {tail:?}"
+        );
+    }
+
+    /// Scrolling is local: no command goes to the Router for a wheel, a page or
+    /// a `Home`, and nothing goes to the input box either.
+    #[test]
+    fn scrolling_is_not_a_round_trip_and_not_a_keystroke_anyones_else() {
+        let (mut app, mut rx) = app_with(TerminalType::Pi);
+        settle(&mut app, 12, 80);
+        for code in [
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            app.update(Msg::Term(key(code, KeyModifiers::NONE)));
+            assert!(
+                rx.try_recv().is_err(),
+                "{code:?} sent a command; the scrollback is the app\'s own state"
+            );
+        }
+        assert!(
+            app.input.text().is_empty(),
+            "the box took none of them either"
+        );
+    }
+
+    /// A resize re-wraps the store rather than re-adding to it: the same content,
+    /// once, at the new width.
+    #[test]
+    fn a_resize_rewraps_the_store_without_doubling_or_losing_content() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let id = SessionId::new(TerminalType::Pi, 1);
+        app.view_mut(id)
+            .push_delta(MessageKind::Answer, "MARKER-1 alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau. MARKER-2 the quick brown fox jumps over the lazy dog again and again until it needs a second row at eighty columns and a third at forty.
+
+");
+        app.flush_active(80);
+        let wide = app.scrollback().len();
+        assert!(wide > 1, "the answer rendered: {wide} rows");
+
+        app.set_window(40, 24);
+        app.flush_active(40);
+        let narrow = app.scrollback().len();
+        assert_eq!(app.scrollback().width(), 40, "the store is wrapped for 40");
+        assert!(
+            narrow > wide,
+            "narrower window, more rows: {wide} -> {narrow}"
+        );
+
+        let all: String = app
+            .scrollback()
+            .rows()
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
+        assert_eq!(all.matches("MARKER-1").count(), 1, "{all:?}");
+        assert_eq!(all.matches("MARKER-2").count(), 1, "{all:?}");
+    }
+
+    /// The page a scroll key moves is the band the frame lays out — the same
+    /// number, from the same function, rather than two arithmetic that can drift.
+    #[test]
+    fn a_page_is_the_band_the_frame_lays_out() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle(&mut app, 40, 80);
+        let band = app.transcript_band_rows();
+        let max = app.scrollback().max_scroll(band);
+        assert!(
+            max > band,
+            "enough history that a page is not the whole way"
+        );
+
+        app.update(Msg::Term(key(KeyCode::PageUp, KeyModifiers::NONE)));
+        assert_eq!(
+            app.scrollback().offset(),
+            band.min(max),
+            "one page is exactly one band of transcript"
+        );
+
+        // Walked up page by page, the head of the content is where it stops.
+        for _ in 0..(max / band.max(1) + 2) {
+            app.update(Msg::Term(key(KeyCode::PageUp, KeyModifiers::NONE)));
+        }
+        assert_eq!(app.scrollback().offset(), max, "and no page goes past it");
+
+        app.update(Msg::Term(key(KeyCode::End, KeyModifiers::NONE)));
+        assert_eq!(
+            app.scrollback().offset(),
+            0,
+            "and `End` is all the way back"
+        );
+        assert!(app.pinned());
     }
 }

@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 use components::card::LiveCardPreview;
-use components::text_stream::TranscriptBand;
+use components::text_stream::{NewRowsPill, TranscriptBand};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
@@ -185,7 +185,7 @@ async fn run(
         .map(|id| (id, router.status_of(initial)));
 
     let sz = frame.size()?;
-    let mut app = App::new(cmd_tx, InputState::new(), initial, sz.width);
+    let mut app = App::new(cmd_tx, InputState::new(), initial, sz.width, sz.height);
     if let Some((id, status)) = boot {
         app.view_mut(id).set_status(status, Instant::now());
     }
@@ -442,22 +442,34 @@ fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
     let [text_area, card_area, status_area, input] =
         viewport::frame_areas(f.area(), card_rows, input_rows);
 
-    // The transcript band: everything this session has finished saying, plus the
-    // live tail, pinned to the bottom so the newest line sits right above the
-    // chrome. Whether the live tail is *shown* is the session's business
-    // (`ChatState`): a tool or a compaction owns the row while it runs, and a
-    // prose answer that has stopped streaming owns nothing that is not already in
-    // the settled lines above.
+    // The live tail shows only while the view is following the tail. Scrolled up
+    // into history, the band belongs to the history: putting a live line under the
+    // rows the user stopped on would redraw the thing they are reading with every
+    // delta, and the "N new" pill is the honest signal about what is happening
+    // down there without showing it.
     let streaming = matches!(app.chat_state(), ChatState::Chat);
+    let live: &[Line<'static>] = if streaming && app.pinned() {
+        preview
+    } else {
+        &[]
+    };
+    // The live tail takes its rows off the bottom of the band before the store
+    // gets any, so the newest *settled* row sits above it rather than under it —
+    // the same order the band has always laid out, now measured against the store
+    // that decides which rows exist.
+    let room = text_area.height.saturating_sub(live.len() as u16).max(1) as usize;
     f.render_widget(
-        TranscriptBand::new(
-            app.transcript(),
-            if streaming { preview } else { &[] },
-            app.spinner,
-            streaming,
-        ),
+        TranscriptBand::new(app.transcript_window(room), live, app.spinner, streaming),
         text_area,
     );
+
+    // The "N new" affordance: a pill over the band's bottom row, saying the tail
+    // moved and naming the one action that gets back to it. Overlaid rather than
+    // a row of its own so an arrival cannot shift the text the user is reading
+    // (ADR-0004 R21's reasoning for the copy toast, applied one band over).
+    if app.scrollback().shows_new() {
+        f.render_widget(NewRowsPill(app.new_rows()), text_area);
+    }
 
     for (i, e) in cards.iter().enumerate() {
         let row = Rect {
@@ -498,6 +510,12 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::CellWidth;
 
+    /// The window the frame tests paint into: a 60-column, 24-row terminal — the
+    /// `App::new` width the rest of this module already used, plus the height the
+    /// store needs in order to know how tall a page of scrollback is.
+    const WIDTH: u16 = 60;
+    const HEIGHT: u16 = 24;
+
     /// Read the backend's screen back as trimmed rows of text.
     fn rows(b: &TestBackend) -> Vec<String> {
         let w = b.buffer().area.width.max(1) as usize;
@@ -528,7 +546,7 @@ mod tests {
     /// Bash is the mode that is always open.
     fn app(mode: TerminalType, need_input: bool) -> App {
         let (tx, _rx) = mpsc::channel::<UiCommand>(4);
-        let mut app = App::new(tx, InputState::new(), mode, 60);
+        let mut app = App::new(tx, InputState::new(), mode, WIDTH, HEIGHT);
         if !need_input {
             app.view_mut(SessionId::new(mode, 1))
                 .set_status(SessionStatus::Running, Instant::now());
@@ -806,5 +824,182 @@ mod tests {
         })
         .unwrap();
         rows(term.backend()).first().cloned().unwrap_or_default()
+    }
+
+    // ─────────── the scrollback store drives the band (looprs-pdl.6) ───────────
+
+    /// As [`paint`], with a live tail handed to the frame the way the run loop
+    /// hands it: rendered once by the caller, drawn by the band.
+    fn paint_preview(app: &App, h: u16, preview: &[Line<'static>], input_rows: u16) -> Vec<String> {
+        let backend = TestBackend::new(60, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| view(app, f, preview, input_rows)).unwrap();
+        rows(term.backend())
+    }
+
+    /// `n` settled system lines in the given view, flushed at 60 columns.
+    fn settle(app: &mut App, id: SessionId, n: usize) {
+        for i in 0..n {
+            app.view_mut(id)
+                .push_note(MessageKind::System, format!("settled {i}"));
+        }
+        app.flush_active(60);
+    }
+
+    /// The live tail belongs to the tail. Scrolled up into the transcript, a
+    /// streaming line must not keep repainting the thing the user stopped to
+    /// read — the band is the history then, and the pill is what says the
+    /// session is still talking.
+    #[test]
+    fn the_live_tail_shows_only_while_the_view_follows_the_tail() {
+        let mut app = app(TerminalType::Pi, true);
+        app.set_window(60, 30);
+        let id = SessionId::new(TerminalType::Pi, 1);
+        settle(&mut app, id, 30);
+        app.view_mut(id).chat = ChatState::Chat;
+        let preview = vec![Line::from("LIVE-TAIL".to_string())];
+
+        let on = paint_preview(&app, 30, &preview, viewport::MIN_INPUT_ROWS).concat();
+        assert!(
+            on.contains("LIVE-TAIL"),
+            "pinned, the live line is on the band: {on:?}"
+        );
+
+        app.top_active();
+        assert!(!app.pinned(), "the top of the transcript is not the tail");
+        let off = paint_preview(&app, 30, &preview, viewport::MIN_INPUT_ROWS).concat();
+        assert!(
+            !off.contains("LIVE-TAIL"),
+            "the live tail drew over the history the user stopped on: {off:?}"
+        );
+        assert!(
+            off.contains("settled 0"),
+            "the band is showing the head of the transcript: {off:?}"
+        );
+    }
+
+    /// The "N new" affordance: visible while the tail has moved away from the
+    /// view, naming the count and the one action that answers it — and gone
+    /// once the user is back at the tail, because there is nothing to say.
+    #[test]
+    fn the_new_rows_pill_shows_while_off_the_tail_and_only_then() {
+        let mut app = app(TerminalType::Pi, true);
+        app.set_window(60, 30);
+        let id = SessionId::new(TerminalType::Pi, 1);
+        settle(&mut app, id, 30);
+        let band = app.transcript_band_rows();
+        let band_area =
+            viewport::frame_areas(Rect::new(0, 0, 60, 30), 0, viewport::MIN_INPUT_ROWS)[0];
+        assert_eq!(
+            band as u16, band_area.height,
+            "the band the app counts and the band the frame lays out are the same"
+        );
+
+        // Pinned: nothing is unseen, so nothing is said.
+        let pinned_screen = paint(&app, 30).concat();
+        assert!(
+            !pinned_screen.contains("new"),
+            "a pinned view was told about rows it can see: {pinned_screen:?}"
+        );
+
+        app.scroll_active(-(band as isize));
+        app.view_mut(id)
+            .push_note(MessageKind::System, "late arrival".into());
+        app.flush_active(60);
+        assert_eq!(app.new_rows(), 2, "the line and its separator");
+
+        let off = paint(&app, 30);
+        let off_concat = off.concat();
+        assert!(
+            off_concat.contains("2 new"),
+            "no affordance for the unseen rows: {off:?}"
+        );
+        assert!(
+            off_concat.contains("End"),
+            "the affordance does not name the way back: {off:?}"
+        );
+        // It sits on the band\'s bottom row, which is the row the tail would be on.
+        let bottom = &off[band_area.bottom() as usize - 1];
+        assert!(
+            bottom.contains("2 new"),
+            "the pill is not on the band\'s bottom row: {off:?}"
+        );
+
+        app.tail_active();
+        let back = paint(&app, 30).concat();
+        assert!(
+            !back.contains("End for the tail"),
+            "the pill outlived the thing it was reporting: {back:?}"
+        );
+        assert!(
+            back.contains("late arrival"),
+            "and the tail is shown: {back:?}"
+        );
+    }
+
+    /// **The resize property, painted.** A window drag re-wraps the transcript,
+    /// and the line the view was resting on stays on the screen. The row that
+    /// line occupies changes — that is what a re-wrap *is* — so an
+    /// index-preserving scroll position would move the text out from under the
+    /// user, which is the difference between a usable scrollback and a useless
+    /// one.
+    #[test]
+    fn a_resize_keeps_the_line_the_user_was_looking_at_on_screen() {
+        let mut app = app(TerminalType::Pi, true);
+        let id = SessionId::new(TerminalType::Pi, 1);
+        let filler = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega aaaa bbbb cccc dddd eeee ffff gggg hhhh";
+        for i in 0..12 {
+            app.view_mut(id)
+                .push_note(MessageKind::Answer, format!("MARK-{i} {filler}"));
+        }
+        app.flush_active(80);
+        let wide = app.scrollback().len();
+        let band = viewport::frame_areas(Rect::new(0, 0, 60, 30), 0, viewport::MIN_INPUT_ROWS)[0]
+            .height as usize;
+
+        // Rest the view with MARK-7 as its bottom-most visible row.
+        let marker = app
+            .scrollback()
+            .rows()
+            .iter()
+            .position(|r| r.to_string().contains("MARK-7"))
+            .expect("the marker row is in the store");
+        let offset = wide - marker - 1;
+        assert!(
+            offset <= app.scrollback().max_scroll(band),
+            "setup: MARK-7 has to be reachable, offset={offset} max={}",
+            app.scrollback().max_scroll(band)
+        );
+        app.scroll_active(-(offset as isize));
+        assert!(
+            app.transcript_window(band)
+                .last()
+                .unwrap()
+                .to_string()
+                .contains("MARK-7")
+        );
+        let before = paint(&app, 30).concat();
+        assert!(before.contains("MARK-7"), "{before:?}");
+
+        // A narrower window: the paragraphs take more rows each.
+        app.set_window(56, 30);
+        app.flush_active(56);
+        let narrow = app.scrollback().len();
+        assert!(narrow > wide, "nothing re-wrapped: {wide} -> {narrow}");
+
+        let after = paint(&app, 30).concat();
+        assert!(
+            after.contains("MARK-7"),
+            "the resize moved the content the view was resting on off the screen: {after:?}"
+        );
+        assert_ne!(before, after, "the frame did not change at all");
+        // …and it is still the row the view rests on, not merely still somewhere.
+        assert!(
+            app.transcript_window(band)
+                .last()
+                .unwrap()
+                .to_string()
+                .contains("MARK-7")
+        );
     }
 }

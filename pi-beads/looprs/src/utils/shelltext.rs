@@ -827,6 +827,80 @@ fn cluster_cells(text: &str) -> usize {
     text.width().max(1)
 }
 
+/// One laid-out cluster: the text that renders as one unit, and the cells it takes.
+///
+/// `start`/`end` are byte offsets into the text passed to [`clusters`], always on
+/// `char` boundaries, and they *cover the whole input*: the clusters returned are
+/// a partition of `text`, so slicing them out loses nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cluster {
+    pub start: usize,
+    pub end: usize,
+    /// Cells this cluster occupies: 1, 2, or more for an exotic join.
+    pub cells: usize,
+}
+
+/// Split `text` into the clusters the renderer lays out.
+///
+/// This is deliberately the *same* rule [`put_char`] uses to lay a resolved line
+/// out — a base opens a cluster, a joiner (`is_joiner`) extends the one to its
+/// left, `ZWJ` additionally pulls the next base in — and not a second
+/// implementation of it. Two cluster rules is the divergence ADR-0005 Q4 warns
+/// about: the cell grid a selection snaps to and the cells the resolver painted
+/// would stop agreeing, and the failure is a copy that cuts a glyph in half.
+///
+/// Two differences from the resolver, both forced by having no cursor to fall
+/// back on:
+///
+/// * a joiner at the very start has nothing to join, so rather than being dropped
+///   it is carried along with the cluster that follows. The resolver can throw a
+///   orphan mark away because it is painting a screen; a cell map that dropped
+///   bytes would make the map lie about the string it indexes.
+/// * the input is already resolved text, so there is no overwrite and therefore
+///   no re-measuring of a cluster another write landed on.
+///
+/// [`put_char`]: LineResolver::put_char
+pub fn clusters(text: &str) -> Vec<Cluster> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut starts: Vec<usize> = Vec::new();
+    let mut pull_next = false;
+    for (i, c) in text.char_indices() {
+        // A base right after a ZWJ belongs to the cluster the ZWJ is hanging off.
+        if pull_next {
+            pull_next = false;
+            continue;
+        }
+        if is_joiner(c) {
+            pull_next = c == ZWJ;
+            continue;
+        }
+        starts.push(i);
+    }
+    // Leading joiners (and a string that is nothing *but* joiners) have no base
+    // to open. Rather than dropping their bytes or giving them a cell of their own,
+    // they join the cluster that follows: that slice is exactly what the renderer
+    // is handed, so whatever it measures is what this says.
+    if starts.is_empty() {
+        starts.push(0);
+    } else {
+        starts[0] = 0;
+    }
+    starts
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| {
+            let end = starts.get(i + 1).copied().unwrap_or(text.len());
+            Cluster {
+                start,
+                end,
+                cells: cluster_cells(&text[start..end]),
+            }
+        })
+        .collect()
+}
+
 /// `"38;5;208"` → `[38, 5, 208]`. An empty parameter list is `[0]`, which is
 /// what `CSI m` means (reset) and what `git` emits at the end of every span.
 fn params(raw: &str) -> Vec<u32> {

@@ -81,7 +81,7 @@ pub fn code_header(lang: &str) -> Line<'static> {
 #[derive(Default)]
 struct R {
     width: usize,
-    out: Vec<Line<'static>>,
+    out: Vec<Wrapped>,
     cur: Vec<Span<'static>>,
     style: Vec<Style>,
     lists: Vec<Option<u64>>, // Some(n) = ordered, next number
@@ -94,6 +94,17 @@ struct R {
 /// Render a *complete* markdown fragment to wrapped lines (no trailing blank).
 /// Tables/images/html are not handled in this sketch.
 pub fn render_markdown(src: &str, width: u16) -> Vec<Line<'static>> {
+    unwrap(render_markdown_tracked(src, width))
+}
+
+/// As [`render_markdown`], keeping the wrap facts the caller cannot recover from
+/// the pixels: which rows ended a logical line and which are a soft wrap of ours.
+///
+/// The renderer is the only thing in the tree that knows this — the wrap decides
+/// the break, and by the time a `Line` comes out the evidence has gone. A store
+/// that has to re-wrap later (looprs-pdl.6) and a copy path that has to paste
+/// without inventing newlines (ADR-0004 R14) both need it said out loud.
+pub fn render_markdown_tracked(src: &str, width: u16) -> Vec<Wrapped> {
     let mut r = R {
         width: width.max(20) as usize,
         ..Default::default()
@@ -103,10 +114,38 @@ pub fn render_markdown(src: &str, width: u16) -> Vec<Line<'static>> {
         r.event(ev);
     }
     r.flush();
-    while r.out.last().is_some_and(|l| l.spans.is_empty()) {
+    while r.out.last().is_some_and(|l| l.line.spans.is_empty()) {
         r.out.pop();
     }
     r.out
+}
+
+/// Drop the wrap metadata, keeping the lines.
+pub fn unwrap(rows: Vec<Wrapped>) -> Vec<Line<'static>> {
+    rows.into_iter().map(|w| w.line).collect()
+}
+
+/// One row of rendered markdown, with the way its end joins to the next row.
+#[derive(Clone, Debug)]
+pub struct Wrapped {
+    pub line: Line<'static>,
+    /// `true` = **our soft wrap**: the logical line goes on at the start of the
+    /// next row, and joining the two inserts nothing. `false` = a **hard** end,
+    /// the source's own line break.
+    ///
+    /// The distinction is the whole of ADR-0004 R14: paste the joined text of a
+    /// soft-wrapped paragraph with a `\n` between the rows and every paragraph
+    /// reads as if it was typed with a stuck Enter key.
+    pub soft: bool,
+}
+
+impl Wrapped {
+    pub fn hard(line: Line<'static>) -> Self {
+        Self { line, soft: false }
+    }
+    pub fn soft(line: Line<'static>) -> Self {
+        Self { line, soft: true }
+    }
 }
 
 impl R {
@@ -121,7 +160,7 @@ impl R {
             Event::Text(t) => {
                 if let Some(hl) = self.code.as_mut() {
                     for l in t.lines() {
-                        self.out.push(code_line(hl, l));
+                        self.out.push(Wrapped::hard(code_line(hl, l)));
                     }
                 } else {
                     let s = self.cur_style();
@@ -138,8 +177,9 @@ impl R {
             Event::HardBreak => self.flush(),
             Event::Rule => {
                 self.flush();
-                self.out.push(Line::styled("─".repeat(self.width), DIM));
-                self.out.push(Line::default());
+                self.out
+                    .push(Wrapped::hard(Line::styled("─".repeat(self.width), DIM)));
+                self.out.push(Wrapped::hard(Line::default()));
             }
             Event::TaskListMarker(done) => {
                 self.cur.push(Span::raw(if done { "☑ " } else { "☐ " }))
@@ -172,7 +212,7 @@ impl R {
                     }
                     _ => String::new(),
                 };
-                self.out.push(code_header(&lang));
+                self.out.push(Wrapped::hard(code_header(&lang)));
                 self.code = Some(highlighter().start(&lang));
             }
             Tag::List(n) => {
@@ -214,13 +254,13 @@ impl R {
             TagEnd::Paragraph => {
                 self.flush();
                 if self.lists.is_empty() {
-                    self.out.push(Line::default());
+                    self.out.push(Wrapped::hard(Line::default()));
                 }
             }
             TagEnd::Heading(_) => {
                 self.flush();
                 self.style.pop();
-                self.out.push(Line::default());
+                self.out.push(Wrapped::hard(Line::default()));
             }
             TagEnd::BlockQuote(_) => {
                 self.flush();
@@ -228,13 +268,13 @@ impl R {
             }
             TagEnd::CodeBlock => {
                 self.code = None;
-                self.out.push(Line::default());
+                self.out.push(Wrapped::hard(Line::default()));
             }
             TagEnd::List(_) => {
                 self.flush();
                 self.lists.pop();
                 if self.lists.is_empty() {
-                    self.out.push(Line::default());
+                    self.out.push(Wrapped::hard(Line::default()));
                 }
             }
             TagEnd::Item => self.flush(),
@@ -276,14 +316,19 @@ impl R {
     }
 }
 
-/// Greedy word-wrap over styled spans. Prefixes count toward `width`.
-/// (Words longer than a full line are not hard-split in this sketch.)
-pub fn wrap(
-    spans: Vec<Span<'static>>,
-    width: usize,
-    first: String,
-    rest: String,
-) -> Vec<Line<'static>> {
+/// Greedy word-wrap over styled spans, returning *rows* rather than lines.
+/// Prefixes count toward `width`. (Words longer than a full line are not
+/// hard-split in this sketch.)
+///
+/// It returns [`Wrapped`] rather than `Line` because the wrap is the only thing
+/// that knows which breaks were made by us, and the store that has to re-wrap
+/// later and the copy path that must not invent newlines both need that said
+/// ([`RowEnd`]/ADR-0004 R14). The rows the loop breaks on are the ones that
+/// *continue* onto the next row, so they are `soft`; whatever the input ends
+/// with has really ended, so it is `hard`.
+///
+/// [`RowEnd`]: crate::state::scrollback::RowEnd
+pub fn wrap(spans: Vec<Span<'static>>, width: usize, first: String, rest: String) -> Vec<Wrapped> {
     let mk = |p: &str| -> Vec<Span<'static>> {
         if p.is_empty() {
             vec![]
@@ -301,7 +346,10 @@ pub fn wrap(
             let pw = piece.trim_end().width();
             if has && w + pw > width {
                 trim_trailing(&mut cur);
-                lines.push(Line::from(std::mem::replace(&mut cur, mk(&rest))));
+                lines.push(Wrapped::soft(Line::from(std::mem::replace(
+                    &mut cur,
+                    mk(&rest),
+                ))));
                 w = rest.width();
                 has = false;
             }
@@ -315,7 +363,7 @@ pub fn wrap(
     }
     trim_trailing(&mut cur);
     if has {
-        lines.push(Line::from(cur));
+        lines.push(Wrapped::hard(Line::from(cur)));
     }
     lines
 }
