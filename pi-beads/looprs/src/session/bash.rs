@@ -825,6 +825,20 @@ impl BashTask {
     }
 
     fn shutdown(&mut self) {
+        // The screen debt is paid *before* the shell is sent anywhere. A program
+        // that held the alternate screen and dies without saying so leaves the user
+        // stranded inside it — their prompt gone, the dead program's paint still on
+        // the glass — and this is the last moment the outer terminal is ours to
+        // write to. `release_screen_at_command_end` is the boundary the SIGKILLed
+        // vim case already uses; the quit path simply never reached it, because the
+        // command never ended.
+        //
+        // It goes first, ahead of the kill, for the same reason `ScreenWatch` puts
+        // a release after its bytes: the owed `ESC[?1049l` has to leave through a
+        // UI that still believes the session owns the screen, because that is the
+        // only state in which the app tees bytes instead of transcripting them.
+        self.release_screen_at_command_end();
+
         if let Some(mut shell) = self.shell.take() {
             // Close the write end first so a shell reading stdin sees EOF, then
             // make sure it is actually gone.
@@ -1772,6 +1786,64 @@ mod tests {
         let joined = events.join("|");
         assert_no_marker_bytes(&joined);
         assert_eq!(s.status(), SessionStatus::Idle, "and the shell is fine");
+    }
+
+    /// Everything the session says from now until its stream closes (the session
+    /// task ending is what closes it, so this is "what it said on the way out").
+    async fn until_closed(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + NO_HANG;
+        let mut events = Vec::new();
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(ev)) => events.push(describe(&ev)),
+                Ok(None) => return events,
+                Err(_) => panic!("the session never closed its stream: {events:?}"),
+            }
+        }
+    }
+
+    /// **Acceptance: quitting while a full-screen program holds the screen pays the
+    /// alternate screen back.**
+    ///
+    /// `printf` takes the alt screen and never returns it — the shape of vim
+    /// killed, `less` closed by a signal, a pager that died mid-paint. The command
+    /// boundary pays that debt for a command that finishes; this is the other way
+    /// out, the quit that arrives *while* the program still holds it. Nobody else
+    /// can pay it: this session is the only thing that watched the bytes go by,
+    /// and the moment `shutdown` returns the terminal belongs to whatever started
+    /// us. Left unpaid, the user is inside a dead program's screen with their prompt
+    /// gone, and the only way out is `reset` typed blind.
+    #[tokio::test]
+    async fn quitting_while_a_full_screen_program_holds_the_screen_leaves_the_alt_screen() {
+        let (mut s, mut rx) = bash(21);
+        s.send_text("printf '\\033[?1049hpainted and stuck'; sleep 30".into())
+            .unwrap();
+
+        // Wait for the takeover, then quit mid-hold. The `sleep 30` keeps a
+        // command in front of the shell so nothing can end it politely for us: the
+        // only thing that can pay the screen back here is the quit path itself.
+        let deadline = tokio::time::Instant::now() + NO_HANG;
+        loop {
+            let line = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("the session went silent before taking the screen")
+                .expect("stream closed");
+            if describe(&line) == "screen true" {
+                break;
+            }
+        }
+
+        s.shutdown().unwrap();
+        let events = until_closed(&mut rx).await;
+        let joined = events.join("|");
+        assert!(
+            joined.contains("\u{1b}[?1049l"),
+            "the alt screen the program died holding must be paid back on the quit path: {events:?}"
+        );
+        assert!(
+            events.contains(&"screen false".to_string()),
+            "and the UI must be told the screen is free on the way out: {events:?}"
+        );
     }
 
     /// The non-alt-screen case: a program that repaints in place without ever

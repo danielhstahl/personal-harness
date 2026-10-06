@@ -34,6 +34,7 @@
 //! the child is drawing its own screen.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::sync::{Arc, Mutex};
 
 /// A change in who owns the real terminal screen, read out of the child's bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +85,11 @@ pub struct ScreenWatch {
     held: bool,
     /// Started the alt screen (and therefore owes a restore).
     alt: bool,
+    /// Which alternate-screen code the switch used (`1049`, `1047`, `47`), so the
+    /// leave that gets paid back is the one that matches the entry. `None` for a
+    /// takeover the watcher only *inferred* (cursor addressing with no linefeeds),
+    /// which switched nothing and therefore owes nothing.
+    alt_code: Option<u16>,
     state: Scan,
     /// The bytes still being decided: everything read since the last piece was
     /// handed back. Held rather than emitted because an escape sequence at the end
@@ -116,6 +122,16 @@ impl ScreenWatch {
         self.held
     }
 
+    /// The alternate-screen code this watcher believes is currently switched on,
+    /// if the switch it saw was an explicit one.
+    ///
+    /// This is the half of [`Self::alt`] that a leave sequence needs: `?1047h` is
+    /// not put back by `?1049l`, and guessing is the difference between a screen
+    /// that returns and a screen that changes again on the way out.
+    pub fn alt_code(&self) -> Option<u16> {
+        self.alt_code
+    }
+
     /// Feed one read of the child's output; get the pieces back in order.
     pub fn observe(&mut self, bytes: &[u8]) -> Vec<Piece> {
         // The heuristic half (cursor addressing with no linefeeds) needs the shape
@@ -141,7 +157,17 @@ impl ScreenWatch {
                     run.push(b);
                     let final_byte = (0x40..=0x7e).contains(&b);
                     if final_byte {
-                        if let Some(change) = classify(&run[self.seq_start..], has_lf, self.held) {
+                        let change = classify(&run[self.seq_start..], has_lf, self.held);
+                        // Which alternate-screen code this sequence switched on,
+                        // read out of the same bytes now, before the branch below
+                        // starts draining `run` out from under the slice.
+                        let entered = match change {
+                            Some(ScreenChange::Takeover { alt: true }) => {
+                                alt_code_of(&run[self.seq_start..])
+                            }
+                            _ => None,
+                        };
+                        if let Some(change) = change {
                             match change {
                                 ScreenChange::Takeover { alt } => {
                                     // Everything before the switch belongs to the
@@ -155,6 +181,7 @@ impl ScreenWatch {
                                     out.push(Piece::Change(ScreenChange::Takeover { alt }));
                                     self.held = true;
                                     self.alt = alt;
+                                    self.alt_code = entered;
                                     // The run now starts at the sequence, so the
                                     // index it is addressed by moves to the front.
                                     self.seq_start = 0;
@@ -167,6 +194,7 @@ impl ScreenWatch {
                                     out.push(Piece::Change(ScreenChange::Release));
                                     self.held = false;
                                     self.alt = false;
+                                    self.alt_code = None;
                                 }
                             }
                         }
@@ -221,24 +249,26 @@ impl ScreenWatch {
     /// gets the main screen — and the scrollback with it — back.
     pub fn force_release(&mut self) -> Vec<u8> {
         let mut bytes = self.drain();
-        if self.alt {
-            bytes.extend_from_slice(b"\x1b[?1049l");
+        if let Some(code) = self.alt_code {
+            bytes.extend_from_slice(alt_leave(code));
         }
         self.held = false;
         self.alt = false;
+        self.alt_code = None;
         bytes
     }
 }
 
 const ESC: u8 = 0x1b;
 
-/// Classify a complete CSI sequence.
+/// A complete CSI sequence, taken apart: whether it is a private (`?`) mode
+/// sequence, the numbers it carries, and its final byte.
 ///
-/// `has_lf` is the shape of the chunk this came from: the cursor-addressing
-/// heuristic only fires for a chunk with **no linefeeds in it**, because that is
-/// the measurable difference between a program that writes lines (which the
-/// transcript serves fine) and a program that paints a screen (which it cannot).
-fn classify(seq: &[u8], has_lf: bool, held: bool) -> Option<ScreenChange> {
+/// One parser for every reader of these bytes. `ScreenWatch`'s classifier and the
+/// alternate-screen debt tracker below ask different questions of the same
+/// sequences, and two hand-rolled parsers is how one of them starts answering a
+/// question the other got wrong.
+fn parse_csi(seq: &[u8]) -> Option<(bool, Vec<u16>, u8)> {
     // seq = ESC '[' <params> <final>
     if seq.len() < 3 || seq[0] != ESC || seq[1] != b'[' {
         return None;
@@ -251,10 +281,21 @@ fn classify(seq: &[u8], has_lf: bool, held: bool) -> Option<ScreenChange> {
         .split(';')
         .filter_map(|p| p.trim().parse::<u16>().ok())
         .collect();
+    Some((private, nums, final_byte))
+}
+
+/// Classify a complete CSI sequence.
+///
+/// `has_lf` is the shape of the chunk this came from: the cursor-addressing
+/// heuristic only fires for a chunk with **no linefeeds in it**, because that is
+/// the measurable difference between a program that writes lines (which the
+/// transcript serves fine) and a program that paints a screen (which it cannot).
+fn classify(seq: &[u8], has_lf: bool, held: bool) -> Option<ScreenChange> {
+    let (private, nums, final_byte) = parse_csi(seq)?;
 
     // The explicit signal: someone switched to the alternate screen. 1049 is the
     // xterm/vim/less/htop code; 1047 and 47 are its older spellings.
-    if private && is_alt_screen_code(&nums) {
+    if private && alt_screen_code(&nums).is_some() {
         return match final_byte {
             b'h' if !held => Some(ScreenChange::Takeover { alt: true }),
             b'l' if held => Some(ScreenChange::Release),
@@ -282,8 +323,120 @@ fn classify(seq: &[u8], has_lf: bool, held: bool) -> Option<ScreenChange> {
     paint.then_some(ScreenChange::Takeover { alt: false })
 }
 
-fn is_alt_screen_code(nums: &[u16]) -> bool {
-    nums.iter().any(|n| matches!(n, 1049 | 1047 | 47))
+/// The alternate-screen code among these parameters, if there is one.
+fn alt_screen_code(nums: &[u16]) -> Option<u16> {
+    nums.iter().copied().find(|n| matches!(n, 1049 | 1047 | 47))
+}
+
+/// Which alternate-screen code this sequence switched **on**.
+///
+/// `None` for anything that is not a private-mode set of one of the alt-screen
+/// codes, including the matching reset: a `l` is somebody else paying a debt, not
+/// one being taken on.
+fn alt_code_of(seq: &[u8]) -> Option<u16> {
+    let (private, nums, final_byte) = parse_csi(seq)?;
+    if !private || final_byte != b'h' {
+        return None;
+    }
+    alt_screen_code(&nums)
+}
+
+/// The bytes that put a given alternate-screen code back.
+///
+/// The leave has to be spelled the way the entry was: `?1047h` is not undone by
+/// `?1049l`, and a mismatched leave is a screen that is still not the user's when
+/// the app stops writing to it.
+pub fn alt_leave(code: u16) -> &'static [u8] {
+    match code {
+        1047 => b"\x1b[?1047l",
+        47 => b"\x1b[?47l",
+        // 1049 is the spelling everything real uses, and the one that saves the
+        // cursor along with the screen.
+        _ => b"\x1b[?1049l",
+    }
+}
+
+/// The alternate screen a full-screen child switched on and may never have given
+/// back, seen from the bytes the passthrough wrote to the **real** terminal.
+///
+/// [`crate::teardown::Ledger`] tracks the modes *this app* switched on, and it is
+/// the right owner of those. The alternate screen a `vim` entered is different in
+/// one important way: the app did not switch it on, it *passed the byte through*.
+/// That distinction is worth nothing to the user standing in front of the terminal
+/// — either way the program on the glass is not the shell — and it is worth
+/// everything to the exit path, because the only thing left that can write to the
+/// terminal when the app goes down is the app.
+///
+/// So the debt is recorded where it can be seen honestly: from the tee'd bytes
+/// themselves. `?1049h` going out makes us answerable for `?1049l`; seeing the
+/// child's own `?1049l` go out through the same pipe discharges it. No question
+/// is asked of the terminal, in this or any other direction: the bytes we wrote
+/// are the whole record, exactly as [`crate::teardown`] requires of a mode.
+///
+/// Note what this is *not*: it is not the same fact as "a child currently holds
+/// the screen" (`SessionEvent::ScreenHeld`). That is about who gets the next
+/// frame. This is about who owes the terminal a leave sequence, and it outlives
+/// the session that ran up the debt on purpose — a child killed with `SIGKILL`
+/// never pays it, and the pump that would have carried its last words is already
+/// gone by the time the app hands the terminal back.
+#[derive(Clone, Default)]
+pub struct ScreenDebt(Arc<Mutex<DebtInner>>);
+
+#[derive(Default)]
+struct DebtInner {
+    /// A watcher pointed at the tee'd stream rather than at the child's own read,
+    /// so the debt follows what actually reached the terminal. If the app was not
+    /// teeing, the bytes never got there and no debt was incurred — which is the
+    /// answer a `ScreenWatch` on the child's side could not give.
+    watch: ScreenWatch,
+    /// The alt-screen code still owed, and the only thing `restore` reads.
+    owed: Option<u16>,
+}
+
+impl ScreenDebt {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The passthrough wrote `bytes` to the real terminal: update the debt.
+    ///
+    /// Only an explicit alt-screen switch counts, and only in the direction that
+    /// takes it on. A cursor-addressing takeover (the watcher's inferred half)
+    /// switched nothing the terminal needs a leave for, and treating it as one
+    /// would put a `?1049l` on the wire for a screen nobody switched — the exact
+    /// mistake the mode ledger exists to prevent.
+    pub fn note_tee(&self, bytes: &[u8]) {
+        let mut inner = self.lock();
+        for piece in inner.watch.observe(bytes) {
+            match piece {
+                Piece::Change(ScreenChange::Takeover { alt: true }) => {
+                    inner.owed = inner.watch.alt_code();
+                }
+                Piece::Change(ScreenChange::Release) => inner.owed = None,
+                _ => {}
+            }
+        }
+    }
+
+    /// The alternate-screen code the app still owes the terminal, if any.
+    pub fn outstanding(&self) -> Option<u16> {
+        self.lock().owed
+    }
+
+    /// Discharge the debt without writing anything.
+    ///
+    /// For the caller that *paid* it with bytes of its own, which is the ordinary
+    /// case: `vim` quits properly, its leave goes out through the tee, and the
+    /// child's command-end [`ScreenWatch::force_release`] has already settled up.
+    pub fn pay(&self) {
+        self.lock().owed = None;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, DebtInner> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 /// Copy the child's bytes to the real terminal, verbatim, and flush.
@@ -428,6 +581,100 @@ mod tests {
 
     fn s(x: &str) -> Vec<u8> {
         x.as_bytes().to_vec()
+    }
+
+    /// The watcher remembers *which* alternate screen it saw, so the leave that
+    /// gets paid back matches the entry instead of guessing at it.
+    #[test]
+    fn the_watcher_remembers_which_alt_screen_was_switched() {
+        for code in [1049u16, 1047, 47] {
+            let mut w = ScreenWatch::new();
+            w.observe(format!("\x1b[?{code}h").as_bytes());
+            assert_eq!(
+                w.alt_code(),
+                Some(code),
+                "{code} was switched on and must be remembered"
+            );
+            w.observe(format!("\x1b[?{code}l").as_bytes());
+            assert_eq!(w.alt_code(), None, "{code} was given back");
+        }
+    }
+
+    /// A takeover inferred from cursor addressing switched nothing, so nothing is
+    /// remembered and `force_release` invents no leave bytes.
+    #[test]
+    fn an_inferred_takeover_is_not_an_alt_screen() {
+        let mut w = ScreenWatch::new();
+        w.observe(b"\x1b[10;1H\x1b[2Jpainted without switching");
+        assert!(w.is_held(), "the heuristic still holds the screen");
+        assert_eq!(w.alt_code(), None, "but nothing was switched on");
+        let forced = w.force_release();
+        assert!(
+            !String::from_utf8_lossy(&forced).contains("1049")
+                && !String::from_utf8_lossy(&forced).contains("1047"),
+            "no leave for a screen nobody switched: {forced:?}"
+        );
+    }
+
+    /// `force_release` pays with the code that was entered, not with a literal.
+    #[test]
+    fn a_forced_release_pays_the_code_it_remembered() {
+        let mut w = ScreenWatch::new();
+        w.observe(b"\x1b[?1047h");
+        let forced = w.force_release();
+        assert_eq!(
+            String::from_utf8_lossy(&forced),
+            "\x1b[?1047l",
+            "1047 goes back as 1047"
+        );
+        assert_eq!(w.alt_code(), None, "and the debt is settled");
+    }
+
+    /// The debt tracks what the passthrough actually wrote: `h` takes it on, the
+    /// child's own `l` discharges it.
+    #[test]
+    fn the_debt_follows_the_bytes_the_passthrough_wrote() {
+        let d = ScreenDebt::new();
+        assert_eq!(d.outstanding(), None);
+        d.note_tee(b"\x1b[?1049hframe");
+        assert_eq!(d.outstanding(), Some(1049));
+        // Still on the child's screen a chunk later; the debt did not fade.
+        d.note_tee(b"more paint");
+        assert_eq!(d.outstanding(), Some(1049));
+        d.note_tee(b"\x1b[?1049l");
+        assert_eq!(d.outstanding(), None, "the child paid its own way out");
+    }
+
+    /// A sequence split across two tees is still one switch — the same straddle
+    /// the watcher exists for, now feeding the debt instead of the drawing path.
+    #[test]
+    fn a_switch_split_across_two_tees_is_still_one_switch() {
+        let d = ScreenDebt::new();
+        d.note_tee(b"paint\x1b[?104");
+        assert_eq!(d.outstanding(), None, "not decided yet");
+        d.note_tee(b"9hmore");
+        assert_eq!(d.outstanding(), Some(1049), "decided, and owed");
+    }
+
+    /// Paying without writing is the seam for "somebody else's bytes already left
+    /// the screen" — the command-boundary release in the Bash session.
+    #[test]
+    fn paying_the_debt_by_hand_leaves_nothing_owed() {
+        let d = ScreenDebt::new();
+        d.note_tee(b"\x1b[?1049h");
+        d.pay();
+        assert_eq!(d.outstanding(), None);
+    }
+
+    /// Each alt-screen code leaves with its own spelling.
+    #[test]
+    fn every_alt_screen_code_names_its_own_leave() {
+        assert_eq!(alt_leave(1049), b"\x1b[?1049l");
+        assert_eq!(alt_leave(1047), b"\x1b[?1047l");
+        assert_eq!(alt_leave(47), b"\x1b[?47l");
+        // An unknown code still gets the one spelling that is always safe to send
+        // rather than nothing at all.
+        assert_eq!(alt_leave(9999), b"\x1b[?1049l");
     }
 
     /// Alt screen in, alt screen out, with the ordering rule held: the takeover is

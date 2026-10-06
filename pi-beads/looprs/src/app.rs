@@ -594,6 +594,17 @@ pub struct App {
     /// job, and the run loop has to be able to ask "am I allowed to draw?" without
     /// reaching into a backend.
     screen: Option<SessionId>,
+    /// The alternate screen this app *passed through* to a full-screen child and
+    /// has not seen given back.
+    ///
+    /// Not the same fact as [`Self::screen`]: that says who gets the next frame;
+    /// this says who owes the terminal a leave sequence. It is tracked from the
+    /// bytes the passthrough wrote, because that is the only record of what the
+    /// real terminal was actually told, and it is read once, by
+    /// [`crate::teardown::Teardown::restore`], when nothing else is left that can
+    /// write. A child killed while holding the screen never pays this; the exit
+    /// path does.
+    screen_debt: crate::screen::ScreenDebt,
     /// The screen came back and the inline viewport must be re-anchored before
     /// anything is drawn. Set on release, consumed by the run loop in `main.rs`,
     /// which is the only place that can stop the key stream, resize the
@@ -639,6 +650,7 @@ impl App {
             should_quit: false,
             spinner: 0,
             screen: None,
+            screen_debt: crate::screen::ScreenDebt::new(),
             reanchor: false,
             clock: now,
             row_phase: now,
@@ -948,6 +960,11 @@ impl App {
                     // this is also precisely what a real terminal does — the
                     // alternate screen is discarded on exit, not recalled.
                     crate::screen::tee(chunk.as_bytes());
+                    // Recorded in the same breath as the write: the debt is a
+                    // fact about these bytes reaching the real terminal, and the
+                    // one thing it may not be is a guess made later about whether
+                    // they got there.
+                    self.screen_debt.note_tee(chunk.as_bytes());
                 } else {
                     // Line-oriented output: `push_bash` resolves the presentation
                     // into styles and in-line edits, and never re-wraps and never
@@ -1037,6 +1054,25 @@ impl App {
                 self.restore_input(session, text);
             }
         }
+    }
+
+    /// Wire this App's passthrough to the teardown's alternate-screen debt.
+    ///
+    /// Handed in rather than owned here because the debt belongs to the exit path:
+    /// the App never hands the terminal back, it can only report what it wrote to
+    /// it — which is what [`Self::update`] does for every teed chunk.
+    pub fn set_screen_debt(&mut self, debt: crate::screen::ScreenDebt) {
+        self.screen_debt = debt;
+    }
+
+    /// The alternate-screen debt this App has run up, as the exit path sees it.
+    ///
+    /// Test-only: the real consumer is the teardown, which holds its own handle to
+    /// the same debt and never asks the App about it. This is the window the tests
+    /// look through to see what the passthrough booked.
+    #[cfg(test)]
+    pub fn screen_debt(&self) -> &crate::screen::ScreenDebt {
+        &self.screen_debt
     }
 
     /// Is the **active** mode the one whose child currently owns the real screen?
@@ -2651,6 +2687,68 @@ mod tests {
             "and it is still the live line it was: nothing was ended, so the              scrollback got nothing — while hidden, the bytes are held, not smeared"
         );
         assert!(app.view(TerminalType::Pi).is_none(), "Pi was not touched");
+    }
+
+    /// **The tee is where the alternate-screen debt gets booked**, because the
+    /// tee is the only thing this app uses to tell the real terminal anything.
+    /// A child that switched the screen through us and died there leaves us
+    /// holding it, and the exit path reads that off this handle (`looprs-pdl.3`).
+    #[test]
+    fn a_teed_alt_screen_is_a_screen_we_owe_the_terminal_back() {
+        let (mut app, _rx) = app_with(TerminalType::Bash);
+        app.update(Msg::ScreenHeld {
+            session: bash_id(),
+            active: true,
+        });
+        assert_eq!(
+            app.screen_debt().outstanding(),
+            None,
+            "nothing was switched on yet"
+        );
+
+        app.update(Msg::BashOutput {
+            session: bash_id(),
+            stream: ByteStream::Merged,
+            chunk: "\u{1b}[?1049h--INSERT--".into(),
+        });
+        assert_eq!(
+            app.screen_debt().outstanding(),
+            Some(1049),
+            "that screen is now ours to give back"
+        );
+
+        app.update(Msg::BashOutput {
+            session: bash_id(),
+            stream: ByteStream::Merged,
+            chunk: ":wq\r\n\u{1b}[?1049l".into(),
+        });
+        assert_eq!(
+            app.screen_debt().outstanding(),
+            None,
+            "the child paid its own leave, so nobody owes it twice"
+        );
+    }
+
+    /// The other half: bytes that never reached the terminal cannot have switched
+    /// anything on it. With the user looking at Pi, Bash's paint is transcripted,
+    /// and a transcript of `?1049h` is text, not a mode switch.
+    #[test]
+    fn a_screen_switch_that_was_never_teed_owes_nothing() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        app.update(Msg::ScreenHeld {
+            session: bash_id(),
+            active: true,
+        });
+        app.update(Msg::BashOutput {
+            session: bash_id(),
+            stream: ByteStream::Merged,
+            chunk: "\u{1b}[?1049hpaint that stayed in the transcript".into(),
+        });
+        assert_eq!(
+            app.screen_debt().outstanding(),
+            None,
+            "the real terminal was never told anything, so it is owed nothing"
+        );
     }
 
     /// **Acceptance: Esc reaches a full-screen program as Esc.** In vim `Esc` is

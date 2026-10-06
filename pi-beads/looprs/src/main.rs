@@ -3,6 +3,7 @@ mod components;
 mod screen;
 mod services;
 mod session;
+mod signals;
 mod state;
 mod teardown;
 #[cfg(test)]
@@ -14,7 +15,6 @@ use anyhow::Result;
 use app::{App, Msg, UiCommand};
 use components::input::InputState;
 use crossterm::event::{Event, EventStream};
-use crossterm::terminal::enable_raw_mode;
 use futures::StreamExt;
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
@@ -35,8 +35,9 @@ use tracing_subscriber::EnvFilter;
 use crate::services::notification;
 use crate::session::router::{Router, SHUTDOWN_GRACE};
 use crate::session::{ChatState, SessionConfig, TerminalType};
+use crate::signals::ExitSignals;
 use crate::state::transcript::Entry;
-use crate::teardown::{LiveAnchor, Teardown, install_panic_hook};
+use crate::teardown::{LiveAnchor, Mode, Teardown, install_panic_hook, panic_injected};
 
 fn init_logging() -> anyhow::Result<WorkerGuard> {
     //let dir = std::env::temp_dir(); // or a proper data dir, e.g. via the `dirs` crate
@@ -74,12 +75,12 @@ fn insert_lines(
 async fn main() -> Result<()> {
     let _log_guard = init_logging()?; // keep alive until exit, or buffered logs are lost
 
-    enable_raw_mode()?;
-    // The teardown is built *before* the live view, and the hook goes in before
-    // anything that can fail in raw mode. `LiveView::new` constructs a `Terminal`,
-    // which queries the cursor and can error; a panic or an `?` in that window is
-    // exactly what a terminal-left-in-raw-mode story is made of, so the way back
-    // exists before the thing that can break does.
+    // The teardown is built before anything that can switch a terminal mode on,
+    // and the panic hook goes in before anything that can fail with one switched
+    // on. From this line to the end of the process there is an object that knows
+    // which modes are ours and how to hand them back — which is the only way the
+    // guarantee (exactly once, from every path) can be true of the whole app and
+    // not just of the paths that remembered to arrange it.
     //
     // The anchor is handed in rather than read out afterwards for the same reason:
     // it is the one fact the exit path needs about the screen, and it is published
@@ -89,35 +90,78 @@ async fn main() -> Result<()> {
     let exit = Arc::new(Teardown::new(anchor.clone()));
     install_panic_hook(exit.clone());
 
-    let initial = TerminalType::Beeds;
-    // The live region opens at the height the policy wants for an empty stream —
-    // its chrome plus one row — instead of the constant 10 it used to be. From
-    // here on the frame decides the shape; see `viewport`.
-    let rows = crossterm::terminal::size().map(|(_, r)| r).unwrap_or(24);
-    let boot_h = viewport::desired_height(initial, rows, 0, 0, viewport::MIN_INPUT_ROWS);
-    let mut live = viewport::LiveView::with_anchor(
-        CrosstermBackend::new(io::stdout()),
-        boot_h,
-        |_| Ok(CrosstermBackend::new(io::stdout())),
-        anchor,
-    )?;
-    let res = run(&mut live, initial, &exit).await;
-    // The run loop restores the terminal itself, on its own exit path. This is the
-    // net under every way of getting here that skipped it — an early `?` out of
-    // `run`, most of which are terminal-write failures, which is precisely when
-    // the terminal most needs taking back. `restore` is idempotent, so this is a
-    // no-op when the loop already did the job, and the "exactly once" holds for
-    // the two of them together rather than for each of them separately.
+    // Every way in to the terminal state lives behind this one call, and the hand-
+    // back sits in front of its result. That ordering is the point: before it, an
+    // early `?` out of setup — `LiveView::new` asking the cursor where it is and
+    // timing out is the real-world one — returned from `main` with raw mode on and
+    // nothing left to turn it off. Now there is.
+    let res = app(anchor, exit.clone()).await;
+    // `restore` is idempotent, so this is a no-op when the run loop or the panic
+    // hook already did the job, and the "exactly once" holds for the whole set of
+    // callers rather than for each of them separately.
     exit.restore();
     // `res` is returned rather than swallowed: a run that failed is worth an exit
     // code, and the terminal is already safe by the time we get here to say so.
     res
 }
 
+/// The app proper: the live view, the Router, the run loop.
+///
+/// Split out of `main` so that `main`'s tail — the unconditional `restore` — is
+/// on the path of every `?` this function contains.
+async fn app(anchor: LiveAnchor, exit: Arc<Teardown>) -> Result<()> {
+    // The modes this app switches on, switched on *through the ledger*.
+    //
+    // This is the only place a terminal mode gets turned on, which is what makes
+    // "the ledger knows every mode we hold" a fact rather than a hope: `startup_set`
+    // is the whole list, and `restore` hands back exactly that list. Raw mode goes
+    // through here too for that reason — it is not a byte string, it is
+    // `tcsetattr`, and it is still something we do to the user's tty.
+    //
+    // Parsed before any of it is applied, so an unknown name in `LOOPRS_MODES`
+    // stops the app with a message instead of half-starting with half a mode set.
+    for mode in Mode::startup_set().map_err(anyhow::Error::msg)? {
+        exit.enable(mode)?;
+    }
+
+    let initial = TerminalType::Beeds;
+    // The live region opens at the height the policy wants for an empty stream —
+    // its chrome plus one row — instead of the constant 10 it used to be. From
+    // here on the frame decides the shape; see `viewport`.
+    let rows = crossterm::terminal::size().map(|(_, r)| r).unwrap_or(24);
+    let boot_h = viewport::desired_height(initial, rows, 0, 0, viewport::MIN_INPUT_ROWS);
+    // `ManuallyDrop`, deliberately: ratatui's `Terminal::drop` shows the cursor,
+    // and a cursor is a ledgered mode (`Mode::CursorHidden`). A destructor that
+    // switches a terminal mode is a mode switch that happens after the teardown,
+    // outside the ledger, in an order nobody controls and nothing can make
+    // once-only — the `?25h` it writes used to land *after* the closing newline,
+    // which is the tail the shutdown spike had to forgive.
+    //
+    // Holding the view here instead means the destructor never runs: the cursor
+    // comes back from the ledger, in the ledger's order, exactly once, on every
+    // path including the panic one. What is not freed is the view's two cell
+    // buffers, in a process that is on its way out; that is the whole cost, and
+    // it is paid once.
+    let mut live = std::mem::ManuallyDrop::new(viewport::LiveView::with_anchor(
+        CrosstermBackend::new(io::stdout()),
+        boot_h,
+        |_| Ok(CrosstermBackend::new(io::stdout())),
+        anchor,
+    )?);
+
+    // The signals are installed before the loop, not inside it: a `SIGHUP` that
+    // arrives while the handlers are still the default ones is a process killed
+    // with the ledger still holding everything it switched on.
+    let mut signals = ExitSignals::install()?;
+
+    run(&mut live, initial, &exit, &mut signals).await
+}
+
 async fn run(
     live: &mut viewport::LiveView<CrosstermBackend<Stdout>>,
     initial: TerminalType,
     exit: &Teardown,
+    signals: &mut ExitSignals,
 ) -> Result<()> {
     // all terminal UI events and events originating outside the app
     // come from cmd_tx and are received on cmd_rx
@@ -173,6 +217,13 @@ async fn run(
     if let Some((id, status)) = boot {
         app.view_mut(id).set_status(status, Instant::now());
     }
+    // The passthrough reports straight into the teardown's record of what the
+    // real terminal got switched into. This is the whole wiring between "a `vim`
+    // took the screen through us" and "the exit path puts the screen back": one
+    // shared handle, and the bytes themselves are the report. It goes here, before
+    // any session exists, because the first full-screen program a user runs should
+    // not be the one that discovers the wire was never connected.
+    app.set_screen_debt(exit.screen_debt());
     // Tell the sessions the size they are being shown at before anyone runs a
     // command. A Bash shell spawned later still inherits this: `BashTask::resize`
     // records the size even with no shell up yet, and uses it for the pty it
@@ -330,12 +381,45 @@ async fn run(
                     // before it has swapped buffers or flushed anything, so there
                     // is nothing inconsistent to recover from: leave `dirty` set
                     // and the next frame tries again.
-                    if let Err(e) = live.draw(|f| view(&app, f, &preview, input)) {
+                    if let Err(e) = live.draw(|f| {
+                        // Fault injection for the exit contract (looprs-pdl.3):
+                        // a panic that happens *inside* the frame, which is where
+                        // the frame code is doing its damage and where a teardown
+                        // that does not run is most visible. The panic hook holds
+                        // the same `Teardown` this loop does, so what the spike
+                        // sees is the same hand-back Ctrl-Q gets, not a second
+                        // one written for the occasion.
+                        if panic_injected() {
+                            panic!(
+                                                                "deliberate panic inside the draw (LOOPRS_PANIC=draw)"
+
+                            );
+                        }
+                        view(&app, f, &preview, input)
+                    }) {
                         tracing::warn!("frame not drawn: {e}");
                     } else {
                         app.dirty = false;
                     }
                 }
+            }
+            // A signal from outside the terminal. It means the same thing Ctrl-Q
+            // means and takes the same road: `should_quit` ends the loop below, and
+            // the loop's own six-step exit hands the terminal back with every mode
+            // on it. There is no second shutdown path for signals, because a
+            // second shutdown path is a second set of promises about the terminal
+            // and those two can disagree — which is the bug `looprs-ecr` removed.
+            //
+            // Ctrl-Q drains the sessions and repaints first because a human pressed
+            // a key and can wait; a `SIGHUP` is a window closing and there is
+            // nobody left to watch either way, so both get the same treatment and
+            // the same bounded budget rather than a special case that is tested
+            // less than the one people use.
+            term = signals.recv() => {
+                tracing::warn!(
+                    "{term} received; taking the same way out as Ctrl-Q and giving the terminal back"
+                );
+                app.should_quit = true;
             }
         }
         if app.should_quit {
@@ -388,9 +472,11 @@ async fn run(
         );
     }
 
-    // (4) + (5) The pane goes, raw mode comes off, the line closes. No cursor
-    // query anywhere in it: it erases from the anchor the live view has been
-    // publishing, which `insert_before` above follows downward as it pushes.
+    // (4) + (5) The pane goes, every mode that was switched on comes back off,
+    // raw mode with them, and the line closes. No cursor query anywhere in it: it
+    // erases from the anchor the live view has been publishing, which
+    // `insert_before` above follows downward as it pushes. See `crate::teardown`
+    // for the ledger and for why none of it asks the terminal a question.
     exit.restore();
 
     // (6) The router task is the task that waited on every pump, so joining it

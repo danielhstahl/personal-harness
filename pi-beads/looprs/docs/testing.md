@@ -359,6 +359,76 @@ is announced nowhere but that mode's own transcript — the same limit a tool ca
 lives under, with the status row saying only that the mode is working.
 
 
+### The terminal mode ledger, and every way out (looprs-pdl.3)
+
+**What it proves:** every terminal mode the app switches on — raw mode, the alternate
+screen, the three mouse modes, bracketed paste, the hidden cursor — is switched back off on
+every path out of the app, exactly once, without the exit path asking the terminal a single
+question. See [ADR-0006](adr/0006-terminal-mode-ledger.md) for why "exactly once" cuts both
+ways: a leaked `?1002` reports drags forever, and a second `?1049l` replaces the user's
+screen with the terminal's stale save.
+
+| Layer | Where | What it pins |
+| --- | --- | --- |
+| the table | `teardown::tests` | `every_mode_names_its_own_pair_of_bytes` (the wire format, pinned rather than read out of a table), `a_mode_spec_is_parsed_into_boot_order_whatever_order_it_came_in`, `an_unknown_mode_is_an_error_that_names_the_names`, `the_startup_set_is_the_default_plus_what_was_asked_for` |
+| the ledger | `teardown::tests` | `the_ledger_hands_back_in_the_reverse_of_the_order_it_went_on`, `a_mode_we_never_switched_on_is_never_left_off`, `a_switch_that_never_reached_the_terminal_is_still_a_mode_we_hold`, `enabling_a_mode_writes_it_once_and_repeating_the_enable_writes_nothing`, `releasing_a_mode_early_takes_it_off_the_ledger` |
+| the hand-back | `teardown::tests` | `restore_hands_every_mode_back_once_and_nothing_after_it`, `holding_the_alternate_screen_means_no_erase_and_no_closing_newline`, `the_panic_hook_and_the_normal_exit_agree`, `a_restore_does_not_toggle_raw_mode_that_was_never_on` |
+| the inherited screen | `screen::tests`, `teardown::tests` | `the_debt_follows_the_bytes_the_passthrough_wrote`, `a_switch_split_across_two_tees_is_still_one_switch`, `the_watcher_remembers_which_alt_screen_was_switched`, `the_leave_is_spelled_the_way_the_entry_was`, `an_inferred_takeover_is_not_an_alt_screen`, `a_screen_a_dying_child_left_behind_is_left_on_the_way_out`, `a_screen_the_child_already_left_is_not_left_again`, `our_own_alternate_screen_already_covers_the_childs`, `a_screen_that_was_only_guessed_at_owes_no_leave` |
+| the tee reports it | `app::tests` | `a_teed_alt_screen_is_a_screen_we_owe_the_terminal_back`, `a_screen_switch_that_was_never_teed_owes_nothing` |
+| the command boundary | `session::bash::tests` | `quitting_while_a_full_screen_program_holds_the_screen_leaves_the_alt_screen` |
+| the signals | `signals::tests` | `the_signals_install_inside_a_runtime`, `a_signal_sent_to_this_process_is_received` |
+| the real pty | `spikes/shutdown_e2e.py` | 8 scenarios, 149 checks, and a control run at 85/112 whose 27 failures are the ticket |
+
+The spike keeps its **own** ledger of the wire (`ModeTrace`) instead of reading the app's:
+"not in the alternate screen after exit" is not something the app may be asked at exit —
+asking is a `DECRQM`, and the exit path is forbidden from asking — and there is no terminal
+emulator behind a pty to answer one anyway. What was written is the whole truth, so the
+driver folds the capture the way a terminal would, and counts the leaves rather than only
+the final state: a mode turned off twice and one turned off once end in the same place, and
+only one of those was promised.
+
+Run it:
+
+```sh
+cargo build
+python3 spikes/shutdown_e2e.py | tee spikes/results/shutdown-e2e-pdl3.log
+python3 spikes/shutdown_e2e.py alt child sigterm sighup panic   # one group at a time
+
+# the control: the same spike against the pre-looprs-pdl.3 binary
+git worktree add --detach /tmp/looprs-pdl3-ctrl HEAD
+(cd /tmp/looprs-pdl3-ctrl/pi-beads/looprs && cargo build --target-dir /tmp/base-target)
+LOOPRS_BIN=/tmp/base-target/debug/looprs python3 spikes/shutdown_e2e.py \
+    | tee spikes/results/shutdown-e2e-pdl3-control.log
+```
+
+| Scenario | What is held at the moment of leaving | Expected |
+| --- | --- | --- |
+| Ctrl-Q mid-stream (inline) | `raw`, `cursor_hidden` | erase at the published anchor, the ledger's leaves, **one** newline — leaves before the newline, not after it; no `?1049l`/mouse/paste leave for a mode nothing switched on |
+| `LOOPRS_MODES=all` + Ctrl-Q | every mode in the table | all taken, each left exactly once, and `?1049l` is the **last byte** the app writes |
+| `SIGTERM` with the whole set | every mode | leaves by itself in ~0.3 s, code 0, nothing left on, tty cooked |
+| `SIGHUP`, inline defaults | `raw`, `cursor_hidden` | same |
+| `LOOPRS_PANIC=draw` | every mode, panicked inside the frame | each mode still left exactly once, exit code 101, tty cooked |
+| full-screen child killed while it holds the screen | the *child's* `?1049h`, passed through the tee and never left | the user is not in the alternate screen at the end; exactly one `?1049l`; the tail after that leave is the ordinary inline hand-back (erase → the ledger's own bytes → one newline); tty cooked |
+
+**Known pre-existing failures, not this ticket's.** `flash_e2e.py` is 0/3 (25 reshapes where
+≤19.5 are allowed, worst hole ~3.6 ms against a 1.5 ms budget), and `fullscreen_e2e.py` is
+18/21 — the three failing checks are the vim-keystroke needles (`Esc` reaching the screen while
+the program holds it, `:wq!` writing the file, the typed text landing at the cursor). Both fail
+with **identical** numbers against the pre-looprs-pdl.3 binary (`flash_e2e` 25 reshapes /
+3.54 ms; `fullscreen_e2e` 18/21, same three names), so they regressed before this branch and
+nothing here touches the frame path or the keystroke path. Written down rather than silenced,
+per the rule above about the one named exception.
+
+**Known gap this ticket names instead of fixing:** a real full-screen child also leaves its
+*own* switches on in the user's terminal — `?2004h` (bracketed paste) always, and
+`?1000`/`?1002`/`?1006` with a mouse-tracking vim. The alt screen is paid back because it has
+a defined thing to return to (the main screen, cursor included); those have to return to
+whatever the user's terminal was doing before looprs started, which the exit path does not know
+and is forbidden to ask. The honest shape is to read them at **startup** with `DECRQM` — one
+round trip at boot, where a round trip is affordable — and restore that on the way out. The
+`child` scenario prints what is left behind (`tee'd modes still on at exit: [...]`) so the gap
+stays measured; see [ADR-0006](adr/0006-terminal-mode-ledger.md).
+
 ---
 
 ## Why "pure" matters here, once

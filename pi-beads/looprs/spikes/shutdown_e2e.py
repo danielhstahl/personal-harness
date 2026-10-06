@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""looprs-ecr acceptance: the exit path, in a real pty, judged by bytes and by the process table.
+"""The exit path, in a real pty, judged by bytes and by the process table.
 
-Four things no unit test can see, one scenario each.
+looprs-ecr filed this spike; looprs-pdl.3 widened it into the terminal-mode
+ledger's proof. One scenario per thing no unit test can see.
 
   1. **Nothing visible is lost.** Quit mid-stream, while the streamed answer is
      still sitting in the live preview region: that text has to appear in the
@@ -21,9 +22,34 @@ Four things no unit test can see, one scenario each.
      *and* SIGTERM still gets killed inside the exit budget, and the app still
      comes back with its terminal.
 
+  5. **Every mode we switch on gets switched off, exactly once** (pdl.3). Run
+     with `LOOPRS_MODES=all` — alternate screen, mouse report/drag/SGR,
+     bracketed paste, hidden cursor — and the spike's *own* ledger of the bytes on
+     the wire says they were all taken and all given back, one leave sequence
+     each, with the alternate-screen leave the last word the app wrote.
+  6. **A signal from outside gets the same hand-back.** `SIGTERM` with the whole
+     mode set held, and `SIGHUP` on the plain inline run: the app leaves by
+     itself, inside budget, with nothing left switched on and no `ESC[6n` asked
+     after the signal arrived. Before this ticket there was no handler at all —
+     both signals killed the app where it stood and the user got a raw,
+     cursorless tty back, with the pane still painted on it.
+  7. **A panic inside the draw is the same hand-back too.** `LOOPRS_PANIC=draw`
+     makes the frame panic on purpose; the ledger still leaves each mode exactly
+     once, the tty is cooked again, and the exit code says something went wrong.
+
 Every backend is a fake the script writes, so nothing here costs a model call.
 
     python3 spikes/shutdown_e2e.py | tee spikes/results/shutdown-e2e.log
+
+**Why the spike keeps its own ledger.** "Not in the alternate screen after exit" is
+not something the app can be asked at exit — asking is a `DECRQM`, and the exit
+path is forbidden from asking anything of the terminal (that is the `ESC[6n` rule).
+So the driver tracks the mode state from the sequences it *observed*, the way a
+terminal would, and answers the question from the user's side of the pty. The
+app's ledger and the spike's ledger are independent, which is the only way "we
+handed it all back" can be a check rather than a claim. There is no terminal
+emulator behind a pty anyway: a real `DECRQM` here would go unanswered, so what is
+on the wire is the whole truth there is.
 """
 
 import fcntl
@@ -31,6 +57,7 @@ import os
 import pty
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -38,6 +65,7 @@ import tempfile
 import termios
 import threading
 import time
+from collections import Counter
 
 BIN = os.environ.get("LOOPRS_BIN", "target/debug/looprs")
 SLOW_PI = "spikes/fake_pi_slow.py"
@@ -128,10 +156,376 @@ def last_erase(text):
     boundary between "rows the app owns and just gave back" and "rows above it,
     which are the user's scrollback and must still be there".
     """
+    span = last_erase_span(text)
+    return (span[1], span[2]) if span else None
+
+
+def last_erase_span(text):
+    """`(start, end, row)` of the final erase, for rules read as an ordering.
+
+    "The leave came before the erase" is a statement about two offsets, and the
+    erase's *start* is the one that answers it: the leave has to be off the wire
+    before the erase is addressed to the screen it just got back.
+    """
     last = None
     for m in re.finditer(r"\x1b\[(\d+);1H\x1b\[(?:2)?J", text):
-        last = (m.end(), int(m.group(1)) - 1)
+        last = (m.start(), m.end(), int(m.group(1)) - 1)
     return last
+
+
+# Every mode the app's ledger can hold, keyed by the DEC private mode number the
+# terminal knows it by, with the value that mode takes when the terminal is told to
+# *set* it (`CSI ? <n> h`).
+#
+# The polarity column is not decoration. `?25` is "cursor visible", so `h` means
+# the cursor is shown and `l` means it is hidden: tracking the mode as the user
+# experiences it (`cursor_hidden`) rather than as the register spells it is what
+# makes `cursor_visible` the same fact the ledger holds, and not its inverse.
+# 47 and 1047 are aliases of `alt_screen` because `src/screen.rs` treats the
+# three spellings as one fact, and a spike that disagreed with the app about what a
+# screen is would be checking nothing.
+MODE_BY_NUMBER = {
+    25: ("cursor_hidden", False),  # `?25h` sets visibility, which is *not* hidden
+    47: ("alt_screen", True),
+    1000: ("mouse_report", True),
+    1002: ("mouse_drag", True),
+    1006: ("mouse_sgr", True),
+    1047: ("alt_screen", True),
+    1049: ("alt_screen", True),
+    2004: ("bracketed_paste", True),
+}
+WATCHED = ["alt_screen", "cursor_hidden", "mouse_report", "mouse_drag",
+           "mouse_sgr", "bracketed_paste"]
+
+MODE_SEQ = re.compile(r"\x1b\[\?([0-9;]*)h|\x1b\[\?([0-9;]*)l")
+
+
+def _numbers(params):
+    out = []
+    for part in (params or "").split(";"):
+        part = part.strip()
+        if part.isdigit():
+            out.append(int(part))
+    return out
+
+
+class ModeTrace:
+    """The terminal's mode state, read off the bytes the app actually wrote.
+
+    This is the spike keeping its own ledger. It is not the app's bookkeeping read
+    back — it is a fold over the wire, the way a terminal would keep it, and it is
+    the only honest way to answer "is the user in the alternate screen now?"
+    without asking the user's terminal a question the exit path is forbidden to
+    ask. (There is no terminal emulator behind a pty: a real `DECRQM` here would
+    simply go unanswered.)
+
+    It also counts the leaves, because "exactly once" is a claim about a count and
+    not about a final state — a mode turned off twice and a mode turned off once
+    end in the same place, and only one of those is what was promised.
+    """
+
+    def __init__(self, text):
+        self.state = {m: False for m in WATCHED}
+        self.on_counts = Counter()
+        self.off_counts = Counter()
+        self.last_leave_of = {}  # name -> (offset just after its leave bytes)
+        pos = 0
+        while True:
+            m = MODE_SEQ.search(text, pos)
+            if m is None:
+                break
+            params = m.group(1) if m.group(1) is not None else m.group(2)
+            setting = m.group(1) is not None  # `h` sets, `l` resets
+            for num in _numbers(params):
+                mapped = MODE_BY_NUMBER.get(num)
+                if mapped is None:
+                    continue
+                name, value_when_set = mapped
+                value = value_when_set if setting else not value_when_set
+                self.state[name] = value
+                if value:
+                    self.on_counts[name] += 1
+                else:
+                    self.off_counts[name] += 1
+                    self.last_leave_of[name] = m.end()
+            pos = m.end()
+
+    @property
+    def cursor_visible(self):
+        return not self.state["cursor_hidden"]
+
+    def still_on(self):
+        return sorted(m for m, v in self.state.items() if v)
+
+    def summary(self):
+        return ", ".join(f"{m}={int(self.state[m])}" for m in WATCHED)
+
+
+def check_quiet_after_the_handback(trace, text, where):
+    """Nothing the terminal has to answer appears after the ledger's last leave.
+
+    Read from the last leave rather than from the key or the signal, because the
+    mark on the capture is not the mark on the app: a viewport reshape's `ESC[6n`
+    can be sitting in the pump's buffer when the user quits, and that is a query
+    the exit path never made. What is unambiguous is the far end of the hand-back —
+    after the last leave sequence, the app is done with the terminal, and anything
+    that still asks a question there is the exit path asking it.
+    """
+    offs = list(trace.last_leave_of.values())
+    if not offs:
+        check(f"{where}: a hand-back to read the tail from", False,
+              "no leave sequence anywhere in the capture")
+        return
+    tail = text[max(offs):]
+    check(
+        f"{where}: no cursor query after the hand-back",
+        "\x1b[6n" not in tail and "^[6n" not in tail,
+        f"asked after leaving: {tail[:120]!r}",
+    )
+
+
+def check_ledger_handed_back(trace, entered, where):
+    """Every mode we saw switched on is off now, and was left exactly once.
+
+    `entered` is the set the run switched on, taken from `on_counts` while the app
+    was up — what it *did*, not what it meant to.
+
+    The cursor is the one mode whose off-sequence is not exclusively the ledger's:
+    ratatui writes `?25h` itself when it inserts lines above the pane, so it
+    appears many times in a run and none of that is a leaked cursor. What is
+    assertable for the cursor is the final state — visible — which is also the only
+    question the user ever asks.
+    """
+    for mode in WATCHED:
+        on = trace.on_counts[mode]
+        off = trace.off_counts[mode]
+        if mode in entered:
+            check(f"{where}: {mode} was switched on", on > 0, f"{on} on-sequences")
+            if mode != "cursor_hidden":
+                check(
+                    f"{where}: {mode} left exactly once",
+                    off == 1,
+                    f"{off} leave sequences for a mode we took",
+                )
+            check(
+                f"{where}: {mode} is off at the end",
+                not trace.state[mode],
+                f"still on -- {trace.summary()}",
+            )
+        else:
+            check(
+                f"{where}: no {mode} leave for a mode nothing switched on",
+                off == 0,
+                f"emitted {off} leaves for a screen we never took",
+            )
+    check(
+        f"{where}: the cursor is visible at the end",
+        trace.cursor_visible,
+        f"cursor still hidden -- {trace.summary()}",
+    )
+
+
+def scenario_alt_screen():
+    say("=== the whole mode set: alt screen, mouse, bracketed paste, hidden cursor ===")
+    d = Driver(LOOPRS_MODES="all")
+    time.sleep(2.0)
+    check("the app boots with every mode on", d.alive())
+    mid = ModeTrace(d.text())
+    entered = sorted(mid.on_counts)
+    check("the app is in the alternate screen", mid.state["alt_screen"], mid.summary())
+    check(
+        "all three mouse modes are switched on",
+        all(mid.state[m] for m in ("mouse_report", "mouse_drag", "mouse_sgr")),
+        mid.summary(),
+    )
+    check("bracketed paste is on", mid.state["bracketed_paste"], mid.summary())
+    check(
+        "the app hides the cursor for its own frames",
+        mid.on_counts["cursor_hidden"] > 0,
+        f"never emitted ?25l -- {mid.summary()}",
+    )
+
+    code, mark, dt = d.quit()
+    full = ModeTrace(d.text())
+    check("the app exits on Ctrl-Q with the whole mode set", code is not None)
+    check("exit code is 0", code == 0, f"exit {code}")
+    check_ledger_handed_back(full, entered, "alt-screen quit")
+    check(
+        "mouse modes are silent: nothing left to report a drag into the shell",
+        not any(full.state[m] for m in ("mouse_report", "mouse_drag", "mouse_sgr")),
+        full.summary(),
+    )
+    left = full.last_leave_of.get("alt_screen")
+    check("the app left the alternate screen", left is not None)
+    if left is not None:
+        tail = strip_cpr_replies(d.text()[left:])
+        check(
+            "the alternate-screen leave is the last thing the app wrote",
+            tail == "",
+            f"bytes after the leave: {tail!r}",
+        )
+    check_quiet_after_the_handback(full, d.text(), "alt-screen quit")
+    check("the tty is cooked again after exit", d.tty_is_cooked())
+    say(f"exited {dt:.2f}s after the quit key, code {code}")
+    d.close()
+
+
+def scenario_child_holds_screen():
+    """The exit path inherits a screen it did not switch on.
+
+    A full-screen child paints through the passthrough, so the `?1049h` that took
+    the user's screen was written by the app's own stdout — by the child's hand.
+    When that child is killed instead of quitting, nothing on the session side can
+    put the screen back: the shell is dead, its pump is cut, and the task that
+    watched the switch is gone. The only thing left holding a write handle to the
+    terminal is the app, which is why `ScreenDebt` exists and why the leave is
+    paid from `restore` rather than from the session.
+
+    The child here is a `sh` that enters the alternate screen and sits in it, because
+    that is `vim` SIGKILLed reduced to the byte that matters — and a spike that
+    depends on `vim` being installed is a spike that silently stops running.
+    """
+    say("=== a full-screen child killed while it holds the screen ===")
+    d = Driver()
+    time.sleep(1.5)
+    d.send(b"\t")  # Beads -> Pi
+    time.sleep(0.3)
+    d.send(b"\t")  # Pi -> Bash
+    time.sleep(0.6)
+    d.send(
+        b"sh -c 'printf \"\\033[?1049h\\033[2Jthe child owns this screen"
+        b"\\033[10;1Hstill here\"; sleep 120'\r"
+    )
+    time.sleep(1.8)
+    mid = ModeTrace(d.text())
+    check(
+        "the child took the alternate screen through the passthrough",
+        mid.state["alt_screen"],
+        mid.summary(),
+    )
+
+    code, mark, dt = d.quit()
+    full = ModeTrace(d.text())
+    check(
+        "the app exits on Ctrl-Q while the child still holds the screen",
+        code is not None,
+        "it never left",
+    )
+    check("exit code is 0", code == 0, f"exit {code}")
+    check(
+        "not in the alternate screen after the exit",
+        not full.state["alt_screen"],
+        f"the user is still inside the dead program -- {full.summary()}",
+    )
+    check(
+        "the alternate screen was left exactly once",
+        full.off_counts["alt_screen"] == 1,
+        f"{full.off_counts['alt_screen']} leaves for one screen",
+    )
+    leave = full.last_leave_of.get("alt_screen")
+    erase = last_erase_span(d.text())
+    check(
+        "the leave and the pane erase are both there to order",
+        leave is not None and erase is not None,
+    )
+    if leave is not None and erase is not None:
+        check(
+            "the leave comes off before the pane is erased, so the erase lands on the "
+            "user's own screen and not on the dead program's",
+            leave <= erase[0],
+            f"leave at {leave}, erase starting at {erase[0]}",
+        )
+        # The whole inline hand-back, read as one shape: the erase, then whatever
+        # modes the ledger still held, then the single closing newline. Coming back
+        # from a child's screen has to end in exactly the hand-back an ordinary
+        # inline quit ends in — anything else means the user gets some third thing.
+        tail = strip_cpr_replies(d.text()[leave:])
+        check(
+            "after the leave comes the ordinary inline hand-back: erase, the ledger's "
+            "own bytes, one closing newline",
+            re.fullmatch(
+                r"\x1b\[\d+;1H\x1b\[(?:2)?J(?:\x1b\[\?[0-9;]+[hl])*\r?\n", tail
+            )
+            is not None,
+            f"tail after the leave: {tail!r}",
+        )
+    # The app's own ledger, plus the screen it inherited and paid for. The mouse
+    # and paste modes are deliberately not in this set: nothing switched them on in
+    # this scenario, and the child here does not switch them on either -- a real
+    # `vim` does, and that leftover is a separate gap, recorded in
+    # docs/adr/0006-terminal-mode-ledger.md.
+    check_ledger_handed_back(full, {"cursor_hidden", "alt_screen"}, "child-held screen")
+    check("the tty is cooked again after exit", d.tty_is_cooked())
+    leftovers = [
+        m for m in ("mouse_report", "mouse_drag", "mouse_sgr", "bracketed_paste")
+        if full.state[m]
+    ]
+    say(f"  tee'd modes still on at exit: {leftovers or 'none'}")
+    say(f"exited {dt:.2f}s after the quit key, code {code}")
+    d.close()
+
+
+def scenario_signal(sig, modes, label):
+    """A signal from outside gets the same hand-back the quit key gets.
+
+    Nothing in the app knows which one it was answering, and that is the point:
+    one exit path, one ledger, one set of promises about the terminal.
+    """
+    say(f"=== {label}: {sig} with the ledger holding {modes or 'the default modes'} ===")
+    env = {"LOOPRS_MODES": modes} if modes else {}
+    d = Driver(**env)
+    time.sleep(2.2)
+    check(f"the app is up before {sig}", d.alive())
+    mid = ModeTrace(d.text())
+    entered = sorted(mid.on_counts)
+    check(f"the modes asked for are actually on ({modes})", bool(entered), mid.summary())
+
+    mark = d.mark()
+    t0 = time.time()
+    d.proc.send_signal(getattr(signal, sig))
+    try:
+        code = d.proc.wait(timeout=EXIT_BUDGET)
+    except subprocess.TimeoutExpired:
+        d.proc.kill()
+        code = None
+    time.sleep(0.3)
+    dt = time.time() - t0
+    full = ModeTrace(d.text())
+    check(f"the app leaves on {sig} by itself", code is not None, "it never exited")
+    check(f"exit code is 0 after {sig}", code == 0, f"exit {code}")
+    check(f"the {sig} exit stayed inside the budget", dt <= EXIT_BUDGET, f"{dt:.2f}s")
+    check_ledger_handed_back(full, entered, f"{sig} exit")
+    check_quiet_after_the_handback(full, d.text(), f"{sig} exit")
+    check(f"the tty is cooked again after {sig}", d.tty_is_cooked())
+    say(f"exited {dt:.2f}s after {sig}, code {code}")
+    d.close()
+
+
+def scenario_panic_in_draw():
+    say("=== a panic inside the draw: the ledger still leaves everything once ===")
+    d = Driver(LOOPRS_MODES="all", LOOPRS_PANIC="draw")
+    try:
+        code = d.proc.wait(timeout=EXIT_BUDGET)
+    except subprocess.TimeoutExpired:
+        d.proc.kill()
+        code = None
+    time.sleep(0.3)
+    check("the app is gone after panicking in the frame", code is not None)
+    check("the exit code says something failed", code not in (0, None), f"exit {code}")
+    check(
+        "it panicked where the fault injector put it",
+        "LOOPRS_PANIC=draw" in d.text(),
+        "no panic message on the wire",
+    )
+    full = ModeTrace(d.text())
+    entered = sorted(full.on_counts)
+    check("the frame did get as far as switching the modes on", len(entered) >= 5,
+          f"only switched on: {entered}")
+    check_ledger_handed_back(full, entered, "panic in draw")
+    check_quiet_after_the_handback(full, d.text(), "panic in draw")
+    check("the tty is cooked again after the panic", d.tty_is_cooked())
+    say(f"exited code {code} with the whole mode set held at the moment of the panic")
+    d.close()
 
 
 class Driver:
@@ -275,16 +669,15 @@ def scenario_mid_stream():
     time.sleep(2.5)
     live = [r for r, t in d.screen().items() if "bravo" in t or MARK in t]
     check("the answer is streaming into the live region", len(live) >= 2, f"{len(live)} rows carrying it")
+    # Every mode the app switched on during this run, read off the wire rather
+    # than asserted from what it meant to do. `on_counts` and not the state at
+    # the instant of the snapshot: a cursor the app hid and later showed is still
+    # a cursor the app hid, and the promise is about the hiding.
+    entered = sorted(ModeTrace(d.text()).on_counts)
 
     code, mark, dt = d.quit()
-    since = d.since(mark)
     check("the app exits on Ctrl-Q", code is not None, "it never left")
     check("exit code is 0", code == 0, f"exit {code}")
-    check(
-        "no cursor query on the exit path",
-        "\x1b[6n" not in since and "^[6n" not in since,
-        "the exit path asked the terminal where the cursor is",
-    )
     check(
         "no 'cursor position could not be read' anywhere in the run",
         "could not be read" not in d.text(),
@@ -294,6 +687,16 @@ def scenario_mid_stream():
     check("the live pane is erased on the way out", erased is not None)
     if erased is not None:
         erase_end, erase_row = erased
+        # The exit path *begins* at the erase, so that is the offset this rule is
+        # read from. Measuring from the quit key instead is a race with the
+        # measurement, not with the app: a viewport reshape's `ESC[6n` can still be
+        # in the pump's buffer when the key is typed, and it lands in the capture
+        # after the mark while being a query the exit path never made.
+        check(
+            "no cursor query on the exit path",
+            "\x1b[6n" not in d.text()[erase_end:],
+            "the exit path asked the terminal where the cursor is",
+        )
         # The precise form of "everything that was on screen is still in the
         # scrollback": the answer was sitting in the live region, and the live
         # region is exactly the rows the final erase takes away. So the answer
@@ -312,12 +715,25 @@ def scenario_mid_stream():
             len(above) >= 2,
             f"{len(above)} answer rows above row {erase_row} — the rest went with the pane",
         )
-        after_erase = d.text()[erase_end:]
+        after_erase = strip_cpr_replies(d.text()[erase_end:])
+        seqs = re.findall(r"\x1b\[\?[0-9;]+[hl]", after_erase)
+        rest = re.sub(r"\x1b\[\?[0-9;]+[hl]", "", after_erase)
         check(
             "exactly one closing newline after the erase (no doubled prompt)",
-            re.fullmatch(r"\r?\n", strip_cpr_replies(after_erase)) is not None,
+            rest in ("\r\n", "\n"),
             f"trailing bytes after the erase: {after_erase!r}",
         )
+        check(
+            "nothing between the erase and the newline but the ledger's own bytes",
+            set(seqs) <= {"\x1b[?25h"},
+            f"unexpected sequences after the erase: {seqs}",
+        )
+        check(
+            "the ledger's own bytes come before the closing newline, not after it",
+            re.fullmatch(r"(?:\x1b\[\?[0-9;]+[hl])*\r?\n", after_erase) is not None,
+            f"the run does not end on the hand-back: {after_erase!r}",
+        )
+    check_ledger_handed_back(ModeTrace(d.text()), entered, "inline quit")
     check("the tty is cooked again after exit", d.tty_is_cooked())
     check("no bash from the generated rcfile survived", not procs_matching("looprs-bash-integration"))
     check("no fake pi survived the app", not procs_matching(pi), procs_matching(pi))
@@ -396,9 +812,25 @@ def main():
         if not os.path.exists(path):
             say(f"{why}: {path}")
             return 2
-    scenario_mid_stream()
-    scenario_bash_child()
-    scenario_wedged_child()
+
+    # A filter on the command line runs one group by name, because these scenarios
+    # are minutes-long and the one you just broke is one of them.
+    wanted = {a.lower() for a in sys.argv[1:]}
+
+    def run(name, fn):
+        if not wanted or name in wanted:
+            fn()
+
+    run("midstream", scenario_mid_stream)
+    run("bash", scenario_bash_child)
+    run("wedged", scenario_wedged_child)
+    run("alt", scenario_alt_screen)
+    run("child", scenario_child_holds_screen)
+    if not wanted or "sigterm" in wanted:
+        run("sigterm", lambda: scenario_signal("SIGTERM", "all", "the whole mode set"))
+    if not wanted or "sighup" in wanted:
+        run("sighup", lambda: scenario_signal("SIGHUP", None, "the plain inline run"))
+    run("panic", scenario_panic_in_draw)
 
     failed = [n for n, ok in RESULTS if not ok]
     say(f"{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
