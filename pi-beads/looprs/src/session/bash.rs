@@ -943,7 +943,16 @@ impl BashSession {
             interrupt_attempt: 0,
             stall_reported: false,
             pending: Vec::new(),
-            screen: ScreenWatch::new(),
+            // The one place the session learns who owns the alternate screen. With
+            // the app in the alternate screen, the child's own enter/leave pair is
+            // cut out of the stream here rather than teed (ADR-0001 amendment 4),
+            // which is what keeps the user inside our screen for the whole run and
+            // leaves exactly one `?1049l` for the ledger to write at the exit.
+            screen: {
+                let mut w = ScreenWatch::new();
+                w.hosting_alt_screen(cfg.alt_screen_hosted);
+                w
+            },
             utf8: Vec::new(),
             // An honest starting size; the app sends the real one on its first
             // resize (and `Shell::spawn` uses this for the initial pty).
@@ -1769,7 +1778,9 @@ mod tests {
         // "painted", so only an actual escape byte tells them apart.
         let painted = events
             .iter()
-            .position(|e| e.starts_with("out ") && e.contains("painted") && e.contains('\u{1b}'))
+            .position(|e| {
+                e.starts_with("out ") && e.contains("painted") && e.contains("\u{1b}[?1049h")
+            })
             .unwrap_or_else(|| panic!("the paint never arrived: {events:?}"));
         let released = events
             .iter()

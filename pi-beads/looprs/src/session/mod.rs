@@ -369,6 +369,17 @@ pub struct SessionConfig {
     /// touched the network" a matter of luck. `main` is the only place that calls
     /// [`notifier_from_env`](crate::services::notification::notifier_from_env).
     pub notifier: Arc<dyn crate::services::notification::Notifier>,
+    /// Is the **app** living in the alternate screen?
+    ///
+    /// The Bash session needs this one fact from the terminal mode ledger because it
+    /// decides what the screen watcher does with a child's own `?1049h`/`?1049l`
+    /// pair: cut it out of the stream when the alternate screen is ours
+    /// (ADR-0004 rule 1 + ADR-0001 amendment 4), or tee it when we are in an
+    /// inline pane and the child's switch is the only screen switch happening in
+    /// the run. Read from [`crate::teardown::Mode::alt_screen_claimed`] — the
+    /// same startup list the ledger was loaded from — so the session and the ledger
+    /// cannot disagree about who owns the screen.
+    pub alt_screen_hosted: bool,
 }
 
 impl Default for SessionConfig {
@@ -378,6 +389,7 @@ impl Default for SessionConfig {
             bd_bin: std::env::var("LOOPRS_BD_BIN").unwrap_or_else(|_| "bd".to_string()),
             shell_bin: default_shell_bin(),
             notifier: Arc::new(crate::services::notification::Noop),
+            alt_screen_hosted: crate::teardown::Mode::alt_screen_claimed(),
         }
     }
 }
@@ -588,6 +600,7 @@ mod tests {
             bd_bin: "true".into(),
             shell_bin: "true".into(),
             notifier: Arc::new(crate::services::notification::Noop),
+            alt_screen_hosted: false,
         };
         for (generation, mode) in TerminalType::ALL.into_iter().enumerate() {
             let spawned = spawn(mode, &cfg, generation as u64).expect("stub spawn must not fail");

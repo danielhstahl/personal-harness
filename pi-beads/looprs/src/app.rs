@@ -605,6 +605,22 @@ pub struct App {
     /// write. A child killed while holding the screen never pays this; the exit
     /// path does.
     screen_debt: crate::screen::ScreenDebt,
+    /// The modes this process holds and a full-screen child is allowed to have
+    /// switched off behind our back — written out again the moment the screen comes
+    /// back, before anything is drawn.
+    ///
+    /// Set from [`crate::teardown::Teardown::reassert_bytes`] at startup, so the
+    /// list is the ledger's own held set and not a second guess at it. Empty means
+    /// "nothing to put back" (no modes on), which is why a default-constructed
+    /// `App` behaves exactly as it did before this existed.
+    reassert_bytes: Vec<u8>,
+    /// Are *we* the ones living in the alternate screen? (ADR-0004 rule 1.)
+    ///
+    /// The App needs this to know whether taking the screen back includes clearing
+    /// the canvas: inside our own alternate screen the child's last frame is our
+    /// garbage and the whole display is ours to erase; in the inline pane it is the
+    /// user's scrollback and the only thing we may erase is the pane itself.
+    alt_screen_hosted: bool,
     /// The screen came back and the inline viewport must be re-anchored before
     /// anything is drawn. Set on release, consumed by the run loop in `main.rs`,
     /// which is the only place that can stop the key stream, resize the
@@ -651,6 +667,8 @@ impl App {
             spinner: 0,
             screen: None,
             screen_debt: crate::screen::ScreenDebt::new(),
+            reassert_bytes: Vec::new(),
+            alt_screen_hosted: false,
             reanchor: false,
             clock: now,
             row_phase: now,
@@ -1030,6 +1048,16 @@ impl App {
                     self.dirty = false;
                 } else if self.screen == Some(session) {
                     self.screen = None;
+                    // The modes the child may have switched off come back on
+                    // first: the child's last bytes are already on the wire, this
+                    // process still owns the screen, and the frame that follows is
+                    // drawn against the mode set the ledger says we are running
+                    // with. `?2004` and `?1000/2/6` are the ones a real vim
+                    // takes away; they are not ours to lose.
+                    let modes = self.take_back_screen();
+                    if !modes.is_empty() {
+                        crate::screen::tee(&modes);
+                    }
                     // The real terminal is not showing what ratatui's diff thinks
                     // it is showing: the child drew over it (or switched it, in
                     // the alt-screen case, where switching back restores the main
@@ -1063,6 +1091,50 @@ impl App {
     /// it — which is what [`Self::update`] does for every teed chunk.
     pub fn set_screen_debt(&mut self, debt: crate::screen::ScreenDebt) {
         self.screen_debt = debt;
+    }
+
+    /// Tell this App which modes to put back on when a full-screen child hands the
+    /// screen over. See [`Self::reassert_bytes`].
+    pub fn set_reassert_bytes(&mut self, bytes: Vec<u8>) {
+        self.reassert_bytes = bytes;
+    }
+
+    /// Tell this App that its frames live in the alternate screen.
+    pub fn set_alt_screen_hosted(&mut self, hosted: bool) {
+        self.alt_screen_hosted = hosted;
+    }
+
+    /// Take the screen back from a full-screen child.
+    ///
+    /// Returns the bytes that have to go to the real terminal *before* anything
+    /// else is drawn: the modes the ledger still holds and the child was free to
+    /// switch off (mouse capture, bracketed paste, the hidden cursor). Not
+    /// re-enabling them is the failure looprs-pdl.2 measured — after a
+    /// `mouse=a` vim the app's mouse is dead and a pasted line is N submits,
+    /// with nothing on screen to say why.
+    ///
+    /// Returns a clone rather than consuming the list, because this is not a
+    /// one-shot: every child in the session takes the modes with it on the way
+    /// out, so every return has to put them back. The ledger's leave at the exit
+    /// is still exactly one per mode — writing the `h` bytes again is not a second
+    /// `enable` and books nothing.
+    ///
+    /// Split out so a test can read the bytes without a unit test writing to the
+    /// real stdout, and called with the tee itself from `update` so the ordering
+    /// (child's last bytes, our modes, our frame) is not something each caller
+    /// has to remember.
+    pub fn take_back_screen(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.alt_screen_hosted {
+            // The child's last frame is painted on the screen we still own. Leave
+            // it there and the user keeps looking at a dead vim's `~` filler above
+            // our pane; in a plain terminal those cells vanished the moment the
+            // program left the alternate screen. The equivalent here is to hand
+            // ourselves a blank canvas before the repaint.
+            out.extend_from_slice(crate::screen::alt_canvas());
+        }
+        out.extend_from_slice(&self.reassert_bytes);
+        out
     }
 
     /// The alternate-screen debt this App has run up, as the exit path sees it.

@@ -3381,6 +3381,10 @@ mod tests {
             bd_bin: "/bin/true".into(),
             shell_bin: "/bin/true".into(),
             notifier: Arc::new(crate::services::notification::Noop),
+            // Not the point of any test in this file; explicit rather than
+            // defaulted-from-env so a `LOOPRS_MODES` in the developer's shell
+            // cannot change what these table tests assert.
+            alt_screen_hosted: false,
         };
         (
             BeadsLoop::new(SessionId::new(TerminalType::Beeds, 0), tx, ctl_tx, cfg),

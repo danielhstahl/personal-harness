@@ -352,6 +352,20 @@ impl Mode {
     /// spike in `spikes/shutdown_e2e.py` sets it to `all`. A mode nobody asked
     /// for is a mode nobody is testing, which is the other half of why unknown
     /// names are an error.
+    /// Did this process claim the alternate screen at startup?
+    ///
+    /// The one question from the startup set that anything *else* in the app has to
+    /// ask, and it is asked here rather than re-derived from `$LOOPRS_MODES` at
+    /// every call site because "who owns the alternate screen" is exactly the fact
+    /// the full-screen child handover turns on (looprs-pdl.12, ADR-0001
+    /// amendment 4). The ledger is the authority; this reads the same list the
+    /// ledger was loaded from, once.
+    pub fn alt_screen_claimed() -> bool {
+        Self::startup_set()
+            .map(|modes| modes.contains(&Mode::AltScreen))
+            .unwrap_or(false)
+    }
+
     pub fn startup_set() -> Result<Vec<Mode>, String> {
         let mut modes = Mode::DEFAULT.to_vec();
         modes.extend(Mode::parse_all(
@@ -564,6 +578,39 @@ impl Teardown {
     /// terminal, and two copies is one copy that is wrong.
     pub fn screen_debt(&self) -> crate::screen::ScreenDebt {
         self.screen_debt.clone()
+    }
+
+    /// The bytes that put back the modes this process still holds, after a
+    /// full-screen child has been through them.
+    ///
+    /// Measured (looprs-pdl.2 #7): a `vim` with `mouse=a` switches all three of
+    /// our mouse modes off on the way out, and a `SIGKILL`ed vim leaves the
+    /// terminal holding modes the ledger handed it. Neither is something the
+    /// *ledger* changes — it still holds them, and still owes exactly one leave
+    /// for each — but the terminal is not in the state the ledger describes, and
+    /// the next thing the user does (drag, paste) is answered by a mode that is
+    /// off. So the return from a child re-asserts rather than re-enables:
+    /// same bytes, no second ledger entry, still one leave at the exit.
+    ///
+    /// What is deliberately **not** in the result:
+    ///
+    /// * [`Mode::Raw`] — not a byte string.
+    /// * [`Mode::AltScreen`] — re-sending `?1049h` while already in the alternate
+    ///   screen asks the terminal to save the *current* contents as the main
+    ///   screen, which is the one destructive thing this app could do to the
+    ///   user's scrollback. We are already there; the child's own enter is cut
+    ///   upstream (ADR-0001 amendment 4) rather than replayed.
+    pub fn reassert_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for mode in self.ledger.held_modes() {
+            if mode == Mode::AltScreen || mode == Mode::Raw {
+                continue;
+            }
+            if let Some(bytes) = mode.on_bytes() {
+                out.extend_from_slice(bytes);
+            }
+        }
+        out
     }
 
     /// Switch a terminal mode on, and take responsibility for it.

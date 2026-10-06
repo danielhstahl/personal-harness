@@ -98,6 +98,15 @@ pub struct ScreenWatch {
     run: Vec<u8>,
     /// Index into `run` of the `ESC` that started the sequence in flight.
     seq_start: usize,
+    /// **We** hold the alternate screen (ADR-0004 rule 1), so the child's own
+    /// enter/leave pair has to be cut out of the stream instead of teed.
+    ///
+    /// This is the whole resolution of the alt-screen collision (ADR-0001
+    /// amendment 4) seen from the byte level, and it lives here because this type
+    /// is the one place that knows where those sequences start and end across read
+    /// boundaries. Everywhere else the pair is invisible; see
+    /// [`ScreenWatch::hosting_alt_screen`].
+    ours: bool,
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -120,6 +129,48 @@ impl ScreenWatch {
 
     pub fn is_held(&self) -> bool {
         self.held
+    }
+
+    /// Say that the *app* is the one living in the alternate screen, and that the
+    /// child's own `?1049h` / `?1049l` pair must therefore never reach the real
+    /// terminal.
+    ///
+    /// Why cutting rather than teeing, and why cutting rather than swallowing the
+    /// child's belief:
+    ///
+    /// * **Teeing the pair is the collision.** The child's `l` drops the terminal
+    ///   to the main screen while our ledger still says the alternate screen is
+    ///   ours, so we then repaint into a screen the user is not looking at, and
+    ///   the exit pays a leave for a screen that is already gone.
+    /// * **Leaving our screen first is worse.** ADR-0004 rule 1 takes the
+    ///   alternate screen precisely so the user's main screen is untouched for
+    ///   the whole run. Handing over by leaving means the user's scrollback shows
+    ///   through in the middle of a command, and if the process dies in that
+    ///   window our frames are nowhere and their screen is the one we abandoned.
+    /// * **Cutting keeps the invariant unbroken**: the screen the user is looking
+    ///   at is ours from the first frame to the last. The child paints into it
+    ///   and never learns the difference, because the alternate screen it asked
+    ///   for is the screen it gets.
+    ///
+    /// The child's `l` is then not a failure but the *return of our own screen*
+    /// (looprs-pdl.12's "the child returning to our screen rather than its
+    /// own"): the bytes that would have switched it away are gone, the
+    /// `Release` is still reported, and the release path repaints. Two
+    /// consequences follow that the ledger depends on:
+    ///
+    /// * the child's enter never reaches the tee, so [`ScreenDebt`] never books a
+    ///   debt for a screen the child never actually switched — there is nothing
+    ///   left to pay back on `SIGKILL`, and exactly one `?1049l` in the run
+    ///   instead of two (a second `?1049h` is *destructive*: it re-saves the
+    ///   current, alternate contents as the "main screen", which is the one
+    ///   thing this app must never do to the user's scrollback);
+    /// * [`ScreenWatch::force_release`] stops emitting a leave of our own.
+    ///
+    /// Default `false`, which is today's passthrough: the app in an inline pane
+    /// has no alternate screen to protect, and the child's pair is its own
+    /// business.
+    pub fn hosting_alt_screen(&mut self, ours: bool) {
+        self.ours = ours;
     }
 
     /// The alternate-screen code this watcher believes is currently switched on,
@@ -173,12 +224,33 @@ impl ScreenWatch {
                                     // Everything before the switch belongs to the
                                     // old owner; emit it first, then announce, and
                                     // keep the switch itself in the run so it is
-                                    // the first thing teed under the new owner.
+                                    // the first thing teed under the new owner —
+                                    // unless the alternate screen is ours, in which
+                                    // case the switch is cut rather than teed.
                                     let head: Vec<u8> = run.drain(..self.seq_start).collect();
                                     if !head.is_empty() {
                                         out.push(Piece::Out(head));
                                     }
+                                    if alt && self.ours {
+                                        run.clear();
+                                    }
+                                    // Announced before the canvas goes out, for the
+                                    // same reason the switch bytes used to be
+                                    // announced before they were teed: the UI must
+                                    // already be teeing when the bytes that change
+                                    // what is on the screen reach it.
                                     out.push(Piece::Change(ScreenChange::Takeover { alt }));
+                                    if alt && self.ours {
+                                        // The enter is cut, but `?1049h` does two
+                                        // jobs and the child expects both: switch
+                                        // to the alternate screen **and** hand the
+                                        // program a blank canvas. Dropping the
+                                        // switch is the whole point; dropping the
+                                        // clear as well would paint the child over
+                                        // our previous frame and leave every cell
+                                        // it does not write showing our UI.
+                                        out.push(Piece::Out(alt_canvas().to_vec()));
+                                    }
                                     self.held = true;
                                     self.alt = alt;
                                     self.alt_code = entered;
@@ -189,8 +261,20 @@ impl ScreenWatch {
                                 ScreenChange::Release => {
                                     // The leave sequence itself must reach the
                                     // terminal first — that byte is what puts the
-                                    // main screen back.
-                                    out.push(Piece::Out(std::mem::take(&mut run)));
+                                    // main screen back. Except when the alternate
+                                    // screen is ours: then the main screen is not
+                                    // coming back under any circumstances, and the
+                                    // leave bytes are cut and only the remainder
+                                    // of the run goes out.
+                                    if self.ours {
+                                        let head: Vec<u8> = run.drain(..self.seq_start).collect();
+                                        if !head.is_empty() {
+                                            out.push(Piece::Out(head));
+                                        }
+                                        run.clear();
+                                    } else {
+                                        out.push(Piece::Out(std::mem::take(&mut run)));
+                                    }
                                     out.push(Piece::Change(ScreenChange::Release));
                                     self.held = false;
                                     self.alt = false;
@@ -249,7 +333,14 @@ impl ScreenWatch {
     /// gets the main screen — and the scrollback with it — back.
     pub fn force_release(&mut self) -> Vec<u8> {
         let mut bytes = self.drain();
-        if let Some(code) = self.alt_code {
+        // Only pay a leave for a screen we actually switched. When the alternate
+        // screen is ours the child's enter was cut on the way through, so the
+        // child switched nothing and a leave here would drop the *user* out of
+        // the app's own screen — the exact inverse of the bug this function was
+        // written for.
+        if !self.ours
+            && let Some(code) = self.alt_code
+        {
             bytes.extend_from_slice(alt_leave(code));
         }
         self.held = false;
@@ -339,6 +430,16 @@ fn alt_code_of(seq: &[u8]) -> Option<u16> {
         return None;
     }
     alt_screen_code(&nums)
+}
+
+/// The blank canvas a full-screen program expects when it asks for an alternate
+/// screen, without the screen switch.
+///
+/// Home the cursor and erase the whole visible display. Not `3J`: that one also
+/// throws away scrollback, which is not ours to throw (and, in the alternate
+/// screen, is not where the transcript lives either — ADR-0004 rule 2).
+pub fn alt_canvas() -> &'static [u8] {
+    b"\x1b[H\x1b[2J"
 }
 
 /// The bytes that put a given alternate-screen code back.
@@ -914,7 +1015,212 @@ mod tests {
         );
     }
 
+    // ---------- the alternate screen is OURS (looprs-pdl.12) ----------
+    /// When the app lives in the alternate screen, the child's own enter is cut
+    /// out of the stream instead of teed. The child's `?1049l` would drop the
+    /// terminal to the main screen while our ledger still says the alternate
+    /// screen is ours, and every frame after that is painted somewhere the user is
+    /// not looking.
+    #[test]
+    fn when_we_host_the_alt_screen_the_childs_enter_is_cut_not_teeyed() {
+        let mut w = ScreenWatch::new();
+        w.hosting_alt_screen(true);
+        assert_eq!(
+            w.observe(b"\x1b[?1049hpainted"),
+            vec![
+                // Announced first: the UI must be teeing before the canvas moves.
+                Piece::Change(ScreenChange::Takeover { alt: true }),
+                // The blank canvas the child thinks it just got, in place of the
+                // switch that would have taken the screen away from us.
+                Piece::Out(s("\x1b[H\x1b[2J")),
+                Piece::Out(s("painted")),
+            ],
+            "the enter never reaches the wire",
+        );
+        assert!(w.is_held(), "the child still owns the screen it draws on");
+    }
+
+    /// ...and so is the child's leave. The `Release` is still reported — the child
+    /// really did stop drawing, and that is what the UI needs to know — but the
+    /// bytes that would have switched the user out of our screen are gone. This is
+    /// the ticket's "the child returning to *our* screen rather than its own",
+    /// which stops being a failure mode the moment the switch is cut: the screen
+    /// it comes back to is the one the user was already looking at.
+    #[test]
+    fn when_we_host_the_alt_screen_the_childs_leave_is_cut_but_still_reported() {
+        let mut w = ScreenWatch::new();
+        w.hosting_alt_screen(true);
+        w.observe(b"\x1b[?1049hpainted");
+        assert_eq!(
+            w.observe(b"last frame\x1b[?1049lback to the prompt"),
+            vec![
+                Piece::Out(s("last frame")),
+                Piece::Change(ScreenChange::Release),
+                Piece::Out(s("back to the prompt")),
+            ],
+            "no `?1049l` on the wire, release still announced, nothing lost",
+        );
+        assert!(!w.is_held());
+    }
+
+    /// Every alt-screen spelling is cut, not just the one vim uses — the watcher
+    /// already treats 47/1047/1049 as one fact, and cutting only one of them
+    /// would leave the other two as live collisions.
+    #[test]
+    fn every_alt_screen_spelling_is_cut_when_we_host_the_screen() {
+        for code in [1049u16, 1047, 47] {
+            let mut w = ScreenWatch::new();
+            w.hosting_alt_screen(true);
+            let out: Vec<u8> = w
+                .observe(format!("\x1b[?{code}ha").as_bytes())
+                .into_iter()
+                .flat_map(|p| match p {
+                    Piece::Out(b) => b,
+                    Piece::Change(_) => vec![],
+                })
+                .chain(
+                    w.observe(format!("b\x1b[?{code}lc").as_bytes())
+                        .into_iter()
+                        .flat_map(|p| match p {
+                            Piece::Out(b) => b,
+                            Piece::Change(_) => vec![],
+                        }),
+                )
+                .collect();
+            let text = String::from_utf8_lossy(&out).to_string();
+            assert!(
+                !text.contains(&format!("[?{code}")),
+                "{code} switched the real terminal: {text:?}"
+            );
+            assert!(
+                text.contains('a') && text.contains('b') && text.contains('c'),
+                "the paint around the cuts survives: {text:?}"
+            );
+        }
+    }
+
+    /// A cut enter books no debt. The exit path then leaves the alternate screen
+    /// exactly once — the ledger's own leave, for the screen the ledger itself
+    /// switched on. Teeing the child's enter would have made the run leave twice:
+    /// once paid for a screen the child never switched, once for ours. A second
+    /// `?1049l` restores whatever the terminal happened to keep, which is the one
+    /// thing this app must not do to the user's scrollback.
+    #[test]
+    fn a_cut_enter_books_no_alt_screen_debt() {
+        let d = crate::screen::ScreenDebt::new();
+        let mut w = ScreenWatch::new();
+        w.hosting_alt_screen(true);
+        for piece in w.observe(b"\x1b[?1049hpaint\x1b[?1049l") {
+            if let Piece::Out(b) = piece {
+                d.note_tee(&b);
+            }
+        }
+        assert_eq!(
+            d.outstanding(),
+            None,
+            "the tee never wrote an enter, so nothing is owed"
+        );
+    }
+
+    /// The mirror of `a_forced_release_pays_an_unpaid_alt_screen_leave`: when the
+    /// screen is ours, a child that dies inside it leaves nothing for us to pay.
+    /// Emitting a leave here would drop the *user* out of the app's own screen —
+    /// the exact inverse of the bug that function was written for.
+    #[test]
+    fn a_forced_release_from_a_hosted_alt_screen_owes_no_leave() {
+        let mut w = ScreenWatch::new();
+        w.hosting_alt_screen(true);
+        w.observe(b"\x1b[?1049hpainting");
+        assert!(w.is_held(), "the child holds the screen");
+        assert_eq!(
+            w.force_release(),
+            Vec::<u8>::new(),
+            "no leave for a screen the child never switched"
+        );
+        assert!(!w.is_held(), "and the watcher is rearmed all the same");
+    }
+
+    /// The hosted screen still detects, still releases, and still rearms: cutting
+    /// the child's switches must not cut the watcher's ability to see the *next*
+    /// child take the screen.
+    #[test]
+    fn a_hosted_alt_screen_still_watches_the_next_child() {
+        let mut w = ScreenWatch::new();
+        w.hosting_alt_screen(true);
+        w.observe(b"\x1b[?1049hpaint\x1b[?1049l");
+        assert!(
+            w.observe(b"\x1b[?1049hsecond child")
+                .contains(&Piece::Change(ScreenChange::Takeover { alt: true })),
+            "the second child is still seen as a takeover"
+        );
+    }
+
+    /// A non-alt-screen paint program is nobody's alternate screen, hosted or not:
+    /// nothing is cut, because nothing was switched. The heuristic case stays
+    /// shape-based, exactly as ADR-0001 amendment 3 left it.
+    #[test]
+    fn a_paint_takeover_cuts_nothing_hosted_or_not() {
+        let mut w = ScreenWatch::new();
+        w.hosting_alt_screen(true);
+        let out: Vec<u8> = w
+            .observe(b"\x1b[10;1H\x1b[2Jpainted without switching")
+            .into_iter()
+            .flat_map(|p| match p {
+                Piece::Out(b) => b,
+                Piece::Change(_) => vec![],
+            })
+            .collect();
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "\x1b[10;1H\x1b[2Jpainted without switching",
+            "the heuristic case keeps every byte, because it tees no switch"
+        );
+    }
+
+    /// An ordinary mode the child sets for itself — hide the cursor, bracketed
+    /// paste — is not a screen switch and is not cut. Only the alternate screen
+    /// belongs to us, and the ledger's rule "only unset what you set" has its
+    /// mirror here: only cut what would take *our* screen.
+    #[test]
+    fn the_childs_own_non_screen_modes_pass_straight_through() {
+        let mut w = ScreenWatch::new();
+        w.hosting_alt_screen(true);
+        let out: Vec<u8> = w
+            .observe(b"\x1b[?1049h\x1b[?25l\x1b[?2004hworking\x1b[?2004l\x1b[?25h")
+            .into_iter()
+            .flat_map(|p| match p {
+                Piece::Out(b) => b,
+                Piece::Change(_) => vec![],
+            })
+            .collect();
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            text.contains("\x1b[?25l")
+                && text.contains("\x1b[?2004h")
+                && text.contains("working")
+                && text.contains("\x1b[?2004l")
+                && text.contains("\x1b[?25h"),
+            "the child keeps its own non-screen modes: {text:?}"
+        );
+        assert!(
+            !text.contains("1049"),
+            "only the screen switch was cut: {text:?}"
+        );
+    }
+
+    /// The blank canvas is a whole-screen erase at home, and not the scrollback
+    /// destroyer: `3J` would throw away history we do not own.
+    #[test]
+    fn the_canvas_is_an_erase_at_home_not_a_scrollback_clear() {
+        assert_eq!(alt_canvas(), b"\x1b[H\x1b[2J");
+        assert!(
+            !String::from_utf8_lossy(alt_canvas()).contains("3J"),
+            "3J clears scrollback, which is not ours to clear"
+        );
+    }
+
     // ---------------- the passthrough write ----------------
+
     /// The passthrough is a copy, not a rendition: what the child wrote is what
     /// goes out, byte for byte, and it is flushed rather than buffered — a frame
     /// sitting in a userspace buffer is a frame the user cannot see.

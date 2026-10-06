@@ -224,6 +224,19 @@ async fn run(
     // any session exists, because the first full-screen program a user runs should
     // not be the one that discovers the wire was never connected.
     app.set_screen_debt(exit.screen_debt());
+    // The other half of the same wire: what to write when a child hands the screen
+    // *back*. A mouse-tracking vim switches our `?1000/?1002/?1006` off on the
+    // way out (looprs-pdl.2 #7), and the app would carry on as if it still had
+    // them. The list comes from the ledger's own held set so the App is not
+    // keeping a second guess at the mode set, and it excludes the alternate screen
+    // itself: re-sending `?1049h` while already in it would save the current
+    // contents as the user's main screen, which is not ours to lose.
+    app.set_reassert_bytes(exit.reassert_bytes());
+    // …and which screen that hand-back happens on. Same source as the ledger's
+    // own startup list, so "who owns the alternate screen" is one answer shared
+    // by the session that cuts the child's switches, the App that repaints, and
+    // the exit that leaves the screen for good.
+    app.set_alt_screen_hosted(Mode::alt_screen_claimed());
     // Tell the sessions the size they are being shown at before anyone runs a
     // command. A Bash shell spawned later still inherits this: `BashTask::resize`
     // records the size even with no shell up yet, and uses it for the pty it

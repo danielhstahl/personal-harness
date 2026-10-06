@@ -411,3 +411,124 @@ under `spikes/results/`):
 * The takeover is per Bash session, and only teed while that session is the mode on
   screen. A Bash child holding the screen while the user looks at Pi is not shown
   and is not lost either: its bytes go to its own view.
+
+## Amendment 4 — two owners of one alternate screen: the handover rule (`looprs-pdl.12`)
+
+Amendment 3 made a full-screen child's paint reach the user. It did it in the one
+arrangement where that is simple: looprs drawing an **inline** pane, so the only
+alternate-screen switch happening in the run is the child's own. ADR-0004 rule 1
+then committed this app to taking the alternate screen itself, and that turns every
+`vim`, `less` and `htop` into a second claimant on the same resource. This
+amendment decides who wins and what the child gets instead. It does not re-open
+Amendment 3's mechanism — the watcher, the tee and the file guard all stand; what
+changes is what the watcher does with the switch bytes when *we* are the ones
+living in the screen.
+
+**R4.1 — While the app holds the alternate screen, a child's own
+`?1049`-family enter and leave are cut, not teed.** They are removed from the
+stream in `ScreenWatch::observe` (the same place that already sequences the
+announcement against the paint), and the takeover and release events are reported
+exactly as before. The child believes it switched screens; the terminal never did.
+
+The decision is the asymmetric one. Write the child's `?1049h` and the terminal
+saves the current main screen to make the alternate screen its new "back" buffer —
+and inside our own alternate screen, the thing being saved **is our frame**. The
+user's real scrollback is destroyed at the moment vim starts, before anything
+could be corrected, and no later cleanup brings it back. Let the child's `?1049l`
+through instead and the terminal restores that saved state: our old frame, with
+looprs still drawing into a screen the user has just been dropped out of, and the
+ledger still convinced it owns the alternate screen. Cutting the enter costs a
+screen the child expected and can be given another way; teeing it costs the user's
+history, which cannot be had back. Between a worse-looking program and a destroyed
+scrollback, the scrollback wins.
+
+**R4.2 — The cut enter is replaced with a blank canvas.** `?1049h` does two jobs:
+switch screens, and hand the program a cleared display. Cutting the switch and the
+clear together would paint the child over our previous frame, and every cell the
+child does not write would show our UI through it. So the watcher emits
+`\x1b[H\x1b[2J` in its place — home and erase, first bytes under the new owner.
+Never `3J`: that clears scrollback, which is not ours to clear.
+
+**R4.3 — Taking the screen back means clearing and re-asserting.** The child's
+last frame is painted on the screen we still own, and cutting its leave also cut
+the vanishing that leave performed. So the take-back path erases the canvas
+(same primitive, R4.2) and then writes back every mode the ledger still holds
+except two:
+
+* **`Raw`** — a syscall, not a byte string, and still in force.
+* **`AltScreen`** — because `?1049h` is the save-the-main-screen sequence, and
+  re-sending it inside our own alternate screen re-bases the user's saved state
+  onto our frame. The one mode the ledger holds is the one mode it must not
+  re-assert. This is the same asymmetry as R4.1 arriving from the other
+  direction.
+
+What does get written back is the list that matters, because full-screen programs
+switch all of it off on the way out — measured against vim: `?1000l`, `?1002l`,
+`?1006l`, `?2004l`. Without the re-assert the mouse is dead for the rest of the
+session and a pasted block arrives as if typed, with every newline in it executed.
+
+**R4.4 — A child that dies inside the screen owes no leave.** The mirror of
+Amendment 3's paid-debt case. `force_release` used to write a leave for a child
+killed mid-paint; with the screen hosted, that leave would drop the *user* out of
+the app's own screen, which is the exact inverse of the bug the function was
+written for. A cut enter books nothing, so a forced release books nothing. The
+watcher rearms all the same, so the next child is still seen.
+
+**R4.5 — In the inline pane nothing changes.** The cut is conditional on
+`hosting_alt_screen`, which is set from the ledger's own startup list
+(`Mode::alt_screen_claimed()`) rather than re-derived from `$LOOPRS_MODES` at the
+call site, so the session that cuts, the viewport that repaints and the exit that
+leaves cannot disagree about who owns the screen. With no alternate screen the
+child's switches tee through as they did, `ScreenDebt` still pays them, and every
+check written before this amendment still passes in that mode set.
+
+### Why not leave first
+
+The other way to avoid the collision is for looprs to leave its own alternate
+screen before the child enters, so the child has the terminal to itself. Rejected:
+it shows the user their own main screen mid-handover — the transcript they are not
+supposed to be able to see the way ADR-0004 R1 arranged it — and if the child
+never comes back, or the app dies while it holds the screen, the user is left in a
+terminal state neither owner booked. Hosting and cutting keeps the user inside our
+screen from the first frame to the last, with no window in which the wrong thing is
+visible.
+
+### What R4 does not fix
+
+* **The child's frame is the whole canvas.** It is not composited with our status
+  row and input box; it replaces them, exactly as it does for a program run in a
+  plain terminal. Handing over a terminal means that.
+* **What the rows above the pane show after the handback is the app's problem to
+  repaint, and today it repaints the live region only.** The erase in R4.3 makes
+  the pane's own rows clean; a future frame migration that owns the whole window
+  and can redraw the stored transcript into it is what makes the whole display
+  restated rather than partially.
+* **A child that asks the terminal about the alternate screen directly (`DECRQM`)
+  will get an answer that contradicts what it asked for.** Nobody asked during the
+  measurement; a program that does would be told the truth about a screen it
+  believes it owns.
+* The cut is per-Bash-session, on the session that holds the screen, and only for
+  the alternate-screen family. Every other private mode a child sets — application
+  cursor keys, the cursor itself, bracketed paste as *the child's* mode — passes
+  through untouched, because only the screen belongs to us.
+
+### Measured
+
+`spikes/fullscreen_e2e.py` now runs the whole file in both mode sets, inline and
+`LOOPRS_MODES=all`, 70/70 (`spikes/results/fullscreen-alt-handover.log`):
+
+| Check | Result |
+| --- | --- |
+| exactly one `?1049h` on the wire — ours, at startup; the child's never appears | pass |
+| the child was handed a blank canvas in place of the switch | pass |
+| no `?1049l` at any point during the run; the user is never dropped to the main screen | pass |
+| the take-back erases the child's frame before repainting | pass |
+| mouse report / drag / SGR and bracketed paste are back on after vim switched them off (with a control proving the child really did switch them off) | pass |
+| no watched mode is left different from before the child took the screen | pass |
+| the re-assert does not re-enter the alternate screen | pass |
+| a child SIGKILLed while holding the screen owes no leave and the app keeps going | pass |
+| a child that leaves its own alt screen mid-command keeps the user on ours, and its later line output reaches the transcript | pass |
+| across the whole session the exit leaves the alternate screen exactly once, and it is the exit's own | pass |
+| the inline mode set is unchanged by all of this | pass |
+| unit tests, `screen.rs` (cut / canvas / no-debt / rearm / non-screen modes pass through) | 449 pass |
+| the mode ledger's own spike, unchanged by the handover (`spikes/results/shutdown-e2e-pdl12.log`) | 149/149 |

@@ -495,6 +495,28 @@ comes from whether we can prove it landed.
 
 ---
 
+**R22. A full-screen child that asks for the alternate screen does not get it; it gets a canvas.**
+Rule R1 says the alternate screen is ours, and a child typing `?1049h` is asking for the same
+resource. The rule is that **we keep it**: the child's enter and leave are cut out of the byte
+stream, a blank canvas (`\x1b[H\x1b[2J`) is handed over in place of the enter, and the takeover
+and release are reported to the UI exactly as if the switch had happened. Full decision, the
+asymmetry that decides it (tee the enter and the user's saved main screen *is* our frame, so
+their scrollback is destroyed before anything could be corrected), and the take-back
+re-assertion list are ADR-0001 amendment 4 — recorded there because the mechanism lives in the
+Bash screen path, and restated here because **R1 is the rule that makes the collision exist** and
+must not be read without it. Three consequences worth saying in this file's own voice:
+
+* **The user never leaves our screen.** Across a whole vim session the wire carries one
+  `?1049h` (ours, at startup) and no `?1049l` until the exit's own single leave. The handover
+  is total at the pixels and invisible in the mode ledger.
+* **The hand-back re-asserts every mode we hold except the two that must not be re-asserted** —
+  `Raw`, which is a syscall, and `AltScreen`, which is the save-the-main-screen sequence. vim
+  switches the mouse and bracketed paste off on the way out; without this the session comes back
+  with no mouse and pastes that execute.
+* **"Our scrollback is intact" now has a stronger meaning than a promise.** Our frames were
+  never composited onto the user's main screen, and nothing of the child's was saved over it,
+  because between our enter and our exit there was no second screen switch at all.
+
 ## Out of scope
 
 Decided *out*, not merely unbuilt. Each of these is a thing a later contributor could plausibly add
@@ -535,8 +557,12 @@ Each with the thing that would settle it, so none of these stays theoretical by 
    painted. The failure mode is a mitigation that does not exist. Settle with: the `--in-terminal`
    leg, two shift-drags and a `y`/`n`. If it does not work, R17's `LOOPRS_MOUSE=off` is the only
    escape hatch that remains, and pdl.10's failure-toast text must not promise shift-drag.
-3. **What the user sees while a full-screen child holds our alternate screen** — the pty has no
-   window. Settle with: run vim inside the real-terminal leg.
+3. ~~**What the user sees while a full-screen child holds our alternate screen**~~ — **settled
+   by R22 and `spikes/fullscreen_e2e.py`**: the child gets the whole canvas and the whole
+   keyboard, the user is never dropped out of our screen, and the child's own `?1049` enter and
+   leave never reach the terminal. What is still open is only what a real human sees at the
+   pixels — the pty has no window — so the `--in-terminal` leg of the same spike remains the
+   way to check the aesthetics, not the mechanism.
 4. **Per-terminal OSC 52 caps, for every terminal except WezTerm and Apple Terminal.** We have one
    terminal with no cap found up to 1 MiB and one whose cap is zero, and nothing in between — and
    the plausible failure mode is a terminal that *clips silently* above some size. iTerm2, Ghostty,
@@ -635,6 +661,7 @@ Rule → measurement map, so no rule rests on an adjective:
 | R12, R13 | burst: **128/128 reports in 0.282 ms**, worst gap 0.036 ms, nothing merged (so the drag redraw is free and the copy is not) |
 | R14 | ADR-0005: `line.cells == line.text.width()` asserted per line; the store is control-free; `copy_text()` is the trim rule |
 | R19 | `clipboard-cost.log` unit table: 2/4/6, 7/14/21, 5/2/18, 2/1/3 — and per-character widths summed over the ZWJ family (6) disagree with the family's own width (2) |
+| R22 | `fullscreen_e2e.py` run twice, inline and `LOOPRS_MODES=all`: **70/70**. The child's `?1049` family never reaches the wire, no leave during the run, the canvas is handed over in its place, mouse/drag/SGR/bracketed-paste are back on after vim switched them off (with a control proving the child really switched them off), no watched mode left changed, a SIGKILLed child owes no leave, and the exit leaves the alternate screen exactly once |
 | R18 | `flash-e2e-at-pdl5.log`: a reshape's erase→content hole is 8.8–9.3 ms, so the toast is an overlay |
 | R17, open-2 | the shift-drag fall-through is **measured as unmeasurable from a pty** (`5b`), which is why R17 has three hatches and not one |
 
