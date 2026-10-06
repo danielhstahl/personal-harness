@@ -1,5 +1,6 @@
 use crate::components::compaction::CompactionState;
 use crate::components::tool::ToolStateCategory;
+use crate::utils::shelltext::{StyleRun, StyledLine};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MessageKind {
@@ -63,6 +64,18 @@ pub struct Entry {
     pub kind: MessageKind,
     pub text: String,
     pub done: bool,
+    /// The *presentation* of `text`, as byte ranges into it (ADR-0005).
+    ///
+    /// Only shell output ever fills this: it is the one kind whose incoming bytes
+    /// carry styling that is worth keeping and that cannot be expressed in the
+    /// `text` itself. Empty means "nothing was said about style", which is not
+    /// the same fact as "default style" but renders the same, and it is the
+    /// common case for every other kind in the tree.
+    ///
+    /// Ranges are only meaningful against this entry's own `text` — they are
+    /// re-based at push time ([`Transcript::push_shell_lines`]) — so an
+    /// `Entry`'s text and styles must always be appended together.
+    pub styles: Vec<StyleRun>,
 }
 
 #[derive(Default)]
@@ -85,6 +98,54 @@ impl Transcript {
                     kind,
                     text: delta.to_string(),
                     done: false,
+                    styles: Vec::new(),
+                });
+            }
+        }
+    }
+
+    /// Resolved shell output, appended line by line with its styling intact
+    /// (ADR-0005).
+    ///
+    /// This is the only way shell output enters a transcript — the plain
+    /// [`Self::push_delta`] path would take the bytes but drop the one thing the
+    /// resolver went to some trouble to work out. Each line is written with its
+    /// own terminating `\n`, so an entry's text is a sequence of complete lines
+    /// and its `styles` are byte ranges into that text: the styles travel with
+    /// the text they belong to, and the two can never be re-paired by guesswork.
+    ///
+    /// Extends the open Bash entry if there is one (a shell stream is one entry,
+    /// not one entry per line), and closes whatever else was open, exactly like
+    /// [`Self::push_delta`] would.
+    pub fn push_shell_lines(&mut self, lines: &[StyledLine]) {
+        if lines.is_empty() {
+            return;
+        }
+        match self.entries.last_mut() {
+            Some(e) if e.kind == MessageKind::Bash && !e.done => {}
+            _ => {
+                self.finish_last();
+                self.entries.push(Entry {
+                    kind: MessageKind::Bash,
+                    text: String::new(),
+                    done: false,
+                    styles: Vec::new(),
+                });
+            }
+        }
+        let e = self
+            .entries
+            .last_mut()
+            .expect("the entry above was just created");
+        for line in lines {
+            let base = e.text.len();
+            e.text.push_str(&line.text);
+            e.text.push('\n');
+            for run in &line.runs {
+                e.styles.push(StyleRun {
+                    start: base + run.start,
+                    end: base + run.end,
+                    style: run.style,
                 });
             }
         }
@@ -97,6 +158,7 @@ impl Transcript {
             kind,
             text,
             done: true,
+            styles: Vec::new(),
         });
     }
 
@@ -112,6 +174,7 @@ impl Transcript {
             },
             text: String::new(), // result summary arrives later
             done: false,
+            styles: Vec::new(),
         });
     }
 
@@ -163,6 +226,7 @@ impl Transcript {
             // slot a tool's result summary uses.
             text: String::new(),
             done: false,
+            styles: Vec::new(),
         });
     }
 

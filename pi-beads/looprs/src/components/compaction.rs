@@ -110,6 +110,7 @@ mod tests {
             },
             text: detail.into(),
             done: state != CompactionState::Running,
+            styles: Vec::new(),
         }
     }
 

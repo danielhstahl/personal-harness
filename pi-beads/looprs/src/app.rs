@@ -949,11 +949,14 @@ impl App {
                     // alternate screen is discarded on exit, not recalled.
                     crate::screen::tee(chunk.as_bytes());
                 } else {
-                    // Line-oriented output: `push_bash` strips the presentation
-                    // but never re-wraps and never reaches markdown
-                    // (ADR-0001 rule 1).
+                    // Line-oriented output: `push_bash` resolves the presentation
+                    // into styles and in-line edits, and never re-wraps and never
+                    // reaches markdown (ADR-0001 rule 1, ADR-0005). The width
+                    // handed over is the width the pty was given, so a `\r` in
+                    // the stream lands on the row the child thought it had.
                     self.dirty = true;
-                    self.view_mut(session).push_bash(&chunk);
+                    let width = self.width;
+                    self.view_mut(session).push_bash(&chunk, width);
                 }
             }
             Msg::BeadStep { session, step } => {
@@ -2505,9 +2508,10 @@ mod tests {
         }
     }
 
-    /// **A `Msg::BashOutput` lands in the Bash view as raw text** and never in the
-    /// mode the input box happens to be in — and the chunk is kept whole rather
-    /// than re-split into lines (ADR-0001 rule 1: the child owns its framing).
+    /// **A `Msg::BashOutput` lands in the Bash view and never in the mode the input
+    /// box happens to be in** — and the child keeps its own framing: a line the
+    /// child ended is stored as one line, and a line it did not end stays live and
+    /// unfinished until the stream does (ADR-0001 rule 1, ADR-0005).
     #[test]
     fn bash_output_lands_in_its_own_view_verbatim() {
         let mut app = {
@@ -2522,14 +2526,36 @@ mod tests {
             chunk: chunk.into(),
         });
 
+        // The finished line is in the store. The unterminated tail is *not*: ADR-0005
+        // makes the store a list of complete lines so the line still being written
+        // can be overwritten by the next `\r`, and the tail lives in the view's
+        // resolver until the stream ends. Both halves are checked here, because
+        // "arrived whole" is the same promise and it now has two addresses.
         assert_eq!(
             text_of(&app, TerminalType::Bash),
-            chunk,
-            "the read chunk arrived whole — not re-split, not re-joined"
+            "first line\n",
+            "the line the child ended is in the store, as the child wrote it"
+        );
+        let live: String = app
+            .view(TerminalType::Bash)
+            .map(|v| v.preview(80).iter().map(|l| l.to_string()).collect())
+            .unwrap_or_default();
+        assert!(
+            live.contains("second line, with no trailing newline"),
+            "the line it did not end is live, not lost: {live:?}"
         );
         assert!(
             app.view(TerminalType::Beeds).is_none(),
             "and it went nowhere near the mode the box was in"
+        );
+
+        // And ending the stream lands the tail rather than dropping it.
+        let bash = SessionId::new(TerminalType::Bash, 1);
+        app.view_mut(bash).seal();
+        assert_eq!(
+            text_of(&app, TerminalType::Bash),
+            format!("{chunk}\n"),
+            "the seal collected the live line; nothing was lost with the stream"
         );
     }
 
@@ -2611,9 +2637,18 @@ mod tests {
             stream: ByteStream::Merged,
             chunk: "painted while hidden".into(),
         });
+        let live: String = app
+            .view(TerminalType::Bash)
+            .map(|v| v.preview(80).iter().map(|l| l.to_string()).collect())
+            .unwrap_or_default();
         assert!(
-            text_of(&app, TerminalType::Bash).contains("painted while hidden"),
+            live.contains("painted while hidden"),
             "kept in its own view instead of overwriting Pi"
+        );
+        assert_eq!(
+            text_of(&app, TerminalType::Bash),
+            "",
+            "and it is still the live line it was: nothing was ended, so the              scrollback got nothing — while hidden, the bytes are held, not smeared"
         );
         assert!(app.view(TerminalType::Pi).is_none(), "Pi was not touched");
     }

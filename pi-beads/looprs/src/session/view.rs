@@ -27,7 +27,8 @@ use crate::components::scrollback::Flusher;
 use crate::session::ActiveBead;
 use crate::session::{BeadStep, SessionStatus};
 use crate::state::transcript::{Entry, MessageKind, Transcript};
-use crate::utils::render::ControlStripper;
+use crate::theme::styles::{restyle, style_for};
+use crate::utils::shelltext::LineResolver;
 
 /// Default cap on how much text an *inactive* view will hold.
 ///
@@ -178,9 +179,16 @@ pub struct SessionView {
     /// Dropped-line bookkeeping for the buffer cap (see [`DEFAULT_VIEW_BUFFER`]).
     dropped: usize,
     limit: usize,
-    /// Escape-sequence stripper for this view's Bash output (see [`Self::push_bash`]).
-    /// Per-view because a sequence can straddle two reads.
-    bash_strip: ControlStripper,
+    /// The resolver for this view's Bash output (see [`Self::push_bash`]).
+    ///
+    /// Per-view, and per-stream: shell output is not a string, it is a *stream*
+    /// with state — an escape sequence straddles two reads, an SGR style carries
+    /// from one line to the next, and the cell a `\r` returns to is the cell
+    /// earlier bytes of *this* shell wrote. ADR-0005 is the decision; this field
+    /// is where that state lives, and there is exactly one of them per Bash
+    /// session, which is what makes "who owns the resolution" a answered
+    /// question rather than a rumour.
+    shell: LineResolver,
 }
 
 impl SessionView {
@@ -205,22 +213,47 @@ impl SessionView {
             tokens: Tokens::default(),
             dropped: 0,
             limit,
-            bash_strip: ControlStripper::default(),
+            shell: LineResolver::new(),
         }
     }
 
-    /// Shell output into the transcript: verbatim content, presentation stripped,
-    /// **never** markdown and **never** re-wrapped (ADR-0001 rules 1 and 5).
+    /// Shell output into the transcript (ADR-0005, superseding the "strip the
+    /// presentation" reading of ADR-0001 rule 5).
     ///
-    /// The strip is per-view because a colour sequence split across two reads must
-    /// not come out as half-dropped, half-printed-garbage.
-    pub fn push_bash(&mut self, chunk: &str) {
-        let text = self.bash_strip.strip(chunk);
-        if text.is_empty() {
+    /// The bytes are *resolved* — SGR becomes a style, `\r`/`\b`/`\t`/`EL` are
+    /// applied inside the line, clusters keep their cell count — and the finished
+    /// lines go to [`Transcript::push_shell_lines`] with their styles attached.
+    /// What is still guaranteed by ADR-0001 rule 1 is unchanged: no markdown, and
+    /// no re-wrap by us at any point between the child and the scrollback.
+    ///
+    /// `term_width` is the width the child is writing for, in cells, and it must
+    /// be the **same value that was forwarded to the pty**. That is what makes a
+    /// `\r` here land on the row the child believed it was on rather than on the
+    /// head of the whole logical line (ADR-0005 Q2).
+    pub fn push_bash(&mut self, chunk: &str, term_width: u16) {
+        self.shell.set_wrap_width(term_width as usize);
+        let lines = self.shell.feed(chunk);
+        if lines.is_empty() {
             return;
         }
-        self.transcript.push_delta(MessageKind::Bash, &text);
+        self.transcript.push_shell_lines(&lines);
         self.enforce_buffer();
+    }
+
+    /// Move the line the resolver still has open into the transcript, ended.
+    ///
+    /// The open line lives in the resolver rather than in the entry so that it can
+    /// still be overwritten by the next `\r` — which is the whole reason the
+    /// store can stay an append-only list of finished lines. That only works if
+    /// "the stream ended" is answered by *somebody*, and every path that ends one
+    /// (a different kind of entry opening, the seal, teardown) calls this first.
+    /// Nothing typed into a shell is allowed to evaporate because a newline
+    /// never arrived before the prompt changed hands.
+    fn flush_shell_pending(&mut self) {
+        if let Some(line) = self.shell.take_pending() {
+            self.transcript
+                .push_shell_lines(std::slice::from_ref(&line));
+        }
     }
 
     /// Lines that became final since the last call. Call once per frame, for the
@@ -234,6 +267,17 @@ impl SessionView {
 
     /// The not-yet-final tail, for the live preview region.
     pub fn preview(&self, width: u16) -> Vec<Line<'static>> {
+        // A Bash view's live tail is in the resolver, not in the entry: the entry
+        // only ever holds lines the resolver *finished*, so the flusher would
+        // honestly answer "nothing open" while the shell is mid-line.
+        //
+        // The pending line needs no guard against "but something else is live":
+        // every path that writes a different kind through this view calls
+        // `flush_shell_pending` first, so a pending line is, by construction, the
+        // newest thing this session said.
+        if let Some(line) = self.shell.pending() {
+            return vec![restyle(line.to_line(), style_for(&MessageKind::Bash))];
+        }
         self.flusher.preview(&self.transcript, width)
     }
 
@@ -246,6 +290,11 @@ impl SessionView {
     /// dead text forever. This is the seam that breaks the `insert_before`
     /// invariant, so it is part of the contract rather than a detail.
     pub fn seal(&mut self) {
+        // The line the resolver still had open is part of this tail, and it goes
+        // in *before* anything is closed: pushed into the still-open Bash entry,
+        // then closed with it. After `finish_last` the entry is done, and the tail
+        // would start a second entry — same words, wrong shape.
+        self.flush_shell_pending();
         self.transcript.finish_last();
         // ...and so are any cards still open in it. `finish_last` deliberately
         // leaves running tools alone (parallel tools must survive a delta
@@ -258,17 +307,19 @@ impl SessionView {
         // send the rest of it. Left as it is, the next Bash generation's first
         // bytes get eaten by the previous one's dangling `\x1b[`, which shows up
         // as the first line of a brand new shell silently missing its head.
-        self.bash_strip.reset();
+        self.shell.reset();
     }
 
     /// A finished, one-shot line (status notices, the mode-switch separator).
     pub fn push_note(&mut self, kind: MessageKind, text: String) {
+        self.flush_shell_pending();
         self.transcript.push_done(kind, text);
         self.enforce_buffer();
     }
 
     /// A streaming delta from this session's backend.
     pub fn push_delta(&mut self, kind: MessageKind, delta: &str) {
+        self.flush_shell_pending();
         self.transcript.push_delta(kind, delta);
         self.enforce_buffer();
     }
@@ -276,6 +327,7 @@ impl SessionView {
     /// A session-level error: recorded for the status row and shown.
     pub fn push_error(&mut self, text: String) {
         self.last_error = Some(text.clone());
+        self.flush_shell_pending();
         self.transcript.push_done(MessageKind::Error, text);
         self.enforce_buffer();
     }
@@ -393,7 +445,12 @@ impl SessionView {
     /// The notice's own size is reserved out of the cap: without that the view ends
     /// at `limit + notice` and the cap is a rounding error with an apology note.
     fn enforce_buffer(&mut self) {
-        if self.limit == 0 || self.transcript.byte_len() <= self.limit {
+        // What the cap has to cover is everything this view holds, which is the
+        // transcript *plus* the Bash line the resolver is still resolving: the
+        // store cannot see that one, and it is exactly the thing a child that
+        // never ends a line can grow without bound.
+        let buffered = self.transcript.byte_len() + self.shell.pending_len();
+        if self.limit == 0 || buffered <= self.limit {
             return;
         }
         let target = self.limit.saturating_sub(NOTICE_BUDGET);
@@ -419,6 +476,7 @@ impl SessionView {
                 kind: MessageKind::System,
                 text: format!("… {} bytes dropped (buffer cap) …", self.dropped),
                 done: true,
+                styles: Vec::new(),
             },
         );
         self.flusher.reseat(at);
@@ -763,11 +821,11 @@ mod tests {
     #[test]
     fn sealing_drops_a_dangling_escape_sequence_too() {
         let mut v = view(TerminalType::Bash);
-        v.push_bash("first-line\u{1b}["); // ends mid-escape-sequence
+        v.push_bash("first-line\u{1b}[", 60); // ends mid-escape-sequence
         v.seal();
         let first = v.flush(60);
 
-        v.push_bash("second-line\n"); // the next stream, which must be unaffected
+        v.push_bash("second-line\n", 60); // the next stream, which must be unaffected
         v.seal();
         let second = v.flush(60);
 

@@ -812,6 +812,7 @@ mod tests {
             kind: MessageKind::System,
             text: String::new(),
             done: false,
+            styles: Vec::new(),
         });
         let backend = TestBackend::new(60, 1);
         let mut term = Terminal::new(backend).unwrap();

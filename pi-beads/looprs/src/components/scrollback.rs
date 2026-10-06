@@ -3,7 +3,7 @@ use crate::{
     components::card::card_line,
     state::transcript::{Entry, MessageKind, Transcript},
     theme::styles::{content_width, restyle, style_for},
-    utils::md,
+    utils::{md, shelltext::spanned},
 };
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -133,17 +133,27 @@ impl Cursor {
     /// the scrollback as the exact lines the child wrote, as soon as each line is
     /// complete — waiting for a blank line would hold back everything a shell does
     /// between prompts, and markdown would reinterpret `# comment` as a heading.
+    /// One line at a time, with the styles the resolver put on them (ADR-0005).
+    ///
+    /// Deliberately *not* `drain_stream`: that one accumulates a prose block and
+    /// renders it through markdown when the block closes. Shell output must reach
+    /// the scrollback as the exact lines the child wrote, as soon as each line is
+    /// complete — waiting for a blank line would hold back everything a shell does
+    /// between prompts, and markdown would reinterpret `# comment` as a heading.
+    ///
+    /// No re-wrap and no re-parse happens here either: the text is already
+    /// resolved (control-free, tab-free, overwrites applied) and the styles are
+    /// byte ranges into it, so this function's whole job is to cut both at the
+    /// line boundaries it is already standing on.
     fn drain_raw(&mut self, e: &Entry) -> Vec<Line<'static>> {
         let mut out = Vec::new();
         while let Some(nl) = e.text[self.scan..].find('\n') {
-            let line = e.text[self.scan..self.scan + nl].trim_end_matches('\r');
-            out.push(Line::from(line.to_string()));
-            self.scan += nl + 1;
+            let end = self.scan + nl;
+            out.push(spanned(&e.text, &e.styles, self.scan, end));
+            self.scan = end + 1;
         }
         if e.done && self.scan < e.text.len() {
-            out.push(Line::from(
-                e.text[self.scan..].trim_end_matches('\r').to_string(),
-            ));
+            out.push(spanned(&e.text, &e.styles, self.scan, e.text.len()));
             self.scan = e.text.len();
         }
         out

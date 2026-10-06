@@ -1,0 +1,12 @@
+[1mdiff --git a/pi-beads/looprs/Cargo.toml b/pi-beads/looprs/Cargo.toml[m
+[1mindex 4056282..7679680 100644[m
+[1m--- a/pi-beads/looprs/Cargo.toml[m
+[1m+++ b/pi-beads/looprs/Cargo.toml[m
+[36m@@ -22,6 +22,7 @@[m [mserde = { version = "1.0.229", features = ["derive"] }[m
+ # trips a future-incompat lint inside nix's own build script; that is a dependency[m
+ # warning, not ours (see ADR-0001 "Costs / follow-ups").[m
+ portable-pty = "0.9.0"[m
+[32m+[m[32mreqwest = "0.13.5"[m
+ [m
+ [dev-dependencies][m
+ # examples/spike_bash.rs (the ADR-0001 spike) uses portable-pty, which is now a[m
