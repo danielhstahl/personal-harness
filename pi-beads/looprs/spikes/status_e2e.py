@@ -579,8 +579,15 @@ def scenario_empty_board():
     check("S1 the row says the loop is waiting for a human", ok, w)
     ok, w = d.await_row(["Tab switch · ^C quit"], timeout=6)
     check("S1 the row carries both key hints together", ok, w)
-    check("S1 nothing was flushed to the alt screen",
-          "\x1b[?1049h" not in d.text(), kind="app")
+    # Premise changed by looprs-pdl.4: this check used to prove the app never
+    # touched the alternate screen, which was true of the inline pane and is the
+    # opposite of the full-screen frame (ADR-0004 R1). What is true now, and what
+    # this is asked to keep true, is that the frame takes that screen **once** at
+    # startup — a second `?1049h` mid-run would re-save the user's own contents
+    # as their main screen. The matching leave is proved by `shutdown_e2e.py`.
+    enters = d.text().count("\x1b[?1049h")
+    check("S1 the app took the alternate screen exactly once", enters == 1,
+          f"{enters} `?1049h` in the capture", kind="app")
     d.dump("empty-board")
     d.quit()
 

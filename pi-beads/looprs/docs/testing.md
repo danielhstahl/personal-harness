@@ -246,7 +246,7 @@ LOOPRS_BIN=/tmp/ctl-target/debug/looprs python3 spikes/status_e2e.py --control \
 
 | Scenario | State under test | Row expected |
 | --- | --- | --- |
-| S1 empty board | loop waiting on a human | `awaiting input · Tab switch · ^C quit`, nothing flushed to the alt screen |
+| S1 empty board | loop waiting on a human | `awaiting input · Tab switch · ^C quit`, and the app took the alternate screen **exactly once** (since `pdl.4`; a second `?1049h` would re-save the user's own contents as their main screen) |
 | S2 `bd` down | loop parked by a failing CLI | `paused · ✗ …` on the **row**, not only in scrollback |
 | S3 beads working, Tab away | a paid-for pass, then focus moved (ADR-0002) | `working · <bead-id>`, then `bg: Beeds working · <id> <elapsed>` with Pi focused; never `bg: Pi` |
 | S4 shell liveness | `sleep 6` start → finish | `running · … · Esc cancel`, then `idle`; a mode merely Tabbed through is not claimed warm |
@@ -403,21 +403,27 @@ LOOPRS_BIN=/tmp/base-target/debug/looprs python3 spikes/shutdown_e2e.py \
 
 | Scenario | What is held at the moment of leaving | Expected |
 | --- | --- | --- |
-| Ctrl-Q mid-stream (inline) | `raw`, `cursor_hidden` | erase at the published anchor, the ledger's leaves, **one** newline — leaves before the newline, not after it; no `?1049l`/mouse/paste leave for a mode nothing switched on |
+| Ctrl-Q mid-stream | `raw`, `alt_screen`, `cursor_hidden` | the ledger's leaves and then the leave itself; **nothing at all is written after `?1049l`** and no closing newline (that newline belonged to the inline pane's last row); no mouse/paste leave for a mode nothing switched on |
 | `LOOPRS_MODES=all` + Ctrl-Q | every mode in the table | all taken, each left exactly once, and `?1049l` is the **last byte** the app writes |
 | `SIGTERM` with the whole set | every mode | leaves by itself in ~0.3 s, code 0, nothing left on, tty cooked |
-| `SIGHUP`, inline defaults | `raw`, `cursor_hidden` | same |
+| `SIGHUP`, default modes | `raw`, `alt_screen`, `cursor_hidden` | same |
 | `LOOPRS_PANIC=draw` | every mode, panicked inside the frame | each mode still left exactly once, exit code 101, tty cooked |
-| full-screen child killed while it holds the screen | the *child's* `?1049h`, passed through the tee and never left | the user is not in the alternate screen at the end; exactly one `?1049l`; the tail after that leave is the ordinary inline hand-back (erase → the ledger's own bytes → one newline); tty cooked |
+| full-screen child killed while it holds the screen | nothing: the frame hosts the alternate screen, so the child's `?1049h` is **cut** and replaced by the canvas (ADR-0001 amendment 4) | the child painted on the screen it was handed; one `?1049h` in the whole run (the app's own); **no debt to pay and no leave from the session**; exactly one `?1049l`, at exit; nothing after it; tty cooked |
 
-**Known pre-existing failures, not this ticket's.** `flash_e2e.py` is 0/3 (25 reshapes where
-≤19.5 are allowed, worst hole ~3.6 ms against a 1.5 ms budget), and `fullscreen_e2e.py` is
-18/21 — the three failing checks are the vim-keystroke needles (`Esc` reaching the screen while
-the program holds it, `:wq!` writing the file, the typed text landing at the cursor). Both fail
-with **identical** numbers against the pre-looprs-pdl.3 binary (`flash_e2e` 25 reshapes /
-3.54 ms; `fullscreen_e2e` 18/21, same three names), so they regressed before this branch and
-nothing here touches the frame path or the keystroke path. Written down rather than silenced,
-per the rule above about the one named exception.
+**Rewritten by `pdl.4`, not silenced.** `flash_e2e.py` used to be this file's named
+exception — 0/3, 25 reshapes against a ≤19.5 budget, worst hole ~3.6 ms — and it stayed that
+way through `pdl.3` because the thing it measured was the inline pane's erase/paint split.
+The frame has no such split: it diffs the whole screen and writes once per frame, so the
+partial erase whose gap was the measurement is now something the binary is required **not**
+to emit. It passes **4/4** here (0 partial erases; no `ESC[2J` that needed timing; two
+non-vacuity checks proving the stream actually ran). The control inverted with it: against the
+pre-pdl.4 binary the same script fails with **26 partial erases, 1.83–3.58 ms**
+(`spikes/results/flash-e2e-pdl4-control.log`), which is the number the old failure was
+trying to catch. `fullscreen_e2e.py`, 18/21 on the vim-keystroke needles through `pdl.3`, is
+**70/70** with the frame hosting the alternate screen — the child paints on a canvas it is
+handed instead of switching a screen under us, which is what those needles needed all along.
+The pre-pdl.3 numbers stay above as the ledger of what regressed when; they describe binaries
+these spikes were not written for.
 
 **Known gap this ticket names instead of fixing:** a real full-screen child also leaves its
 *own* switches on in the user's terminal — `?2004h` (bracketed paste) always, and

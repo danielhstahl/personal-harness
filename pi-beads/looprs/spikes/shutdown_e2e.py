@@ -5,16 +5,37 @@ looprs-ecr filed this spike; looprs-pdl.3 widened it into the terminal-mode
 ledger's proof. One scenario per thing no unit test can see.
 
   1. **Nothing visible is lost.** Quit mid-stream, while the streamed answer is
-     still sitting in the live preview region: that text has to appear in the
-     bytes painted *after* the quit key, above the erased pane. It used to go
-     with the pane — `term.clear()` wipes the live area and `insert_before` never
-     got the tail.
-  2. **The terminal is handed back exactly once.** The capture ends with one
-     erase and one newline; the pty is cooked again (`stty -a` equivalent, read
-     straight off the tty the app was using); the exit code is 0; and there is no
-     "cursor position could not be read" anywhere. That error used to be the
-     *last line of every run*, because the final clear asked the terminal where
-     the cursor was and the async key reader ate the answer.
+     still open: the answer the user could see is still on the screen when the
+     frame is left, and the exit drain gets its flush in. It used to go with the
+     pane — `term.clear()` wiped the live area and `insert_before` never got the
+     tail.
+  2. **The terminal is handed back exactly once.** The capture ends with the
+     alternate-screen leave and nothing after it; the pty is cooked again
+     (`stty -a` equivalent, read straight off the tty the app was using); the
+     exit code is 0; and there is no "cursor position could not be read"
+     anywhere. That error used to be the *last line of every run*, because the
+     final clear asked the terminal where the cursor was and the async key reader
+     ate the answer.
+
+**The shape of the hand-back changed in looprs-pdl.4, and this spike was
+rewritten for it rather than left passing on the old premise.** The rules used to
+be written against the inline pane: erase the pane, land the drained tail *above*
+the erase line, end with one closing newline. Since the frame owns the alternate
+screen there is no pane inside the user's screen to erase, nothing the app paints
+reaches the user's scrollback at all, and the hand-back is `?1049l`. What is
+checked now, in those scenarios' place:
+
+  * the app painted **inside** the alternate screen and nowhere else — the
+    user's own screen and scrollback come back exactly as they were found;
+  * the answer was on the screen the frame left (the drain ran; nothing was
+    dropped between the quit key and the leave);
+  * **nothing is written after the leave.** The old closing newline belonged to
+    the inline pane's last row. After `?1049l` the cursor belongs to the user's
+    prompt, so a newline there is a blank line in their shell.
+
+The transcript no longer landing in scrollback is the deliberate trade of
+full-screen (ADR-0004 R1 as amended); looprs-pdl.5/6/7 give it a scrollback of
+its own.
   3. **No child outlives the app.** Not the shell from the generated rcfile, not
      the pi child — checked in the process table after the app is gone, which is
      where an orphan lives.
@@ -399,7 +420,8 @@ def scenario_child_holds_screen():
     time.sleep(1.8)
     mid = ModeTrace(d.text())
     check(
-        "the child took the alternate screen through the passthrough",
+        "the run is on the alternate screen while the child holds it — the frame's "
+        "screen, not the child's",
         mid.state["alt_screen"],
         mid.summary(),
     )
@@ -423,30 +445,41 @@ def scenario_child_holds_screen():
         f"{full.off_counts['alt_screen']} leaves for one screen",
     )
     leave = full.last_leave_of.get("alt_screen")
-    erase = last_erase_span(d.text())
+    # Replaces "the leave and the pane erase are both there to order", which was
+    # a check about the inline pane (looprs-pdl.4).
+    #
+    # The frame hosts the alternate screen now, so a child that asks to switch
+    # into it is cut upstream and handed a blank canvas instead (ADR-0004 R22):
+    # the child's `?1049h` never reaches the wire, no debt is booked for a screen
+    # it never switched, and the app's own single leave at exit is the only
+    # `?1049l` in the run. A second enter would be the destructive one — it
+    # re-saves whatever is on screen as the user's *main* screen, which here
+    # would be the app's own frame.
+    whole = d.text()
+    enters = whole.count("\x1b[?1049h")
     check(
-        "the leave and the pane erase are both there to order",
-        leave is not None and erase is not None,
+        "the child's `?1049h` never reached the wire: one enter for the run, the app's own",
+        enters == 1,
+        f"{enters} enters in the capture",
     )
-    if leave is not None and erase is not None:
+    check(
+        "no pane erase is written on the way out: the inline pane is gone, and so is its erase",
+        last_erase_span(whole) is None,
+        f"erase span: {last_erase_span(whole)}",
+    )
+    check(
+        "no cursor query anywhere: nothing on this path has to ask where the cursor is",
+        "\x1b[6n" not in whole,
+    )
+    if leave is not None:
+        # `last_leave_of` is the offset just *after* the leave bytes, so the tail
+        # here is what came after the hand-back: nothing. The old check required
+        # "erase, the ledger's own bytes, one closing newline"; the absence of
+        # all three is the point now.
+        tail = strip_cpr_replies(whole[leave:])
         check(
-            "the leave comes off before the pane is erased, so the erase lands on the "
-            "user's own screen and not on the dead program's",
-            leave <= erase[0],
-            f"leave at {leave}, erase starting at {erase[0]}",
-        )
-        # The whole inline hand-back, read as one shape: the erase, then whatever
-        # modes the ledger still held, then the single closing newline. Coming back
-        # from a child's screen has to end in exactly the hand-back an ordinary
-        # inline quit ends in — anything else means the user gets some third thing.
-        tail = strip_cpr_replies(d.text()[leave:])
-        check(
-            "after the leave comes the ordinary inline hand-back: erase, the ledger's "
-            "own bytes, one closing newline",
-            re.fullmatch(
-                r"\x1b\[\d+;1H\x1b\[(?:2)?J(?:\x1b\[\?[0-9;]+[hl])*\r?\n", tail
-            )
-            is not None,
+            "the run ends on the app's own leave: nothing after the alternate screen",
+            tail == "",
             f"tail after the leave: {tail!r}",
         )
     # The app's own ledger, plus the screen it inherited and paid for. The mouse
@@ -683,56 +716,50 @@ def scenario_mid_stream():
         "could not be read" not in d.text(),
         [l for l in d.text().splitlines() if "could not be read" in l][:1],
     )
-    erased = last_erase(d.text())
-    check("the live pane is erased on the way out", erased is not None)
-    if erased is not None:
-        erase_end, erase_row = erased
-        # The exit path *begins* at the erase, so that is the offset this rule is
-        # read from. Measuring from the quit key instead is a race with the
-        # measurement, not with the app: a viewport reshape's `ESC[6n` can still be
-        # in the pump's buffer when the key is typed, and it lands in the capture
-        # after the mark while being a query the exit path never made.
-        check(
-            "no cursor query on the exit path",
-            "\x1b[6n" not in d.text()[erase_end:],
-            "the exit path asked the terminal where the cursor is",
-        )
-        # The precise form of "everything that was on screen is still in the
-        # scrollback": the answer was sitting in the live region, and the live
-        # region is exactly the rows the final erase takes away. So the answer
-        # survives **only if** the drain put it back above that row first.
-        #
-        # This is the check a repaint racing the quit key cannot satisfy: a
-        # repaint only ever touches the pane, and the pane is below the line.
-        screen = rows_painted(d.text()[:erase_end])
-        above = sorted(
-            r
-            for r, txt in screen.items()
-            if r < erase_row and ("bravo" in txt or MARK in txt)
-        )
-        check(
-            "nothing on screen was lost: the live tail was flushed ABOVE the erase line",
-            len(above) >= 2,
-            f"{len(above)} answer rows above row {erase_row} — the rest went with the pane",
-        )
-        after_erase = strip_cpr_replies(d.text()[erase_end:])
-        seqs = re.findall(r"\x1b\[\?[0-9;]+[hl]", after_erase)
-        rest = re.sub(r"\x1b\[\?[0-9;]+[hl]", "", after_erase)
-        check(
-            "exactly one closing newline after the erase (no doubled prompt)",
-            rest in ("\r\n", "\n"),
-            f"trailing bytes after the erase: {after_erase!r}",
-        )
-        check(
-            "nothing between the erase and the newline but the ledger's own bytes",
-            set(seqs) <= {"\x1b[?25h"},
-            f"unexpected sequences after the erase: {seqs}",
-        )
-        check(
-            "the ledger's own bytes come before the closing newline, not after it",
-            re.fullmatch(r"(?:\x1b\[\?[0-9;]+[hl])*\r?\n", after_erase) is not None,
-            f"the run does not end on the hand-back: {after_erase!r}",
-        )
+    # What the hand-back looks like now that the frame owns the alternate screen
+    # (looprs-pdl.4 rewrote this block). The inline pane's shape — park on the
+    # pane's own top row, erase downward, one closing newline — is gone, and with
+    # it the offset every rule here used to be measured against. What replaces
+    # them is the alternate-screen shape described in the module docstring.
+    whole = d.text()
+    enter = whole.find("\x1b[?1049h")
+    leave = whole.rfind("\x1b[?1049l")
+    check("the run opened by taking the alternate screen and painted nothing before it",
+          enter >= 0
+          and re.sub(r"\x1b\[\?[0-9;]+[hl]", "", whole[:enter]).strip() == "",
+          f"bytes before the enter: {whole[:enter][:120]!r}")
+    check(
+        "no pane erase is written anywhere in the run: the erase went out with the pane",
+        last_erase_span(whole) is None,
+        f"erase span: {last_erase_span(whole)}",
+    )
+    check(
+        "no cursor query in the whole run — a full-screen frame never has to ask "
+        "the terminal where the cursor is",
+        "\x1b[6n" not in whole,
+        f"{whole.count(chr(27) + '[6n')} queries on the wire",
+    )
+    check("the alternate screen is left, and nothing at all is written after it",
+          leave >= 0
+          and strip_cpr_replies(whole[leave + len("\x1b[?1049l"):]) == "",
+          repr(strip_cpr_replies(whole[leave + len("\x1b[?1049l"):]))[:200])
+    # "Nothing visible was lost", measured the only way it can still be
+    # measured: the rows the answer was painted on, in the frames the app drew
+    # before it left the screen. It can no longer be measured as "above the erase
+    # line", because the answer does not land in the user's scrollback at all —
+    # the app's transcript is the band, and the band is on the alternate screen.
+    # That is the trade full-screen makes deliberately (ADR-0004 R1 as amended),
+    # and looprs-pdl.5/6/7 are the tickets that give the transcript a scrollback
+    # of its own.
+    painted = rows_painted(whole[:leave] if leave > 0 else whole)
+    answer_rows = sorted(
+        r for r, txt in painted.items() if "bravo" in txt or MARK in txt
+    )
+    check(
+        "nothing visible was lost: the answer was painted on the screen the frame left",
+        len(answer_rows) >= 2,
+        f"{len(answer_rows)} answer rows before the leave",
+    )
     check_ledger_handed_back(ModeTrace(d.text()), entered, "inline quit")
     check("the tty is cooked again after exit", d.tty_is_cooked())
     check("no bash from the generated rcfile survived", not procs_matching("looprs-bash-integration"))

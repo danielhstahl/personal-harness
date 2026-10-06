@@ -19,21 +19,28 @@
 //!
 //! > **the exit path never asks the terminal a question.**
 //!
-//! It already knows what it needs. The live region's top row is published by
-//! [`crate::viewport::LiveView`] as it moves ([`LiveAnchor`]), and erasing
-//! downward from a known row is a write, not a round trip. That is the same
-//! [`ClearType::FromCursorDown`](ratatui::backend::ClearType) the live region uses
-//! between shape changes all session; the difference is that this one has no
-//! cursor query in front of it.
+//! It already knows what it needs — and since the frame migration
+//! (looprs-pdl.4) it needs a good deal less than it used to. The app now runs a
+//! full-screen frame on the alternate screen, so the hand-back *is* the leave
+//! sequence: `?1049l` puts the user's main screen and their cursor back exactly
+//! as they were, and there is no pane of ours to erase, no row above it to
+//! protect, and no line of theirs to close.
+//!
+//! What used to sit here was the inline pane's half of the contract: a
+//! `LiveAnchor` published by `viewport::LiveView` as the pane moved, and
+//! `restore_bytes` erasing from that row down. Both are gone, and the
+//! `Mode::AltScreen` that replaced them is the reason — see ADR-0004 R1 and
+//! the deletion note in [ADR-0006](0006-terminal-mode-ledger.md).
 //!
 //! # The contract
 //!
 //! [`Teardown::restore`] is idempotent, total and non-propagating: it can be
 //! called by the run loop, then again by `main`, then again by a panic hook that
-//! fired inside one of the first two, and the terminal is taken back exactly once
-//! — clear the live pane, raw mode off, one closing newline, in that order. The
-//! "exactly once" is the acceptance criterion: a second newline is a doubled
-//! prompt line, and a second clear is one more erase than the user agreed to.
+//! fired inside one of the first two, and the terminal is taken back exactly
+//! once — every mode we hold handed back newest-first, and, on the one path that
+//! does not hold the alternate screen, a single closing newline. The "exactly
+//! once" is the acceptance criterion: a second newline is a doubled prompt line,
+//! and a second leave is one more restore than the user agreed to.
 //!
 //! The guard is an [`AtomicBool`] swap rather than a [`std::sync::Once`] on
 //! purpose: `Once::call_once` re-entered from a panic *inside its own closure*
@@ -41,12 +48,12 @@
 //! hook exists to survive. A swap can only lose to a thread that is already doing
 //! the job, which is the answer we want anyway.
 //!
-//! Unknown anchor (`None`) means *erase nothing*. Before the first frame, or after
-//! something moved the viewport without telling us (a window resize, a
-//! full-screen hand-back), the row we would clear from is a guess, and a wrong
-//! guess erases scrollback rows above the pane — the one loss in this program the
-//! user cannot get back. In that case we still take raw mode off and still close
-//! the line.
+//! The closing newline is written only when the alternate screen is **not** held.
+//! That branch is not a live path in this app any more — `Mode::DEFAULT` takes
+//! the screen on before anything can draw — but the ledger is the thing that
+//! knows what it holds, and the rule "a line we opened is a line we close" costs
+//! one `if` and keeps the hand-back correct for whatever the mode set turns out
+//! to be.
 //!
 //! # What lives where at exit
 //!
@@ -94,92 +101,24 @@
 //! ## Why the alternate screen changes the shape of the hand-back
 //!
 //! `?1049h` saves the main screen and the cursor along with it; `?1049l` puts
-//! both back exactly as they were. So while the alternate screen is held there is
-//! nothing above the pane to erase *over* (the pane is not sharing the screen
-//! with the user's text), and no line that needs closing afterwards (the user's
-//! prompt returns to the exact row it was on). [`Teardown::restore`] therefore
-//! asks its own ledger one question — do I hold the alternate screen? — and
-//! writes the erase and the newline only on the inline path. This is also why
-//! [`LiveAnchor`] stays in the contract rather than being deleted with the inline
-//! viewport: the ledger has to serve both paths until the frame migration
-//! (looprs-pdl.4) makes the alternate screen the only one.
+//! both back exactly as they were. So while the alternate screen is held there
+//! is nothing of ours to erase and no line of theirs to close afterwards — the
+//! user's prompt returns to the exact row it was on. [`Teardown::restore`]
+//! therefore asks its own ledger one question — do I hold the alternate screen?
+//! — and writes the closing newline only when it does not.
+//!
+//! Since looprs-pdl.4 that is the whole erase half of the contract, because the
+//! alternate screen is the only screen. The `LiveAnchor` this type used to read
+//! at restore time is deleted with the inline viewport it described: there is no
+//! pane, so there is no top row of a pane to publish, and no row to erase from.
+//! The one thing that still has to be paid by us rather than by the ledger is a
+//! child's unpaid screen (`ScreenDebt`), and that is a different question —
+//! whose screen are we standing on — read before the unwind for exactly that
+//! reason.
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-
-use crossterm::cursor::MoveTo;
-use crossterm::terminal::{Clear, ClearType};
-
-/// Where the top edge of the live region is, shared between the live view and the
-/// exit path.
-///
-/// `None` is "unknown", not "row zero", and the exit path treats it that way: see
-/// the module docs on why a guessed anchor is the one unrecoverable mistake.
-///
-/// Cloning hands out another handle to the *same* row, which is the point: the
-/// live view keeps publishing into it and the teardown keeps reading it, and there
-/// is no second copy to drift out of agreement with the first.
-#[derive(Clone, Default)]
-pub struct LiveAnchor(Arc<Mutex<Option<u16>>>);
-
-impl LiveAnchor {
-    /// An anchor that nothing has written yet (unknown).
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// An anchor that starts on a known row. Test seam, mostly: the real one is
-    /// created unknown and filled in by the first frame.
-    #[cfg(test)]
-    pub fn at(row: u16) -> Self {
-        let a = Self::new();
-        a.set(Some(row));
-        a
-    }
-
-    pub fn get(&self) -> Option<u16> {
-        *self.lock()
-    }
-
-    /// Publish the live region's top row (`None` = no idea, see [`Self::get`]).
-    pub fn set(&self, row: Option<u16>) {
-        *self.lock() = row;
-    }
-
-    /// A poisoned anchor still holds the last true row it was given. At exit that
-    /// is worth far more than the panic that poisoned it, and refusing to act is
-    /// not one of the options here — this lock is taken from inside a panic hook.
-    fn lock(&self) -> MutexGuard<'_, Option<u16>> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-/// The bytes that take the live region back, for a region starting at `anchor`.
-///
-/// Park on the pane's own top row at column 0, then erase from there down. The
-/// rows above it — the scrollback, everything the user has read — are not part of
-/// this function's reach, which is the same invariant `LiveView::fit` holds when
-/// it reshapes the pane mid-session.
-///
-/// Empty for an unknown anchor, and empty is the safe answer.
-pub fn restore_bytes(anchor: Option<u16>) -> Vec<u8> {
-    let mut out = Vec::new();
-    if let Some(row) = anchor {
-        // `FromCursorDown` is `CSI J` — the erase ratatui issues for
-        // `ClearType::AfterCursor`, so this is the pane disappearing exactly the
-        // way it has been disappearing between shape changes all session.
-        let _ = write!(
-            out,
-            "{}{}",
-            MoveTo(0, row),
-            Clear(ClearType::FromCursorDown)
-        );
-    }
-    out
-}
 
 /// One terminal mode the app can switch on, spelled exactly once.
 ///
@@ -243,12 +182,21 @@ impl Mode {
         Mode::BracketedPaste,
     ];
 
-    /// What the app switches on today: the inline pane and its hidden cursor.
+    /// What the app switches on to run: the alternate screen the frame is drawn
+    /// on, the cursor we hide while we draw it, and the raw tty both of them
+    /// need.
+    ///
+    /// The alternate screen is in the default set because of ADR-0004 R1 — the
+    /// full-screen frame (looprs-pdl.4) owns the whole window, and the promise
+    /// that makes taking it safe is `?1049`'s: the main screen and the cursor are
+    /// saved, and come back exactly. It is a default rather than a hard-wired
+    /// requirement because the ledger is what decides the hand-back, and "a mode
+    /// in the set is a mode that gets left" is the property worth keeping.
     ///
     /// `LOOPRS_MODES` *adds* to this rather than replacing it (see
-    /// [`Mode::parse_all`]), so a run that asks for the alternate screen still
-    /// gets a raw tty and a cursor that comes back.
-    pub const DEFAULT: &'static [Mode] = &[Mode::Raw, Mode::CursorHidden];
+    /// [`Mode::parse_all`]), so a run that asks for the mouse still gets a raw
+    /// tty, a screen of its own, and a cursor that comes back.
+    pub const DEFAULT: &'static [Mode] = &[Mode::Raw, Mode::AltScreen, Mode::CursorHidden];
 
     /// The name of the mode, as it appears in `LOOPRS_MODES` and in the log.
     pub fn label(self) -> &'static str {
@@ -347,11 +295,10 @@ impl Mode {
     /// The mode set the app starts with: [`Mode::DEFAULT`] plus whatever
     /// `LOOPRS_MODES` asks for.
     ///
-    /// `LOOPRS_MODES` exists so the full-screen mode set can be proved on a real
-    /// pty before the frame migration (looprs-pdl.4) makes it the default; the
-    /// spike in `spikes/shutdown_e2e.py` sets it to `all`. A mode nobody asked
-    /// for is a mode nobody is testing, which is the other half of why unknown
-    /// names are an error.
+    /// `LOOPRS_MODES` exists so the modes past the default set — the mouse and
+    /// bracketed paste — can be proved on a real pty; `spikes/shutdown_e2e.py`
+    /// sets it to `all`. A mode nobody asked for is a mode nobody is testing,
+    /// which is the other half of why unknown names are an error.
     /// Did this process claim the alternate screen at startup?
     ///
     /// The one question from the startup set that anything *else* in the app has to
@@ -537,7 +484,6 @@ impl Ledger {
 /// claim to be "the one that restores the terminal" without ever restoring it
 /// twice.
 pub struct Teardown {
-    anchor: LiveAnchor,
     /// Every terminal mode this process switched on, and the only thing allowed to
     /// switch any of them off.
     ledger: Ledger,
@@ -550,19 +496,26 @@ pub struct Teardown {
     out: SharedSink,
 }
 
+/// `new()` with no arguments is the same thing; `Default` exists so that the
+/// clippy `new_without_default` gate stays a gate rather than getting waived.
+impl Default for Teardown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Teardown {
     /// A teardown wired to the real stdout.
-    pub fn new(anchor: LiveAnchor) -> Self {
-        Self::with_sink(anchor, io::stdout())
+    pub fn new() -> Self {
+        Self::with_sink(io::stdout())
     }
 
     /// As [`Teardown::new`], writing somewhere other than the real stdout.
     /// Test seam: the byte sequence *is* the behaviour, and a test that cannot
     /// read the bytes back cannot pin it.
-    fn with_sink(anchor: LiveAnchor, sink: impl Write + Send + 'static) -> Self {
+    fn with_sink(sink: impl Write + Send + 'static) -> Self {
         let out: SharedSink = Arc::new(Mutex::new(Box::new(sink)));
         Self {
-            anchor,
             ledger: Ledger::new(out.clone()),
             screen_debt: crate::screen::ScreenDebt::new(),
             done: AtomicBool::new(false),
@@ -639,34 +592,34 @@ impl Teardown {
         self.done.load(Ordering::SeqCst)
     }
 
-    /// Take the terminal back: pay whatever the child left on the screen, erase the
-    /// live pane, hand back every mode we switched on, close the line. Exactly
-    /// once, no matter how many times this is called or from where.
+    /// Take the terminal back: pay whatever child's screen we are standing on,
+    /// hand back every mode we switched on, and close the line if we are the one
+    /// who owes a line. Exactly once, no matter how many times this is called or
+    /// from where.
     ///
     /// Never fails the caller. Every step is best-effort and every failure is
     /// logged rather than returned: a teardown that aborts halfway because the
     /// first write failed is how a user is left stuck in raw mode, which is a
     /// worse morning than a stray byte.
     ///
-    /// The alternate screen is read out of the ledger *before* the unwind, because
-    /// the unwind is what forgets it, and it decides the shape of both the erase
-    /// and the newline: see the module docs.
+    /// The alternate screen is read out of the ledger *before* the unwind,
+    /// because the unwind is what forgets it and it decides whether a closing
+    /// newline is owed at all: see the module docs.
     pub fn restore(&self) {
         if self.done.swap(true, Ordering::SeqCst) {
             tracing::debug!("terminal already restored; this teardown is a no-op");
             return;
         }
 
-        // Do we hold the alternate screen? If so the user's main screen is parked
-        // and comes back untouched, with the cursor along with it: there is nothing
-        // above the pane to erase over and no line of theirs to close.
+        // Do we hold the alternate screen? If so the user's main screen is
+        // parked and comes back untouched, cursor along with it: nothing of ours
+        // to erase, and no line of theirs to close behind us.
         let ours_is_the_screen = self.is_on(Mode::AltScreen);
-        // A child's alternate screen is a different shape of the same problem: the
-        // bytes that put it there went through us, and the program that would have
-        // taken it back is dead, wedged, or never scheduled again. Read the debt
-        // before the erase, because the erase is only worth doing on the screen it
-        // is anchored to — the user's main screen — and that is what this byte
-        // returns.
+        // A child's alternate screen is a different shape of the same question:
+        // the bytes that put it there went through us, and the program that
+        // would have taken it back is dead, wedged, or never scheduled again.
+        // Read it before the unwind, because every byte written after this one is
+        // addressed to whichever screen this says we are on.
         let owed_by_us_to_them = self.screen_debt.outstanding();
         tracing::info!(
             holding = ?self.ledger.held_modes(),
@@ -674,23 +627,20 @@ impl Teardown {
             "handing the terminal back"
         );
 
-        if !ours_is_the_screen {
-            if let Some(code) = owed_by_us_to_them {
-                // First, off the dead program's screen. Every byte this function
-                // writes after this one is addressed to the user's own terminal,
-                // and none of them mean anything while we are still standing inside
-                // somebody else's.
-                self.write(
-                    crate::screen::alt_leave(code),
-                    "the alt-screen leave the child did not pay",
-                );
-                self.screen_debt.pay();
-            }
-            // Erase next, before the modes come off, so the erase is the last
-            // thing the terminal was asked to *draw* and nothing can repaint the
-            // pane behind us.
-            let bytes = restore_bytes(self.anchor.get());
-            self.write(&bytes, "live region clear");
+        if !ours_is_the_screen && let Some(code) = owed_by_us_to_them {
+            // Off the dead program's screen first. Everything below this is for
+            // the user's own terminal and means nothing while we are still
+            // standing inside somebody else's.
+            //
+            // Only reachable on a run that did not host the alternate screen
+            // itself: when we do host it, a child's `?1049h` is cut upstream
+            // (ADR-0001 amendment 4 / ADR-0004 R22) and never books a debt, and
+            // our own single leave is the one that covers the screen.
+            self.write(
+                crate::screen::alt_leave(code),
+                "the alt-screen leave the child did not pay",
+            );
+            self.screen_debt.pay();
         }
 
         // Every mode we set, newest first, unconditionally, without asking the
@@ -700,10 +650,11 @@ impl Teardown {
         self.ledger.unwind();
 
         if !ours_is_the_screen {
-            // One closing newline, cooked. The erased pane left the cursor at the
-            // left margin of the row it occupied; this ends that line so the
-            // shell prompt starts on a clean one. Exactly one: two is the
-            // doubled prompt.
+            // One closing newline, cooked, for a run that drew on the user's own
+            // screen: this ends the line the frame left so the shell prompt does
+            // not start in the middle of it. Exactly one: two is the doubled
+            // prompt. On the alternate-screen path there is nothing to close —
+            // `?1049l` put the cursor back where their prompt already was.
             self.write(b"\n", "the closing newline");
         }
     }
@@ -773,31 +724,60 @@ pub fn install_panic_hook(exit: Arc<Teardown>) {
 mod tests {
     use super::*;
 
-    /// The erase is anchored at the pane's own top row, and only erases downward.
+    /// The hand-back describes no place on the screen.
+    ///
+    /// The inline pane needed a published top row, because erasing down from the
+    /// wrong row deletes scrollback the user cannot get back. A full-screen
+    /// frame's leave is one byte string — no row, no query — so there is nothing
+    /// left that can be stale, wrong or unknown at restore time, and the bytes
+    /// say where nothing.
     #[test]
-    fn a_known_anchor_clears_from_the_panes_top_row_down() {
-        let bytes = restore_bytes(Some(11));
-        let s = String::from_utf8(bytes).expect("ascii escape sequence");
+    fn the_hand_back_describes_no_place_on_the_screen() {
+        let (t, buf) = teardown();
+        t.restore();
+        let out = bytes(&buf);
+        for not_a_row in ["\x1b[1;", "\x1b[2;", "\x1b[3;", "\x1b[H", "\x1b[J"] {
+            assert!(
+                !out.contains(not_a_row),
+                "the hand-back addressed a row ({not_a_row:?}); it should not \
+                 know any: {out:?}"
+            );
+        }
+    }
+
+    /// On the path that does not hold the alternate screen — not the one this app
+    /// takes any more, but the one the ledger still has to be right about — the
+    /// hand-back is a single closing newline, and exactly one of those.
+    #[test]
+    fn a_run_that_owes_a_line_gets_exactly_one_closing_newline() {
+        let (t, buf) = teardown();
+        t.restore();
+        let out = bytes(&buf);
+        assert_eq!(out, "\n");
+        assert!(t.is_done());
         assert_eq!(
-            s, "\x1b[12;1H\x1b[J",
-            "row 11 -> 1-based row 12, then erase down"
+            out.matches('\n').count(),
+            1,
+            "one closing newline, not a doubled prompt"
         );
     }
 
-    /// Unknown anchor: erase nothing. Guessing a row is how a teardown paints over
-    /// scrollback the user still wanted.
+    /// Idempotence, stated as "the second call writes nothing at all" — which is
+    /// the acceptance criterion "the terminal is restored exactly once" seen from
+    /// the only place it can be observed: the bytes.
     #[test]
-    fn an_unknown_anchor_erases_nothing() {
-        assert!(restore_bytes(None).is_empty());
+    fn restoring_twice_restores_once() {
+        let (t, buf) = teardown();
+        t.restore();
+        let first = bytes(&buf);
+        t.restore();
+        t.restore();
+        assert_eq!(bytes(&buf), first, "the second call must not write");
     }
 
-    fn teardown(anchor: Option<u16>) -> (Teardown, Arc<Mutex<Vec<u8>>>) {
+    fn teardown() -> (Teardown, Arc<Mutex<Vec<u8>>>) {
         let buf = Arc::new(Mutex::new(Vec::new()));
-        let t = Teardown::with_sink(
-            anchor.map(LiveAnchor::at).unwrap_or_default(),
-            Sink(buf.clone()),
-        );
-        (t, buf)
+        (Teardown::with_sink(Sink(buf.clone())), buf)
     }
 
     /// A shared, readable sink.
@@ -816,73 +796,12 @@ mod tests {
         String::from_utf8(buf.lock().unwrap().clone()).unwrap()
     }
 
-    /// The whole normal-path sequence: clear, then one closing newline.
-    #[test]
-    fn restore_clears_the_pane_and_closes_the_line_once() {
-        let (t, buf) = teardown(Some(7));
-        t.restore();
-        let out = bytes(&buf);
-        assert_eq!(out, "\x1b[8;1H\x1b[J\n");
-        assert!(t.is_done());
-        assert_eq!(
-            out.matches('\n').count(),
-            1,
-            "one closing newline, not a doubled prompt"
-        );
-    }
-
-    /// Idempotence, stated as "the second call writes nothing at all" — which is
-    /// the acceptance criterion "the terminal is restored exactly once" seen from
-    /// the only place it can be observed: the bytes.
-    #[test]
-    fn restoring_twice_restores_once() {
-        let (t, buf) = teardown(Some(4));
-        t.restore();
-        let first = bytes(&buf);
-        t.restore();
-        t.restore();
-        assert_eq!(bytes(&buf), first, "the second call must not write");
-    }
-
-    /// Unknown anchor still gets the raw-mode and newline halves; only the erase is
-    /// withheld, because there is nothing safe to erase.
-    #[test]
-    fn an_unknown_anchor_still_leaves_the_terminal_usable() {
-        let (t, buf) = teardown(None);
-        t.restore();
-        assert_eq!(bytes(&buf), "\n", "no clear, but the line still closes");
-        assert!(
-            !crossterm::terminal::is_raw_mode_enabled().unwrap(),
-            "and raw mode is not left on"
-        );
-    }
-
-    /// The anchor is live, not a snapshot taken at construction: the row that is
-    /// published by the time `restore` runs is the row that gets cleared from.
-    /// That is what keeps the published row from being a second copy of the truth.
-    #[test]
-    fn the_anchor_is_read_at_restore_time_not_at_build_time() {
-        let anchor = LiveAnchor::new();
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let t = Teardown::with_sink(anchor.clone(), Sink(buf.clone()));
-
-        // Nothing published yet: unknown anchor, so nothing is erased.
-        t.restore();
-        assert_eq!(bytes(&buf), "\n", "no anchor means no clear");
-
-        // A teardown built *after* the row became known does clear from it.
-        anchor.set(Some(9));
-        let buf2 = Arc::new(Mutex::new(Vec::new()));
-        Teardown::with_sink(anchor.clone(), Sink(buf2.clone())).restore();
-        assert_eq!(bytes(&buf2), "\x1b[10;1H\x1b[J\n");
-    }
-
     /// A panic takes the terminal back the same way the normal exit does, because
     /// it is the same call on the same object — the anti-drift requirement.
     #[test]
     fn the_panic_hook_and_the_normal_exit_agree() {
         let direct = {
-            let (t, buf) = teardown(Some(6));
+            let (t, buf) = teardown();
             t.restore();
             bytes(&buf)
         };
@@ -893,7 +812,7 @@ mod tests {
         // default hook would shout a backtrace at whoever is running the suite.
         std::panic::set_hook(Box::new(|_| {}));
         {
-            let t = Arc::new(Teardown::with_sink(LiveAnchor::at(6), Sink(buf.clone())));
+            let t = Arc::new(Teardown::with_sink(Sink(buf.clone())));
             // Chains onto the silenced hook, so the panic text stays out of the
             // way and the restore still happens first.
             install_panic_hook(t.clone());
@@ -926,7 +845,7 @@ mod tests {
             !crossterm::terminal::is_raw_mode_enabled().unwrap(),
             "no test in this binary puts the real terminal into raw mode"
         );
-        let (t, buf) = teardown(None);
+        let (t, buf) = teardown();
         t.restore();
         assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
         assert_eq!(
@@ -977,7 +896,7 @@ mod tests {
     /// acceptance criterion is exactly one.
     #[test]
     fn enabling_a_mode_writes_it_once_and_repeating_the_enable_writes_nothing() {
-        let (t, buf) = teardown(Some(2));
+        let (t, buf) = teardown();
         t.enable(Mode::MouseSgr).unwrap();
         assert_eq!(bytes(&buf), "\x1b[?1006h");
         t.enable(Mode::MouseSgr).unwrap();
@@ -1003,7 +922,7 @@ mod tests {
     /// because each leave sequence lands on the screen its `h` left the terminal on.
     #[test]
     fn the_ledger_hands_back_in_the_reverse_of_the_order_it_went_on() {
-        let (t, buf) = teardown(Some(2));
+        let (t, buf) = teardown();
         for m in [Mode::AltScreen, Mode::CursorHidden, Mode::BracketedPaste] {
             t.enable(m).unwrap();
         }
@@ -1026,7 +945,7 @@ mod tests {
     /// never leave.
     #[test]
     fn a_mode_we_never_switched_on_is_never_left_off() {
-        let (t, buf) = teardown(Some(9));
+        let (t, buf) = teardown();
         t.enable(Mode::CursorHidden).unwrap();
         t.restore();
         let out = bytes(&buf);
@@ -1050,7 +969,7 @@ mod tests {
     /// did — the leave goes out at restore time either way.
     #[test]
     fn a_switch_that_never_reached_the_terminal_is_still_a_mode_we_hold() {
-        let t = Teardown::with_sink(LiveAnchor::at(4), Failing);
+        let t = Teardown::with_sink(Failing);
         assert!(
             t.enable(Mode::AltScreen).is_err(),
             "the write failed, and said so"
@@ -1070,7 +989,7 @@ mod tests {
     /// inside either.
     #[test]
     fn restore_hands_every_mode_back_once_and_nothing_after_it() {
-        let (t, buf) = teardown(Some(6));
+        let (t, buf) = teardown();
         t.enable(Mode::BracketedPaste).unwrap();
         t.enable(Mode::MouseDrag).unwrap();
         t.restore();
@@ -1079,7 +998,6 @@ mod tests {
             first,
             concat!(
                 "\x1b[?2004h\x1b[?1002h", // what we switched on, in order
-                "\x1b[7;1H\x1b[J",        // the pane, erased from its own top row down
                 "\x1b[?1002l\x1b[?2004l", // handed back, newest first
                 "\n",                     // and the line closed, cooked
             )
@@ -1095,7 +1013,7 @@ mod tests {
     /// prompt that is already where it belongs.
     #[test]
     fn holding_the_alternate_screen_means_no_erase_and_no_closing_newline() {
-        let (t, buf) = teardown(Some(3));
+        let (t, buf) = teardown();
         t.enable(Mode::AltScreen).unwrap();
         t.enable(Mode::CursorHidden).unwrap();
         t.restore();
@@ -1126,7 +1044,7 @@ mod tests {
     /// screen, and then does the inline hand-back it was always going to do.
     #[test]
     fn a_screen_a_dying_child_left_behind_is_left_on_the_way_out() {
-        let (t, buf) = teardown(Some(5));
+        let (t, buf) = teardown();
         // What the passthrough reported: the child entered the alt screen and we
         // never saw it leave.
         t.screen_debt()
@@ -1140,11 +1058,10 @@ mod tests {
         assert_eq!(
             out,
             concat!(
-                "\x1b[?25l",       // what we switched on
-                "\x1b[?1049l",     // the child's screen, paid back by us
-                "\x1b[6;1H\x1b[J", // our pane, erased on the screen we just got back
-                "\x1b[?25h",       // our own mode, handed back
-                "\n",              // and the line closed, cooked
+                "\x1b[?25l",   // what we switched on
+                "\x1b[?1049l", // the child's screen, paid back by us
+                "\x1b[?25h",   // our own mode, handed back
+                "\n",          // and the line closed, cooked
             ),
             "off the dead program's screen first, then the hand-back the user expects"
         );
@@ -1155,7 +1072,7 @@ mod tests {
     /// screen nobody holds.
     #[test]
     fn a_screen_the_child_already_left_is_not_left_again() {
-        let (t, buf) = teardown(Some(2));
+        let (t, buf) = teardown();
         t.screen_debt().note_tee(b"\x1b[?1049hpaint\x1b[?1049l");
         assert_eq!(
             t.screen_debt().outstanding(),
@@ -1179,7 +1096,7 @@ mod tests {
             (b"\x1b[?1047h".as_slice(), "\x1b[?1047l"),
             (b"\x1b[?47h".as_slice(), "\x1b[?47l"),
         ] {
-            let (t, buf) = teardown(Some(1));
+            let (t, buf) = teardown();
             t.screen_debt().note_tee(entered);
             t.restore();
             let out = bytes(&buf);
@@ -1193,7 +1110,7 @@ mod tests {
     /// second leave.
     #[test]
     fn our_own_alternate_screen_already_covers_the_childs() {
-        let (t, buf) = teardown(Some(1));
+        let (t, buf) = teardown();
         t.enable(Mode::AltScreen).unwrap();
         t.screen_debt().note_tee(b"\x1b[?1049hchild paint");
         t.restore();
@@ -1210,7 +1127,7 @@ mod tests {
     /// for it would be the one class of byte this exit path is not allowed to emit.
     #[test]
     fn a_screen_that_was_only_guessed_at_owes_no_leave() {
-        let (t, buf) = teardown(Some(3));
+        let (t, buf) = teardown();
         t.screen_debt()
             .note_tee(b"\x1b[10;1H\x1b[2Jpainted without an alt screen");
         assert_eq!(t.screen_debt().outstanding(), None);
@@ -1227,7 +1144,7 @@ mod tests {
     /// mouse back before a full-screen child takes the screen.
     #[test]
     fn releasing_a_mode_early_takes_it_off_the_ledger() {
-        let (t, buf) = teardown(Some(1));
+        let (t, buf) = teardown();
         t.enable(Mode::MouseReport).unwrap();
         t.enable(Mode::MouseSgr).unwrap();
         assert!(t.ledger.release(Mode::MouseReport), "we were holding it");
@@ -1323,21 +1240,28 @@ mod tests {
         }
     }
 
+    /// A poisoned *ledger* is still unwound.
+    ///
+    /// The teardown is called from inside a panic hook, which is exactly how the
+    /// mutex gets poisoned, and "the lock is poisoned" is not an acceptable
+    /// reason to leave the user's terminal in raw mode. What the mutex was
+    /// protecting is still in there and still true.
     #[test]
-    fn a_poisoned_anchor_is_still_read() {
-        let anchor = LiveAnchor::at(5);
-        let shared = anchor.clone();
-        // A real panic while holding the lock — the only way this mutex can be
-        // poisoned, and one of the ways the teardown gets called.
+    fn a_poisoned_ledger_still_hands_everything_back() {
+        let (t, buf) = teardown();
+        t.enable(Mode::MouseSgr).unwrap();
+        let held = t.ledger.held.clone();
         let poisoner = std::thread::spawn(move || {
-            let _held = shared.lock();
+            let _guard = held.lock();
             panic!("poison it");
         });
         assert!(poisoner.join().is_err(), "the poisoner really panicked");
 
-        // Poisoned, and still answered: the row in there is the last true one,
-        // which is worth more at exit than the panic that poisoned it.
-        assert_eq!(anchor.get(), Some(5));
-        assert_eq!(restore_bytes(anchor.get()), restore_bytes(Some(5)));
+        t.restore();
+        let out = bytes(&buf);
+        assert!(
+            out.contains("\x1b[?1006l"),
+            "poisoned and still handed back: {out:?}"
+        );
     }
 }

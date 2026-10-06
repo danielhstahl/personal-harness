@@ -1,26 +1,90 @@
+[  0.00s] 
+[  0.00s] ########## inline pane (default) ##########
 [  4.85s] PASS  baseline: vim on a bare pty can be driven to write the file (the control works)
-[  4.86s] spawned target/debug/looprs (pid 70082) in a 40x132 pty
-[  9.38s] PASS  vim starts under looprs without the 'not to a terminal' warning
-[ 10.41s] PASS  the typed text reaches the screen while the program holds it
-[ 10.41s] screen paint: baseline 118 chars, looprs 360 chars
-[ 10.42s] PASS  a whole screen of paint reaches the user, not just the typed characters
-[ 13.53s] PASS  Esc + `:wq!` writes the file (Esc reached vim as Esc, `:` as `:`)
-[ 13.53s] PASS  the app never reported an interrupt during the vim session (Esc was not 0x03)
-[ 13.53s] PASS  vim: the file name was drawn (baseline drew it, looprs showed it too)
-[ 13.53s] PASS  vim: the blank-line `~` filler was drawn (baseline drew it, looprs showed it too)
-[ 13.53s] PASS  vim: the typed text landed at the cursor (baseline drew it, looprs showed it too)
-[ 13.53s] n/a   vim: a status/ruler line was drawn (line/column text)  -- the bare pty never drew it either, so it is not a signal here (checking for it would prove nothing)
-[ 13.59s] PASS  after vim, the shell still runs commands and they reach the screen
-[ 13.69s] PASS  Ctrl-Q quits after vim
-[ 15.81s] baseline: less's first screen reaches line 039 (filler not drawn)
-[ 19.65s] PASS  less shows the top of the file
-[ 19.65s] PASS  less's own status line is on screen
-[ 19.65s] PASS  the first screen is as full as the bare one (reaches line 039)
-[ 21.16s] PASS  scrolling down reveals lines below the first screen (past 039)
-[ 22.67s] PASS  scrolling back to the top shows line 001 again
-[ 24.23s] PASS  quitting less leaves the shell usable and the screen ours
-[ 24.34s] PASS  Ctrl-Q quits after less
-[ 29.18s] PASS  a program that repaints in place is shown while it runs
-[ 29.24s] PASS  when it ends, the shell is usable again (the screen came back on the command boundary)
-[ 29.35s] PASS  Ctrl-Q quits after the repainting program
-[ 29.35s] 21/21 checks passed
+[  4.85s] spawned target/debug/looprs (pid 3718) in a 40x132 pty
+[  9.39s] PASS  vim starts under looprs without the 'not to a terminal' warning
+[ 12.08s] PASS  the typed text reaches the screen while the program holds it
+[ 12.08s] screen paint: baseline 118 chars, looprs 386 chars
+[ 12.08s] PASS  a whole screen of paint reaches the user, not just the typed characters
+[ 15.20s] PASS  Esc + `:wq!` writes the file (Esc reached vim as Esc, `:` as `:`)
+[ 15.20s] PASS  the app never reported an interrupt during the vim session (Esc was not 0x03)
+[ 15.20s] PASS  vim: the file name was drawn (baseline drew it, looprs showed it too)
+[ 15.20s] PASS  vim: the blank-line `~` filler was drawn (baseline drew it, looprs showed it too)
+[ 15.20s] PASS  vim: the typed text landed at the cursor (baseline drew it, looprs showed it too)
+[ 15.20s] n/a   vim: a status/ruler line was drawn (line/column text)  -- the bare pty never drew it either, so it is not a signal here (checking for it would prove nothing)
+[ 15.26s] PASS  after vim, the shell still runs commands and they reach the screen
+[ 15.37s] PASS  Ctrl-Q quits after vim
+[ 17.48s] baseline: less's first screen reaches line 039 (filler not drawn)
+[ 21.31s] PASS  less shows the top of the file
+[ 21.31s] PASS  less's own status line is on screen
+[ 21.31s] PASS  the first screen is as full as the bare one (reaches line 039)
+[ 22.82s] PASS  scrolling down reveals lines below the first screen (past 039)
+[ 24.33s] PASS  scrolling back to the top shows line 001 again
+[ 25.90s] PASS  quitting less leaves the shell usable and the screen ours
+[ 26.01s] PASS  Ctrl-Q quits after less
+[ 30.85s] PASS  a program that repaints in place is shown while it runs
+[ 30.91s] PASS  when it ends, the shell is usable again (the screen came back on the command boundary)
+[ 31.02s] PASS  Ctrl-Q quits after the repainting program
+[ 31.02s] n/a   the alt-screen handover checks  -- this run has no alternate screen; they run under LOOPRS_MODES=all, below
+[ 31.02s] 
+[ 31.02s] ########## alternate screen: all ##########
+[ 35.88s] PASS  baseline: vim on a bare pty can be driven to write the file (the control works)
+[ 35.88s] spawned target/debug/looprs (pid 4607) in a 40x132 pty
+[ 40.42s] PASS  vim starts under looprs without the 'not to a terminal' warning
+[ 43.16s] PASS  the typed text reaches the screen while the program holds it
+[ 43.16s] screen paint: baseline 118 chars, looprs 426 chars
+[ 43.16s] PASS  a whole screen of paint reaches the user, not just the typed characters
+[ 46.27s] PASS  Esc + `:wq!` writes the file (Esc reached vim as Esc, `:` as `:`)
+[ 46.27s] PASS  the app never reported an interrupt during the vim session (Esc was not 0x03)
+[ 46.27s] PASS  vim: the file name was drawn (baseline drew it, looprs showed it too)
+[ 46.27s] PASS  vim: the blank-line `~` filler was drawn (baseline drew it, looprs showed it too)
+[ 46.27s] PASS  vim: the typed text landed at the cursor (baseline drew it, looprs showed it too)
+[ 46.27s] n/a   vim: a status/ruler line was drawn (line/column text)  -- the bare pty never drew it either, so it is not a signal here (checking for it would prove nothing)
+[ 46.33s] PASS  after vim, the shell still runs commands and they reach the screen
+[ 46.44s] PASS  Ctrl-Q quits after vim
+[ 48.56s] baseline: less's first screen reaches line 039 (filler not drawn)
+[ 52.39s] PASS  less shows the top of the file
+[ 52.40s] PASS  less's own status line is on screen
+[ 52.40s] PASS  the first screen is as full as the bare one (reaches line 039)
+[ 53.91s] PASS  scrolling down reveals lines below the first screen (past 039)
+[ 55.42s] PASS  scrolling back to the top shows line 001 again
+[ 56.98s] PASS  quitting less leaves the shell usable and the screen ours
+[ 57.09s] PASS  Ctrl-Q quits after less
+[ 61.93s] PASS  a program that repaints in place is shown while it runs
+[ 61.99s] PASS  when it ends, the shell is usable again (the screen came back on the command boundary)
+[ 62.10s] PASS  Ctrl-Q quits after the repainting program
+[ 62.10s] 
+[ 62.10s] --- alt-screen handover: vim takes the screen we are living in ---
+[ 64.43s] PASS  alt: one `?1049h` on the wire before the child, ours at startup
+[ 66.94s] PASS  alt: the child's `?1049h` never reached the wire
+[ 66.94s] PASS  alt: the child was handed a blank canvas instead of a screen switch
+[ 69.46s] PASS  alt: the child's paint reaches the user while it holds the screen
+[ 69.46s] PASS  alt: no `?1049l` during the run -- the user stays on our screen
+[ 69.46s] PASS  alt: the child's non-screen modes are not cut (cursor hide passed through)
+[ 72.58s] PASS  alt: the child's leave was cut too; looprs never left its own screen
+[ 72.58s] PASS  alt: the takeback cleared the screen before repainting
+[ 72.58s] PASS  alt: the child really did switch the mouse off (control)
+[ 72.58s] PASS  alt: mouse reporting is on again after the child
+[ 72.58s] PASS  alt: bracketed paste is on again after the child
+[ 72.58s] PASS  alt: the child left no watched mode different from before it took the screen
+[ 72.58s] PASS  alt: the re-assert does NOT re-enter the alternate screen
+[ 72.64s] PASS  alt: a command runs after the handback
+[ 72.64s] PASS  alt: across the whole run, the main screen was never shown and never saved
+[ 72.75s] PASS  alt: Ctrl-Q quits
+[ 72.75s] PASS  alt: the exit leaves the alternate screen exactly once
+[ 72.75s] PASS  alt: the one leave is the exit's own, after the quit was pressed
+[ 72.75s] 
+[ 72.75s] --- alt screen: the child is killed while holding it ---
+[ 78.59s] PASS  killed: the child entered and painted on the screen handed to it
+[ 78.59s] PASS  killed: the child's enter was cut
+[ 78.59s] PASS  killed: a child SIGKILLed inside the screen owes no leave
+[ 78.65s] PASS  killed: the app repaints and runs the next command
+[ 78.65s] PASS  killed: the app never left its own screen
+[ 78.65s] 
+[ 78.65s] --- alt screen: the child returns to line output, not to a screen ---
+[ 83.98s] PASS  returned: the child's paint arrived on the canvas it was handed
+[ 83.98s] PASS  returned: the child's `?1049l` never reached the terminal
+[ 83.98s] PASS  returned: the child kept drawing and it went to the transcript
+[ 83.98s] PASS  returned: the app is still on its own screen afterwards
+[ 84.04s] PASS  returned: usable after the child went back to line output
+[ 84.04s] 70/70 checks passed

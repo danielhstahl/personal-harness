@@ -113,6 +113,12 @@ has to serve both paths, and until the frame migration (looprs-pdl.4) lands ther
 inline pane whose top row the exit path must know in order to erase without guessing. The
 deletion is a `pdl.4` change with a real owner, not a leftover of this one.
 
+**Landed (`looprs-pdl.4`): it left.** The frame took the alternate screen, so there is no
+pane and no top row to know. `Teardown::new()` takes no anchor, `restore_bytes` is gone, and
+the erase branch of `restore` went with them: the hand-back is the leave. The one question the
+exit path still asks its own ledger is `is_on(AltScreen)` — not to find a row to erase, but to
+know that no closing newline is owed. See ADR-0004, *Landed — pdl.4*.
+
 ### The screen the app did not switch on
 
 The ledger answers "what did **we** switch on", and that is the right question for the app's
@@ -332,17 +338,20 @@ this ticket changes nothing on the frame path. Named here rather than silenced, 
 * **The `ManuallyDrop` leak.** Two cell buffers of a process that is exiting, once. Taken
   deliberately: the alternative is a destructor that switches a terminal mode behind the
   ledger's back.
-* **`LOOPRS_MODES` is a knob with no user-facing story.** It is the seam that lets
-  `pdl.4`'s modes be proved before they are the default. When `pdl.4` lands, the default
-  set becomes the real one and the knob's reason for existing goes with it; it should be
-  revisited then rather than accreting.
-* **Alt screen without the frame.** Running `LOOPRS_MODES=all` today gives an *inline*
-  viewport drawn inside the alternate screen: no scrollback above the pane, and the shape
-  policy is negotiating with a screen it does not own. That is expected and temporary — it is
-  the ledger being exercised, not the migrated app.
+* **`LOOPRS_MODES` is a knob with no user-facing story.** It is the seam that let
+  `pdl.4`'s modes be proved before they were the default. `pdl.4` has made the default set
+  the real one (`raw`, `alt_screen`, `cursor_hidden`), so what the knob adds now is the rest
+  of the set — the mouse modes and bracketed paste the shutdown spike runs under
+  `LOOPRS_MODES=all`. Its reason for existing is thinner than it was and should be revisited
+  rather than accreted.
+* **Alt screen with the frame.** Until `pdl.4` this was the odd shape: an *inline* viewport
+  drawn inside the alternate screen, no scrollback above the pane, and a height policy
+  negotiating with a screen it did not own. `pdl.4` ended it — the frame is the alternate
+  screen now, and the bands are sized against the window rather than against room.
 * **Not covered:** `SIGKILL`/`SIGSTOP` (uncatchable — the ledger's bytes went out with the
   last flush before it, which is all there is), and `SIGQUIT` (a core-dump request; a
    program that turns it into a tidy shutdown is a program that cannot be asked for a
    backtrace).
-* **Not deleted:** `LiveAnchor`, per the rule above, and the inline erase/newline path. Both
-  are `pdl.4`'s call to make, with the frame in hand.
+* **Deleted by `pdl.4`:** `LiveAnchor`, `restore_bytes`, and the inline erase/newline path
+  they served. The exit path's hand-back is the alternate-screen leave; `restore` no longer
+  needs to know where anything was.

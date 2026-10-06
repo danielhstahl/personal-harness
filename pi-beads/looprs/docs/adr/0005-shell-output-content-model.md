@@ -409,4 +409,8 @@ will look rather than left for them to rediscover mid-migration.
   If they diverge, `\r` resolves against a row the child never had. There is no runtime check
   for that yet — it is a candidate for a `debug_assert` in whoever next owns that pair.
 - **flash / shutdown spike failures** recorded above as pre-existing; both die with the inline
-  viewport in pdl.4. Re-run both after that migration and re-book them if they survive.
+  viewport in pdl.4. **Outcome after `pdl.4`:** both are gone. `shutdown_e2e.py` passes
+  **153/153** with its erase-anchored checks replaced by alternate-screen shape checks, and
+  `flash_e2e.py` passes **4/4** with its premise rewritten — zero partial erases on the wire,
+  with the pre-pdl.4 binary now failing that check at **26 erases / 1.83–3.58 ms**
+  (`spikes/results/flash-e2e-pdl4-control.log`). See the spike table in `docs/testing.md`.

@@ -1,32 +1,38 @@
 #!/usr/bin/env python3
-"""The live-region flash, measured off the wire.
+"""The blank-the-screen interval, measured off the wire.
 
-What the user sees of a shape change is the status row and the input box vanishing
-for a moment before they come back. That moment has a size, and it is measurable
-without asking the binary: the app **flushes** its erase (`ESC[<row>;1H ESC[J`)
-separately from the frame that replaces what it erased, so the interval between
-the erase reaching the pty and the next printable bytes reaching the pty is
-exactly the interval a real terminal had nothing there.
+**Premise changed by looprs-pdl.4; read this before the checks.** What used to
+be measured was the live *pane*'s flash: the app parked on the pane's top row,
+flushed `ESC[<row>;1H ESC[J` on its own, then composed and sent the frame that
+replaced what it had just erased. The interval between the erase reaching the pty
+and the next printable bytes reaching the pty was exactly the interval a real
+terminal had nothing there — pre-fix it was 3.1–8.8 ms on every one of 25
+erases, post-fix 0.18–0.35 ms on 13.
 
-Run against the pre-fix binary as a control it fails both checks and the margin is
-wide enough to keep them honest:
+The full-screen frame has no such step. ratatui diffs the whole screen and sends
+only the cells that changed, in one write per frame, and there is no inline pane
+to clear below a cursor. So the erase whose gap used to be the measurement is not
+supposed to appear at all, and "measured no erases, so nothing was measured" is
+no longer the failure it looked like — it is the expected result, and the check
+is written to say so.
 
-    pre-fix   25 erases, blank window  min 3.12  p50 8.25  max 8.81  ms
-    fixed     13 erases, blank window  min 0.18  p50 0.26  max 0.35  ms
+What is asserted now:
+
+* **no partial erase on the wire.** `ESC[J` / `ESC[0J` is the inline pane's
+  shape. This is the inverted control: run against the pre-pdl.4 binary
+  (`LOOPRS_BIN=/path/to/old-binary`) and it fails with the 13–25 partial erases
+  that binary needed per streamed answer.
+* **a whole-screen clear never leaves the screen blank for long.** `ESC[2J` is
+  the one thing that still blanks cells before replacing them — the full repaint
+  a resize or a child that had the screen forces. Same budget as before.
+* **the run actually streamed.** Content reached the wire, and the answer spread
+  past the ten rows the old fixed viewport allowed. Without these the two
+  property checks above could pass on a run that did nothing.
 
 Nothing here needs the binary's log, and nothing here is a screenshot: the needles
 are escape sequences and the clock on the reading side of the pty. Read *"Why the
 spike reads the wire and not the screen"* in `docs/testing.md` before changing
 them.
-
-Two things are being asserted:
-
-* **the hole is gone** — every erase is followed by printable content inside
-  `BLANK_BUDGET_MS`. The pre-fix run is not marginally over this; it is an order
-  of magnitude over.
-* **the reshape is batched** — the erase count stays under half the number of rows
-  the streamed answer spread over. One reshape per wrapped row of an answer is the
-  thing `Reshape` exists to stop, and the pre-fix binary sits at roughly one.
 
 Usage:
 
@@ -64,16 +70,14 @@ FAKE_PI = os.environ.get("FAKE_PI", "spikes/fake_pi_slow.py")
 # the write only. 1.5 ms clears the measured 0.35 ms max by a wide margin and
 # still catches the pre-fix 8.8 ms with room to spare.
 BLANK_BUDGET_MS = 1.5
-# `RESHAPE_MIN_DELTA` is 3 rows, so the floor on erases is about one per three
-# rows of answer, plus a settle at the end of the flow. Half the answer's rows is
-# comfortably above that floor and comfortably below the pre-fix ~1 per row.
-MAX_ERASES_PER_ROW = 0.5
 
-# The erase our own live region issues: `ESC[J` / `ESC[0J` (erase below the cursor),
-# normally preceded by a cursor move to the pane's top row, which is where the
-# `top` in the timeline comes from. `ESC[2J` is the whole-screen clear and belongs
-# to another path, so it is not matched here.
-WIPE = re.compile(rb"\x1b\[(?:0)?J")
+# The two erase shapes, kept apart because they mean different things now. The
+# partial one (`ESC[J` / `ESC[0J`, erase below the cursor) is the inline pane's:
+# the frame took the alternate screen in looprs-pdl.4 and no longer has a pane to
+# clear, so seeing one is the regression. `ESC[2J` is the whole-screen clear, and
+# it is legitimate — the full repaint a resize or a returned full-screen child
+# forces — which is why it is measured rather than forbidden.
+WIPE = re.compile(rb"\x1b\[([02])?J")
 CUP = re.compile(rb"\x1b\[(\d+)(?:;(\d+))?H")
 # Cursor-position report, which the rebuild asks for and which has to be answered
 # or the app sits there until crossterm gives up.
@@ -202,12 +206,12 @@ class Driver:
 
 
 def measure(chunks):
-    """One record per erase: what row it started at and how long the hole was."""
+    """One record per erase: its shape, the row it started at, how long the hole was."""
     events = []
     for i, (t, buf) in enumerate(chunks):
         for m in WIPE.finditer(buf):
             # The top row is whatever cursor move most recently preceded the erase
-            # — the app parks the cursor there before clearing, and that parked
+            # — the app parked the cursor there before clearing, and that parked
             # row is the pane's own top.
             top = None
             for c in CUP.finditer(buf, 0, m.start()):
@@ -220,8 +224,15 @@ def measure(chunks):
                     if has_printable(b2):
                         gap = (t2 - t) * 1000.0
                         break
-            events.append({"chunk": i, "top": top, "gap_ms": gap})
-    return [e for e in events if e["gap_ms"] is not None]
+            events.append(
+                {
+                    "chunk": i,
+                    "mode": (m.group(1) or b"").decode(),
+                    "top": top,
+                    "gap_ms": gap,
+                }
+            )
+    return events
 
 
 def main():
@@ -247,48 +258,74 @@ def main():
     time.sleep(0.3)
 
     events = measure(d.chunks)
-    gaps = [e["gap_ms"] for e in events]
+    partial = [e for e in events if e["mode"] != "2"]
+    cleared = [e for e in events if e["mode"] == "2"]
+    measured = [e for e in events if e["gap_ms"] is not None]
+    content_chunks = sum(1 for _, b in d.chunks if has_printable(b))
     answer_rows = d.cursor.deepest  # deepest row the answer ever reached
-    print(f"chunks={len(d.chunks)}  erases={len(events)}  answer reached row {answer_rows}")
-
-    if not events:
-        print("FAIL  no erase was seen, so nothing here measured anything")
-        return 1
-
-    print("\nerase timeline:")
-    for e in events:
-        flag = "" if e["gap_ms"] <= BLANK_BUDGET_MS else "   <-- OVER BUDGET"
-        print(f"  chunk {e['chunk']:4d}  top row {str(e['top']):>4}  hole {e['gap_ms']:7.2f} ms{flag}")
-
-    s = sorted(gaps)
     print(
-        f"\nblank window: min={s[0]:.2f}  p50={s[len(s)//2]:.2f}  "
-        f"p90={s[int(len(s)*.9)]:.2f}  max={s[-1]:.2f} ms"
+        f"chunks={len(d.chunks)} (carrying content: {content_chunks})  "
+        f"partial erases (ESC[J / ESC[0J)={len(partial)}  "
+        f"whole-screen clears (ESC[2J)={len(cleared)}  "
+        f"answer reached row {answer_rows}"
     )
+
+    if measured:
+        print("\nerase timeline:")
+        for e in measured:
+            flag = "" if e["gap_ms"] <= BLANK_BUDGET_MS else "   <-- OVER BUDGET"
+            print(
+                f"  chunk {e['chunk']:4d}  mode ESC[{e['mode'] or ''}J  "
+                f"top row {str(e['top']):>4}  hole {e['gap_ms']:7.2f} ms{flag}"
+            )
+        gaps = [e["gap_ms"] for e in measured]
+        s = sorted(gaps)
+        print(
+            f"\nblank window: min={s[0]:.2f}  p50={s[len(s)//2]:.2f}  "
+            f"p90={s[int(len(s)*.9)]:.2f}  max={s[-1]:.2f} ms"
+        )
+    else:
+        print("\nno erase whose replacement content had to wait: nothing to time.")
 
     checks = []
-    over = [e for e in events if e["gap_ms"] > BLANK_BUDGET_MS]
+    # (1) The premise looprs-pdl.4 put in place of the old one. The hole this
+    # spike was written to measure was made by the inline pane's erase, and the
+    # full-screen frame has no such step: ratatui diffs the whole screen and sends
+    # the changed cells in one write per frame. So on a streamed run the wire
+    # should carry **no partial erase at all**. Inverted control: against the
+    # pre-pdl.4 binary this fails with the 13–25 partial erases per answer that
+    # binary needed, which is the whole reason the hole existed.
     checks.append(
         (
-            f"every erase got replacement content inside {BLANK_BUDGET_MS} ms",
+            "no partial erase on the wire: the frame never clears below the cursor",
+            not partial,
+            f"{len(partial)} `ESC[J`-shaped erases — that is the inline pane's "
+            "shape and it should be gone (see spikes/results/flash-e2e-control.log)",
+        )
+    )
+    over = [e for e in cleared if e["gap_ms"] is not None and e["gap_ms"] > BLANK_BUDGET_MS]
+    checks.append(
+        (
+            f"every whole-screen clear got replacement content inside {BLANK_BUDGET_MS} ms",
             not over,
-            f"{len(over)} of {len(events)} left a hole longer than that",
+            f"{len(over)} of {len(cleared)} clears left the screen blank longer",
         )
     )
-    budget = max(2.0, answer_rows * MAX_ERASES_PER_ROW)
+    # A run that did nothing would pass both checks above by silence, so the run
+    # has to prove it streamed: content arriving, and the answer reaching well
+    # past the ten rows the old `const VIEWPORT_H: u16 = 10` allowed.
     checks.append(
         (
-            f"erases batched: {len(events)} <= {budget:.1f} (answer spread over ~{answer_rows} rows)",
-            len(events) <= budget,
-            f"{len(events) / max(answer_rows, 1):.2f} reshapes per row of answer",
+            f"the stream actually ran ({content_chunks} chunks carried content)",
+            content_chunks >= 20,
+            "too little came down the wire to have measured anything",
         )
     )
-    longest = max(events, key=lambda e: e["gap_ms"])
     checks.append(
         (
-            f"the worst hole is short enough not to read as a blink (<{BLANK_BUDGET_MS} ms)",
-            longest["gap_ms"] <= BLANK_BUDGET_MS,
-            f"worst {longest['gap_ms']:.2f} ms at chunk {longest['chunk']}",
+            f"the answer spread past the old 10-row viewport (reached row {answer_rows})",
+            answer_rows > 10,
+            f"deepest painted row {answer_rows}",
         )
     )
 

@@ -1122,6 +1122,25 @@ mod tests {
         (s, rx)
     }
 
+    /// As [`bash`], with the alternate screen **not** hosted — the inline-pane
+    /// passthrough, where a child's `?1049` pair is the child's own business and
+    /// its bytes go to the terminal untouched.
+    ///
+    /// Not the app's configuration since looprs-pdl.4 took the screen for the
+    /// frame (ADR-0004 R1), but still the shape the passthrough has to be right
+    /// about, and the only way these tests can tell the two behaviours apart.
+    fn bash_not_hosting(generation: u64) -> (BashSession, mpsc::UnboundedReceiver<SessionEvent>) {
+        let cfg = SessionConfig {
+            shell_bin: real_shell(),
+            alt_screen_hosted: false,
+            ..Default::default()
+        };
+        let (mut s, rx) = BashSession::build(SessionId::new(TerminalType::Bash, generation), &cfg)
+            .expect("build");
+        s.resize(24, 80).ok();
+        (s, rx)
+    }
+
     fn describe(ev: &SessionEvent) -> String {
         match ev {
             SessionEvent::BashOutput { chunk, .. } => format!("out {chunk}"),
@@ -1762,6 +1781,13 @@ mod tests {
     /// the release — and `printf` emits the same alt-screen bytes vim does without
     /// depending on vim's timing. That vim itself reaches the screen is proved in
     /// the real terminal by `spikes/vim_fullscreen.py`.
+    ///
+    /// Since the frame owns the alternate screen (ADR-0004 R22), what is handed
+    /// over is *our* screen and a blank canvas, not a screen switch: the child's
+    /// `?1049h` and `?1049l` are cut out of the stream and never reach the
+    /// terminal. The takeover and the release are still reported to the UI
+    /// exactly as if the switch had happened, because the UI's question — "is
+    /// something else painting right now?" — is answered the same either way.
     #[tokio::test]
     async fn a_full_screen_program_is_handed_the_screen_and_gives_it_back() {
         let (mut s, mut rx) = bash(21);
@@ -1778,6 +1804,57 @@ mod tests {
         // "painted", so only an actual escape byte tells them apart.
         let painted = events
             .iter()
+            .position(|e| e.starts_with("out ") && e.contains("painted") && e.contains('\u{1b}'))
+            .unwrap_or_else(|| panic!("the paint never arrived: {events:?}"));
+        let released = events
+            .iter()
+            .position(|e| e == "screen false")
+            .unwrap_or_else(|| panic!("the release was never reported: {events:?}"));
+        assert!(
+            took < painted,
+            "the UI must be teeing before the bytes that change the screen: {events:?}"
+        );
+        assert!(
+            painted < released,
+            "the release must come after the paint it follows: {events:?}"
+        );
+        // The switch itself never reached the wire: neither the enter nor the leave.
+        // Measured from the takeover onwards: everything before it is the echo of
+        // the command line, which contains the literal characters `?1049` as
+        // text and says nothing about what reached the wire.
+        let after = events[took..].join("|");
+        assert!(
+            !after.contains("?1049"),
+            "the child's alt-screen bytes reached the terminal; the frame owns \
+             that screen now: {events:?}"
+        );
+        // …and in place of the enter, the canvas the child expected: a blank
+        // screen, not our previous frame showing through wherever it did not paint.
+        assert!(
+            events.iter().any(|e| e.contains("\u{1b}[H\u{1b}[2J")),
+            "no blank canvas was handed over: {events:?}"
+        );
+        assert_no_marker_bytes(&after);
+        assert_eq!(s.status(), SessionStatus::Idle, "and the shell is fine");
+    }
+
+    /// The same program on the **non-hosting** path: nothing is cut, the pair
+    /// goes through as written, and the leave lands before the release is
+    /// reported — which is the shape that path had before the frame took the
+    /// screen, kept tested so a change to the cutter cannot silently widen.
+    #[tokio::test]
+    async fn a_childs_alt_screen_pair_passes_through_when_we_do_not_host_the_screen() {
+        let (mut s, mut rx) = bash_not_hosting(21);
+        s.send_text("printf '\\033[?1049h\\033[?25lpainted\\033[?1049l'".into())
+            .unwrap();
+        let events = until_exit(&mut rx).await;
+
+        let took = events
+            .iter()
+            .position(|e| e == "screen true")
+            .unwrap_or_else(|| panic!("the takeover was never reported: {events:?}"));
+        let painted = events
+            .iter()
             .position(|e| {
                 e.starts_with("out ") && e.contains("painted") && e.contains("\u{1b}[?1049h")
             })
@@ -1786,17 +1863,13 @@ mod tests {
             .iter()
             .position(|e| e == "screen false")
             .unwrap_or_else(|| panic!("the release was never reported: {events:?}"));
-        assert!(
-            took < painted,
-            "the UI must be teeing before the bytes that switch the screen: {events:?}"
-        );
+        assert!(took < painted, "{events:?}");
         assert!(
             painted < released,
             "the leave bytes must reach the terminal before the release: {events:?}"
         );
-        let joined = events.join("|");
-        assert_no_marker_bytes(&joined);
-        assert_eq!(s.status(), SessionStatus::Idle, "and the shell is fine");
+        assert_no_marker_bytes(&events.join("|"));
+        assert_eq!(s.status(), SessionStatus::Idle);
     }
 
     /// Everything the session says from now until its stream closes (the session
@@ -1824,9 +1897,14 @@ mod tests {
     /// and the moment `shutdown` returns the terminal belongs to whatever started
     /// us. Left unpaid, the user is inside a dead program's screen with their prompt
     /// gone, and the only way out is `reset` typed blind.
+    ///
+    /// Driven on the **non-hosting** path, because that is the only shape where
+    /// the child's switch is real. With the frame hosting the alternate screen
+    /// this debt cannot exist at all — see
+    /// [`quitting_while_a_hosted_child_holds_the_screen_leaves_no_debt_to_pay`].
     #[tokio::test]
     async fn quitting_while_a_full_screen_program_holds_the_screen_leaves_the_alt_screen() {
-        let (mut s, mut rx) = bash(21);
+        let (mut s, mut rx) = bash_not_hosting(24);
         s.send_text("printf '\\033[?1049hpainted and stuck'; sleep 30".into())
             .unwrap();
 
@@ -1854,6 +1932,56 @@ mod tests {
         assert!(
             events.contains(&"screen false".to_string()),
             "and the UI must be told the screen is free on the way out: {events:?}"
+        );
+    }
+
+    /// The hosted shape of the same quit. The child asks for the alternate screen
+    /// while the **frame** owns it, so its `?1049h` is cut (ADR-0004 R22) and
+    /// nothing is switched — which means there is no debt for the quit path to
+    /// pay, and the session must write **no** leave of its own. A second
+    /// `?1049l` after the ledger's one would be aimed at the user's real main
+    /// screen.
+    ///
+    /// What the quit still owes is the *report*: `screen false`, so nothing
+    /// downstream keeps waiting for a screen that was never switched away. Proved
+    /// end to end by `spikes/fullscreen_e2e.py` ("a SIGKILLed child owes no
+    /// leave"); this is the same promise at unit speed.
+    #[tokio::test]
+    async fn quitting_while_a_hosted_child_holds_the_screen_leaves_no_debt_to_pay() {
+        let (mut s, mut rx) = bash(25);
+        let mut seen: Vec<String> = Vec::new();
+        s.send_text("printf '\\033[?1049hpainted and stuck'; sleep 30".into())
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + NO_HANG;
+        loop {
+            let line = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("silent before taking the screen, got: {seen:?}"))
+                .expect("stream closed");
+            let d = describe(&line);
+            seen.push(d.clone());
+            if d == "screen true" {
+                break;
+            }
+        }
+
+        s.shutdown().unwrap();
+        let mut events = until_closed(&mut rx).await;
+        events.splice(0..0, seen);
+        // Measured from the takeover on: everything before it is the echo of the
+        // command line, whose literal `?1049` characters are text, not wire.
+        let took = events
+            .iter()
+            .position(|e| e == "screen true")
+            .expect("no takeover in the merged stream");
+        assert!(
+            !events[took..].join("|").contains("?1049"),
+            "the session charged or repaid a screen it had already cut: {events:?}",
+        );
+        assert!(
+            events.contains(&"screen false".to_string()),
+            "the UI must still be told the screen is free on the way out: {events:?}",
         );
     }
 

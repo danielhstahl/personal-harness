@@ -18,9 +18,9 @@ use crossterm::event::{Event, EventStream};
 use futures::StreamExt;
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Rect, Size};
+use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::Paragraph;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 use components::card::LiveCardPreview;
-use components::text_stream::LiveTextPreview;
+use components::text_stream::TranscriptBand;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
@@ -37,7 +37,7 @@ use crate::session::router::{Router, SHUTDOWN_GRACE};
 use crate::session::{ChatState, SessionConfig, TerminalType};
 use crate::signals::ExitSignals;
 use crate::state::transcript::Entry;
-use crate::teardown::{LiveAnchor, Mode, Teardown, install_panic_hook, panic_injected};
+use crate::teardown::{Mode, Teardown, install_panic_hook, panic_injected};
 
 fn init_logging() -> anyhow::Result<WorkerGuard> {
     //let dir = std::env::temp_dir(); // or a proper data dir, e.g. via the `dirs` crate
@@ -57,20 +57,6 @@ fn init_logging() -> anyhow::Result<WorkerGuard> {
     Ok(guard)
 }
 
-fn insert_lines(
-    live: &mut viewport::LiveView<CrosstermBackend<Stdout>>,
-    lines: Vec<Line<'static>>,
-) -> io::Result<()> {
-    for chunk in lines.chunks(64) {
-        //64 is arbitrary
-        let height = chunk.len() as u16;
-        live.insert_before(height, |buf| {
-            Paragraph::new(chunk.to_vec()).render(buf.area, buf);
-        })?;
-    }
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let _log_guard = init_logging()?; // keep alive until exit, or buffered logs are lost
@@ -82,20 +68,18 @@ async fn main() -> Result<()> {
     // guarantee (exactly once, from every path) can be true of the whole app and
     // not just of the paths that remembered to arrange it.
     //
-    // The anchor is handed in rather than read out afterwards for the same reason:
-    // it is the one fact the exit path needs about the screen, and it is published
-    // by the live view from the first frame onward (see `viewport` /
-    // `teardown::LiveAnchor`).
-    let anchor = LiveAnchor::new();
-    let exit = Arc::new(Teardown::new(anchor.clone()));
+    // It takes no argument any more. The inline pane needed the live region's top
+    // row published to it so the exit could erase downward from a known row; the
+    // full-screen frame leaves nothing to erase, because `?1049l` is the whole
+    // hand-back (ADR-0004 R1, ADR-0006).
+    let exit = Arc::new(Teardown::new());
     install_panic_hook(exit.clone());
 
     // Every way in to the terminal state lives behind this one call, and the hand-
     // back sits in front of its result. That ordering is the point: before it, an
-    // early `?` out of setup — `LiveView::new` asking the cursor where it is and
-    // timing out is the real-world one — returned from `main` with raw mode on and
-    // nothing left to turn it off. Now there is.
-    let res = app(anchor, exit.clone()).await;
+    // early `?` out of setup returned from `main` with raw mode on and nothing
+    // left to turn it off. Now there is.
+    let res = app(exit.clone()).await;
     // `restore` is idempotent, so this is a no-op when the run loop or the panic
     // hook already did the job, and the "exactly once" holds for the whole set of
     // callers rather than for each of them separately.
@@ -105,11 +89,11 @@ async fn main() -> Result<()> {
     res
 }
 
-/// The app proper: the live view, the Router, the run loop.
+/// The app proper: the frame, the Router, the run loop.
 ///
 /// Split out of `main` so that `main`'s tail — the unconditional `restore` — is
 /// on the path of every `?` this function contains.
-async fn app(anchor: LiveAnchor, exit: Arc<Teardown>) -> Result<()> {
+async fn app(exit: Arc<Teardown>) -> Result<()> {
     // The modes this app switches on, switched on *through the ledger*.
     //
     // This is the only place a terminal mode gets turned on, which is what makes
@@ -124,12 +108,10 @@ async fn app(anchor: LiveAnchor, exit: Arc<Teardown>) -> Result<()> {
         exit.enable(mode)?;
     }
 
-    let initial = TerminalType::Beeds;
-    // The live region opens at the height the policy wants for an empty stream —
-    // its chrome plus one row — instead of the constant 10 it used to be. From
-    // here on the frame decides the shape; see `viewport`.
-    let rows = crossterm::terminal::size().map(|(_, r)| r).unwrap_or(24);
-    let boot_h = viewport::desired_height(initial, rows, 0, 0, viewport::MIN_INPUT_ROWS);
+    // The whole window, taken after the alternate screen is on: every byte the
+    // frame writes from here lands on the screen we own, and none of it lands on
+    // the user's scrollback on the way in.
+    //
     // `ManuallyDrop`, deliberately: ratatui's `Terminal::drop` shows the cursor,
     // and a cursor is a ledgered mode (`Mode::CursorHidden`). A destructor that
     // switches a terminal mode is a mode switch that happens after the teardown,
@@ -137,16 +119,13 @@ async fn app(anchor: LiveAnchor, exit: Arc<Teardown>) -> Result<()> {
     // once-only — the `?25h` it writes used to land *after* the closing newline,
     // which is the tail the shutdown spike had to forgive.
     //
-    // Holding the view here instead means the destructor never runs: the cursor
+    // Holding the frame here instead means the destructor never runs: the cursor
     // comes back from the ledger, in the ledger's order, exactly once, on every
-    // path including the panic one. What is not freed is the view's two cell
+    // path including the panic one. What is not freed is the frame's two cell
     // buffers, in a process that is on its way out; that is the whole cost, and
     // it is paid once.
-    let mut live = std::mem::ManuallyDrop::new(viewport::LiveView::with_anchor(
+    let mut frame = std::mem::ManuallyDrop::new(viewport::ScreenFrame::full(
         CrosstermBackend::new(io::stdout()),
-        boot_h,
-        |_| Ok(CrosstermBackend::new(io::stdout())),
-        anchor,
     )?);
 
     // The signals are installed before the loop, not inside it: a `SIGHUP` that
@@ -154,11 +133,11 @@ async fn app(anchor: LiveAnchor, exit: Arc<Teardown>) -> Result<()> {
     // with the ledger still holding everything it switched on.
     let mut signals = ExitSignals::install()?;
 
-    run(&mut live, initial, &exit, &mut signals).await
+    run(&mut frame, TerminalType::Beeds, &exit, &mut signals).await
 }
 
 async fn run(
-    live: &mut viewport::LiveView<CrosstermBackend<Stdout>>,
+    frame: &mut viewport::ScreenFrame<CrosstermBackend<Stdout>>,
     initial: TerminalType,
     exit: &Teardown,
     signals: &mut ExitSignals,
@@ -170,9 +149,8 @@ async fn run(
     let (app_tx, mut app_rx) = mpsc::unbounded_channel::<Msg>();
 
     // The Router owns every backend from here: one session per terminal state, and
-    // only this task's copy of `cmd_tx` can ask it for anything. The old shape —
-    // `BeadsLoop::new(...)` hand-wired here, with a Tab being a border-color change
-    // — is what looprs-05j replaces.
+    // only this task's copy of `cmd_tx` can ask it for anything.
+    //
     // Out-of-band notification: a ticket this harness finished reaches a human who
     // is not looking at this terminal. Built here, once, before the Router, so the
     // poster task outlives every session — a beads session gets respawned per
@@ -197,8 +175,6 @@ async fn run(
     // pass runs now, so the input box opens in the right state instead of
     // flickering once the BeadStep message lands.
     router.boot().await?;
-    // Sole owner of the sessions from here on. It never blocks on a child, so Esc
-    // cannot queue behind somebody's model call.
     // The liveness edges fired during `boot()` arrived before this App existed, so
     // prime the open mode's view from the Router's own mirror. The status row and
     // the keyboard rule both read that view, and neither should have to guess what
@@ -208,12 +184,8 @@ async fn run(
         .id_of(initial)
         .map(|id| (id, router.status_of(initial)));
 
-    let mut app = App::new(
-        cmd_tx,
-        InputState::new(),
-        initial,
-        live.screen_size()?.width,
-    );
+    let sz = frame.size()?;
+    let mut app = App::new(cmd_tx, InputState::new(), initial, sz.width);
     if let Some((id, status)) = boot {
         app.view_mut(id).set_status(status, Instant::now());
     }
@@ -241,7 +213,6 @@ async fn run(
     // command. A Bash shell spawned later still inherits this: `BashTask::resize`
     // records the size even with no shell up yet, and uses it for the pty it
     // eventually opens.
-    let sz = live.screen_size()?;
     app.forward_resize(sz.height, sz.width);
 
     // Sole owner of the sessions from here on: nothing after this point may touch a
@@ -252,90 +223,39 @@ async fn run(
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60 fps cap
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // The loop has one shape now: read a message, read a key, redraw if anything
+    // changed. What is *not* here is the reason the old loop had four shapes —
+    // nothing below stops `keys` to go ask the terminal where the cursor is, so
+    // the stream is started once and left started for the whole run.
     loop {
         tokio::select! {
             //app_rx receives events that require state updates
             Some(ev) = app_rx.recv() => app.update(ev),
             Some(Ok(ev)) = keys.next() => {
                 if let Event::Resize(w, h) = ev {
-                    app.width = w;
-                    if app.passthrough() {
-                        // The child owns the real screen. Resizing our inline
-                        // viewport now would query the cursor and clear a region
-                        // we are not showing — onto the *child's* screen, in the
-                        // middle of its frame. So the child gets the new size
-                        // (ADR-0001 rule 6: it wraps for the window it is really
-                        // shown in) and our own geometry waits to be rebuilt when
-                        // the screen comes back.
-                        app.reanchor = true;
-                        app.forward_resize(h, w);
-                    } else {
-                        // …and the children get it too. A pty sized 80x24 while the
-                        // window is 180x50 wraps every program's output for a terminal
-                        // that is not there (ADR-0001 rule 6).
-                        app.forward_resize(h, w);
-                        // The frame's own size poll may have applied this resize
-                        // already — it runs whether or not the key stream was
-                        // alive when the window changed — and reshaping twice buys
-                        // nothing but a second cursor read and a second clear.
-                        if !live.sees_window(Size::new(w, h)) {
-                            drop(keys);                           // stop reading stdin
-                            // `resize_window` also marks the live region's anchor
-                            // unknown: the viewport moved and we will only learn
-                            // where from the next frame's area, and `fit` refuses
-                            // to rebuild onto a guess.
-                            if let Err(e) = live.resize_window(Rect::new(0, 0, w, h)) {
-                                // don't kill the session over a failed re-anchor
-                                tracing::warn!("resize failed: {e}");
-                            }
-                            keys = EventStream::new();            // resume
-                        }
-                    }
+                    // The frame picks the new window up itself on the next draw
+                    // (`autoresize`: a size `ioctl` and a clear, not a cursor
+                    // query). What the event is *for* is the two things ratatui
+                    // cannot know — the width our own wrapping uses, and the pty
+                    // sizes the children wrap for (ADR-0001 rule 6).
+                    app.set_window(w, h);
                 } else {
                     app.update(Msg::Term(ev));
                 }
             }
             _ = tick.tick() => {
                 app.update(Msg::Tick); //spinner only atm
-                // Notice a window resize the key stream never delivered. A
-                // `SIGWINCH` is not a byte on stdin, so one that arrives while the
-                // stream is stopped — around a rebuild, which has to stop it — is
-                // gone for good, and ratatui's fallback is to read the cursor back
-                // mid-draw from its own `autoresize`, the same race against the
-                // same stream. Asking the backend for its size is an ioctl with no
-                // round trip, so this settles the question cheaply before any draw
-                // and leaves nothing for `autoresize` to notice.
-                let sz = live.screen_size()?;
-                if !live.sees_window(sz) && !app.passthrough() {
-                    app.width = sz.width;
-                    app.forward_resize(sz.height, sz.width);
-                    drop(keys);
-                    if let Err(e) = live.resize_window(Rect::new(0, 0, sz.width, sz.height)) {
-                        tracing::warn!("resize failed: {e}");
+                // A full-screen child had the canvas and gave it back. Our back
+                // buffer still describes the screen as it was before the child
+                // painted over it, and a diff against that is ADR-0001's "screen
+                // is garbled after exiting vim" bug. One full repaint fixes it;
+                // see `viewport::ScreenFrame::repaint_all` for why this is
+                // `resize` and not `clear`.
+                if app.repaint_all && !app.passthrough() {
+                    if let Err(e) = frame.repaint_all() {
+                        tracing::warn!("full repaint after the full-screen program failed: {e}");
                     }
-                    keys = EventStream::new();
-                }
-                if app.reanchor {
-                    // The full-screen child let go of the terminal. Re-anchor the
-                    // inline viewport at where the cursor actually is now and force
-                    // a full repaint of it: ratatui's diff still describes the
-                    // screen as it was before the child painted over it, and
-                    // trusting that is ADR-0001's "screen is garbled after exiting
-                    // vim" bug. Resizing to the real size recomputes the viewport,
-                    // clears it and resets the back buffer, which is the same job
-                    // as recreating the Terminal without dropping the borrow.
-                    //
-                    // The key stream is stopped across it because a re-anchor reads
-                    // the cursor position back, and the async reader would eat the
-                    // answer — exactly why the resize arm above does the same.
-                    let sz = live.screen_size()?;
-                    drop(keys);
-                    live.anchor_lost();
-                    if let Err(e) = live.resize_window(Rect::new(0, 0, sz.width, sz.height)) {
-                        tracing::warn!("re-anchor after the full-screen program failed: {e}");
-                    }
-                    keys = EventStream::new();
-                    app.reanchor = false;
+                    app.repaint_all = false;
                     app.dirty = true;
                 }
                 // The gate: while a child holds the screen we draw nothing at all,
@@ -344,57 +264,28 @@ async fn run(
                 // whole path exists to fix, so it is blocked here rather than
                 // trusted to be absent.
                 if app.dirty && !app.passthrough() {
-                    // The per-frame sequence is fit -> flush -> insert_before -> draw,
-                    // and only for the ACTIVE view (ADR-0002 Q5). A hidden view
-                    // buffers; its backlog goes out as one burst when you switch to it.
-                    //
-                    // `fit` comes first because it re-anchors against the row the last
-                    // frame reported; letting `insert_before` move the viewport first
-                    // would make it anchor on a row that has already changed. Growing
-                    // is where the extra screen the flushed lines were not using gets
-                    // spent, which is the whole point of looprs-afw.
-                    let lines = app.flush_active(app.width);
+                    // Settled lines are *made* final by the flush, so it happens
+                    // here, in the branch that draws, and with the width this
+                    // frame will draw at. Flushing outside a draw would wrap the
+                    // lines for a width that may never be painted; flushing after
+                    // the preview is taken would show a line in the live tail one
+                    // frame after it stopped being live.
+                    app.flush_active(app.width);
+                    // Both of these are taken once and handed down, for the same
+                    // reason the old loop took them once: the value that sized a
+                    // band and the lines drawn into it must be one number, or the
+                    // box grows a row of blank space every time the two disagree.
+                    // (The third value the old loop needed — the height the live
+                    // region should be — is gone: the frame is the window, so
+                    // there is no height to negotiate.)
                     let preview = app.preview_active(app.width);
-                    let cards = app.live_card_rows();
-                    // Computed once and handed to both the height policy and the
-                    // frame, for the same reason `preview` is: the rows the box
-                    // asked for and the rows it is drawn with must be one number,
-                    // or the box grows a row of blank space (or loses a row of
-                    // typed text) every time the two disagree. This is also where
-                    // a hidden box costs nothing: `input_band` returns zero rows
-                    // for a session that has taken the keyboard, so the status row
-                    // ends the live region instead of hanging above three blank
-                    // rows where no box was drawn.
                     let input = app.input_band(app.width);
-                    let want = viewport::desired_height(
-                        app.active,
-                        live.rows()?,
-                        preview.len(),
-                        cards,
-                        input,
-                    );
-                    // Rebuilding an inline viewport reads the cursor position
-                    // back, and the async key reader would eat the answer — the
-                    // same reason the resize and re-anchor arms above stop the
-                    // stream first. So the stream is stopped only when the shape
-                    // is actually going to change, not every frame.
-                    if live.needs_fit(want) {
-                        drop(keys);
-                        // A resize that fails (the rebuild reads the cursor back,
-                        // so it is the one step here that can time out) is logged
-                        // inside `fit` and left with the old height, which keeps
-                        // `needs_fit` true: the next frame tries again. A shape
-                        // that will not change is not worth the session.
-                        let _ = live.fit(want);
-                        keys = EventStream::new();
-                    }
-                    insert_lines(live, lines)?;
                     // A frame that could not be drawn is not a reason to take the
                     // session down with it. `try_draw` fails inside `autoresize`,
                     // before it has swapped buffers or flushed anything, so there
                     // is nothing inconsistent to recover from: leave `dirty` set
                     // and the next frame tries again.
-                    if let Err(e) = live.draw(|f| {
+                    if let Err(e) = frame.draw(|f| {
                         // Fault injection for the exit contract (looprs-pdl.3):
                         // a panic that happens *inside* the frame, which is where
                         // the frame code is doing its damage and where a teardown
@@ -404,8 +295,7 @@ async fn run(
                         // one written for the occasion.
                         if panic_injected() {
                             panic!(
-                                                                "deliberate panic inside the draw (LOOPRS_PANIC=draw)"
-
+                                "deliberate panic inside the draw (LOOPRS_PANIC=draw)"
                             );
                         }
                         view(&app, f, &preview, input)
@@ -418,16 +308,10 @@ async fn run(
             }
             // A signal from outside the terminal. It means the same thing Ctrl-Q
             // means and takes the same road: `should_quit` ends the loop below, and
-            // the loop's own six-step exit hands the terminal back with every mode
-            // on it. There is no second shutdown path for signals, because a
-            // second shutdown path is a second set of promises about the terminal
-            // and those two can disagree — which is the bug `looprs-ecr` removed.
-            //
-            // Ctrl-Q drains the sessions and repaints first because a human pressed
-            // a key and can wait; a `SIGHUP` is a window closing and there is
-            // nobody left to watch either way, so both get the same treatment and
-            // the same bounded budget rather than a special case that is tested
-            // less than the one people use.
+            // the loop's own exit hands the terminal back with every mode on it.
+            // There is no second shutdown path for signals, because a second
+            // shutdown path is a second set of promises about the terminal and
+            // those two can disagree — which is the bug `looprs-ecr` removed.
             term = signals.recv() => {
                 tracing::warn!(
                     "{term} received; taking the same way out as Ctrl-Q and giving the terminal back"
@@ -442,17 +326,18 @@ async fn run(
 
     // ── exit ─────────────────────────────────────────────────────────────────
     //
-    // Six steps, in this order, because every one of them is here to stop a
-    // specific way of losing something (looprs-ecr). The shared `exit` object is
-    // the same one the panic hook holds, so steps (4) and (5) cannot drift from
-    // what a crash does — see `crate::teardown`.
+    // Five steps now, where it used to be six. What fell out is step 4, "clear the
+    // live pane": with the alternate screen the leave *is* the erase, and the
+    // pane it would have cleared does not exist. Every one of the remaining steps
+    // is still here to stop a specific way of losing something (looprs-ecr), and
+    // the shared `exit` object is the same one the panic hook holds, so step (4)
+    // cannot drift from what a crash does — see `crate::teardown`.
     //
     //   1. stop accepting input
     //   2. tell every session to shut down
-    //   3. drain what they say into the scrollback, bounded
-    //   4. clear the live pane            ┐
-    //   5. raw mode off, one newline     ┘ `exit.restore()`, exactly once
-    //   6. bound-wait on the session tasks
+    //   3. drain what they say into the transcript, bounded
+    //   4. hand every mode back            `exit.restore()`, exactly once
+    //   5. bound-wait on the session tasks
     //
     // (1) The key stream goes first because it is the one thing in this function
     // that can steal a terminal reply. Its reader thread is parked on the same
@@ -464,19 +349,19 @@ async fn run(
     drop(tick);
 
     // (2) A command, not a `drop(app)`. Closing the channel does shut the
-    // sessions down, but it also closes the only reader of what they say next:
-    // the tail of a streamed answer that was still in the live preview region,
-    // and the `SessionDown` that seals each transcript. Losing that is the
-    // headline bug this ticket was filed for.
+    // sessions down, but it also closes the only reader of what they say next.
     app.request_shutdown().await;
 
     // (3) Bounded, because "until they are done talking" is not a bound: a child
     // that streams forever is a `yes | cat` away from an app that never exits.
-    // Everything that was on screen goes out *before* the wait, so a quit
-    // mid-stream is safe in scrollback immediately and does not sit on the
-    // sessions' goodwill.
+    //
+    // What the drain collects goes into the transcript now, not onto the screen.
+    // The old step had to finish before the pane was erased because the pane was
+    // the only copy of the live tail; the store is that copy now, so what this
+    // step is really for is letting each session get its parting word in — and
+    // the `SessionDown` that seals it — before the process goes.
     let drain_budget = SHUTDOWN_GRACE + Duration::from_millis(500);
-    if tokio::time::timeout(drain_budget, drain_sessions(&mut app, live, &mut app_rx))
+    if tokio::time::timeout(drain_budget, drain_sessions(&mut app, &mut app_rx))
         .await
         .is_err()
     {
@@ -485,14 +370,14 @@ async fn run(
         );
     }
 
-    // (4) + (5) The pane goes, every mode that was switched on comes back off,
-    // raw mode with them, and the line closes. No cursor query anywhere in it: it
-    // erases from the anchor the live view has been publishing, which
-    // `insert_before` above follows downward as it pushes. See `crate::teardown`
-    // for the ledger and for why none of it asks the terminal a question.
+    // (4) Every mode that was switched on comes back off, newest first, with raw
+    // mode last because the bytes above are written through a tty that is only
+    // byte-at-a-time while it is raw. No cursor query anywhere in it, and no
+    // erase: the alternate screen's leave puts the user's own screen back, row
+    // for row and cursor for cursor.
     exit.restore();
 
-    // (6) The router task is the task that waited on every pump, so joining it
+    // (5) The router task is the task that waited on every pump, so joining it
     // joins the shutdown. It has already bounded itself at `SHUTDOWN_GRACE` with
     // `abort()` past that; this is the net under the whole thing, and past *this*
     // the task is cut rather than waited on, because the user has already pressed
@@ -508,34 +393,23 @@ async fn run(
     Ok(())
 }
 
-/// The exit drain: everything the sessions say on the way out, written above the
-/// live pane before the pane disappears (looprs-ecr step 3).
+/// The exit drain: everything the sessions say on the way out, collected into
+/// their own transcripts before the process goes (looprs-ecr step 3).
 ///
-/// Note the order inside the loop — **flush, then wait**. Flushing only after a
-/// message arrives would mean the text already on screen when the user pressed
-/// Ctrl-Q has to wait for the sessions to finish before it is safe, and a quit
-/// during a long silence would then be a quit with nothing drained at all. Flushing
-/// first means "what was on screen is in the scrollback" is true within one
-/// iteration of this loop, whatever the children decide to do afterwards.
+/// Note the order inside the loop — **flush, then wait**. Flushing first means the
+/// text that was still streaming when the user pressed Ctrl-Q is finalized into
+/// the transcript within one iteration of this loop, whatever the children decide
+/// to do afterwards. It is the same reason the flush ran before the insert it
+/// used to feed: never leave the newest thing the session said sitting behind a
+/// wait on the session.
 ///
 /// Only the active view is drained. A hidden view's backlog is not on the screen,
 /// so nothing about it is "lost" by the exit — and dumping a session the user
-/// walked away from into their scrollback at the worst possible moment, one
-/// message at a time, is its own kind of noise. It is dropped with the view.
-async fn drain_sessions(
-    app: &mut App,
-    live: &mut viewport::LiveView<CrosstermBackend<Stdout>>,
-    rx: &mut mpsc::UnboundedReceiver<Msg>,
-) {
+/// walked away from into *their scrollback* at the worst possible moment was its
+/// own kind of noise. It is dropped with the view.
+async fn drain_sessions(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Msg>) {
     loop {
-        let lines = app.flush_active(app.width);
-        if !lines.is_empty() && insert_lines(live, lines).is_err() {
-            // The screen stopped accepting output. There is no point trying to
-            // drain anything further, and no point taking the app down over it
-            // either: the restore that follows is what matters now.
-            tracing::warn!("the final flush never reached the screen; leaving the rest undrained");
-            return;
-        }
+        app.flush_active(app.width);
         match rx.recv().await {
             Some(msg) => app.update(msg),
             // Every sender is gone: each session got its parting word out, or had
@@ -547,32 +421,43 @@ async fn drain_sessions(
 
 /// Pure function of state (the tail preview re-parses only the open block).
 ///
-/// `preview` is the active view's live tail, rendered once by the caller and shared
-/// with the height policy so the number that sized this frame and the lines drawn
-/// into it are the same value, not two renders that might disagree.
+/// `preview` is the active view's live tail, rendered once by the caller and
+/// shared with the bands so the number that laid this frame out and the lines
+/// drawn into it are the same value, not two renders that might disagree.
 ///
-/// `input_rows` is shared for the same reason: it is the height the box asked for
-/// when the frame was sized — or [`viewport::NO_INPUT_ROWS`] when the active
-/// session is not taking input — so the box is drawn into the rows it was promised
-/// and not into a re-derived guess.
+/// `input_rows` is shared for the same reason: it is the height the box asked
+/// for when the frame was laid out — or [`viewport::NO_INPUT_ROWS`] when the
+/// active session is not taking input — so the box is drawn into the rows it was
+/// promised and not into a re-derived guess.
 fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
     let active = app.active_view();
+    // The card count comes from the App so the band and the cards cannot ask for
+    // two different numbers of rows: `live_card_rows` is the cap, and taking
+    // exactly that many cards is what makes the rows counted and the rows drawn
+    // one number.
+    let card_rows = app.live_card_rows();
     let cards: Vec<&Entry> = active
-        .map(|v| {
-            v.transcript
-                .open_cards()
-                .take(viewport::MAX_TOOL_ROWS as usize)
-                .collect()
-        })
+        .map(|v| v.transcript.open_cards().take(card_rows as usize).collect())
         .unwrap_or_default();
     let [text_area, card_area, status_area, input] =
-        viewport::frame_areas(f.area(), cards.len() as u16, input_rows);
+        viewport::frame_areas(f.area(), card_rows, input_rows);
 
-    // What the live region shows is a property of the session on screen, not of any
-    // session that happens to be streaming.
-    if matches!(app.chat_state(), ChatState::Chat) {
-        f.render_widget(LiveTextPreview::new(app.spinner, preview), text_area);
-    }
+    // The transcript band: everything this session has finished saying, plus the
+    // live tail, pinned to the bottom so the newest line sits right above the
+    // chrome. Whether the live tail is *shown* is the session's business
+    // (`ChatState`): a tool or a compaction owns the row while it runs, and a
+    // prose answer that has stopped streaming owns nothing that is not already in
+    // the settled lines above.
+    let streaming = matches!(app.chat_state(), ChatState::Chat);
+    f.render_widget(
+        TranscriptBand::new(
+            app.transcript(),
+            if streaming { preview } else { &[] },
+            app.spinner,
+            streaming,
+        ),
+        text_area,
+    );
 
     for (i, e) in cards.iter().enumerate() {
         let row = Rect {
@@ -583,20 +468,21 @@ fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
         f.render_widget(LiveCardPreview::new(e, app.spinner), row);
     }
 
-    // The status row (looprs-guh): the row `frame_areas` has been reserving and
-    // nothing drew into. Drawn unconditionally — every state, including "no view,
-    // no session, no idea", has an answer worth showing, and a row that is only
-    // drawn when there is something to report is a row that is missing exactly when
-    // it is needed. `status_line` has already cut itself to this area's width, so
-    // there is nothing here to wrap and no reason for the row to reflow anything.
+    // The status row (looprs-guh): the row `frame_areas` reserves and this draws
+    // into. Drawn unconditionally — every state, including "no view, no session,
+    // no idea", has an answer worth showing, and a row that is only drawn when
+    // there is something to report is a row that is missing exactly when it is
+    // needed. `status_line` has already cut itself to this area's width, so there
+    // is nothing here to wrap and no reason for the row to reflow anything.
     f.render_widget(
         Paragraph::new(app.status_line(status_area.width)),
         status_area,
     );
 
     // input. `App::input_band` — the value `input_rows` was built from — is zero
-    // for a session that has taken the keyboard, so the box is never drawn when it
-    // is not wanted, and never drawn outside the band the height policy paid for.
+    // for a session that has taken the keyboard, so the box is never drawn when
+    // it is not wanted, and never drawn outside the band the frame laid out for
+    // it.
     if app.need_input() && !input.is_empty() {
         app.input.render(f, input)
     }
@@ -689,7 +575,7 @@ mod tests {
         app.input
             .set_text(format!("{} THE-END", "word ".repeat(20)));
         let want = app.input_rows(60);
-        let h = viewport::desired_height(TerminalType::Pi, 40, 0, 0, want);
+        let h = 40; // the window: the frame *is* the window now
         let [_, _, status, input] = viewport::frame_areas(Rect::new(0, 0, 60, h), 0, want);
         assert!(
             input.height > viewport::MIN_INPUT_ROWS,
@@ -755,7 +641,7 @@ mod tests {
             "a session that took the keyboard asks for no box rows"
         );
 
-        let h = viewport::desired_height(TerminalType::Beeds, 40, 1, 0, band);
+        let h = 40; // the window: the frame *is* the window now
         let [_, _, status, input] = viewport::frame_areas(Rect::new(0, 0, 60, h), 0, band);
         assert_eq!(input.height, 0, "the hidden box kept rows: {input:?}");
         assert_eq!(status.bottom(), h, "the status row does not end the frame");
@@ -791,7 +677,7 @@ mod tests {
         assert!(app.need_input(), "idle: the box is open again");
         let band = app.input_band(60);
         assert_eq!(band, app.input_rows(60), "the box did not come back whole");
-        let h = viewport::desired_height(TerminalType::Beeds, 40, 1, 0, band);
+        let h = 40; // the window: the frame *is* the window now
         let [_, _, status, input] = viewport::frame_areas(Rect::new(0, 0, 60, h), 0, band);
         assert_eq!(input.height, band);
         assert_eq!(status.bottom(), input.top());
@@ -852,7 +738,7 @@ mod tests {
             rows, 1,
             "the frame is told there is a card to make room for"
         );
-        let h = viewport::desired_height(TerminalType::Pi, 40, 0, rows, band);
+        let h = 40; // the window: the frame *is* the window now
         let [_, cards, _, _] = viewport::frame_areas(Rect::new(0, 0, 60, h), rows, band);
 
         let screen = paint_with(&app, h, band);

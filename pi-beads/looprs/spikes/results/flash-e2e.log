@@ -1,25 +1,11 @@
 BIN=target/debug/looprs  rows=40 cols=100
-chunks=532  erases=13  answer reached row 39
+chunks=407 (carrying content: 126)  partial erases (ESC[J / ESC[0J)=0  whole-screen clears (ESC[2J)=0  answer reached row 39
 
-erase timeline:
-  chunk   34  top row    6  hole    0.25 ms
-  chunk   67  top row    6  hole    0.34 ms
-  chunk  101  top row    6  hole    0.38 ms
-  chunk  141  top row    6  hole    0.25 ms
-  chunk  179  top row    6  hole    0.30 ms
-  chunk  219  top row    6  hole    0.34 ms
-  chunk  263  top row    6  hole    0.27 ms
-  chunk  304  top row    6  hole    0.27 ms
-  chunk  349  top row    6  hole    0.26 ms
-  chunk  400  top row    6  hole    0.26 ms
-  chunk  447  top row    6  hole    0.28 ms
-  chunk  497  top row    6  hole    0.28 ms
-  chunk  530  top row   35  hole    0.20 ms
+no erase whose replacement content had to wait: nothing to time.
 
-blank window: min=0.20  p50=0.27  p90=0.34  max=0.38 ms
+  PASS  no partial erase on the wire: the frame never clears below the cursor   [0 `ESC[J`-shaped erases — that is the inline pane's shape and it should be gone (see spikes/results/flash-e2e-control.log)]
+  PASS  every whole-screen clear got replacement content inside 1.5 ms   [0 of 0 clears left the screen blank longer]
+  PASS  the stream actually ran (126 chunks carried content)   [too little came down the wire to have measured anything]
+  PASS  the answer spread past the old 10-row viewport (reached row 39)   [deepest painted row 39]
 
-  PASS  every erase got replacement content inside 1.5 ms   [0 of 13 left a hole longer than that]
-  PASS  erases batched: 13 <= 19.5 (answer spread over ~39 rows)   [0.33 reshapes per row of answer]
-  PASS  the worst hole is short enough not to read as a blink (<1.5 ms)   [worst 0.38 ms at chunk 101]
-
-3/3
+4/4

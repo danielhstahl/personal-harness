@@ -165,7 +165,7 @@ happens when the mechanism does not work.
        │   │   pump(id, rx) ── SessionEvent ──wrap(id, ·)──> Msg ──┘
        │   └───────────────────────────────────────────────────────┘
        ▼
-  run() loop: Msg → App.update(view state) → flush → insert_before → draw
+  run() loop: Msg → App.update(view state) → flush → draw (band | cards | status | input)
 ```
 
 * **Only the Router task touches a `dyn Session`** — one owner at a time, so no mutex and no torn
@@ -194,7 +194,7 @@ session (`Msg::*{ session }`); rendering selects the view that is *active*.** Th
 being independent is the fix for the whole "I tabbed away and the other session wrecked this view"
 class.
 
-Invariants, all load-bearing for the existing inline `insert_before` behavior:
+Invariants, all still load-bearing. The surface they protect moved from the terminal's scrollback to the frame's transcript band in `pdl.4`; the amendment at the end of this file says which words to substitute where:
 
 1. **A `Flusher` is a cursor into one specific `Transcript`.** `SessionView` creates both and
    keeps `flusher` private, so a mismatched pairing is not expressible. The API is
@@ -462,3 +462,34 @@ position could not be read within a normal duration`, exit code 1, with the live
 painted. The clear is done from the anchor `LiveView` publishes instead, which is also why
 `insert_before` has to move that anchor with the pane: erase from the row the pane occupied
 *before* the last insert and the erase deletes the lines that insert just wrote.
+
+---
+
+## Amendment — the frame replaced the pane (`looprs-pdl.4`)
+
+Two of the words used above are no longer live. The **invariants** are.
+
+* **`insert_before` is gone.** Finalized lines reach the screen as the **transcript band**:
+  the tail of `SessionView::display` plus the live preview, drawn into the top band of the
+  full-screen frame (`viewport::frame_areas`). Read "scrollback" as "the transcript band"
+  wherever a sentence above is about where a line *lands*. Invariant 1's "one flusher per
+  one transcript" is now enforced against `display`, which only `flush` writes, so "each
+  finalized line reaches the band exactly once" is the same property with a new owner — and
+  a new reason it cannot leak across modes, since the band reads the active view and nothing
+  else.
+* **`LiveView` / `LiveAnchor` are gone**, and with them the anchor half of the last paragraph
+  above. The rule that paragraph was teaching — *the exit path must never ask the terminal a
+  question* — is not merely intact, it is structural: the frame never queries the cursor on
+  any path, and a test backend that counts `get_cursor_position` calls fails the suite if it
+  ever does (`viewport::tests::the_frame_never_asks_the_terminal_where_the_cursor_is`).
+  There is therefore no query for the key stream to eat, at exit or anywhere else. The
+  hand-back is `?1049l`, one byte that restores the user's main screen and their cursor
+  (ADR-0006).
+* **The per-frame sequence is now** `flush()` → take the preview and the input band →
+  `draw()`, for the active view only, and the reason for the order is the reason invariant 2
+  gave: the width the lines were wrapped at, the row count that sized a band, and the pixels
+  that fill it must be one number.
+* **"Inactive views buffer, then go out as one burst"** still holds. The burst is now a band
+  that jumps rather than a pane that pushes, which is what makes switching modes one repaint
+  of one band instead of a reprint above the pane — and is why ADR-0002's cross-mode class of
+  bug stays closed without the ordering dance the pane needed.

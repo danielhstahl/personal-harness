@@ -621,13 +621,16 @@ pub struct App {
     /// garbage and the whole display is ours to erase; in the inline pane it is the
     /// user's scrollback and the only thing we may erase is the pane itself.
     alt_screen_hosted: bool,
-    /// The screen came back and the inline viewport must be re-anchored before
-    /// anything is drawn. Set on release, consumed by the run loop in `main.rs`,
-    /// which is the only place that can stop the key stream, resize the
-    /// `Terminal` (a re-anchor reads the cursor position back) and restart it —
-    /// the same dance `main.rs` already does for a window resize, for the same
-    /// reason.
-    pub reanchor: bool,
+    /// The screen came back from a full-screen child and must be repainted from
+    /// scratch before anything else is seen. Set on release, consumed by the run
+    /// loop in `main.rs`, which is the only place holding the frame.
+    ///
+    /// The reason is not the geometry, it is the *diff*: our back buffer still
+    /// describes the screen as it was before the child painted over it, so the
+    /// next frame would compare two things that agree and write nothing, leaving
+    /// a dead vim's `~` filler where our frame used to be. ADR-0001's "screen is
+    /// garbled after exiting vim", one deletion of the inline viewport away.
+    pub repaint_all: bool,
     /// The row's wall clock, advanced only by `Msg::Tick` (see [`Self::on_tick`]).
     ///
     /// Held here rather than read at draw time so the render path reads no clock, as
@@ -669,7 +672,7 @@ impl App {
             screen_debt: crate::screen::ScreenDebt::new(),
             reassert_bytes: Vec::new(),
             alt_screen_hosted: false,
-            reanchor: false,
+            repaint_all: false,
             clock: now,
             row_phase: now,
             row_spinner: 0,
@@ -759,6 +762,45 @@ impl App {
         self.active_view()
             .map(|v| v.preview(width))
             .unwrap_or_default()
+    }
+
+    /// The active session's settled transcript, bottom-of-the-list-last.
+    ///
+    /// This is the content of the frame's transcript band: every line the session
+    /// finished saying, already rendered at the width it was rendered at. It is
+    /// what used to be printed into the terminal's own scrollback by
+    /// `insert_before`, and the reason the frame can show it at all is that it is
+    /// now ours — the same lines, held in the view that produced them, so a
+    /// session's transcript cannot leak into another mode's band
+    /// (ADR-0002 Q5).
+    ///
+    /// The live tail is *not* in here; that comes from [`Self::preview_active`],
+    /// and the band is the two of them joined in that order.
+    pub fn transcript(&self) -> &[Line<'static>] {
+        self.active_view().map(|v| v.display()).unwrap_or(&[])
+    }
+
+    /// The real window changed shape (`Event::Resize`).
+    ///
+    /// Three things follow, and only three: our wrapping width changes, the
+    /// children must be told because a pty sized 80x24 while the window is
+    /// 180x50 wraps every program's output for a terminal that is not there
+    /// (ADR-0001 rule 6), and the frame must be redrawn. The frame's *own* idea
+    /// of its area is not one of them — `draw` re-reads the window itself, and
+    /// for a full-screen viewport that is an `ioctl` and a clear, not a cursor
+    /// query the key stream has to get out of the way for.
+    ///
+    /// The one exception is a resize taken while a child holds the screen: the
+    /// frame we will draw when it comes back is a full repaint anyway (the child
+    /// painted over everything, at whatever size the window had at the time), so
+    /// the flag is set here rather than trusting a later diff.
+    pub fn set_window(&mut self, cols: u16, rows: u16) {
+        self.width = cols;
+        self.forward_resize(rows, cols);
+        self.dirty = true;
+        if self.passthrough() {
+            self.repaint_all = true;
+        }
     }
 
     /// How many live cards the live region is carrying right now — open tool calls
@@ -1032,7 +1074,7 @@ impl App {
                 // those.
                 if self.screen == Some(session) {
                     self.screen = None;
-                    self.reanchor = true;
+                    self.repaint_all = true;
                 }
                 let now = self.clock;
                 let view = self.view_mut(session);
@@ -1064,7 +1106,7 @@ impl App {
                     // screen but not our cursor). Re-anchor, then repaint from
                     // scratch — trusting the diff here is the "screen is garbled
                     // after exiting vim" bug ADR-0001 names.
-                    self.reanchor = true;
+                    self.repaint_all = true;
                     self.dirty = true;
                 }
             }
@@ -2906,7 +2948,7 @@ mod tests {
             active: true,
         });
         assert!(
-            !app.reanchor,
+            !app.repaint_all,
             "taking the screen over is not a reason to resize"
         );
         app.update(Msg::ScreenHeld {
@@ -2914,7 +2956,7 @@ mod tests {
             active: false,
         });
         assert!(
-            app.reanchor,
+            app.repaint_all,
             "getting it back is: ratatui's diff no longer describes the screen"
         );
     }
@@ -2939,7 +2981,7 @@ mod tests {
             !app.passthrough(),
             "a dead child cannot hold a screen; not releasing here wedges the UI dark"
         );
-        assert!(app.reanchor, "and the viewport has to be rebuilt");
+        assert!(app.repaint_all, "and the viewport has to be rebuilt");
     }
 
     /// A release from some *other* session must not disturb a held screen. The
@@ -2960,7 +3002,7 @@ mod tests {
             app.passthrough(),
             "a generation that never held the screen cannot release it"
         );
-        assert!(!app.reanchor);
+        assert!(!app.repaint_all);
     }
 
     // ─────────────────────── the status row (looprs-guh) ───────────────────────

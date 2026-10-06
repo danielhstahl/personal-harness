@@ -137,7 +137,7 @@ Two layers, because they answer different questions.
   | Ctrl-Q quits; nothing from the run survives | pass |
 
   A fake `pi` cannot fake *arriving on screen*, which is the thing the in-process tests are
-  blind to: `App.update` → `Flusher` → `insert_before` → the real terminal is where an
+  blind to: `App.update` → `Flusher` → the frame's transcript band → the real terminal is where an
   acknowledgement would actually get lost, and where the mode's routing gets exercised.
 
 ## Costs / follow-ups

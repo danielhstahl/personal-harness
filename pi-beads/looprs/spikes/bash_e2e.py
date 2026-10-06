@@ -3,9 +3,9 @@
 
 The unit tests in `src/session/bash.rs` prove the *session* behaves (real pty, real
 bash, real markers). This proves the thing nobody can prove from a unit test: that
-the bytes get through `App.update` -> `Flusher` -> `insert_before` -> the real
-terminal, in a real terminal, with the inline viewport still intact — and that the
-keyboard chords actually reach the shell instead of the app.
+the bytes get through `App.update` -> `Flusher` -> the frame -> the real terminal,
+in a real terminal — and that the keyboard chords actually reach the shell instead
+of the app.
 
 Every backend except Bash is pointed at a harmless binary so the run cannot cost a
 model call: `LOOPRS_BD_BIN=/bin/echo`, `LOOPRS_PI_BIN=/usr/bin/false`.
@@ -13,8 +13,21 @@ model call: `LOOPRS_BD_BIN=/bin/echo`, `LOOPRS_PI_BIN=/usr/bin/false`.
     python3 spikes/bash_e2e.py | tee spikes/results/bash-e2e.log
 
 Exit 0 means every assertion held.
+
+**Why some checks read a screen and not the wire** (changed by looprs-pdl.4).
+Since the frame owns the alternate screen, every write is a *diff* against what the
+frame last painted, and a cell whose glyph did not change is simply not re-sent.
+Observed on the first run after the migration: the transcript line
+`bash-3.2$ echo hi | tr a-z A-Z` reached the wire as `echo`, `h`, ` |`, `tr`,
+because the `i` in `hi` sat in a cell that had held `i` since the previous line
+(`stty size`) and needed no rewrite. Greping the capture for `echo hi` fails on a
+screen displaying exactly that. `shown_on_screen` therefore replays the capture
+into `status_e2e.Screen` — the same VT subset the app emits, already written for
+this hazard — and asks the *grid*. `shown` on the wire is kept where the question
+really is about the stream, and its needles are chosen so elision cannot bite them.
 """
 
+import codecs
 import fcntl
 import os
 import pty
@@ -26,6 +39,9 @@ import sys
 import termios
 import threading
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from status_e2e import Screen  # noqa: E402  (sibling spike: the VT model, not a driver)
 
 BIN = os.environ.get("LOOPRS_BIN", "target/debug/looprs")
 ROWS, COLS = 40, 132
@@ -70,6 +86,10 @@ class Driver:
         # (arrival time, cumulative byte count) so a stall can be seen for what it
         # is instead of guessed at from a flat capture.
         self.chunks = []
+        # The screen, as opposed to the stream. See the module docstring: with a
+        # diffed full-screen frame the capture cannot answer "is it on screen?".
+        self.term = Screen(ROWS, COLS)
+        self._decode = codecs.getincrementaldecoder("utf-8")(errors="replace")
         threading.Thread(target=self._pump, daemon=True).start()
 
     def _pump(self):
@@ -81,6 +101,7 @@ class Driver:
                 with self.lock:
                     self.raw.extend(data)
                     self.chunks.append((time.time() - START, len(self.raw)))
+                    self.term.feed(self._decode.decode(data))
                 # ratatui's inline viewport starts by asking where the cursor is
                 # (`ESC[6n`). A real terminal answers; this pty has no terminal, so
                 # the app dies with "The cursor position could not be read" unless
@@ -153,9 +174,27 @@ def norm(text):
 
 
 def shown(d, needle, since=None):
-    """Did `needle` reach the terminal?"""
+    """Did `needle` reach the terminal?
+
+    A *stream* question. Only sound for needles that cannot be split by the
+    frame's diff — see `shown_on_screen`.
+    """
     hay = norm(d.text() if since is None else d.since(since))
     return re.sub(r"\s+", "", needle) in hay
+
+
+def shown_on_screen(d, needle):
+    """Is `needle` on the screen right now, per the terminal's own grid?
+
+    Rebuilt from the capture by `status_e2e.Screen`, so a cell the diff did not
+    need to rewrite still reads as the glyph it holds. Compared with whitespace
+    folded out of both sides for the same reason `norm` exists: the renderer
+    addresses word runs separately and never writes the blanks between them.
+    """
+    want = re.sub(r"\s+", "", needle)
+    with d.lock:
+        rows = ["".join(r) for r in d.term.grid]
+    return any(want in re.sub(r"\s+", "", row) for row in rows)
 
 
 def run_for(d, name, cmd, needle, wait_for=8.0):
@@ -204,7 +243,8 @@ def main():
     )
     check(
         "…and the command line itself is echoed as typed",
-        shown(d, "echo hi"),
+        shown_on_screen(d, "echo hi"),
+        "the transcript band is not showing the command that was run",
     )
     check(
         "echo hi -> exit 0 is shown",

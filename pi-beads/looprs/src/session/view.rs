@@ -2,11 +2,14 @@
 //! born with it (ADR-0002 Q5).
 //!
 //! The ADR rejects the single shared transcript. The reason is not aesthetics, it is
-//! the `insert_before` invariant in `main.rs`: a `Flusher` is a *cursor into one
-//! specific transcript*, and the moment two transcripts share one cursor (or one
-//! transcript is rendered through two cursors) lines get dropped or duplicated in
-//! the real terminal scrollback, which is the one place a bug is unrecoverable for
-//! the user.
+//! the flusher's own invariant: a `Flusher` is a *cursor into one specific
+//! transcript*, and the moment two transcripts share one cursor (or one
+//! transcript is rendered through two cursors) lines get dropped or duplicated.
+//! When the pane printed into the terminal's scrollback that was the one place a
+//! bug was unrecoverable for the user; since looprs-pdl.4 the lines land in the
+//! frame's transcript band instead, and the invariant is the same one for a
+//! different surface — the display cache this view keeps is written only by
+//! [`SessionView::flush`].
 //!
 //! So the pairing is the type. `SessionView` owns both halves, its `flusher` field
 //! is private, and there is no way to point it at somebody else's transcript.
@@ -38,6 +41,24 @@ use crate::utils::shelltext::LineResolver;
 /// hidden session overruns the cap, old lines are dropped and one visible notice is
 /// inserted, so the loss is honest rather than silent.
 pub const DEFAULT_VIEW_BUFFER: usize = 256 * 1024;
+
+/// How many rendered transcript lines a view keeps for the frame's band.
+///
+/// This is a *render cache*, not the store: the store is
+/// [`DEFAULT_VIEW_BUFFER`] bytes of text per view, and it is what the frame
+/// shows already-laid-out lines from. The cap exists so the cache cannot be the
+/// thing that grows without bound on a long run — rendered lines are
+/// multi-span, styled, and worth several bytes of allocation per cell of text.
+/// Past the cap the oldest lines fall off the front, which is the same shape as
+/// what a scrollback does.
+///
+/// Choosing it is a trade between memory and how far a user can scroll back
+/// without the transcript having scrolled out of the cache; the honest answer is
+/// that both halves of that are looprs-pdl.6's (the scroll offset) and
+/// looprs-pdl.7's (the budget) to settle. `4096` is "several screens' worth at
+/// every window size we support", which is the requirement this ticket has for
+/// it.
+pub const MAX_DISPLAY_LINES: usize = 4096;
 
 /// Room held back out of the cap for the eviction notice itself, so the view ends
 /// *at or under* the limit rather than limit-plus-a-line. Generous for any wording
@@ -131,6 +152,17 @@ pub struct SessionView {
     pub transcript: Transcript,
     /// Private on purpose: this cursor is only valid for `self.transcript`.
     flusher: Flusher,
+    /// The rendered transcript, as the frame's band draws it.
+    ///
+    /// Written only by [`Self::flush`], which is the only thing that has seen the
+    /// flusher's output — so "a line appears in the band exactly once" follows
+    /// from the same monotonic-cursor property that "a line reaches the
+    /// scrollback exactly once" used to. Read only by
+    /// [`App::transcript`](crate::app::App::transcript), for the band.
+    ///
+    /// Bounded by [`MAX_DISPLAY_LINES`]; the text it was rendered from is
+    /// separately bounded by [`DEFAULT_VIEW_BUFFER`].
+    display: Vec<Line<'static>>,
     /// Liveness mirror of the owning session, for the status row (looprs-guh).
     pub status: SessionStatus,
     /// When the **current run** started, for `run_elapsed`.
@@ -204,6 +236,7 @@ impl SessionView {
             session,
             transcript: Transcript::new(),
             flusher: Flusher::new(),
+            display: Vec::new(),
             status: SessionStatus::NotStarted,
             run_started: None,
             last_error: None,
@@ -257,12 +290,39 @@ impl SessionView {
     }
 
     /// Lines that became final since the last call. Call once per frame, for the
-    /// active view only, immediately before `insert_before` + `draw`.
+    /// active view only; each one is also appended to
+    /// [`Self::display`](SessionView::display), which is what the frame's
+    /// transcript band draws.
     ///
     /// Invariant preserved here: monotonic. Every finalized line of this transcript
-    /// is returned exactly once, ever.
+    /// is returned exactly once, ever — and, for the same reason, appears in the
+    /// display exactly once. The flusher is the only door to either, which is what
+    /// makes "the band shows each line exactly once" a property of the type rather
+    /// than of the caller.
     pub fn flush(&mut self, width: u16) -> Vec<Line<'static>> {
-        self.flusher.drain(&self.transcript, width)
+        let lines = self.flusher.drain(&self.transcript, width);
+        self.append_display(&lines);
+        lines
+    }
+
+    /// Every rendered line this view has produced, oldest first, capped at
+    /// [`MAX_DISPLAY_LINES`].
+    ///
+    /// The frame takes the *tail* of this and pins it to the bottom of the
+    /// transcript band; nothing else reads it.
+    pub fn display(&self) -> &[Line<'static>] {
+        &self.display
+    }
+
+    fn append_display(&mut self, lines: &[Line<'static>]) {
+        if lines.is_empty() {
+            return;
+        }
+        self.display.extend(lines.iter().cloned());
+        let over = self.display.len().saturating_sub(MAX_DISPLAY_LINES);
+        if over > 0 {
+            self.display.drain(..over);
+        }
     }
 
     /// The not-yet-final tail, for the live preview region.
@@ -286,8 +346,8 @@ impl SessionView {
     /// MUST be called when the owning session dies ([`super::SessionEvent::Exited`])
     /// or is torn down. Without it the transcript keeps an entry that is `!done`
     /// forever: the flusher stalls on it, nothing that session already produced
-    /// ever reaches the scrollback again, and the live preview shows a spinner on
-    /// dead text forever. This is the seam that breaks the `insert_before`
+    /// ever reaches the transcript band again, and the live preview shows a
+    /// spinner on dead text forever. This is the seam that breaks the one-door
     /// invariant, so it is part of the contract rather than a detail.
     pub fn seal(&mut self) {
         // The line the resolver still had open is part of this tail, and it goes

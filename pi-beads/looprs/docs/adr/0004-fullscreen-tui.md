@@ -633,6 +633,89 @@ Each with the thing that would settle it, so none of these stays theoretical by 
   ticket; the value here is that they land consistently, and that the ones which are *not* going
   to be built are written down before someone builds them by accident.
 
+## Landed — `pdl.4`, the frame migration, as built
+
+`Mode::DEFAULT` is `[Raw, AltScreen, CursorHidden]`: the app takes the alternate
+screen at startup and every cell of the window is the frame's. The four bands tile
+the whole window instead of "the room above the pane", and the tiling is a pure
+function of the area it is handed.
+
+**What went out, and what replaced it.**
+
+| Gone | Replaced by |
+| --- | --- |
+| `desired_height` / `max_live` / `preview_limit` | `viewport::bands(tool_rows, input_rows, frame_rows)` — the input box is paid first, the tool wall is cut next, the transcript band keeps `MIN_TEXT_ROWS` and absorbs the rest |
+| `fit` / `needs_fit` / `resize_window` / `follow_the_pane_down` / `anchor_lost` / `respawn` | nothing. The frame's area *is* the window, and `ScreenFrame::draw` re-reads it in `Terminal::autoresize` — a size `ioctl` and a clear, not a cursor query |
+| `insert_before` (printing the transcript into the user's scrollback) | the transcript band: the tail of `SessionView::display` plus the live preview, pinned to the bottom of the band. R4 needed no further work — the app paints nothing outside the alternate screen at all |
+| `LiveAnchor` / `restore_bytes` (teardown knowing the pane's top row to erase from) | nothing. The hand-back is `?1049l`, and there is no pane top row to know. See the note in ADR-0006 |
+| `KEEP_SCROLLBACK_ROWS` / `MAX_LIVE_ROWS` (a height policy negotiated against the user's scrollback) | `MAX_TOOL_ROWS` and `MIN_INPUT_ROWS..=MAX_INPUT_ROWS`: a height policy about *bands* — how tall is the input box, how many tool rows fit — with nothing left to negotiate against |
+| the `ESC[6n` cursor query, and the five `drop(keys); keys = EventStream::new()` stop/restart pairs around it | one `EventStream`, started once and left started. The frame never asks the terminal a question, so the key stream never has to get out of the way |
+
+**Measured, not asserted.** `src/viewport.rs` production code 603 → 278 lines
+(−54%); whole file 1533 → 757. The run loop in `main.rs` 387 → 282 lines, run
+loop + `view()` 434 → 341. `desired_height`, `needs_fit`, `max_live`,
+`preview_limit`, `follow_the_pane_down`, `anchor_lost`, `KEEP_SCROLLBACK_ROWS`,
+`MAX_LIVE_ROWS`: 0 occurrences each. Key-stream stop/restart pairs 5 → 1, and the
+one that remains is the quit path's, kept because stopping the reader costs nothing
+and makes the no-query rule independent of whoever edits that list next. Cursor
+queries: 0 in the frame and 0 on the exit path, proved by a `Probe` backend that
+counts `get_cursor_position` calls and fails the test if the frame makes one
+(`viewport::tests::the_frame_never_asks_the_terminal_where_the_cursor_is`).
+
+**What a fifth band costs a contributor** — three places, in this order:
+
+1. `viewport::bands` — grant the rows and say who pays. The ladder is the entire
+   policy: the input box is paid in full, the tool wall gives way before it, the
+   transcript absorbs what the ladder did not spend, and `MIN_TEXT_ROWS` is the
+   floor nothing goes below.
+2. `viewport::frame_areas` — one more `Constraint` and one more entry in the
+   returned array. This is the only place the tiling is written, and it is pure,
+   so a band that is the wrong size is a bug in `bands`, never in the layout.
+3. `main.rs::view` — draw into the area `frame_areas` handed back. The band does
+   not know the window and the frame does not know what the bands contain.
+
+The tests that keep that ordering honest are
+`viewport::tests::the_bands_tile_the_window_at_every_size` (above the
+affordability line every band gets exactly what `bands` granted it; below it,
+nothing runs off the bottom edge) and
+`viewport::tests::the_input_box_outranks_the_tool_wall`.
+
+**Spike premises that had to change.** Every one of these was updated in place,
+with the reason recorded in the spike, because each of them was measuring the
+inline pane:
+
+* `flash_e2e.py` — was: time the hole between the pane's `ESC[J` and the bytes
+  that replace it. The frame has no such step; it diffs the whole screen and
+  writes once per frame. It now asserts **zero** partial erases on the wire,
+  times any `ESC[2J` (the full repaint a resize or a returned full-screen child
+  forces) against the same 1.5 ms budget, and carries two non-vacuity checks so a
+  run that did nothing cannot pass for a measured one. The control inverted: the
+  pre-pdl.4 binary fails it with **26 partial erases, 1.83–3.58 ms holes**
+  (`spikes/results/flash-e2e-pdl4-control.log`); the migrated binary passes 4/4.
+* `shutdown_e2e.py` — the erase-anchored checks ("the live pane is erased", "the
+  live tail landed above the erase line", "one closing newline after the erase")
+  measured a pane that no longer exists. In their place: nothing is painted before
+  the app takes the alternate screen; no pane-erase shape appears anywhere in the
+  run; the answer was painted on the screen the frame left; and **nothing at all
+  is written after the `?1049l`** — the closing newline belonged to the inline
+  pane's last row, and after the leave the cursor is the user's prompt's cursor.
+  149 → 153 checks, all passing.
+* `status_e2e.py` — "nothing was flushed to the alt screen" asserted the old
+  premise head-on. It now asserts the app took the alternate screen **exactly
+  once**, because a second `?1049h` mid-run re-saves the user's own contents as
+  their main screen — the one thing this app must never do to their scrollback.
+* `bash_e2e.py` — "the command line itself is echoed as typed" greps the wire,
+  and a diffed frame legitimately does not re-send a cell that already holds the
+  glyph being asked for: the `i` in `echo hi` was elided because the previous line
+  had put an `i` in that cell. That check now reads a reconstructed screen
+  (`status_e2e.Screen`, the same VT model the status spike already needed for
+  exactly this reason) rather than the stream.
+* `viewport_e2e.py` and `cancel_e2e.py` needed no change: their needles are "is
+  the text on screen, and in time", and survive the migration as written
+  (16/16 and 19/19). `fullscreen_e2e.py` (70/70) is unchanged too, which is the
+  point of ADR-0001 amendment 4's cut: the child gets the frame's screen and the
+  app's screen is never lost.
+
 ## Proof
 
 A decision ticket's proof is the measurements it leans on and the fact that they can be re-run:

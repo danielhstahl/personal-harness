@@ -23,7 +23,7 @@
 //!       │   │   pump(id, rx) ── SessionEvent ──wrap(id, .)──> Msg ──┘
 //!       │   └───────────────────────────────────────────────────────┘
 //!       ▼
-//!   run() loop: Msg -> App.update(view state) -> flush -> insert_before -> draw
+//!   run() loop: Msg -> App.update(view state) -> flush -> frame (band/cards/status/input)
 //! ```
 //!
 //! Three rules fall out of it:
