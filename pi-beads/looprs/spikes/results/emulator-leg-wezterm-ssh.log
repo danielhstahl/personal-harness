@@ -1,0 +1,50 @@
+[  0.00s] --- real-terminal leg in WezTerm 20240203-110809-5046fc22 (TERM=xterm-256color)
+[  0.01s]     clipboard saved (26 bytes); it goes back at the end
+[  0.01s]     --- positive control on the query path: Primary Device Attributes (CSI c)
+[  1.52s] NUM   WezTerm DA1 reply = 1b5b3f36353b343b363b31383b323263
+[  1.52s] PASS  WezTerm: the query path is live (DA1 answered), so a silence below means non-support and not a dead wire
+[  1.52s]     --- DEC mode queries: does this emulator even have what we want?
+[  1.52s] NUM   WezTerm DECRQM ?1000 (mouse_report) = 2 (reset)
+[  1.52s] PASS  WezTerm: mode ?1000 (mouse_report) answers DECRQM at all
+[  1.52s]         ?1000 reported available (reset)
+[  1.53s] NUM   WezTerm DECRQM ?1002 (mouse_drag) = 2 (reset)
+[  1.53s] PASS  WezTerm: mode ?1002 (mouse_drag) answers DECRQM at all
+[  1.53s]         ?1002 reported available (reset)
+[  1.53s] NUM   WezTerm DECRQM ?1003 (any_motion) = 2 (reset)
+[  1.53s] PASS  WezTerm: mode ?1003 (any_motion) answers DECRQM at all
+[  1.53s]         ?1003 reported available (reset)
+[  1.54s] NUM   WezTerm DECRQM ?1006 (mouse_sgr) = 2 (reset)
+[  1.54s] PASS  WezTerm: mode ?1006 (mouse_sgr) answers DECRQM at all
+[  1.54s]         ?1006 reported available (reset)
+[  1.54s] NUM   WezTerm DECRQM ?1049 (alt_screen) = 0 (answered but unavailable)
+[  1.54s] PASS  WezTerm: mode ?1049 (alt_screen) answers DECRQM at all
+[  1.54s] NUM   WezTerm DECRQM ?2004 (bracketed_paste) = 2 (reset)
+[  1.54s] PASS  WezTerm: mode ?2004 (bracketed_paste) answers DECRQM at all
+[  1.54s]         ?2004 reported available (reset)
+[  1.54s]     --- OSC 52 write ladder, each size checked against the real clipboard
+[  1.57s] NUM   WezTerm osc52 64B = landed=83B intact=True marker=True latency=0.01s
+[  1.57s] PASS  WezTerm osc52: a 64B copy lands byte-exact
+[  1.59s] NUM   WezTerm osc52 1024B = landed=1045B intact=True marker=True latency=0.01s
+[  1.59s] PASS  WezTerm osc52: a 1024B copy lands byte-exact
+[  1.62s] NUM   WezTerm osc52 16384B = landed=16406B intact=True marker=True latency=0.01s
+[  1.62s] PASS  WezTerm osc52: a 16384B copy lands byte-exact
+[  1.64s] NUM   WezTerm osc52 65536B = landed=65558B intact=True marker=True latency=0.01s
+[  1.64s] PASS  WezTerm osc52: a 65536B copy lands byte-exact
+[  1.67s] NUM   WezTerm osc52 262144B = landed=262167B intact=True marker=True latency=0.01s
+[  1.67s] PASS  WezTerm osc52: a 262144B copy lands byte-exact
+[  1.72s] NUM   WezTerm osc52 1048576B = landed=1048600B intact=True marker=True latency=0.01s
+[  1.72s] PASS  WezTerm osc52: a 1048576B copy lands byte-exact
+[  1.72s] NUM   WezTerm osc52 largest copy that landed whole = 1048576B
+[  1.72s]     --- control: the same payload under opcode 51 must NOT touch the clipboard
+[  2.94s] PASS  WezTerm: an OSC 51 write leaves the clipboard alone (so an OSC 52 pass above is not a stale clipboard)
+[  2.94s]     --- a copy written in 64-byte chunks: does the emulator reassemble it?
+[  3.28s] NUM   WezTerm fragmented OSC 52 = landed=542B want=542B latency=0.01s
+[  3.28s] PASS  WezTerm: a copy written in 64-byte chunks lands whole
+[  3.28s]     --- OSC 52 read-back query: does this emulator answer it?
+[  5.79s] NUM   WezTerm OSC 52 read-back = answered=False bytes_back=0
+[  5.79s] FAIL  WezTerm: the OSC 52 read-back query answers at all  -- no OSC 52 reply in 0 bytes read back
+[  5.79s]     --- OSC 52 written by a REMOTE host, through a real SSH session, into this emulator
+[  6.08s] NUM   ssh osc52 (remote host -> this emulator) = ssh_rc=0 landed=4117B whole=True latency=0.13s
+[  6.08s] PASS  ssh: an OSC 52 copy written on the remote host reaches this emulator's clipboard whole
+[  6.09s]     clipboard restored (26 bytes)
+LEG_DONE rc=0

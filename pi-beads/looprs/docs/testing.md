@@ -429,6 +429,73 @@ round trip at boot, where a round trip is affordable — and restore that on the
 `child` scenario prints what is left behind (`tee'd modes still on at exit: [...]`) so the gap
 stays measured; see [ADR-0006](adr/0006-terminal-mode-ledger.md).
 
+## The mouse and the clipboard, measured before they are built (looprs-pdl.2)
+
+**What it proves:** the seven claims that looprs-pdl.8/.9/.10/.12 inherit — that a
+selection can be driven from outside, that the clipboard round-trips, what the OSC
+52 ceiling is, what a burst costs, whether shift-drag survives, that the modes come
+back, and what vim does to our mouse capture — each have a number or a yes/no
+attached, taken off a wire. The per-terminal table lives in
+[`spikes/results/terminal-matrix.md`](../spikes/results/terminal-matrix.md) and is
+what ADR-0004 (looprs-pdl.1) lifts.
+
+| Layer | Where | What it pins |
+| --- | --- | --- |
+| the wire → the library | `spikes/mouse_clipboard_e2e.py inject` | 13/13 SGR report types → one event each, kind+button correct; the wire's 1-based coordinates map to crossterm's cells at a constant **(1, 1)** with no variance; the modifier translation is measured, and it is **not** an orderly shift — wire `0x04`→SHIFT, `0x10`→CONTROL, `0x08`→ALT |
+| the path's capacity | `burst` | 128 reports in one 1,536-byte write → 128 events, 0.30 ms span, worst gap 0.037 ms, ~4×10⁵/s, nothing merged or dropped |
+| the hand-back | `modes` | the real binary with `LOOPRS_MODES=all`: every mode taken, each left exactly once, nothing still on, `lflags` identical to the clean `stty` baseline, cursor visible — and the one exemption measured rather than waived (`cursor_hidden`: on 1×, cleared 3×, because a frame that ends without a cursor writes `?25h` every draw) |
+| the nested child | `vim` | vim `-u NONE` leaves our three mouse modes ours and on; vim with `:set mouse=a` **switches all three off on exit**; SIGKILLed vim leaves alt screen + bracketed paste + mouse modes on with nothing restored |
+| our own bytes | `clipboard` | `crossterm`'s writer emits `ESC]52;c;<b64>ESC\` (ST, not BEL) and decodes back to the exact payload, including a copy written in 7 chunks |
+| the emulator, in a real window | `--in-terminal` | DEC mode queries answered by the emulator itself; an OSC 52 size ladder checked against the real clipboard with a latency proxy for permission prompts; chunked reassembly; the read-back query |
+| the hop | `--ssh`, `--ssh-emulator` | mouse reports injected here decode on the far side with the same mapping, and a copy issued on the remote host lands in the **local** emulator's clipboard whole |
+
+**Why the emulator leg is a separate leg and not folded into the pty groups.** A
+pty has no terminal emulator behind it. What an app writes is the whole truth about
+the app and none of the truth about the user's clipboard, because the thing that
+interprets OSC 52 is the window. A bare pty that never answers `ESC]52;c?` and a
+terminal that refuses the copy look identical from the writer's side — so the pty
+groups report *what we send* and the leg reports *what an emulator does*, and the
+summary lists each separately. That is also why the leg starts with a positive
+control on the query path (Primary Device Attributes, `CSI c`): without it, "this
+terminal does not have the mode" cannot be told apart from "nobody is listening".
+Apple Terminal answered DA1 and then answered nothing else — which is how "no OSC
+52, no mouse reporting, selection is the terminal's own" became a measurement
+instead of folklore.
+
+**The controls, and what each one rules out**: `--decode-off` (same tty, same raw
+mode, same `?1000h/?1002h/?1006h` on, no parser — so any "event" there came from
+somewhere other than the injected sequence, and the byte count proves the tty
+carried all of them); malformed SGR with the `<` dropped (no press/drag/release
+chain forms, and nothing arrives as keystrokes — the failure mode worth knowing, since
+keystrokes land in the input box); a +5 coordinate differential (the reported
+numbers track the wire, not the constants in this script); `kill -9` on the app
+(the mode detector must see residue when there is residue, or its clean verdicts
+mean nothing); and the same base64 payload under **OSC 51** (a clipboard that
+changed on *that* changed for a reason other than our sequence).
+
+**What this spike deliberately does not claim.** Three cells are printed as `N/A`
+in every run rather than guessed, and they are the ones a person with hands and other
+terminals has to fill: the shape of one physical **trackpad flick** (no finger on
+this path — `--record-flick` exists and asks for three), whether **shift-drag still
+paints the terminal's own selection** under 1000+1002+1006 (nothing comes back up
+the pty; the leg asks a human for a `y`/`n`), and **what the user sees while vim
+holds our alternate screen** (the pty has no window). Two terminals on the ticket's
+list are not installed on this machine, so their rows are empty with the one-line
+command that fills them (`PDL2_LAUNCH='open -a iTerm {file}' … --launch`); the row
+for the agent's own terminal (Zed) is left unfilled on purpose, because writing the
+leg's escape sequences into the running session's tty would smear the UI.
+
+Run it:
+
+```sh
+cargo build --examples
+python3 spikes/mouse_clipboard_e2e.py           | tee spikes/results/mouse-clipboard-e2e.log
+python3 spikes/mouse_clipboard_e2e.py --control | tee spikes/results/mouse-clipboard-e2e-control.log
+python3 spikes/mouse_clipboard_e2e.py ssh       | tee spikes/results/mouse-clipboard-ssh.log
+python3 spikes/mouse_clipboard_e2e.py burst shift          # one group at a time
+python3 spikes/mouse_clipboard_e2e.py --in-terminal --record-flick   # inside a real window
+```
+
 ---
 
 ## Why "pure" matters here, once

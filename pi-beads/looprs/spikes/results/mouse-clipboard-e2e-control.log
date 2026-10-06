@@ -1,0 +1,52 @@
+[  0.00s] --- claim 1: a selection driven from outside the app (SGR 1006 -> crossterm)
+[  0.00s] --- claim 1 CONTROLS: decode-off, malformed, and a +5 differential
+[  1.13s] PASS  control decode-off: no events without a parser
+[  1.13s] PASS  control decode-off: the tty carried every injected byte intact
+[  2.24s] NUM   malformed (no `<`) reports decoded per kind = {'down': 1}
+[  2.24s] PASS  control malformed: without the SGR introducer no press/drag/release chain forms
+[  2.24s] PASS  control malformed: the malformed reports do not arrive as keystrokes
+[  3.36s] NUM   differential run: second triple injected 5 rows up and 5 cols left = dx=[5, 5, 5] dy=[5, 5, 5]
+[  3.36s] PASS  control differential: every reported coordinate moves by exactly the injected delta
+[  3.36s] --- claim 4a: burst capacity of the mouse path
+[  4.49s] PASS  control burst: the bytes are intact with no parser running
+[  4.49s] --- claim 5a: shift-drag reaches the app at all
+[  5.51s] PASS  control shift: a shift-drag report is one mouse event and not keystrokes
+[  5.51s] --- claim 6: the terminal is handed back in the mode set it started in
+[  5.52s]     baseline lflags=1483 ICANON=True ECHO=True
+[  7.87s]     after SIGKILL: still_on=['alt_screen', 'bracketed_paste', 'mouse_drag', 'mouse_report', 'mouse_sgr'] tty_cooked=False off={'cursor_hidden': 2}
+[  7.87s] PASS  control modes: SIGKILL really does leave modes switched on
+[  7.87s] PASS  control modes: and it leaves the tty raw
+[  7.87s] --- claim 7: what a full-screen child does to our mouse capture
+[  7.88s]     vim: VIM - Vi IMproved 9.1 (2024 Jan 02, compiled Jul 31 2026 22:26:31)
+[  8.64s]     [vim -u NONE, vim's own mouse default] settled; 1345 bytes on the wire so far
+[  9.15s]     [vim -u NONE, vim's own mouse default]
+[  9.15s]         taken={'mouse_report': 1, 'mouse_drag': 1, 'mouse_sgr': 1, 'bracketed_paste': 1, 'alt_screen': 1, 'cursor_hidden': 2}
+[  9.15s]         left_off={'cursor_hidden': 2, 'bracketed_paste': 2, 'alt_screen': 1} still_on_at_end=['mouse_drag', 'mouse_report', 'mouse_sgr']
+[  9.15s]         (tty_cooked is not a measurement here: the harness put the tty raw to stand in for the app's raw mode and only the app would restore it)
+[  9.15s] NUM   vim -u NONE, vim's own mouse default: our mouse modes this child switched off = none
+[  9.15s] PASS  vim: vim -u NONE, vim's own mouse default does not leave the alternate screen on
+[  9.92s]     [vim with :set mouse=a (mouse-tracking vim)] settled; 1366 bytes on the wire so far
+[ 10.43s]     [vim with :set mouse=a (mouse-tracking vim)]
+[ 10.43s]         taken={'mouse_report': 2, 'mouse_drag': 2, 'mouse_sgr': 2, 'bracketed_paste': 1, 'alt_screen': 1, 'cursor_hidden': 2}
+[ 10.43s]         left_off={'cursor_hidden': 2, 'mouse_sgr': 1, 'mouse_report': 1, 'mouse_drag': 1, 'bracketed_paste': 2, 'alt_screen': 1} still_on_at_end=[]
+[ 10.43s]         (tty_cooked is not a measurement here: the harness put the tty raw to stand in for the app's raw mode and only the app would restore it)
+[ 10.43s] NUM   vim with :set mouse=a (mouse-tracking vim): our mouse modes this child switched off = ['mouse_drag', 'mouse_report', 'mouse_sgr']
+[ 10.43s] PASS  vim: vim with :set mouse=a (mouse-tracking vim) does not leave the alternate screen on
+[ 11.18s]     [vim :set mouse=a, SIGKILLed while it holds the tty] settled; 1366 bytes on the wire so far
+[ 11.89s]     [vim :set mouse=a, SIGKILLed while it holds the tty]
+[ 11.89s]         taken={'mouse_report': 2, 'mouse_drag': 2, 'mouse_sgr': 2, 'bracketed_paste': 1, 'alt_screen': 1, 'cursor_hidden': 1}
+[ 11.89s]         left_off={'cursor_hidden': 1} still_on_at_end=['alt_screen', 'bracketed_paste', 'mouse_drag', 'mouse_report', 'mouse_sgr']
+[ 11.89s]         (tty_cooked is not a measurement here: the harness put the tty raw to stand in for the app's raw mode and only the app would restore it)
+[ 11.89s] PASS  vim control: the killed child leaves residue for us to clean up
+[ 11.89s] N/A   7b. what the user's screen looks like while vim holds our alternate screen -- the pty has no window; the byte stream says which modes changed, not what a person saw
+[ 11.89s]       to measure: run vim inside a real terminal window during the --in-terminal leg
+[ 11.89s] --- claim 2a: the OSC 52 bytes we put on the wire
+[ 18.33s] PASS  clipboard: the emitted sequence is ESC ] 52 ; c ; <base64> ESC \ 
+[ 18.33s] NUM   OSC 52 wire shape = prefix=b'\x1b]52;c;M' b64_bytes=156 payload_bytes=115 terminator=1b5c
+[ 18.33s] PASS  clipboard: the base64 body decodes to the exact bytes the copy asked for
+[ 24.76s] PASS  control clipboard: the control emits opcode 51 and no OSC 52 anywhere
+[ 24.76s] === summary ===
+[ 24.76s] 15/15 checks passed [CONTROL RUN: a pass here means the control behaved like a control]
+[ 24.76s] 5 numbers recorded -- malformed (no `<`) reports decoded per kind={'down': 1}; differential run: second triple injected 5 rows up and 5 cols left=dx=[5, 5, 5] dy=[5, 5, 5]; vim -u NONE, vim's own mouse default: our mouse modes this child switched off=none; vim with :set mouse=a (mouse-tracking vim): our mouse modes this child switched off=['mouse_drag', 'mouse_report', 'mouse_sgr'], ...
+[ 24.76s] 1 thing(s) this environment could not measure:
+[ 24.76s]   - 7b. what the user's screen looks like while vim holds our alternate screen: the pty has no window; the byte stream says which modes changed, not what a person saw -> run vim inside a real terminal window during the --in-terminal leg

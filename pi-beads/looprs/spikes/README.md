@@ -21,6 +21,8 @@ evidence, so a future reader can re-run it instead of re-arguing.
 | `spikes/status_e2e.py` | looprs-guh acceptance: the one-row status band, in a real pty, driven off the real state machines — an empty board, a `bd` that fails outright, a beads pass Tabbed away from mid-run (ADR-0002's "the load-bearing case"), a `sleep` holding a shell busy, and a resize to the 40-column floor taken mid-run. Costs no model call (`pi` is `fake_pi_slow.py`, `bd` is a bash fake the script writes). **20/20**; against the pre-looprs-guh binary, 0 of the 13 row-specific checks fire (`spikes/results/status-e2e-control.log`) — which is what makes the passing run mean something. See *"Why the spike reads the wire and not the screen"* in `docs/testing.md` before editing the needles. |
 | `spikes/flash_e2e.py` | The live-region flash, timed off the wire. The app flushes its erase (`ESC[<row>;1H ESC[J`) separately from the frame that replaces what it erased, so the interval between that erase and the next printable bytes **is** the interval a terminal had nothing there — no log parsing, no screenshots, just the clock on the reading side of the pty. Asserts the hole is inside 1.5 ms and that the reshape count stays under half the rows the answer spread over. Against the pre-fix binary: **0/3**, a 3.1–9.6 ms hole on all 25 erases (`spikes/results/flash-e2e-control.log`); fixed: **3/3**, 0.20–0.38 ms over 13 erases. |
 | `spikes/fake_pi_slow.py` | The `pi` that spike needs: one assistant message held **open** while a paragraph dribbles out. `tests/fixtures/fake_pi_chat.py` emits `text_delta` and `message_end` back to back, so its reply is flushed before a frame can be drawn over it and there is no live tail to measure. |
+| `spikes/mouse_clipboard_e2e.py` | looprs-pdl.2: the seven claims under the selection/clipboard tickets, measured rather than assumed. **Bare-pty groups** (no terminal needed): SGR 1006 mouse injection decoded by `crossterm` inside the pty (13/13 report types, coordinate offset a constant −1, ctrl/alt/shift bit translation measured), burst capacity (128 reports in one write → 128 events in 0.30 ms, none merged), shift-drag on the wire, the real binary's mode set/restore symmetry against a `stty` baseline, and vim's nested mouse modes. **Emulator leg** (`--in-terminal`, run inside a real window): DEC mode queries answered by the emulator, the OSC 52 size ladder read back off the real clipboard with a latency proxy for permission prompts, chunked copies, the read-back query, and a trackpad/shift-drag recorder. **SSH leg** (`--ssh`): a container `sshd` with a Linux build of the probe, mouse injection through the hop, and OSC 52 issued remotely and landed in the local emulator's clipboard. Controls: `--decode-off` (bytes without a parser), malformed SGR without the `<`, a +5 coordinate differential, `kill -9` residue for the mode detector, and the same payload under OSC 51. **24/24** bare-pty, **15/15** control, **5/5** ssh; the legs and the matrix of what each terminal did are in [`results/terminal-matrix.md`](results/terminal-matrix.md). |
+| `examples/spike_mouse_probe.rs` | The thing inside the pty for the spike above: reads events with the same `crossterm` the app uses and prints one timestamped line per event (`EV t=… mouse=drag btn=left x=13 y=7 mods=1`), plus the OSC 52 writer, the read-back query, a raw byte counter for the `--decode-off` control, and a `mode-holder` that leaves its modes switched on for the next process. Its mode bytes are copied from `src/teardown.rs` rather than imported, so it can disagree with the app. |
 | `spikes/results/` | Committed raw output of the runs quoted in the ADR. |
 
 ## Running it
@@ -43,6 +45,16 @@ python3 spikes/cancel_e2e.py      | tee spikes/results/cancel-e2e.log
 python3 spikes/viewport_e2e.py    | tee spikes/results/viewport-e2e.log
 python3 spikes/shutdown_e2e.py    | tee spikes/results/shutdown-e2e.log
 python3 spikes/status_e2e.py      | tee spikes/results/status-e2e.log
+
+# …and the mouse/clipboard spike. The bare-pty groups need only the example binary;
+# the emulator leg has to run inside a real terminal window, and the ssh leg needs
+# docker (it builds its own sshd image and caches it).
+cargo build --examples
+python3 spikes/mouse_clipboard_e2e.py           | tee spikes/results/mouse-clipboard-e2e.log
+python3 spikes/mouse_clipboard_e2e.py --control | tee spikes/results/mouse-clipboard-e2e-control.log
+python3 spikes/mouse_clipboard_e2e.py ssh       | tee spikes/results/mouse-clipboard-ssh.log
+python3 spikes/mouse_clipboard_e2e.py --in-terminal --record-flick
+PDL2_LAUNCH='open -a Terminal {file}' python3 spikes/mouse_clipboard_e2e.py --launch
 
 # …and the status spike against the pre-looprs-guh binary, as a control (the same
 # worktree recipe as above; `--control` inverts the verdict and names any needle
