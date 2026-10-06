@@ -1,0 +1,25 @@
+BIN=target/debug/looprs  rows=40 cols=100
+chunks=532  erases=13  answer reached row 39
+
+erase timeline:
+  chunk   34  top row    6  hole    0.25 ms
+  chunk   67  top row    6  hole    0.34 ms
+  chunk  101  top row    6  hole    0.38 ms
+  chunk  141  top row    6  hole    0.25 ms
+  chunk  179  top row    6  hole    0.30 ms
+  chunk  219  top row    6  hole    0.34 ms
+  chunk  263  top row    6  hole    0.27 ms
+  chunk  304  top row    6  hole    0.27 ms
+  chunk  349  top row    6  hole    0.26 ms
+  chunk  400  top row    6  hole    0.26 ms
+  chunk  447  top row    6  hole    0.28 ms
+  chunk  497  top row    6  hole    0.28 ms
+  chunk  530  top row   35  hole    0.20 ms
+
+blank window: min=0.20  p50=0.27  p90=0.34  max=0.38 ms
+
+  PASS  every erase got replacement content inside 1.5 ms   [0 of 13 left a hole longer than that]
+  PASS  erases batched: 13 <= 19.5 (answer spread over ~39 rows)   [0.33 reshapes per row of answer]
+  PASS  the worst hole is short enough not to read as a blink (<1.5 ms)   [worst 0.38 ms at chunk 101]
+
+3/3

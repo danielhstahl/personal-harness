@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
+use components::card::LiveCardPreview;
 use components::text_stream::LiveTextPreview;
-use components::tool::LiveToolPreview;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
@@ -291,7 +291,7 @@ async fn run(
                     // spent, which is the whole point of looprs-afw.
                     let lines = app.flush_active(app.width);
                     let preview = app.preview_active(app.width);
-                    let tools = app.live_tool_rows();
+                    let cards = app.live_card_rows();
                     // Computed once and handed to both the height policy and the
                     // frame, for the same reason `preview` is: the rows the box
                     // asked for and the rows it is drawn with must be one number,
@@ -306,7 +306,7 @@ async fn run(
                         app.active,
                         live.rows()?,
                         preview.len(),
-                        tools,
+                        cards,
                         input,
                     );
                     // Rebuilding an inline viewport reads the cursor position
@@ -458,16 +458,16 @@ async fn drain_sessions(
 /// and not into a re-derived guess.
 fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
     let active = app.active_view();
-    let tools: Vec<&Entry> = active
+    let cards: Vec<&Entry> = active
         .map(|v| {
             v.transcript
-                .open_tools()
+                .open_cards()
                 .take(viewport::MAX_TOOL_ROWS as usize)
                 .collect()
         })
         .unwrap_or_default();
-    let [text_area, tool_area, status_area, input] =
-        viewport::frame_areas(f.area(), tools.len() as u16, input_rows);
+    let [text_area, card_area, status_area, input] =
+        viewport::frame_areas(f.area(), cards.len() as u16, input_rows);
 
     // What the live region shows is a property of the session on screen, not of any
     // session that happens to be streaming.
@@ -475,13 +475,13 @@ fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
         f.render_widget(LiveTextPreview::new(app.spinner, preview), text_area);
     }
 
-    for (i, e) in tools.iter().enumerate() {
+    for (i, e) in cards.iter().enumerate() {
         let row = Rect {
-            y: tool_area.y + i as u16,
+            y: card_area.y + i as u16,
             height: 1,
-            ..tool_area
+            ..card_area
         };
-        f.render_widget(LiveToolPreview::new(e, app.spinner), row);
+        f.render_widget(LiveCardPreview::new(e, app.spinner), row);
     }
 
     // The status row (looprs-guh): the row `frame_areas` has been reserving and
@@ -506,7 +506,9 @@ fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::PiEvent;
     use crate::session::{BeadStep, SessionId, SessionStatus};
+    use crate::state::transcript::MessageKind;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::CellWidth;
@@ -730,5 +732,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The card is not merely *recorded*, it is drawn: with a compaction in flight
+    /// the live region carries its row, so the screen says what the run is doing
+    /// instead of stopping.
+    #[test]
+    fn a_live_compaction_is_drawn_in_the_card_band() {
+        let mut app = app(TerminalType::Pi, true);
+        app.update(Msg::Agent {
+            session: SessionId::new(TerminalType::Pi, 1),
+            event: PiEvent::CompactionStart {
+                reason: "threshold".into(),
+            },
+        });
+
+        let band = app.input_band(60);
+        let rows = app.live_card_rows();
+        assert_eq!(
+            rows, 1,
+            "the frame is told there is a card to make room for"
+        );
+        let h = viewport::desired_height(TerminalType::Pi, 40, 0, rows, band);
+        let [_, cards, _, _] = viewport::frame_areas(Rect::new(0, 0, 60, h), rows, band);
+
+        let screen = paint_with(&app, h, band);
+        let drawn = &screen[cards.y as usize..cards.bottom() as usize];
+        assert!(
+            drawn
+                .iter()
+                .any(|r| r.contains("compacting context") && r.contains("threshold")),
+            "the card band has no compaction row: {screen:?}"
+        );
+        assert!(
+            !drawn.iter().any(|r| r.contains("✗")),
+            "a compaction in progress is not a failure: {screen:?}"
+        );
+    }
+
+    /// A cancel is drawn as a cancel — grey, ⊘ — and a failure as a failure. The
+    /// frame is where that distinction is allowed to be seen, so it has to survive
+    /// the render, not just the enum.
+    #[test]
+    fn a_cancelled_and_a_failed_compaction_are_drawn_differently() {
+        let cancel = compaction_row(|mut e| {
+            e.kind = MessageKind::Compaction {
+                reason: "manual".into(),
+                state: crate::components::compaction::CompactionState::Aborted,
+            };
+            e
+        });
+        let failure = compaction_row(|mut e| {
+            e.kind = MessageKind::Compaction {
+                reason: "overflow".into(),
+                state: crate::components::compaction::CompactionState::Failed,
+            };
+            e.text = "provider refused the summary".into();
+            e
+        });
+
+        assert!(
+            cancel.contains("⊘") && cancel.contains("aborted"),
+            "{cancel}"
+        );
+        assert!(failure.contains("✗"), "{failure}");
+        assert!(failure.contains("provider refused"), "{failure}");
+        assert_ne!(cancel, failure);
+    }
+
+    /// One open card of `kind`, rendered through the frame's own widget, returned
+    /// as the row's text. Built by hand rather than by a scripted event so the two
+    /// endings above can be compared without a session between them.
+    fn compaction_row(build: impl Fn(Entry) -> Entry) -> String {
+        use crate::components::card::LiveCardPreview;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let entry = build(Entry {
+            kind: MessageKind::System,
+            text: String::new(),
+            done: false,
+        });
+        let backend = TestBackend::new(60, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            f.render_widget(LiveCardPreview::new(&entry, 0), f.area());
+        })
+        .unwrap();
+        rows(term.backend()).first().cloned().unwrap_or_default()
     }
 }

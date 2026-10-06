@@ -1,6 +1,6 @@
 // scrollback.rs
 use crate::{
-    components::tool::tool_line,
+    components::card::card_line,
     state::transcript::{Entry, MessageKind, Transcript},
     theme::styles::{content_width, restyle, style_for},
     utils::md,
@@ -80,9 +80,16 @@ impl Flusher {
             } else if e.kind.is_streamed() {
                 self.cur.drain_stream(e, w)
             } else if !e.done {
-                break; // open tool: the viewport owns it
-            } else if matches!(e.kind, MessageKind::Tool { .. }) {
-                vec![tool_line(e, 0)] // spinner frame is irrelevant once finished
+                break; // an open card (tool or compaction): the viewport owns it
+            } else if matches!(
+                e.kind,
+                MessageKind::Tool { .. } | MessageKind::Compaction { .. }
+            ) {
+                // A finished card: one row, drawn by the same renderer the live
+                // band uses, so the scrollback copy and the live copy cannot
+                // disagree about what the card said. Spinner frame is irrelevant
+                // once finished.
+                vec![card_line(e, 0)]
             } else {
                 render_simple(e, w) // User / Error
             };

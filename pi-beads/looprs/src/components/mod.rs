@@ -1,3 +1,5 @@
+pub mod card;
+pub mod compaction;
 pub mod input;
 pub mod scrollback;
 pub mod status;

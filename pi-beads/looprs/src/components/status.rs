@@ -626,7 +626,7 @@ pub fn fmt_elapsed(d: Duration) -> String {
 /// Bounded width is the whole point: `999`, `12.3k`, `1.24M` keep the row's
 /// arithmetic stable at every order of magnitude, so a nine-figure run cannot push
 /// the bead id off the screen by itself.
-fn fmt_tokens(n: u64) -> String {
+pub(crate) fn fmt_tokens(n: u64) -> String {
     const K: u64 = 1_000;
     const M: u64 = 1_000_000;
     if n < K {

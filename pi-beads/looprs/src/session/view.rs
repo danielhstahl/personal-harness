@@ -57,6 +57,16 @@ pub enum ChatState {
     Chat,
     /// A tool run is live.
     Tool,
+    /// A context compaction is live.
+    ///
+    /// Its own state rather than reusing `Tool`: it is not a tool, and the thing
+    /// the state is *for* is deciding what the live region shows and whether the
+    /// spinner turns. Compaction wants the prose preview held back (the card owns
+    /// the row) and the spinner turning (a compaction is a real, slow, paid-for
+    /// call, and a still transcript over a working child is the "is it hung?"
+    /// question this card was added to answer) — which is what
+    /// [`Self::is_streaming`] and `main::view`'s `Chat`-only text draw give it.
+    Compacting,
 }
 
 impl ChatState {
@@ -237,6 +247,13 @@ impl SessionView {
     /// invariant, so it is part of the contract rather than a detail.
     pub fn seal(&mut self) {
         self.transcript.finish_last();
+        // ...and so are any cards still open in it. `finish_last` deliberately
+        // leaves running tools alone (parallel tools must survive a delta
+        // arriving), so without this a tool or compaction that was in flight when
+        // the child died holds the flush cursor forever: everything the session
+        // said *after* that point — which is most of what the exit drain exists
+        // to collect — never reaches the scrollback.
+        self.transcript.abandon_open_cards();
         // A half-parsed escape sequence belongs to a stream that is never going to
         // send the rest of it. Left as it is, the next Bash generation's first
         // bytes get eaten by the previous one's dangling `\x1b[`, which shows up
@@ -461,6 +478,44 @@ mod tests {
             "sealing must release the tail: {after:?}"
         );
         assert!(v.flush(60).is_empty(), "and only once");
+    }
+
+    /// The same stall from a card rather than from prose — and a card is where it
+    /// bites hardest, because a running tool or compaction is *deliberately* not
+    /// closed by whatever streams next (parallel tools). So `seal` closes them
+    /// itself, as aborted: nothing is coming to report them, and a frozen spinner
+    /// in a transcript whose process is gone is a lie that outlives its subject.
+    #[test]
+    fn sealing_closes_cards_left_running_so_the_transcript_keeps_flushing() {
+        let mut v = view(TerminalType::Pi);
+        v.transcript
+            .start_tool("t1".into(), "bash".into(), "sleep 100".into());
+        v.transcript.start_compaction("threshold".into());
+        v.transcript
+            .push_delta(MessageKind::Answer, "said after both\n");
+
+        assert!(
+            v.flush(60).is_empty(),
+            "the open cards hold the cursor, as they should while the session lives"
+        );
+
+        v.seal();
+        let out: String = v.flush(60).iter().map(|l| l.to_string()).collect();
+        assert!(out.contains("said after both"), "{out:?}");
+        assert!(
+            out.contains("compaction aborted"),
+            "the compaction row says how it ended: {out:?}"
+        );
+        assert!(
+            out.contains("sleep 100"),
+            "the tool row is not lost: {out:?}"
+        );
+        for frame in crate::utils::render::FRAMES {
+            assert!(
+                !out.contains(frame),
+                "a dead session's card is still spinning ({frame}): {out:?}"
+            );
+        }
     }
 
     /// Two views never share a cursor: draining one cannot consume the other's

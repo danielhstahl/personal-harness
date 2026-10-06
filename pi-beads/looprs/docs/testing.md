@@ -322,6 +322,42 @@ signal for the buffer cap, and that signal still exists where the loss happens: 
 view inserts a `… N bytes dropped (buffer cap) …` notice into the transcript
 itself (`session::view::tests`). The row spends the room on cost instead.
 
+### A compaction says so (the compaction card)
+
+pi pauses a run to summarise its own history whenever the context crosses its
+reserve. The summarisation is a separate LLM call that puts nothing on the event
+stream but `compaction_start` / `compaction_end`, so without a renderer for
+those two it is ten to sixty seconds of transcript that has stopped moving — the
+exact shape of "is it hung?". It gets the same one-row live card a tool call
+gets: `⠹ compacting context · threshold` while it runs, and once it is over a
+finished row in the scrollback, `✓ context compacted · threshold · 150.0k → 32.0k`.
+
+| claim | where |
+| --- | --- |
+| the wire shape parses as pi writes it: `reason` on the start, `result.tokensBefore` / `estimatedTokensAfter` on the end, and no `result` at all when it was aborted | `app::tests::the_compaction_wire_format_parses` |
+| the start puts a live card on the screen, and the height policy is told to budget its row | `app::tests::a_compaction_shows_a_live_card_while_it_runs` |
+| the finished card reaches the scrollback carrying what it freed | `app::tests::a_finished_compaction_reaches_the_scrollback_with_what_it_freed` |
+| cancelled and failed are two different sentences, and a cancel is not painted in failure's red | `app::tests::an_aborted_compaction_says_aborted_and_a_failed_one_says_why`, `components::compaction::tests::aborted_is_grey_and_failed_is_red` |
+| the card is drawn in the frame's card band, and the two endings draw differently | `main::tests::a_live_compaction_is_drawn_in_the_card_band`, `main::tests::a_cancelled_and_a_failed_compaction_are_drawn_differently` |
+| an `end` whose `start` never arrived is recorded rather than swallowed | `app::tests::a_compaction_end_with_no_open_card_is_recorded_anyway` |
+| closing the card releases everything that queued up behind it | `app::tests::closing_the_compaction_card_releases_what_came_behind_it` |
+| a missing `reason` leaves no dangling separator on the row | `components::compaction::tests::an_unknown_reason_leaves_no_trailing_separator` |
+
+**A card left open when the session dies is a bug with teeth.** A `!done` entry
+stalls the flush cursor, so a compaction — or a tool — that was still in flight
+when the child died would take the rest of that session's transcript with it:
+exactly the tail the exit drain exists to collect. `SessionView::seal` now closes
+open cards of either kind as `Aborted` —
+`session::view::tests::sealing_closes_cards_left_running_so_the_transcript_keeps_flushing`,
+`state::transcript::tests::abandoning_closes_every_open_card_and_nothing_else`.
+A frozen spinner in a transcript whose process is gone is the thing that was
+replaced.
+
+**Not claimed:** the token figures are pi's own and `estimated` in its own words,
+printed without being checked; and a compaction in a mode that is *not* on screen
+is announced nowhere but that mode's own transcript — the same limit a tool card
+lives under, with the status row saying only that the mode is working.
+
 
 ---
 

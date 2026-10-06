@@ -6,6 +6,7 @@
 //! *types* land in `Unknown`, so additive protocol changes are harmless. Renamed/removed fields
 //! show up as parse errors; log them loudly (see `parse`).
 
+use crate::components::compaction::{CompactionState, token_delta};
 use crate::components::input::{InputAction, InputState, inner_width};
 use crate::session::view::SessionView;
 use crate::session::{
@@ -229,11 +230,16 @@ fn print_json_value_to_string(v: &Value) -> String {
 /// **What looprs-guh (the status row) took from this enum: nothing.** That is the
 /// honest label, not an oversight. The row is one line and its `Show` list is
 /// mode / loop step / bead / liveness / last error / key hints. Thinking deltas,
-/// compaction phases, pi's own retry ladder and the per-content-block indices are
-/// none of those, and pushing them in would cost the row the things that are. What
-/// the user gets instead is that a long pause is no longer *unattributed*: the
-/// row says the run is live and how long it has been going, which is the question
-/// those variants are usually standing in for.
+/// pi's own retry ladder and the per-content-block indices are none of those,
+/// and pushing them in would cost the row the things that are. What the user gets
+/// instead is that a long pause is no longer *unattributed*: the row says the run
+/// is live and how long it has been going, which is the question those variants
+/// are usually standing in for.
+///
+/// Compaction went somewhere else rather than into the row: it gets a live card of
+/// its own (`components::compaction`), because "the session is summarising its
+/// own history" is an event with a start and an end, not a segment of a
+/// one-line status.
 ///
 /// They stay for the reason they were written down at all: this enum is the
 /// harness's record of pi's RPC wire format, and a field captured here is a field
@@ -316,22 +322,36 @@ pub enum PiEvent {
         #[serde(default)]
         final_error: Option<String>,
     },
-    /// Context compaction began. Until the UI can say "compacting…" (looprs-guh)
-    /// this arrives as an unexplained pause, which is the bug class the ticket is
-    /// about — so the reason is parsed and kept, not dropped.
-    #[allow(dead_code)] // wire-format record; would surface as: "compacting: <reason>")
+    /// Context compaction began — pi has paused the run to summarise old messages
+    /// so the conversation fits the context window.
+    ///
+    /// Surfaced as a live card (`⠹ compacting context · threshold`), for the
+    /// reason the comment on this variant always said it needed: without it the
+    /// run looks hung for however long the summarisation call takes, and the one
+    /// question a frozen transcript provokes is "is it working?".
     CompactionStart {
+        /// `"manual"` (`/compact`), `"threshold"` (context nearly full) or
+        /// `"overflow"` (the provider rejected the prompt). Printed on the card:
+        /// "why did my run stop" has a different answer for each.
         reason: String,
     },
     /// Compaction finished, was aborted, or failed. `aborted`/`error_message` are
-    /// the two things a user must not have to guess about.
-    #[allow(dead_code)]
-    // wire-format record; would surface as: aborted/failed compaction is loud)
+    /// the two things a user must not have to guess about, so both are on the
+    /// card — grey for a cancel, red with the message for a failure.
     CompactionEnd {
+        /// The reason from the matching `compaction_start`, repeated on the wire.
+        /// Used only when the end arrived with no card open, so that card can say
+        /// what was being done rather than nothing.
+        #[serde(default)]
+        reason: Option<String>,
         #[serde(default)]
         aborted: bool,
         #[serde(default)]
         error_message: Option<String>,
+        /// What the compaction reported on success. `None` when it was aborted or
+        /// failed — the wire says the result is absent in exactly those cases.
+        #[serde(default)]
+        result: Option<CompactionResult>,
     },
     /// An extension in the pi child raised. Not the harness's fault, but it is the
     /// harness's screen, so the path and the message are recorded now that the
@@ -344,6 +364,30 @@ pub enum PiEvent {
     },
     #[serde(other)]
     Unknown, // must be last; swallows any event type you haven't modeled
+}
+
+/// The `result` of a successful `compaction_end`.
+///
+/// Two fields are modelled because two are rendered: the card prints what the
+/// compaction freed (`150k → 32k`), and that is the whole of what this harness
+/// wants from the record.
+///
+/// What is deliberately **not** here: `summary`, `firstKeptEntryId` and the
+/// summarisation call's own `usage`. The first two live in the session file and
+/// have no reader on this side of the wire; and folding that `usage` into the
+/// status row's window would be counting a cost pi has already charged to the
+/// run it paused — the same double-count trap the per-`message_update` `usage`
+/// is avoided for (see [`crate::session::view::Tokens::add`]).
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionResult {
+    /// Context size before the summarisation, in tokens.
+    #[serde(default)]
+    pub tokens_before: Option<u64>,
+    /// What pi estimates it is afterwards. `estimated`, not measured: pi's own
+    /// word for it, kept in the field name so nobody reads it as an exact figure.
+    #[serde(default)]
+    pub estimated_tokens_after: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -687,14 +731,21 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// How many tool rows the live region is carrying right now.
+    /// How many live cards the live region is carrying right now — open tool calls
+    /// and any open compaction.
     ///
     /// The frame paints at most [`crate::viewport::MAX_TOOL_ROWS`] of them and the
     /// height policy budgets the same cap, so a wall of concurrent calls cannot
     /// take the live text's rows — or the input box's — away (looprs-afw).
-    pub fn live_tool_rows(&self) -> u16 {
+    ///
+    /// Compaction shares that budget rather than getting a row of its own, which is
+    /// safe for the one case where it could be squeezed out: pi compacts in
+    /// `prepareNextTurn`, after a tool batch has finished and reported, so a
+    /// compaction is not competing with four live tools for the fifth row. If that
+    /// ever stops being true, the fix is the cap's ordering, not a second band.
+    pub fn live_card_rows(&self) -> u16 {
         self.active_view()
-            .map(|v| v.transcript.open_tools().count() as u16)
+            .map(|v| v.transcript.open_cards().count() as u16)
             .unwrap_or(0)
     }
 
@@ -1232,7 +1283,59 @@ fn apply_pi(view: &mut SessionView, ev: PiEvent) {
         // beads session, and this arm must not grow an opinion about it: the same
         // `AgentSettled` arrives from Pi chat, where there is no loop to advance.
         PiEvent::AgentSettled => view.chat = ChatState::Stopped,
-        // AutoRetryStart / CompactionStart: show a status note if you want one
+        // Compaction: a card, exactly like a tool's, because it is the same shape
+        // of pause — a paid-for LLM call in the middle of the run that prints
+        // nothing of its own. Without the card the run looks hung for as long as
+        // the summary takes, which is the one thing the pause is not.
+        PiEvent::CompactionStart { reason } => {
+            view.chat = ChatState::Compacting;
+            view.transcript.start_compaction(reason);
+        }
+        // Three endings, and the card says which: freed something, was cancelled,
+        // or failed. `aborted` is not painted as a failure because it was not one
+        // — the user pressed Esc — and a cancel that looks like a crash teaches
+        // the wrong lesson about a key they chose to press.
+        PiEvent::CompactionEnd {
+            reason,
+            aborted,
+            error_message,
+            result,
+        } => {
+            let (state, detail) = if aborted {
+                (CompactionState::Aborted, String::new())
+            } else if let Some(err) = error_message {
+                (CompactionState::Failed, err)
+            } else {
+                // pi reports the two figures on a successful compaction only when
+                // it has them; with either missing the card says "compacted" and
+                // stops rather than putting a made-up number on the row.
+                let freed = result
+                    .as_ref()
+                    .and_then(|r| Some((r.tokens_before?, r.estimated_tokens_after?)))
+                    .map(|(before, after)| token_delta(before, after))
+                    .unwrap_or_default();
+                (CompactionState::Done, freed)
+            };
+            // The card closes and the live region hands the row back: whatever
+            // comes next is another event's business (`MessageUpdate` will set
+            // `Chat` again when the run resumes). Leaving `Compacting` set would
+            // keep a spinner turning over work that has finished.
+            //
+            // An `end` with no open card is recorded rather than swallowed — it
+            // happened, and a compaction that finishes unseen is the same bug in
+            // the other direction.
+            if !view.transcript.finish_compaction(state, detail.clone()) {
+                view.transcript.push_done(
+                    MessageKind::Compaction {
+                        reason: reason.unwrap_or_default(),
+                        state,
+                    },
+                    detail,
+                );
+            }
+            view.chat = ChatState::Stopped;
+        }
+        // AutoRetryStart / AutoRetryEnd: show a status note if you want one
         _ => {}
     }
 }
@@ -1707,6 +1810,235 @@ mod tests {
 
         app.active = TerminalType::Beeds;
         assert_eq!(app.chat_state(), ChatState::Tool);
+    }
+
+    /// A compaction is a separate LLM call that pauses the run and prints nothing
+    /// of its own — ten to sixty seconds of a transcript that has stopped moving,
+    /// which is exactly the shape of "is it hung?". So the start event must put a
+    /// row on the screen by itself.
+    #[test]
+    fn a_compaction_shows_a_live_card_while_it_runs() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        app.update(Msg::Agent {
+            session: pi_id(),
+            event: PiEvent::CompactionStart {
+                reason: "threshold".into(),
+            },
+        });
+
+        assert_eq!(
+            app.chat_state(),
+            ChatState::Compacting,
+            "the live region is animating for it, not for stale prose"
+        );
+        assert_eq!(
+            app.live_card_rows(),
+            1,
+            "and the height policy is told to budget its row"
+        );
+
+        let card = app
+            .view(TerminalType::Pi)
+            .unwrap()
+            .transcript
+            .open_cards()
+            .last()
+            .expect("the card is open");
+        let line = crate::components::card::card_line(card, 0).to_string();
+        assert!(line.contains("compacting context"), "{line}");
+        assert!(line.contains("threshold"), "and why: {line}");
+    }
+
+    /// `compaction_start` on its own is only half the feedback. The end is the
+    /// half that says whether it worked, and pi says three different things there
+    /// — freed something, cancelled, failed — each of which has to reach the
+    /// scrollback as its own line once the card closes.
+    #[test]
+    fn a_finished_compaction_reaches_the_scrollback_with_what_it_freed() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        app.on_pi(
+            pi_id(),
+            PiEvent::CompactionStart {
+                reason: "threshold".into(),
+            },
+        );
+        app.on_pi(
+            pi_id(),
+            PiEvent::CompactionEnd {
+                reason: Some("threshold".into()),
+                aborted: false,
+                error_message: None,
+                result: Some(CompactionResult {
+                    tokens_before: Some(150_000),
+                    estimated_tokens_after: Some(32_000),
+                }),
+            },
+        );
+
+        assert_eq!(
+            app.live_card_rows(),
+            0,
+            "the card is closed, so it stops taking live rows"
+        );
+        assert_eq!(
+            app.chat_state(),
+            ChatState::Stopped,
+            "and nothing is left spinning over work that has finished"
+        );
+
+        let flushed: String = app.flush_active(60).iter().map(|l| l.to_string()).collect();
+        assert!(flushed.contains("context compacted"), "{flushed:?}");
+        assert!(
+            flushed.contains("150.0k → 32.0k"),
+            "the numbers pi reported are the point of the row: {flushed:?}"
+        );
+    }
+
+    /// Cancelled and failed are the two endings a user must not have to guess
+    /// about, and they are not the same sentence: `aborted: true` means the user
+    /// pressed Esc, `errorMessage` means the summarisation call broke.
+    #[test]
+    fn an_aborted_compaction_says_aborted_and_a_failed_one_says_why() {
+        let (mut app, _rx) = app_with(TerminalType::Beeds);
+        app.on_pi(
+            beads_id(),
+            PiEvent::CompactionEnd {
+                reason: Some("manual".into()),
+                aborted: true,
+                error_message: None,
+                result: None,
+            },
+        );
+        let aborted: String = app.flush_active(60).iter().map(|l| l.to_string()).collect();
+        assert!(aborted.contains("compaction aborted"), "{aborted:?}");
+        assert!(aborted.contains("manual"), "{aborted:?}");
+
+        app.on_pi(
+            beads_id(),
+            PiEvent::CompactionEnd {
+                reason: Some("overflow".into()),
+                aborted: false,
+                error_message: Some("provider refused the summary".into()),
+                result: None,
+            },
+        );
+        let failed: String = app.flush_active(60).iter().map(|l| l.to_string()).collect();
+        assert!(
+            failed.contains("provider refused the summary"),
+            "pi's own words, not a shrug: {failed:?}"
+        );
+        assert!(
+            !aborted.contains("provider refused"),
+            "and the two endings are two separate rows"
+        );
+    }
+
+    /// An `end` whose `start` never arrived (a reconnect, a dropped line) is still
+    /// an event that happened. Swallowing it because there was nothing to close is
+    /// the same silence this whole path exists to remove.
+    #[test]
+    fn a_compaction_end_with_no_open_card_is_recorded_anyway() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        app.on_pi(
+            pi_id(),
+            PiEvent::CompactionEnd {
+                reason: Some("overflow".into()),
+                aborted: false,
+                error_message: None,
+                result: None,
+            },
+        );
+        let flushed: String = app.flush_active(60).iter().map(|l| l.to_string()).collect();
+        assert!(
+            flushed.contains("context compacted · overflow"),
+            "the reason comes off the end record when there was no start to say it: {flushed:?}"
+        );
+    }
+
+    /// The card must not hold the transcript hostage — but while it is open it
+    /// legitimately owns the flush cursor, the same way a running tool does. What
+    /// matters is that closing it releases everything queued behind it.
+    #[test]
+    fn closing_the_compaction_card_releases_what_came_behind_it() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        app.on_pi(
+            pi_id(),
+            PiEvent::CompactionStart {
+                reason: "threshold".into(),
+            },
+        );
+        app.on_pi(
+            pi_id(),
+            PiEvent::MessageUpdate {
+                assistant_message_event: AssistantEvent::TextDelta {
+                    content_index: 0,
+                    delta: "text after the summary\n\n".into(),
+                },
+            },
+        );
+        assert!(
+            app.flush_active(60).is_empty(),
+            "the open card is the cursor, and nothing past it goes out yet"
+        );
+
+        app.on_pi(
+            pi_id(),
+            PiEvent::CompactionEnd {
+                reason: Some("threshold".into()),
+                aborted: false,
+                error_message: None,
+                result: None,
+            },
+        );
+        let flushed: String = app.flush_active(60).iter().map(|l| l.to_string()).collect();
+        assert!(flushed.contains("context compacted"), "{flushed:?}");
+        assert!(
+            flushed.contains("text after the summary"),
+            "and the run's own text follows it into the scrollback: {flushed:?}"
+        );
+    }
+
+    /// The wire shape, pinned: `reason` is required on the start, and optional on
+    /// the end, where `result` is absent unless the compaction succeeded.
+    #[test]
+    fn the_compaction_wire_format_parses() {
+        let s = parse(&serde_json::json!({"type":"compaction_start","reason":"overflow"})).unwrap();
+        assert!(matches!(s, PiEvent::CompactionStart { reason } if reason == "overflow"));
+
+        let e = parse(&serde_json::json!({
+            "type": "compaction_end",
+            "reason": "threshold",
+            "result": { "summary": "...", "firstKeptEntryId": "abc", "tokensBefore": 150000, "estimatedTokensAfter": 32000 },
+            "aborted": false,
+            "willRetry": true
+        }))
+        .unwrap();
+        match e {
+            PiEvent::CompactionEnd {
+                reason,
+                aborted,
+                error_message,
+                result,
+            } => {
+                assert_eq!(reason.as_deref(), Some("threshold"));
+                assert!(!aborted);
+                assert!(error_message.is_none());
+                let r = result.expect("the result was parsed");
+                assert_eq!(r.tokens_before, Some(150_000));
+                assert_eq!(r.estimated_tokens_after, Some(32_000));
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+
+        // Aborted: no `result` on the wire at all, and `aborted: true`.
+        assert!(matches!(
+            parse(&serde_json::json!({"type":"compaction_end","aborted":true})).unwrap(),
+            PiEvent::CompactionEnd {
+                aborted: true,
+                result: None,
+                ..
+            }
+        ));
     }
 
     /// Death must seal: the text a dead session left un-flushed has to reach the
