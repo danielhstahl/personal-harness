@@ -736,6 +736,17 @@ pub struct App {
     /// [`Self::clipboard`], and for the same reason: the App builds no file path
     /// of its own, so "where did my transcript go" has one answer per run.
     transcript_sink: Arc<dyn crate::services::transcript_file::TranscriptSink>,
+    /// Where each session's transcript goes **as it finalises**
+    /// (looprs-pdl.7, ADR-0004 R2).
+    ///
+    /// One handle shared by every view, injected from `main` like the clipboard
+    /// and the dump sink. It is not the same thing as `transcript_sink`: that one
+    /// answers "write me this transcript now" (`Ctrl-S t`) into a fresh
+    /// timestamped file, this one is the run's own record, appended entry by
+    /// entry, whether or not anyone ever asks. The App holds it so the marker row
+    /// on a trimmed scrollback can name the file where the trimmed content still
+    /// lives, and so `close` has one caller on the way out.
+    journal: Arc<dyn crate::services::journal::Journal>,
     /// The dump we have handed to that sink and are waiting to hear about.
     pending_dump: Option<PendingDump>,
     /// The copy chord's prefix state (looprs-pdl.13).
@@ -969,6 +980,7 @@ impl App {
             pending_copy: None,
             toast: None,
             transcript_sink: Arc::new(crate::services::transcript_file::Noop),
+            journal: crate::services::journal::default_journal(),
             pending_dump: None,
             copy_chord: CopyChord::Off,
             copy_chord_at: now,
@@ -984,10 +996,19 @@ impl App {
     /// "always seal"; the first is `Msg::SessionDown`. Together they keep the
     /// transcript correct whether or not the dying session got to say goodbye.
     pub fn view_mut(&mut self, id: SessionId) -> &mut SessionView {
+        if !self.views.contains_key(&id.mode) {
+            // A view is born knowing where its transcript goes. Injected at
+            // creation rather than picked up by a later sweep, so there is no
+            // window in which a view exists that journalled nothing — and no
+            // early content that quietly missed the file.
+            let mut fresh = SessionView::new(id);
+            fresh.set_journal(self.journal.clone());
+            self.views.insert(id.mode, fresh);
+        }
         let v = self
             .views
-            .entry(id.mode)
-            .or_insert_with(|| SessionView::new(id));
+            .get_mut(&id.mode)
+            .expect("the view for this mode was just created");
         if v.session != id {
             v.seal();
             v.session = id;
@@ -1062,10 +1083,11 @@ impl App {
     /// selection shift down and the highlight starts pointing at the message
     /// *after* the one the user dragged across, which is worse than losing the
     /// selection. `Selection::entries_evicted` is the same mapping the store
-    /// was given, fed the same two numbers from the same place
-    /// (`SessionView::take_trims`), and it clears the selection when the
-    /// eviction ate the anchor — the ticket's "a trim that ate the anchor",
-    /// wired rather than promised.
+    /// was given, fed the same number from the same place
+    /// (`SessionView::take_trims`), and it **clamps** rather than lies: a
+    /// selection whose earlier end was trimmed starts now at the oldest thing
+    /// still there, and the copy that follows reports the count of what actually
+    /// went (looprs-pdl.7).
     ///
     /// Called from [`Self::flush_active`], which the run loop calls inside the
     /// draw branch, so the selection cannot be drawn with stale addresses; and
@@ -1081,8 +1103,8 @@ impl App {
         let Some(v) = self.views.get_mut(&self.active) else {
             return;
         };
-        for (removed, notice_at) in v.take_trims() {
-            self.selection.entries_evicted(removed, notice_at);
+        for removed in v.take_trims() {
+            self.selection.entries_evicted(removed);
         }
     }
 
@@ -1209,6 +1231,26 @@ impl App {
         sink: Arc<dyn crate::services::transcript_file::TranscriptSink>,
     ) {
         self.transcript_sink = sink;
+    }
+
+    /// Replace the journal, and hand it to every view that already exists.
+    ///
+    /// Called once from `main`, before any session runs. Views created after this
+    /// get it from [`Self::view_mut`]; views that already existed get it here,
+    /// which is what keeps "every transcript goes to the same journal for the
+    /// whole run" true regardless of the order the App and the views were built
+    /// in (the tests build views first more often than not).
+    pub fn set_journal(&mut self, journal: Arc<dyn crate::services::journal::Journal>) {
+        self.journal = journal.clone();
+        for v in self.views.values_mut() {
+            v.set_journal(journal.clone());
+        }
+    }
+
+    /// The journal this run is using — for the shutdown drain, and for anything
+    /// that has to say where the transcript went.
+    pub fn journal(&self) -> Arc<dyn crate::services::journal::Journal> {
+        self.journal.clone()
     }
 
     /// The toast currently on screen.
@@ -2661,7 +2703,7 @@ fn apply_pi(view: &mut SessionView, ev: PiEvent) {
         }
         // user messages are already echoed locally on submit; ignore pi's copy
         PiEvent::MessageEnd { message } if message.role == "assistant" => {
-            view.transcript.finish_last();
+            view.finish_stream();
             // The authoritative per-message accounting, folded into this view's
             // window. Only ever here, and never from `message_update`'s `usage`,
             // because that figure is cumulative for the message still streaming —
@@ -2677,9 +2719,10 @@ fn apply_pi(view: &mut SessionView, ev: PiEvent) {
             args,
         } => {
             view.chat = ChatState::Tool;
-            // upsert: fills in the args
-            view.transcript
-                .start_tool(tool_call_id, tool_name, print_json_value_to_string(&args));
+            // upsert: fills in the args. Through the view, not into the transcript:
+            // a tool's argument blob is content like any other, and the write door
+            // that has to run for it (cap, journal) is the view's.
+            view.start_tool(tool_call_id, tool_name, print_json_value_to_string(&args));
         }
         // PiEvent::ToolExecutionUpdate { .. } => stream partial output into the row if you want it
         PiEvent::ToolExecutionEnd {
@@ -2687,8 +2730,10 @@ fn apply_pi(view: &mut SessionView, ev: PiEvent) {
             result,
             is_error,
         } => {
-            view.transcript
-                .finish_tool(tool_call_id, result.text(), is_error);
+            // The tool's result is the single biggest thing a beads pass writes,
+            // and until this went through the view it was also the one thing the
+            // buffer cap never saw. See `SessionView::start_tool`.
+            view.finish_tool(tool_call_id, result.text(), is_error);
         }
         // Settled: this session has no more automatic work, so its live region stops.
         // That is *all* this event means here. Whether it is also "the beads pass
@@ -2702,7 +2747,7 @@ fn apply_pi(view: &mut SessionView, ev: PiEvent) {
         // the summary takes, which is the one thing the pause is not.
         PiEvent::CompactionStart { reason } => {
             view.chat = ChatState::Compacting;
-            view.transcript.start_compaction(reason);
+            view.start_compaction(reason);
         }
         // Three endings, and the card says which: freed something, was cancelled,
         // or failed. `aborted` is not painted as a failure because it was not one
@@ -2737,8 +2782,8 @@ fn apply_pi(view: &mut SessionView, ev: PiEvent) {
             // An `end` with no open card is recorded rather than swallowed — it
             // happened, and a compaction that finishes unseen is the same bug in
             // the other direction.
-            if !view.transcript.finish_compaction(state, detail.clone()) {
-                view.transcript.push_done(
+            if !view.finish_compaction(state, detail.clone()) {
+                view.push_note(
                     MessageKind::Compaction {
                         reason: reason.unwrap_or_default(),
                         state,

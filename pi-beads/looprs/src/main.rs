@@ -1,5 +1,7 @@
 mod app;
 mod components;
+#[cfg(test)]
+mod measure;
 mod screen;
 mod services;
 mod session;
@@ -238,6 +240,16 @@ async fn run(
     // transcript rather than a tutorial.
     let transcript_sink = crate::services::transcript_file::transcript_sink_from_env();
     app.set_transcript_sink(transcript_sink);
+    // …and the journal, which is not the same thing and is not a duplicate of
+    // it. `Ctrl-S t` answers "give me this transcript, now" into a fresh file
+    // the user asked for; the journal answers "what did the loop say at 3am"
+    // for a run nobody was watching, and it answers it whether or not this
+    // process survives — because it is appended and flushed entry by entry while
+    // the session runs, not on the exit path. That is ADR-0004 R2, and it is
+    // also the thing that makes a *bounded* scrollback survivable: the store
+    // drops with a marker, and the marker names the file that kept everything.
+    let journal = crate::services::journal::journal_from_env();
+    app.set_journal(journal);
     // Tell the sessions the size they are being shown at before anyone runs a
     // command. A Bash shell spawned later still inherits this: `BashTask::resize`
     // records the size even with no shell up yet, and uses it for the pty it
@@ -418,6 +430,15 @@ async fn run(
             "sessions were still talking after {drain_budget:?}; leaving them where they are"
         );
     }
+
+    // (3b) The journal drains before anything else goes. Note what this is and
+    // is not: it is a *drain* of work already handed over during the run, not
+    // a transcript written on the exit path — R3 forbids the latter, and R2 put
+    // the durability on the per-entry flush precisely so that a run which never
+    // reaches this line is no less durable than one that does. The bound is
+    // there because a volume that has stopped answering is not a reason to hang
+    // an app the user already told to leave.
+    app.journal().close();
 
     // (4) Every mode that was switched on comes back off, newest first, with raw
     // mode last because the bytes above are written through a tty that is only

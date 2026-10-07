@@ -39,6 +39,35 @@
 //! * `pending` — rows that arrived while unpinned, so the "N new" affordance can
 //!   say so out loud rather than let the user take a held view for the tail.
 //!
+//! # The bound, and what it is bound in
+//!
+//! The store is the transcript, and the transcript is now ours to bound
+//! (looprs-pdl.7). Two things about that bound are load-bearing:
+//!
+//! * **Bytes, not rows.** `4096 rows` says nothing about size: a rendered
+//!   markdown row of prose and a 4 KB row of base64 both count one, and the
+//!   second carries orders of magnitude more structure — one [`CellSpan`] per
+//!   cluster, a `Vec<Span>` per line, a `String` per span. The cap is therefore
+//!   in **retained bytes**, and a row's retained bytes are its own text plus
+//!   [`ROW_STRUCT_BYTES`], the per-row structure measured in
+//!   `spikes/results/scrollback-cost.log`. Counting the structure is what makes
+//!   the cap still mean something for a transcript of a million empty rows.
+//! * **The trim is loud.** Content that goes off the head of the store leaves a
+//!   [`RowKind::TrimMarker`] row in its place: `scrollback trimmed: N earlier
+//!   lines dropped`, plus the journal path when the app has one to give
+//!   ([`Scrollback::set_trim_hint`]). A scrollback that silently starts halfway
+//!   through an answer is worse than a shorter one, because the user cannot tell
+//!   "beginning of session" from "beginning of what was kept" — and the second
+//!   one is a loss.
+//!
+//! The trim runs from the **oldest end and in whole entries** wherever it can, so
+//! what remains starts at a boundary the source wrote rather than in the middle
+//! of a paragraph. The one case it cannot is a single entry bigger than the whole
+//! cap; there it falls back to whole *rows* of that entry, keeping the newest one,
+//! because letting one base64 dump hold the store open past the cap is the
+//! unbounded-Vec failure the cap exists to close, and the marker reports the
+//! boundary either way.
+//!
 //! # Re-wrapping on resize
 //!
 //! A resize re-renders the transcript at the new width and *replaces* the rows
@@ -72,25 +101,79 @@ pub enum RowEnd {
     Soft,
 }
 
-/// How many display rows a view keeps by default.
+/// How many **bytes** of rendered rows a view keeps by default.
 ///
-/// "Several screens' worth at every window size we support", which is about the
-/// most a human scrolls through in one sitting and small enough that the
-/// rendered form of a long run is measured in hundreds of kilobytes rather than
-/// in megabytes. The *text* is capped separately, per view, by the buffer cap in
-/// [`crate::session::view`]; this caps the rendered rows, which are worth
-/// several allocations per cell of text.
-pub const DEFAULT_MAX_ROWS: usize = 4096;
+/// The default cap on **retained rendered content** for one view: 32 MiB.
+///
+/// Chosen from the measured working set of real long passes, not picked.
+/// [`crate::measure`] replays twelve real beads tickets' worth of `pi` session
+/// transcript (answers, thinking, and the tool results which are most of it)
+/// through the real flusher at 100 columns with a live-heap-counting allocator;
+/// `spikes/results/scrollback-cost.log` is that run. Two numbers decide this
+/// one: such a pass renders ~30k rows and 2.6 MiB of visible text, and every
+/// one of those rows costs ~5.6 KiB of live heap ([`ROW_STRUCT_BYTES`]) — so
+/// unbounded, the store held 166 MiB of work nobody was looking at.
+///
+/// 32 MiB is about **5.8k retained rows** at the measured shape: roughly 145
+/// screens of scrollback at 40 rows a screen, ~0.5 MiB of visible text, about
+/// a fifth of a long pass. That is the trade the ticket asks for — enough
+/// history that scrolling back reaches the answer you were reading, and a
+/// ceiling that can be stated in one number and holds on the worst transcript
+/// rather than the average one.
+///
+/// `0` means unbounded, by the convention [`Scrollback::set_cap`] keeps.
+pub const DEFAULT_RETAINED_BYTES: usize = 32 * 1024 * 1024;
+
+/// What one retained row costs beyond its own text: 5,760 bytes.
+///
+/// Measured, not guessed, because the gap is not a small one. A row is not its
+/// text — the same characters exist as owned span strings, as a vector of
+/// styled cells, and as the style runs that map one onto the other — so the
+/// live heap behind a rendered row is dominated by that structure and not by
+/// the sentence on it. The measured slope across the working set above is
+/// **5,642 B of heap per rendered row against an average of 88 B of text per
+/// row** (166.6 MiB of store for 30,239 rows).
+///
+/// Rounded *up* to 5,760 rather than down to the nearest KiB, for the reason
+/// the cap exists at all: a charge smaller than the truth is a cap larger than
+/// the number on it says, and the whole point of the number is that it holds.
+///
+/// `DisplayRow::charged` adds this to the row's text length, which is what
+/// makes the cap a bound on the heap the store actually holds rather than on
+/// the text it happens to contain.
+pub const ROW_STRUCT_BYTES: usize = 5_760;
+
+/// What a row **is**: transcript, or the store's own bookkeeping about the
+/// transcript.
+///
+/// The distinction is not cosmetic. A trim marker is *about* the transcript and
+/// is not *of* it, so it must never be selectable (ADR-0004 R16: chrome is not
+/// transcript — the status row and the card band are not in the store at all, so
+/// they cannot be hit; this is the one piece of chrome that has to live in the
+/// store to scroll with the content, and so has to say what it is), and it must
+/// never be renumbered by an entry eviction, because it belongs to no entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowKind {
+    /// A rendered line of the transcript.
+    Transcript,
+    /// The `scrollback trimmed: …` row, kept at the head of what was kept.
+    TrimMarker,
+}
 
 /// One row of the transcript as it is displayed.
 #[derive(Clone, Debug)]
 pub struct DisplayRow {
+    /// Transcript, or the store's own `scrollback trimmed: …` row. See
+    /// [`RowKind`] for why the type has to know.
+    pub kind: RowKind,
     /// Index of the transcript entry this row was rendered from.
     ///
     /// Meaningful against the transcript the row was rendered *from*, and
     /// re-based when that transcript is compacted
     /// ([`Scrollback::entries_evicted`]) — which is the one way it can go
-    /// stale, and the one way it is kept honest.
+    /// stale, and the one way it is kept honest. `usize::MAX` for a trim marker,
+    /// which belongs to no entry; nothing should read it except
+    /// [`Self::is_trim_marker`], which reads the kind instead.
     pub entry: usize,
     /// Which logical line within that entry (0-based).
     ///
@@ -118,12 +201,63 @@ impl DisplayRow {
     fn new(entry: usize, logical: usize, start: usize, end: RowEnd, line: Line<'static>) -> Self {
         let cells = CellMap::of(&plain(&line));
         Self {
+            kind: RowKind::Transcript,
             entry,
             logical,
             start,
             end,
             line,
             cells,
+        }
+    }
+
+    /// The head-of-store marker: `scrollback trimmed: N earlier lines dropped`,
+    /// with the journal path appended when the app has one to give.
+    ///
+    /// Built here rather than passed in as a finished `Line` so the wording, the
+    /// thousands separator and the style have exactly one definition — the same
+    /// reason `DumpOutcome::toast` builds its own string.
+    pub fn trim_marker(dropped_lines: usize, hint: Option<&str>) -> Self {
+        let line = Line::styled(
+            marker_text(dropped_lines, hint),
+            crate::theme::styles::trim_marker_style(),
+        );
+        let cells = CellMap::of(&plain(&line));
+        Self {
+            kind: RowKind::TrimMarker,
+            // Not from an entry, and never renumbered as if it were. The store
+            // keeps the marker out of every entry-addressed path: `span_on`,
+            // `hit`, `resting_anchor` and the eviction renumbering all test the
+            // kind first.
+            entry: usize::MAX,
+            logical: 0,
+            start: 0,
+            end: RowEnd::Hard,
+            line,
+            cells,
+        }
+    }
+
+    /// Is this the trim marker rather than content?
+    ///
+    /// The one test every "is this selectable / renumberable / counted" question
+    /// asks, so the answer is one function rather than four opinions.
+    pub fn is_trim_marker(&self) -> bool {
+        self.kind == RowKind::TrimMarker
+    }
+
+    /// What this row costs the cap: its own text plus the per-row structure.
+    ///
+    /// The text length is read off the cell map rather than re-plain'd, because
+    /// the map *partitioned* exactly that text — see [`CellMap::text_len`]. A
+    /// marker returns 0: the cap bounds *content*, and the marker is what the
+    /// store says about the content it dropped, so it must not be able to push
+    /// content out of the store.
+    fn charged(&self) -> usize {
+        if self.is_trim_marker() {
+            0
+        } else {
+            self.cells.text_len() + ROW_STRUCT_BYTES
         }
     }
 
@@ -235,6 +369,13 @@ pub fn paste_text<'a>(rows: impl IntoIterator<Item = &'a DisplayRow>) -> String 
 pub fn paste_slices<'a>(slices: impl IntoIterator<Item = RowSlice<'a>>) -> String {
     let mut out = String::new();
     for s in slices {
+        // Chrome never pastes. A selection can never *contain* the marker (it is
+        // not hittable, not selectable), so this only ever fires for a caller
+        // that hands the whole store over — and pasting the store's own
+        // bookkeeping into the user's clipboard is not what they meant.
+        if s.row.is_trim_marker() {
+            continue;
+        }
         out.push_str(&s.text());
         if s.row.end == RowEnd::Hard {
             out.push('\n');
@@ -381,29 +522,86 @@ pub struct Scrollback {
     pinned: bool,
     /// Rows that arrived while unpinned.
     pending: usize,
-    max_rows: usize,
-    /// Rows this cap has thrown away, so the trim is a counted thing rather than
-    /// an invisible one (looprs-pdl.7 reads it).
+    /// The cap, in retained bytes. `0` means unbounded — the same convention the
+    /// transcript buffer cap in [`crate::session::view`] uses.
+    max_bytes: usize,
+    /// What the rows in `rows` currently cost, in the cap's unit
+    /// ([`DisplayRow::charged`]). Kept as a running sum rather than recomputed
+    /// per push because the cap is checked per push and the store can be long;
+    /// [`Self::recount`] is the one place it is rebuilt from scratch, and it runs
+    /// wherever `rows` is replaced wholesale.
+    retained: usize,
+    /// The head of a line this store dropped but did not finish dropping.
+    ///
+    /// A row-level trim (the one-entry-bigger-than-the-cap case) cuts a logical
+    /// line in half: its head goes, its tail stays on the kept side. That loss
+    /// is counted when the head goes, and without this the tail would be counted
+    /// again on its way out — one line reported twice, which is the kind of
+    /// number that makes a reader stop trusting the marker. Cleared whenever the
+    /// store's head moves off that line.
+    front_line_counted: Option<(usize, usize)>,
+    /// Content lines this store has thrown away, so the trim is a counted thing
+    /// rather than an invisible one. Lines, not rows or bytes, because it is the
+    /// unit the reader of the marker thinks in: the marker answers "how much of
+    /// what I was reading is gone", and "lines" is what they were reading.
+    ///
+    /// Monotonic for the life of the store. A line is counted once by whichever
+    /// path dropped it: [`Self::trim`] counts the rows it drops, and
+    /// [`Self::entries_evicted`] is told how many lines the caller removed
+    /// because the caller knows whether this store ever rendered them.
     dropped: usize,
+    /// The second half of the marker: where the dropped content still is. Set by
+    /// the app from the journal path; `None` renders a shorter marker rather than
+    /// a marker that points at nothing.
+    trim_hint: Option<String>,
 }
 
 impl Scrollback {
     pub fn new(width: u16) -> Self {
-        Self::with_rows(width, DEFAULT_MAX_ROWS)
+        Self::with_cap(width, DEFAULT_RETAINED_BYTES)
     }
 
-    /// As [`Self::new`], with an explicit row cap (`0` = unbounded — the same
-    /// convention the byte cap in [`crate::session::view`] uses).
-    pub fn with_rows(width: u16, max_rows: usize) -> Self {
+    /// As [`Self::new`], with an explicit retained-bytes cap (`0` = unbounded —
+    /// the same convention the byte cap in [`crate::session::view`] uses).
+    pub fn with_cap(width: u16, max_bytes: usize) -> Self {
         Self {
             rows: Vec::new(),
             width,
             offset: 0,
             pinned: true,
             pending: 0,
-            max_rows,
+            max_bytes,
+            retained: 0,
             dropped: 0,
+            front_line_counted: None,
+            trim_hint: None,
         }
+    }
+
+    /// Change the cap, trimming immediately if the store is already over it.
+    ///
+    /// A measurement/test seam in the shipped shape: reaching the default cap by
+    /// ordinary means means rendering [`DEFAULT_RETAINED_BYTES`] of real content,
+    /// and a test that does that is a slow test nobody runs. The app never
+    /// retunes a live store, so nothing outside the test and measurement build
+    /// calls this.
+    #[allow(dead_code)] // consumer: crate::measure and this module's cap tests
+    pub fn set_cap(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes;
+        self.trim();
+    }
+
+    /// What the store currently retains, in the cap's unit.
+    #[allow(dead_code)] // consumer: crate::measure and this module's cap tests
+    pub fn retained_bytes(&self) -> usize {
+        self.retained
+    }
+
+    /// Say where the trimmed-away content can still be read. Appears on the
+    /// marker row; the app calls this once it knows the journal's path.
+    pub fn set_trim_hint(&mut self, hint: Option<String>) {
+        self.trim_hint = hint;
+        self.sync_marker();
     }
 
     /// The width the current rows were wrapped at. Differing from the window's
@@ -450,9 +648,13 @@ impl Scrollback {
         !self.pinned && self.pending > 0
     }
 
-    /// Rows the [`Self::max_rows`] cap has dropped.
-    #[allow(dead_code)] // consumer: looprs-pdl.7 (bounded scrollback reports what it trimmed); the row-cap test reads it meanwhile
-    pub fn dropped_rows(&self) -> usize {
+    /// Rows the trim has dropped, counted as the content lines they were.
+    ///
+    /// The marker's number, and the answer to "how much did I lose". Zero for a
+    /// store that has never trimmed, which is the same thing as "the head of this
+    /// scrollback is the head of the session".
+    #[allow(dead_code)] // consumer: crate::measure, the marker's tests, and the app's marker hint
+    pub fn dropped_lines(&self) -> usize {
         self.dropped
     }
 
@@ -475,7 +677,9 @@ impl Scrollback {
             // want when they scrolled up.
             self.offset += rows.len();
         }
-        self.rows.extend(rows_from_rendered(rows));
+        let made = rows_from_rendered(rows);
+        self.retained += made.iter().map(DisplayRow::charged).sum::<usize>();
+        self.rows.extend(made);
         self.trim();
     }
 
@@ -489,6 +693,12 @@ impl Scrollback {
         let anchor = self.resting_anchor();
         self.width = width;
         self.rows = rows_from_rendered(rendered);
+        self.recount();
+        // The rows were replaced wholesale, which threw the marker out with the
+        // old ones; `trim` puts it back along with whatever the new wrap costs
+        // over the cap. Doing it here rather than in the caller is what keeps
+        // "a trimmed store has a marker" true across a resize rather than true
+        // until the window moves.
         self.trim();
         if self.pinned {
             self.offset = 0;
@@ -522,6 +732,13 @@ impl Scrollback {
         }
         let end = self.rows.len().saturating_sub(self.offset);
         let idx = end.saturating_sub(1).min(self.rows.len() - 1);
+        // A view resting on the trim marker has no content under it to rest on:
+        // the marker is chrome, and chrome cannot be an anchor any more than the
+        // status row can. `rewrap` takes the "content is gone" branch, which
+        // holds the offset rather than inventing a position for it.
+        if self.rows[idx].is_trim_marker() {
+            return None;
+        }
         Some(self.rows[idx].anchor())
     }
 
@@ -611,8 +828,8 @@ impl Scrollback {
         &self.rows[start..end]
     }
 
-    /// The transcript was compacted: `removed` entries came off the front and a
-    /// one-line notice was inserted at `notice_at`. Follow the indices.
+    /// The transcript was compacted: `removed` entries came off the front, and
+    /// `lines` says how many content lines went with them. Follow the indices.
     ///
     /// A row whose entry is gone cannot be re-rendered, and a store that cannot
     /// re-render a row must not keep showing it: the next resize would drop it
@@ -621,50 +838,240 @@ impl Scrollback {
     /// same moment their entries do — and the rows that survive are renumbered,
     /// so `entry` still means *this* entry and not whatever now occupies the
     /// number it used to have.
-    pub fn entries_evicted(&mut self, removed: usize, notice_at: usize) {
+    ///
+    /// `lines` is passed in rather than read off the rows for one reason: a view
+    /// that is not on screen is not being flushed, so its store may never have
+    /// held rows for the entries the caller dropped, while the *content* was
+    /// still lost just the same. The caller knows how many lines of transcript
+    /// went; the store knows whether it ever had them, and reports the loss
+    /// either way.
+    pub fn entries_evicted(&mut self, removed: usize, lines: usize) {
         if removed == 0 {
             return;
         }
-        let map = |old: usize| -> Option<usize> {
-            if old < removed {
-                return None;
-            }
-            let shifted = old - removed;
-            // The notice took a slot at `notice_at`, so everything from there on
-            // is one further along than the bare shift says.
-            Some(if shifted >= notice_at {
-                shifted + 1
-            } else {
-                shifted
-            })
-        };
         // Rows are in entry order, so the rows to drop are exactly the leading
-        // run whose entries are gone.
-        let cut = self
-            .rows
-            .iter()
-            .take_while(|r| map(r.entry).is_none())
-            .count();
+        // run whose entries are gone — starting *past* the marker, which belongs
+        // to no entry and must not be eaten by an eviction, miscounted as
+        // content, or treated as the head of the entry run.
+        let start = usize::from(self.rows.first().is_some_and(|r| r.is_trim_marker()));
+        let cut = start
+            + self.rows[start..]
+                .iter()
+                .take_while(|r| r.entry < removed)
+                .count();
+        let dropped_here = self.count_dropped(start, cut);
+        let freed: usize = self.rows[..cut].iter().map(DisplayRow::charged).sum();
         self.rows.drain(..cut);
         for r in self.rows.iter_mut() {
-            if let Some(n) = map(r.entry) {
-                r.entry = n;
+            if !r.is_trim_marker() {
+                // Every surviving entry shifted down by exactly what came off the
+                // front. No notice entry is inserted any more (the marker is the
+                // notice, and it is the store's rather than the transcript's),
+                // so there is nothing else to adjust for.
+                r.entry -= removed;
             }
         }
+        self.retained = self.retained.saturating_sub(freed);
+        // The caller's count is the one that stands, but never a smaller one
+        // than the rows this store actually had: under-reporting a loss is the
+        // exact thing the marker exists to prevent.
+        self.dropped += lines.max(dropped_here);
+        self.sync_marker();
     }
 
+    /// Rebuild [`Self::retained`] from the rows themselves.
+    ///
+    /// The one place the running sum is made rather than maintained: correct by
+    /// construction, and only used where `rows` was replaced wholesale, so the
+    /// common path (a push under the cap) never pays the walk.
+    fn recount(&mut self) {
+        self.retained = self.rows.iter().map(DisplayRow::charged).sum();
+    }
+
+    /// Bring the store back under its cap, oldest end first, in whole entries
+    /// where that is possible.
+    ///
+    /// The walk starts at the tail rather than at the head because the question
+    /// "how much of the newest content fits?" is answerable in one pass from that
+    /// end, and it is the only question worth asking: the rows that fit are kept,
+    /// and everything older goes.
+    ///
+    /// Three cases, and they are worth naming because they are the three ways a
+    /// trim can be wrong:
+    ///
+    /// 1. **the aligned case** — the walk's cut is moved *back* to the start of
+    ///    the entry it landed in, so the store keeps that entry whole and the head
+    ///    of what remains is a boundary the source wrote, not a paragraph cut in
+    ///    half. This costs over the cap by up to one entry, which is what a bound
+    ///    on a projection means.
+    /// 2. **one entry bigger than the cap** — aligning cannot help, so the cut
+    ///    stays where the walk put it and the boundary is mid-entry. That is the
+    ///    "where possible" of the ticket, and the marker reports the lines dropped
+    ///    all the same; a base64 dump must not be able to hold the store open past
+    ///    the cap.
+    /// 3. **not even the newest row fits** — the newest row is kept anyway.
+    ///    A scrollback that throws away the line that just arrived is worse than
+    ///    one that is momentarily over its own bound, and there is nothing else
+    ///    on offer that is not a lie.
     fn trim(&mut self) {
-        if self.max_rows == 0 || self.rows.len() <= self.max_rows {
+        if self.max_bytes == 0 || self.retained <= self.max_bytes {
+            // Even with nothing over the cap, the marker has to be re-checked:
+            // `rewrap` replaces every row it stands on, and a store that lost
+            // content before the resize still lost it after.
+            self.sync_marker();
             return;
         }
-        let over = self.rows.len() - self.max_rows;
-        self.rows.drain(..over);
-        self.dropped += over;
-        // Nothing to do to `offset`: measured from the tail, so dropping rows off
-        // the front moves the content and leaves the view alone. A view anchored
-        // on a row that was just trimmed is re-found by `index_of_anchor` on the
-        // next re-wrap, which fails gently — see [`Self::rewrap`].
+        // The marker, if present, is at index 0 and is charged nothing: the cap
+        // bounds content, and the marker must never be able to push content out
+        // by taking room for itself.
+        let m = match self.rows.first() {
+            Some(r) if r.is_trim_marker() => 1,
+            _ => 0,
+        };
+        // Walk back from the tail, keeping as much as fits.
+        let mut kept = 0usize;
+        let mut first_fit = self.rows.len();
+        let mut i = self.rows.len();
+        while i > m {
+            let charged = self.rows[i - 1].charged();
+            if kept + charged > self.max_bytes {
+                break;
+            }
+            kept += charged;
+            first_fit = i - 1;
+            i -= 1;
+        }
+        // Case 3: nothing fits. Keep the newest row and let the marker say the
+        // rest went.
+        if first_fit == self.rows.len() {
+            first_fit = self.rows.len().saturating_sub(1);
+        }
+        // Case 1: align the cut back to the head of the entry the walk landed in,
+        // so a trimmed store starts at a boundary the source wrote.
+        let head_entry = self.rows[first_fit].entry;
+        let mut cut = first_fit;
+        while cut > m
+            && !self.rows[cut - 1].is_trim_marker()
+            && self.rows[cut - 1].entry == head_entry
+        {
+            cut -= 1;
+        }
+        // Case 2: if the aligned cut does not fit, fall back on the walk's own
+        // cut — whole rows of that entry, boundary mid-entry, cap intact.
+        let aligned_frees: usize = self.rows[m..cut].iter().map(DisplayRow::charged).sum();
+        if self.retained - aligned_frees > self.max_bytes {
+            cut = first_fit;
+        }
+        if cut <= m {
+            return;
+        }
+        let lines = self.count_dropped(m, cut);
+        self.dropped += lines;
+        self.rows.drain(m..cut);
+        self.recount();
+        self.sync_marker();
     }
+
+    /// How many content lines removing `rows[from..to)` costs, adjusted for the
+    /// one line that may already have been reported.
+    ///
+    /// The bookkeeping runs both ways, which is why it is one function rather
+    /// than a subtraction at each call site: this pass subtracts the count it
+    /// would be double-charging for a line whose head went earlier, and records
+    /// whether *this* cut is the one that leaves a line split so the next pass
+    /// can do the same. Only one line can straddle a boundary, so one `Option`
+    /// is the whole ledger.
+    fn count_dropped(&mut self, from: usize, to: usize) -> usize {
+        let dropped = &self.rows[from..to];
+        let last = dropped.last().map(|r| (r.entry, r.logical));
+        let mut lines = count_lines(dropped);
+        if last.is_some() && self.front_line_counted == last {
+            // This line's head was already reported; the rest of it going is not
+            // a second line lost.
+            lines = lines.saturating_sub(1);
+        }
+        self.front_line_counted = match (dropped.last(), self.rows.get(to)) {
+            (Some(d), Some(kept)) if (d.entry, d.logical) == (kept.entry, kept.logical) => {
+                Some((kept.entry, kept.logical))
+            }
+            _ => None,
+        };
+        lines
+    }
+
+    /// Keep the marker honest: present exactly when something has been dropped,
+    /// at index 0, worded for the current count and the current hint.
+    ///
+    /// The one writer of the marker row, so "a trimmed store shows the marker"
+    /// has a single owner that every trim path goes through — `trim`,
+    /// `entries_evicted` and `set_trim_hint` all call it, and none of them
+    /// words the row themselves.
+    fn sync_marker(&mut self) {
+        if self.dropped == 0 {
+            if self.rows.first().is_some_and(|r| r.is_trim_marker()) {
+                self.rows.remove(0);
+            }
+            return;
+        }
+        let text = marker_text(self.dropped, self.trim_hint.as_deref());
+        if let Some(first) = self.rows.first()
+            && first.is_trim_marker()
+            && first.to_string() == text
+        {
+            // Same sentence it already says: rebuilding it would allocate a
+            // `Line`, a `CellMap` and two `String`s per frame to change nothing.
+            return;
+        }
+        let marker = DisplayRow::trim_marker(self.dropped, self.trim_hint.as_deref());
+        if self.rows.first().is_some_and(|r| r.is_trim_marker()) {
+            self.rows[0] = marker;
+        } else {
+            // Inserting at the head moves no view: `offset` is measured from the
+            // tail, so the content on screen does not move and the user simply
+            // finds one more row above when they get there — which is the point.
+            self.rows.insert(0, marker);
+        }
+    }
+}
+
+/// The marker's sentence, in one place so the row and the tests that read it
+/// cannot drift apart on capitalisation, the separator, or the thousands.
+///
+/// `⌄` opens the line because the row is about what is *above* it, and the row
+/// the user is standing on when they read it is the top of what was kept.
+pub fn marker_text(dropped_lines: usize, hint: Option<&str>) -> String {
+    let mut s = format!(
+        "\u{2304} scrollback trimmed: {} earlier lines dropped",
+        crate::services::clipboard::thousands(dropped_lines)
+    );
+    if let Some(h) = hint {
+        s.push_str(" \u{00b7} full transcript: ");
+        s.push_str(h);
+    }
+    s
+}
+
+/// How many content lines a run of rows covers.
+///
+/// Distinct `(entry, logical)` pairs, which is what "a line of content" means in
+/// a store whose rows are *our* wrap of *their* lines: three soft-wrapped rows
+/// of one paragraph are one line dropped, not three. Counting rows instead would
+/// over-report the loss by the wrap ratio, which is the marker lying in the
+/// alarming direction.
+fn count_lines(rows: &[DisplayRow]) -> usize {
+    let mut n = 0usize;
+    let mut last: Option<(usize, usize)> = None;
+    for r in rows {
+        if r.is_trim_marker() {
+            continue;
+        }
+        let key = (r.entry, r.logical);
+        if last != Some(key) {
+            n += 1;
+            last = Some(key);
+        }
+    }
+    n
 }
 
 /// Turn the flusher's lines into display rows.
@@ -1057,22 +1464,231 @@ mod tests {
         assert_eq!(s.pending(), 1, "the same unseen rows are still unseen");
     }
 
-    // ───────────────────────────── caps ─────────────────────────────
+    // ─────────────────────── the cap, and what it trims ───────────────────────
 
-    /// The row cap trims the *oldest* and counts it.
+    /// Content rows only — the marker is not content, and every "what did the
+    /// store keep" question is a question about content.
+    fn content(s: &Scrollback) -> Vec<String> {
+        s.rows()
+            .iter()
+            .filter(|r| !r.is_trim_marker())
+            .map(|r| r.to_string())
+            .collect()
+    }
+
+    /// What a row of this text costs the cap: its text plus the structure it
+    /// drags behind it. Every cap in this suite is written with this rather than
+    /// a literal byte count, so the tests say what they mean in the same units
+    /// the cap does and do not rot when the measured constant moves.
+    fn cost(text: &str) -> usize {
+        text.len() + ROW_STRUCT_BYTES
+    }
+
+    /// The cap that holds exactly these rows and nothing more besides them.
+    fn cap_of(texts: &[&str]) -> usize {
+        texts.iter().map(|t| cost(t)).sum::<usize>() + 1
+    }
+
+    /// The cap is in **bytes** and it trims the **oldest whole entries**: the
+    /// unit is bytes because a row of base64 is not a row of prose, and the
+    /// boundary is an entry because a scrollback that starts mid-paragraph
+    /// reads like the transcript was cut up.
     #[test]
-    fn the_row_cap_drops_the_oldest_and_says_so() {
-        let mut s = Scrollback::with_rows(20, 3);
-        s.push((0..5).map(|i| hard(0, &format!("l{i}"))).collect());
-        assert_eq!(s.len(), 3);
-        assert_eq!(s.dropped_rows(), 2);
-        assert_eq!(lines(s.rows()), ["l2", "l3", "l4"]);
-        assert!(s.is_pinned(), "trimming the front does not move the view");
+    fn the_byte_cap_drops_oldest_entries_whole_and_says_so() {
+        // Room for two rows of this size and nothing more: the first entry fits
+        // exactly, and the second can only come in by taking the first out.
+        let cap = cap_of(&["aaaa", "bbbb"]);
+        let mut s = Scrollback::with_cap(20, cap);
+        s.push(vec![hard(0, "aaaa"), hard(0, "bbbb")]);
+        assert_eq!(
+            content(&s),
+            vec!["aaaa", "bbbb"],
+            "under the cap, nothing went"
+        );
+        assert_eq!(s.dropped_lines(), 0);
 
-        // `0` means unbounded, the same convention the byte cap uses.
-        let mut open = Scrollback::with_rows(20, 0);
-        open.push((0..50).map(|_| hard(0, "x")).collect());
+        s.push(vec![hard(1, "cccc"), hard(1, "dddd")]);
+        assert_eq!(
+            content(&s),
+            vec!["cccc", "dddd"],
+            "the older entry went whole, not one row of it"
+        );
+        assert_eq!(s.dropped_lines(), 2, "and the store counted what it lost");
+        assert!(
+            s.retained_bytes() <= cap,
+            "and stayed under the cap while doing it: {}",
+            s.retained_bytes()
+        );
+    }
+
+    /// **The marker is there, at the head, and says the number** — the
+    /// assertion the ticket is really about.
+    #[test]
+    fn a_trim_leaves_a_visible_marker_at_the_head_of_what_was_kept() {
+        let cap = cost("gone gone gone") + 1;
+        let mut s = Scrollback::with_cap(20, cap);
+        s.push(vec![hard(0, "gone gone gone")]);
+        assert!(
+            !s.rows()[0].is_trim_marker(),
+            "nothing trimmed, nothing to say: {}",
+            s.rows()[0]
+        );
+        s.push(vec![hard(1, "kept kept kept")]);
+
+        assert!(s.rows()[0].is_trim_marker(), "the marker is row 0");
+        let m = s.rows()[0].to_string();
+        assert!(m.contains("scrollback trimmed"), "{m:?}");
+        assert!(m.contains("1 earlier lines dropped"), "{m:?}");
+        assert_eq!(content(&s), vec!["kept kept kept"]);
+        // The marker is chrome, so it is not charged to the cap: a long hint on
+        // the end of it must not push content out to make room for an apology.
+        let charged: usize = s
+            .rows()
+            .iter()
+            .filter(|r| !r.is_trim_marker())
+            .map(|r| r.charged())
+            .sum();
+        assert_eq!(
+            charged,
+            s.retained_bytes(),
+            "the marker costs the cap nothing"
+        );
+    }
+
+    /// The marker counts **content lines**, not the rows our wrap cut them into,
+    /// and it counts a line once even when it went over two trims. Three
+    /// soft-wrapped rows of one paragraph is one line lost; reporting three (or
+    /// reporting the same line twice as the tail follows the head out) is the
+    /// marker lying in the alarming direction.
+    #[test]
+    fn the_marker_counts_content_lines_not_wrapped_rows() {
+        let cap = cost("ccc") + 1;
+        let mut s = Scrollback::with_cap(20, cap);
+        // One logical line, three display rows: soft + soft + hard.
+        s.push(vec![soft(0, "aaa"), soft(0, "bbb"), hard(0, "ccc")]);
+        assert_eq!(s.dropped_lines(), 1, "the head of the line went: one line");
+        s.push(vec![hard(1, "ddd")]);
+        assert_eq!(content(&s), vec!["ddd"], "the whole of entry 0 went");
+        assert_eq!(
+            s.dropped_lines(),
+            1,
+            "and the tail of that same line did not count as a second one"
+        );
+    }
+
+    /// **One entry larger than the cap** is the case a whole-entry trim cannot
+    /// handle, and "where possible" means it rather than "give up on the cap":
+    /// rows go instead, newest kept, and the marker says so.
+    #[test]
+    fn one_entry_bigger_than_the_cap_trims_rows_rather_than_the_cap() {
+        let cap = cap_of(&["x", "x", "x"]);
+        let mut s = Scrollback::with_cap(20, cap);
+        s.push((0..6).map(|_| hard(0, "x")).collect());
+        // Aligning the cut to the head of entry 0 would drop the whole store, so
+        // the trim falls back on whole rows and keeps what fits.
+        assert_eq!(
+            content(&s).len(),
+            3,
+            "three rows of the six survived (the marker is the fourth row of the store)"
+        );
+        assert_eq!(s.dropped_lines(), 3);
+        assert!(s.retained_bytes() <= cap, "{}", s.retained_bytes());
+        assert!(
+            s.rows().iter().any(|r| r.entry == 0),
+            "entry 0 is still there — partly, which is what the marker is for"
+        );
+    }
+
+    /// A cap too small for anything keeps the newest row: a scrollback that
+    /// throws away the line that just arrived is worse than one that is
+    /// momentarily over its own bound.
+    #[test]
+    fn a_cap_too_small_for_anything_keeps_the_newest_row() {
+        let mut s = Scrollback::with_cap(20, 8);
+        s.push(vec![hard(0, "aaa"), hard(0, "bbb")]);
+        assert_eq!(content(&s), vec!["bbb"], "the tail is never what goes");
+        assert_eq!(s.dropped_lines(), 1);
+    }
+
+    /// `0` means unbounded, the same convention the transcript buffer cap uses.
+    #[test]
+    fn zero_is_unbounded_and_says_nothing_about_a_trim() {
+        let mut open = Scrollback::with_cap(20, 0);
+        open.push((0..50).map(|i| hard(i, &format!("l{i}"))).collect());
         assert_eq!(open.len(), 50);
+        assert_eq!(open.dropped_lines(), 0);
+        assert!(!open.rows()[0].is_trim_marker());
+    }
+
+    /// Tightening the cap trims on the spot rather than at the next push: a cap
+    /// that only bites when new content arrives is a cap with a hole in it.
+    #[test]
+    fn setting_a_smaller_cap_trims_immediately() {
+        let mut s = Scrollback::with_cap(20, 1_000_000);
+        s.push(vec![
+            hard(0, "one one"),
+            hard(1, "two two"),
+            hard(2, "three three"),
+        ]);
+        assert_eq!(content(&s).len(), 3);
+        s.set_cap(cost("three three") + 1);
+        assert_eq!(content(&s), vec!["three three"]);
+        assert_eq!(s.dropped_lines(), 2);
+    }
+
+    /// **A trim never moves the view.** `offset` is measured from the tail, so
+    /// a row dropped from the head leaves everything below it where it was —
+    /// even when the marker is inserted at the head in the same breath, and even
+    /// though the same push appended a row at the tail.
+    #[test]
+    fn a_trim_never_moves_the_content_the_user_is_looking_at() {
+        let cap = cap_of(&["a", "b", "c"]);
+        let mut s = Scrollback::with_cap(20, cap);
+        s.push(vec![hard(0, "a"), hard(1, "b"), hard(2, "c")]);
+        s.scroll_by(-1, 1);
+        let before = lines(s.window(1));
+        assert_eq!(before, vec!["b"], "looking at the middle row");
+        s.push(vec![hard(3, "d")]);
+        assert_eq!(
+            lines(s.window(1)),
+            before,
+            "the head lost a row, the tail gained one, the view moved by neither"
+        );
+        assert!(!s.is_pinned());
+        assert!(s.rows()[0].is_trim_marker(), "and the loss is marked above");
+    }
+
+    /// The marker survives the one thing that replaces every row it is standing
+    /// on: a resize. A trim reported before a resize and swallowed by one would
+    /// be a promise the store cannot keep.
+    #[test]
+    fn the_marker_survives_every_row_being_replaced_by_a_rewrap() {
+        let cap = cost("gone gone") + 1;
+        let mut s = Scrollback::with_cap(40, cap);
+        s.push(vec![hard(0, "gone gone")]);
+        s.push(vec![hard(1, "kept kept")]);
+        assert!(s.rows()[0].is_trim_marker());
+        assert_eq!(s.dropped_lines(), 1);
+
+        s.rewrap(80, vec![hard(1, "kept kept")]);
+        assert!(
+            s.rows()[0].is_trim_marker(),
+            "the re-wrap replaced every row and put the marker back: {:?}",
+            lines(s.rows())
+        );
+        assert_eq!(s.dropped_lines(), 1, "and remembered the count");
+        assert_eq!(content(&s), vec!["kept kept"]);
+    }
+
+    /// A store with nothing trimmed has no marker at all: the head of the
+    /// scrollback *is* the head of the session, and a `trimmed: 0` row would
+    /// train the user to read a marker that means nothing.
+    #[test]
+    fn an_untrimmed_store_has_no_marker_to_misread() {
+        let mut s = Scrollback::with_cap(20, 100_000);
+        s.push(vec![hard(0, "a"), hard(1, "b")]);
+        assert!(!s.rows().iter().any(|r| r.is_trim_marker()));
+        assert_eq!(s.dropped_lines(), 0);
     }
 
     /// After the transcript itself is compacted, `entry` must still mean the
@@ -1086,21 +1702,39 @@ mod tests {
             hard(2, "from entry 2"),
             hard(3, "from entry 3"),
         ]);
-        // Entries 0 and 1 came off the front and the notice went in at index 1,
-        // so the transcript now reads [2, notice, 3].
-        s.entries_evicted(2, 1);
+        // Entries 0 and 1 came off the front, two content lines with them.
+        s.entries_evicted(2, 2);
 
-        let got: Vec<(usize, String)> = s.rows().iter().map(|r| (r.entry, r.to_string())).collect();
+        let got: Vec<(usize, String)> = s
+            .rows()
+            .iter()
+            .filter(|r| !r.is_trim_marker())
+            .map(|r| (r.entry, r.to_string()))
+            .collect();
         assert_eq!(
             got,
             vec![
                 (0, "from entry 2".to_string()),
-                (2, "from entry 3".to_string())
+                (1, "from entry 3".to_string())
             ],
-            "entry 2 is index 0 now, and entry 3 is index 2 because the notice \
-             took index 1"
+            "the survivors shifted down by exactly what came off, and no more"
         );
         assert_eq!(paste_text(s.rows()), "from entry 2\nfrom entry 3");
+        assert_eq!(s.dropped_lines(), 2, "and the loss is on the marker");
+        assert!(s.rows()[0].is_trim_marker());
+    }
+
+    /// The eviction's line count is the *caller's*, because the caller knows
+    /// whether this view ever rendered the entries it dropped: a view that was
+    /// off screen has no rows for them and lost the content just the same.
+    #[test]
+    fn eviction_reports_the_lines_the_caller_says_even_with_no_rows_to_lose() {
+        let mut s = Scrollback::new(20);
+        // Nothing rendered yet: this view was never on screen.
+        s.entries_evicted(4, 97);
+        assert_eq!(s.dropped_lines(), 97);
+        assert!(s.rows()[0].is_trim_marker());
+        assert!(content(&s).is_empty());
     }
 
     #[test]
@@ -1110,6 +1744,7 @@ mod tests {
         s.entries_evicted(0, 0);
         assert_eq!(s.len(), 1);
         assert_eq!(s.rows()[0].entry, 0);
+        assert_eq!(s.dropped_lines(), 0);
     }
 
     /// Every `window` call is in range for every shape of store: the frame hands

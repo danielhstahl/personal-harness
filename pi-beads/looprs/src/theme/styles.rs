@@ -29,6 +29,20 @@ pub fn style_for(k: &MessageKind) -> Style {
         _ => Style::default(),
     }
 }
+
+/// The scrollback's trim marker (`looprs-pdl.7`).
+///
+/// Italic so it reads as *about* the transcript rather than as transcript — the
+/// same trick `Thinking` uses, and the reason it works is that nothing else on
+/// the band is italic except thinking, which is at least honest about being the
+/// app's own voice. Dark-gray rather than a colour because the row is a loss
+/// notice, not an answer, and it must not compete with the yellow the status row
+/// spends on "the loop is working"; it stays readable on both palettes, which a
+/// dim-only style is not.
+pub fn trim_marker_style() -> Style {
+    Style::new().dark_gray().add_modifier(Modifier::ITALIC)
+}
+
 pub fn restyle(mut line: Line<'static>, base: Style) -> Line<'static> {
     for span in &mut line.spans {
         span.style = base.patch(span.style); // span's own style wins

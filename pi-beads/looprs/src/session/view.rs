@@ -30,7 +30,7 @@ use crate::components::scrollback::{Flusher, RenderedRow};
 use crate::session::ActiveBead;
 use crate::session::{BeadStep, SessionStatus};
 use crate::state::scrollback::Scrollback;
-use crate::state::transcript::{Entry, MessageKind, Transcript};
+use crate::state::transcript::{MessageKind, Transcript};
 use crate::theme::styles::{restyle, style_for};
 use crate::utils::shelltext::LineResolver;
 
@@ -39,14 +39,18 @@ use crate::utils::shelltext::LineResolver;
 /// A view that is on screen drains every frame, so this only binds for a session
 /// nobody is looking at — which is exactly the unbounded case ADR-0002 names
 /// ("a `yes | sleep 1000000`-style shell … grows its transcript forever"). When a
-/// hidden session overruns the cap, old lines are dropped and one visible notice is
-/// inserted, so the loss is honest rather than silent.
+/// hidden session overruns the cap, old entries are dropped, and the loss is
+/// honest rather than silent — the visible half of that honesty is the store's
+/// own [`TrimMarker`](crate::state::scrollback::RowKind) row, which is why no
+/// notice line is inserted *here*: a notice in the transcript is content, gets
+/// copied, gets journalled, and gets counted against the thing it is apologising
+/// for.
+///
+/// This cap bounds **text held for a session nobody is looking at**. It is not
+/// the same number, and cannot be, as the cap on what a seen session *renders*
+/// ([`DEFAULT_RETAINED_BYTES`](crate::state::scrollback::DEFAULT_RETAINED_BYTES)):
+/// rendered rows carry styling and a cell map and cost several times their text.
 pub const DEFAULT_VIEW_BUFFER: usize = 256 * 1024;
-
-/// Room held back out of the cap for the eviction notice itself, so the view ends
-/// *at or under* the limit rather than limit-plus-a-line. Generous for any wording
-/// under 64 bytes ("… 4,294,967,295 bytes dropped (buffer cap) …" fits).
-const NOTICE_BUDGET: usize = 64;
 
 /// What the live (not-yet-final) region of one session is showing.
 ///
@@ -194,6 +198,13 @@ pub struct SessionView {
     ///   is the work it planned, and beats throwing away a pass that cost money.
     pub tokens: Tokens,
     /// Dropped-line bookkeeping for the buffer cap (see [`DEFAULT_VIEW_BUFFER`]).
+    ///
+    /// Bytes, because that is the unit the cap is a cap in. The *visible* notice
+    /// of a trim is not here: it is the store's
+    /// [`TrimMarker`](crate::state::scrollback::RowKind) row, and it is the
+    /// store's because a notice that lives in the transcript is a notice that
+    /// gets copied, journalled and counted as content. This number feeds the log
+    /// and the store's line count.
     dropped: usize,
     limit: usize,
     /// Trims this view has applied that the app has not yet fed to the other
@@ -203,10 +214,38 @@ pub struct SessionView {
     /// selection (looprs-pdl.9) speaks the same addresses — so it has to hear
     /// about the trim in the same breath, or an eviction moves the entries out
     /// from under a standing selection and the highlight silently starts
-    /// pointing at the message *after* the one the user selected. The pairs are
-    /// `(removed, notice_at)`, exactly as given to the store, and
-    /// [`Self::take_trims`] is how the App drains them.
-    pending_trims: Vec<(usize, usize)>,
+    /// pointing at the message *after* the one the user selected. Each entry is
+    /// the number of transcript entries that came off the front, exactly as
+    /// given to the store, and [`Self::take_trims`] is how the App drains them.
+    pending_trims: Vec<usize>,
+    /// The journal cursor: the index of the first transcript entry that has not
+    /// been handed to the journal yet.
+    ///
+    /// A *prefix* cursor, which is what makes the journal ordered by transcript
+    /// position rather than by finalisation: the walk stops at the first entry
+    /// that is still open, so an answer that finalised behind an open tool card
+    /// waits for that card rather than jumping the queue. The wait is bounded by
+    /// the card's own runtime, and [`Self::seal`] (death, teardown, cancel)
+    /// closes everything and drains the lot.
+    journalled: usize,
+    /// Whether the journal has any entry on record from this view. Decides
+    /// whether a blank line goes before the next chunk, which is what makes the
+    /// journal byte-identical to [`Transcript::plain_text`] over the same
+    /// entries — "the journal *is* select-all-and-copy" (ADR-0004 R2).
+    journalled_any: bool,
+    /// Where the transcript goes as it finalises (looprs-pdl.7, ADR-0004 R2).
+    ///
+    /// Injected, exactly like the clipboard and the dump sink, for the same three
+    /// reasons: it touches a filesystem, it can fail in ways the UI must report
+    /// rather than handle, and `main` being the only place the real one is built
+    /// is what keeps the test suite off the disk by construction. The default is
+    /// the disabled journal, never a real writer.
+    ///
+    /// Held per view because the journal is per session: each mode's transcript
+    /// is its own file, and the sink takes the mode name with every chunk so the
+    /// one writer can keep them apart and never interleave two sessions into one
+    /// document.
+    journal: std::sync::Arc<dyn crate::services::journal::Journal>,
     /// The resolver for this view's Bash output (see [`Self::push_bash`]).
     ///
     /// Per-view, and per-stream: shell output is not a string, it is a *stream*
@@ -243,8 +282,37 @@ impl SessionView {
             dropped: 0,
             limit,
             pending_trims: Vec::new(),
+            journalled: 0,
+            journalled_any: false,
+            journal: std::sync::Arc::new(crate::services::journal::Disabled),
             shell: LineResolver::new(),
         }
+    }
+
+    /// Replace this view's journal.
+    ///
+    /// Called by the App for every view it creates, from the one handle the App
+    /// was given at startup. Setting it after content exists is fine and is what
+    /// the App does: the cursor replays nothing, so content journalled before the
+    /// swap stays journalled and content after it goes to the new sink.
+    pub fn set_journal(&mut self, journal: std::sync::Arc<dyn crate::services::journal::Journal>) {
+        self.journal = journal.clone();
+        // The trim marker names this session's journal when it has one, so the
+        // row that says "N earlier lines dropped" also says where they can still
+        // be read. `None` renders the short form rather than pointing at
+        // nothing.
+        let hint = journal.display_path(self.session.mode.label());
+        self.scrollback.set_trim_hint(hint);
+    }
+
+    /// Change this view's rendered-store cap (0 = unbounded).
+    ///
+    /// The measurement/test seam: reaching the default by ordinary means means
+    /// rendering a whole long pass, and a test that does that is a slow test
+    /// nobody runs.
+    #[allow(dead_code)] // consumer: crate::measure (the cap is measured, not tuned at runtime)
+    pub fn set_store_cap(&mut self, bytes: usize) {
+        self.scrollback_mut().set_cap(bytes);
     }
 
     /// Shell output into the transcript (ADR-0005, superseding the "strip the
@@ -267,7 +335,7 @@ impl SessionView {
             return;
         }
         self.transcript.push_shell_lines(&lines);
-        self.enforce_buffer();
+        self.after_write();
     }
 
     /// Move the line the resolver still has open into the transcript, ended.
@@ -310,6 +378,11 @@ impl SessionView {
     pub fn seal_shell_output(&mut self) {
         self.flush_shell_pending();
         self.transcript.seal_command();
+        // The seal finalises the block it just closed, so it is a write as far as
+        // the journal and the cap are concerned: sealed and not journalled is the
+        // same loss as never sealed, and the seal is the moment that block is
+        // known to be finished.
+        self.after_write();
     }
 
     /// Rows that became final since the last call. Call once per frame, for the
@@ -421,20 +494,28 @@ impl SessionView {
         // bytes get eaten by the previous one's dangling `\x1b[`, which shows up
         // as the first line of a brand new shell silently missing its head.
         self.shell.reset();
+        // The last chance this session gets to say everything it said: sealing
+        // closes the entries the journal's prefix walk was waiting on, so the
+        // tail of a dead or torn-down session reaches the file rather than staying
+        // behind an open card. This is not the journal's mechanism — R2 is
+        // append-as-you-finalise, and by the time we get here the normal case has
+        // been flushed entry by entry — it is the drain of work the walk could
+        // not finish on its own.
+        self.after_write();
     }
 
     /// A finished, one-shot line (status notices, the mode-switch separator).
     pub fn push_note(&mut self, kind: MessageKind, text: String) {
         self.flush_shell_pending();
         self.transcript.push_done(kind, text);
-        self.enforce_buffer();
+        self.after_write();
     }
 
     /// A streaming delta from this session's backend.
     pub fn push_delta(&mut self, kind: MessageKind, delta: &str) {
         self.flush_shell_pending();
         self.transcript.push_delta(kind, delta);
-        self.enforce_buffer();
+        self.after_write();
     }
 
     /// A session-level error: recorded for the status row and shown.
@@ -442,7 +523,70 @@ impl SessionView {
         self.last_error = Some(text.clone());
         self.flush_shell_pending();
         self.transcript.push_done(MessageKind::Error, text);
-        self.enforce_buffer();
+        self.after_write();
+    }
+
+    // ─────────────── the card kinds, through the same door ───────────────
+    //
+    // A tool card and a compaction card used to be written straight into
+    // `view.transcript` by the App, which meant the two things `after_write`
+    // exists to do did not happen for them: no cap, and no journal. Tool
+    // results are the **biggest content in a beads pass** — a `bd show`, a
+    // file read, a `git diff` — so the cap that was supposed to bound a
+    // session's memory did not bound the part of it that actually costs
+    // anything, and the journal that was supposed to survive a crash never saw
+    // the part worth reading. Both are fixed by the same move: the App asks the
+    // view to write the card, and the view runs the edge.
+
+    /// A tool started: opens the card entry.
+    pub fn start_tool(&mut self, id: String, name: String, input: String) {
+        self.flush_shell_pending();
+        self.transcript.start_tool(id, name, input);
+        self.after_write();
+    }
+
+    /// A tool came back: fills the card in and finalises it.
+    ///
+    /// Note this finalises an entry that is *not* the last one — a tool that
+    /// reported back behind an open sibling, or behind streamed prose, lands in
+    /// the middle of the transcript. That is exactly what the journal's prefix
+    /// walk is built for: the entry is journalled when the walk reaches it, and
+    /// the walk cannot pass an entry that is still open, so file order is
+    /// transcript order.
+    pub fn finish_tool(&mut self, id: String, summary: String, is_error: bool) {
+        self.transcript.finish_tool(id, summary, is_error);
+        self.after_write();
+    }
+
+    /// pi is pausing the run to compact the context.
+    pub fn start_compaction(&mut self, reason: String) {
+        self.flush_shell_pending();
+        self.transcript.start_compaction(reason);
+        self.after_write();
+    }
+
+    /// The compaction finished, one way or another.
+    ///
+    /// Returns whether there was a card to close; `false` is the caller's cue to
+    /// record the event itself (see the App's arm), and this records nothing.
+    pub fn finish_compaction(
+        &mut self,
+        state: crate::components::compaction::CompactionState,
+        detail: String,
+    ) -> bool {
+        let closed = self.transcript.finish_compaction(state, detail);
+        self.after_write();
+        closed
+    }
+
+    /// Close the streamed entry that is open, if any: the point a turn's prose
+    /// stops being live and starts being transcript.
+    ///
+    /// The `message_end` arm of the App's event handling, with the edge that goes
+    /// with it — an answer that ended is an answer the journal should have.
+    pub fn finish_stream(&mut self) {
+        self.transcript.finish_last();
+        self.after_write();
     }
 
     /// Mirror the owning session's liveness, and wind the run clock.
@@ -534,29 +678,103 @@ impl SessionView {
         self.step = Some(step);
     }
 
-    /// How many bytes of this view's output the cap has dropped.
+    /// How many bytes of this view's output the buffer cap has dropped.
     ///
-    /// The counter is what makes an eviction honest rather than invisible, and the
-    /// honesty lives in the transcript itself: [`Self::enforce_buffer`] inserts a
-    /// visible `… N bytes dropped (buffer cap) …` notice when it evicts. The
-    /// status row's own `~N dropped` segment is gone — the row now spends that
-    /// room on token counts — so nothing in the shipped binary reads this.
-    #[allow(dead_code)] // test seam: `view::tests` asserts the count and the notice that quotes it
+    /// Bytes, because that is the unit the cap is a cap in. The *visible* record
+    /// of a trim is not here — it is the store's
+    /// [`TrimMarker`](crate::state::scrollback::RowKind) row, which says the
+    /// loss in lines and sits at the head of what was kept. Keeping the notice
+    /// out of the transcript is deliberate: a notice written into the
+    /// transcript is a notice that gets copied (`Ctrl-S a`, `plain_text`) and
+    /// journalled, which makes the app's own bookkeeping part of the user's
+    /// content. This number is for the log.
+    #[allow(dead_code)] // measurement/log seam: `view::tests` asserts the count against the corpus it streamed
     pub fn dropped_bytes(&self) -> usize {
         self.dropped
+    }
+
+    /// Every write to this view's transcript ends here, and only here.
+    ///
+    /// Two things happen on this edge, in this order:
+    ///
+    /// 1. [`Self::journal_finalised`] hands whatever just became final to the
+    ///    journal, and
+    /// 2. [`Self::enforce_buffer`] trims what has grown past the cap.
+    ///
+    /// The order is load-bearing and it is the reason the two are one function
+    /// rather than two calls at every call site: journal **before** trim, so
+    /// content that is about to leave memory has already been handed to the
+    /// file. Done the other way round, the cap eats the history the journal
+    /// exists to keep, which is the exact failure ADR-0004 R2 was written to
+    /// close — and it is silent, because by the time anyone looks, the bytes are
+    /// neither in memory nor on disk.
+    fn after_write(&mut self) {
+        self.journal_finalised();
+        self.enforce_buffer();
+    }
+
+    /// Push every entry that has become final, and only those, to the journal.
+    ///
+    /// The chunk is built to the same join as [`Transcript::plain_text`] — entry
+    /// text with trailing newlines off, entries separated by a blank line — so
+    /// the journal of a whole run is byte-for-byte the same document the
+    /// `Ctrl-S a` dump of that run writes (ADR-0004 R2). The rule lives in both
+    /// places on purpose: this one appends it as it finalises, that one answers
+    /// for a transcript in one go, and the claim that they agree is what
+    /// `the_journal_is_what_select_all_and_copy_would_have_given` checks. If
+    /// `plain_text`'s join ever changes, that test fails and this one follows it
+    /// rather than the journal quietly drifting to a different document.
+    ///
+    /// Entries with no text are skipped without being journalled, and the cursor
+    /// still moves past them: an empty tool summary is not a missing paragraph.
+    fn journal_finalised(&mut self) {
+        let mut chunk = String::new();
+        while self.journalled < self.transcript.entries.len() {
+            let e = &self.transcript.entries[self.journalled];
+            // The prefix walk stops at the first still-open entry. Ordering in
+            // the file is transcript order, not finalisation order; a card that
+            // has not come back holds up what arrived behind it for as long as it
+            // takes, and `seal` empties the pipe when the stream ends.
+            if !e.done {
+                break;
+            }
+            let body = e.text.trim_end_matches('\n');
+            self.journalled += 1;
+            if body.is_empty() {
+                continue;
+            }
+            if self.journalled_any {
+                // Two newlines, because that is the join `plain_text` uses: the
+                // entry's own line ending plus a blank line between entries.
+                // Matching it exactly is the point — the journal of a whole run
+                // and the `Ctrl-S a` dump of that run are then the same bytes,
+                // which is what makes either one safe to hand to someone.
+                chunk.push_str("\n\n");
+            }
+            chunk.push_str(body);
+            chunk.push('\n');
+            self.journalled_any = true;
+        }
+        if chunk.is_empty() {
+            return;
+        }
+        self.journal.append(self.session.mode.label(), chunk);
     }
 
     /// Cap the buffered transcript while this view is *not* on screen.
     ///
     /// Lossy on purpose — that is what a cap is — so the two things it must get
-    /// right are: say what was lost, and do not corrupt the render cursor. The
-    /// notice goes in *at* the cursor rather than at the head of the transcript, so
-    /// it is the next thing the terminal sees and the still-pending entries behind
-    /// it keep their order. The cursor is then reseat-ed, because its per-entry
-    /// state (scan/block/fence) belongs to whatever entry it was last reading.
+    /// right are: say what was lost, and do not corrupt the render cursor. It
+    /// says what was loss by telling the store, which puts it on the marker row
+    /// the user will scroll to; it keeps the cursor honest by reseating the
+    /// flusher to the entry that the eviction moved into the slot it was
+    /// reading, because its per-entry state (scan/block/fence) belongs to
+    /// whatever entry it was last on.
     ///
-    /// The notice's own size is reserved out of the cap: without that the view ends
-    /// at `limit + notice` and the cap is a rounding error with an apology note.
+    /// It used to also insert a `… N bytes dropped (buffer cap) …` entry into
+    /// the transcript itself. That is gone: the marker row says the same thing
+    /// where the user can see it, and the entry said it in the middle of the
+    /// content the copy and the journal carry.
     fn enforce_buffer(&mut self) {
         // What the cap has to cover is everything this view holds, which is the
         // transcript *plus* the Bash line the resolver is still resolving: the
@@ -566,50 +784,54 @@ impl SessionView {
         if self.limit == 0 || buffered <= self.limit {
             return;
         }
-        let target = self.limit.saturating_sub(NOTICE_BUDGET);
         let first = self.flusher.consumed();
         let mut dropped = 0usize;
         let mut removed = 0usize;
+        let mut lines = 0usize;
         // Always keep one entry: an empty transcript with the cursor past the end is
         // a state nothing downstream is written to expect.
-        while self.transcript.byte_len() > target && self.transcript.entries.len() > 1 {
-            dropped += self.transcript.entries.remove(0).text.len();
+        while self.transcript.byte_len() > self.limit && self.transcript.entries.len() > 1 {
+            let gone = self.transcript.entries.remove(0);
+            dropped += gone.text.len();
+            // The unit the marker speaks: lines of content, counted while the
+            // entry is still here to count them. Rows are the store's business;
+            // this store may never have rendered these ones at all.
+            lines += gone.text.lines().count();
             removed += 1;
         }
-        if dropped == 0 {
+        if removed == 0 {
             return;
         }
         self.dropped += dropped;
-        // The eviction shifted the transcript; the cursor follows it, and the notice
-        // takes the cursor's slot so it is what gets written out next.
-        let at = first.saturating_sub(removed);
-        self.transcript.entries.insert(
-            at,
-            Entry {
-                kind: MessageKind::System,
-                text: format!("… {} bytes dropped (buffer cap) …", self.dropped),
-                done: true,
-                styles: Vec::new(),
-            },
-        );
-        self.flusher.reseat(at);
+        // The eviction shifted the transcript; the render cursor follows it.
+        self.flusher.reseat(first.saturating_sub(removed));
+        // …and so does the journal cursor, for the same reason: it addresses the
+        // same list by index. It never points *below* zero (`saturating_sub`),
+        // and if it had not caught up to the eviction it means the journal is
+        // behind by the entries the cap took — which is why `after_write`
+        // journals first.
+        self.journalled = self.journalled.saturating_sub(removed);
         // The store indexes rows by entry, and the entries just moved underneath
         // it. Rows rendered from a gone entry cannot be re-rendered, so they go
         // now rather than vanishing on the next resize; the survivors get
         // renumbered so `entry` keeps naming the right thing.
-        self.scrollback.entries_evicted(removed, at);
-        self.pending_trims.push((removed, at));
+        self.scrollback.entries_evicted(removed, lines);
+        self.pending_trims.push(removed);
+        tracing::debug!(
+            "view buffer cap: {dropped} bytes over {removed} entries dropped ({} lines)",
+            lines
+        );
     }
 
-    /// Drain the trims applied since the last call, as `(removed, notice_at)`
-    /// pairs in the order they happened.
+    /// Drain the trims applied since the last call, each one the number of
+    /// transcript entries that came off the front, in the order they happened.
     ///
     /// The consumer is the drag selection, which addresses rows by entry and so
     /// must be renumbered by the same eviction the store was renumbered by
-    /// (looprs-pdl.9). Both calls take the same two numbers from the same
-    /// place, which is the only thing keeping "what the row is numbered" and
-    /// "what the selection thinks it is numbered" one fact rather than two.
-    pub fn take_trims(&mut self) -> Vec<(usize, usize)> {
+    /// (looprs-pdl.9). Both calls take the same number from the same place,
+    /// which is the only thing keeping "what the row is numbered" and "what the
+    /// selection thinks it is numbered" one fact rather than two.
+    pub fn take_trims(&mut self) -> Vec<usize> {
         std::mem::take(&mut self.pending_trims)
     }
 
@@ -1480,6 +1702,187 @@ mod tests {
         SessionView::new(SessionId::new(mode, 0))
     }
 
+    use std::sync::{Arc, Mutex};
+
+    /// A journal that remembers what it was handed, for the tests that care about
+    /// what reached the file rather than what is on disk. The real writer has its
+    /// own tests (`services::journal`); duplicating its thread here would test
+    /// the scheduler.
+    #[derive(Default, Debug)]
+    struct RecordingJournal {
+        got: Mutex<Vec<(&'static str, String)>>,
+    }
+
+    impl crate::services::journal::Journal for RecordingJournal {
+        fn append(&self, mode: &'static str, text: String) {
+            self.got.lock().unwrap().push((mode, text));
+        }
+        fn display_path(&self, mode: &str) -> Option<String> {
+            Some(format!("/tmp/last-{mode}"))
+        }
+        fn close(&self) {}
+        fn describe(&self) -> &'static str {
+            "recording"
+        }
+    }
+
+    impl RecordingJournal {
+        fn text(&self) -> String {
+            self.got
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect::<String>()
+        }
+    }
+
+    fn with_journal(v: &mut SessionView, j: Arc<RecordingJournal>) {
+        v.set_journal(j);
+    }
+
+    // ─────────────── the journal is the escape hatch (looprs-pdl.7) ───────────────
+
+    /// **The cap does not get to be the reason the transcript is gone.** The
+    /// whole design of a bounded scrollback rests on this ordering: what
+    /// finalised goes to the file before the cap takes it out of memory. Run it
+    /// the other way round and the journal holds the same truncated thing the
+    /// store does, which is a worse copy of a buffer, not an escape hatch.
+    #[test]
+    fn the_cap_takes_it_out_of_memory_and_the_file_still_has_it() {
+        let mut v = SessionView::with_buffer(SessionId::new(TerminalType::Bash, 0), 128);
+        let j = Arc::new(RecordingJournal::default());
+        with_journal(&mut v, j.clone());
+
+        for i in 0..12 {
+            v.push_note(MessageKind::Answer, format!("line {i} {}", "y".repeat(24)));
+            let _ = v.flush(60);
+        }
+        assert!(
+            v.dropped_bytes() > 0,
+            "the cap bit into the transcript: {}",
+            v.dropped_bytes()
+        );
+        assert!(
+            v.transcript.byte_len() <= 128,
+            "and the buffer stayed under it: {}",
+            v.transcript.byte_len()
+        );
+        let journalled = j.text();
+        for i in 0..12 {
+            assert!(
+                journalled.contains(&format!("line {i} ")),
+                "entry {i} went missing from the journal, which is the whole \
+                 point of having one: {journalled:?}"
+            );
+        }
+        assert!(
+            journalled.len() > v.transcript.plain_text().len(),
+            "the file holds more than memory does — that is the inequality the \
+             marker row is promising: file {} vs memory {}",
+            journalled.len(),
+            v.transcript.plain_text().len()
+        );
+    }
+
+    /// **Order is transcript order, not finalisation order.** An answer that
+    /// finalised behind an open tool card waits for the card rather than jumping
+    /// the queue, so reading the file top to bottom reads like the session
+    /// happened.
+    #[test]
+    fn an_open_entry_holds_the_line_behind_it_rather_than_being_jumped() {
+        let mut v = view(TerminalType::Pi);
+        let j = Arc::new(RecordingJournal::default());
+        with_journal(&mut v, j.clone());
+
+        v.push_note(MessageKind::Answer, "first".into());
+        v.start_tool("t1".into(), "a tool still running".into(), String::new());
+        v.push_note(MessageKind::Answer, "behind the card".into());
+        let _ = v.flush(60);
+        let before = j.text();
+        assert!(
+            before.contains("first"),
+            "the closed entry went: {before:?}"
+        );
+        assert!(
+            !before.contains("behind the card"),
+            "the entry behind an open card waits: {before:?}"
+        );
+
+        v.finish_tool("t1".into(), "the card came back".into(), false);
+        v.seal();
+        let after = j.text();
+        assert!(
+            after.contains("first") && after.contains("behind the card"),
+            "sealing empties the pipe: {after:?}"
+        );
+        assert!(
+            after.find("first") < after.find("behind the card"),
+            "and in the order they were said: {after:?}"
+        );
+    }
+
+    /// **The journal of a run is what select-all-and-copy would have given**
+    /// (ADR-0004 R2). Both are the same rule over the same entries; this is the
+    /// test that keeps the two implementations of that rule from drifting.
+    #[test]
+    fn the_journal_is_what_select_all_and_copy_would_have_given() {
+        let mut v = view(TerminalType::Bash);
+        let j = Arc::new(RecordingJournal::default());
+        with_journal(&mut v, j.clone());
+        v.push_note(MessageKind::Answer, "one\n".into());
+        v.push_note(MessageKind::System, "two\n\n".into());
+        v.push_note(MessageKind::Answer, "three".into());
+        v.seal();
+        assert_eq!(
+            j.text(),
+            v.transcript.plain_text(),
+            "the file and the copy must be the same document"
+        );
+    }
+
+    /// Nothing on the exit path invents transcript-shaped bytes (ADR-0004 R3):
+    /// an entry that never finalised never reaches the file, and a `close` adds
+    /// nothing either.
+    #[test]
+    fn what_never_finalised_never_reaches_the_file() {
+        let mut v = view(TerminalType::Pi);
+        let j = Arc::new(RecordingJournal::default());
+        with_journal(&mut v, j.clone());
+        v.push_note(MessageKind::Answer, "done and journalled".into());
+        v.seal();
+        let after_seal = j.text();
+        assert!(after_seal.contains("done and journalled"));
+        crate::services::journal::Journal::close(&*j);
+        assert_eq!(
+            j.text(),
+            after_seal,
+            "close is a drain, not a second pass over the transcript"
+        );
+    }
+
+    /// The marker row names the file, because a marker that says "16,834 lines
+    /// dropped" with nowhere to go is a dead end. The hint is taken when the
+    /// journal is installed, so a view created before the app had a journal is
+    /// not left pointing at nothing.
+    #[test]
+    fn the_marker_names_the_journal_it_can_send_you_to() {
+        let mut v = SessionView::with_buffer(SessionId::new(TerminalType::Bash, 0), 128);
+        let j = Arc::new(RecordingJournal::default());
+        with_journal(&mut v, j.clone());
+        for i in 0..12 {
+            v.push_note(MessageKind::Answer, format!("line {i} {}", "y".repeat(24)));
+            let _ = v.flush(60);
+        }
+        let marker = v.scrollback().rows()[0].to_string();
+        assert!(marker.contains("scrollback trimmed"), "{marker:?}");
+        assert!(
+            marker.contains("/tmp/last-"),
+            "the marker carries the journal path so the reader has somewhere to go: \
+             {marker:?}"
+        );
+    }
+
     // ─────────────── the chord table audit (looprs-pdl.13) ───────────────
     //
     // These are the ticket's three rules, run against `CHORD_TABLE` as data. What
@@ -1941,11 +2344,31 @@ mod tests {
             v.transcript.byte_len()
         );
         assert!(v.dropped_bytes() > 0, "the drop must be counted");
+        // The notice the user sees is the store's marker row, not a line of
+        // transcript: a notice in the transcript gets copied, journalled and
+        // counted as content. So the assertion is on the marker, and the
+        // marker is only in the emitted rows if it was rendered while this
+        // view was on screen — which it is here, because we flushed every round.
+        // The notice the user sees is the store's marker row at the head of the
+        // window, not a line of transcript: a notice in the transcript would be
+        // copied, journalled and counted as content. `flush` hands the frame new
+        // rows and the frame paints the whole window, so what the marker has to
+        // be true about is the store, not the emitted batch.
+        let marker = &v.scrollback().rows()[0];
         assert!(
-            emitted
-                .iter()
-                .any(|l| l.contains("bytes dropped") && l.contains(&v.dropped_bytes().to_string())),
-            "and the notice must reach the scrollback, with the amount: {emitted:?}"
+            marker.is_trim_marker(),
+            "a trimmed store leads with its marker, not with a page cut mid-way"
+        );
+        let marker = marker.to_string();
+        assert!(marker.contains("scrollback trimmed"), "{marker:?}");
+        assert!(
+            marker.contains(&v.scrollback().dropped_lines().to_string())
+                || marker.contains(
+                    &crate::services::clipboard::thousands(v.scrollback().dropped_lines())
+                        .replace(',', "")
+                ),
+            "the marker states the loss: {marker} / dropped {}",
+            v.scrollback().dropped_lines()
         );
     }
 
@@ -2062,6 +2485,9 @@ mod tests {
             entries.len()
         );
         for row in v.scrollback().rows() {
+            if row.is_trim_marker() {
+                continue; // chrome names no entry, by construction
+            }
             assert!(
                 row.entry < entries.len(),
                 "a row outlives the entry it names: {:?}",
@@ -2069,7 +2495,7 @@ mod tests {
             );
             let text = row.to_string();
             let body = text.trim_start_matches(['•', '●', '◌', ' ']).trim();
-            if body.is_empty() || body.contains("bytes dropped") {
+            if body.is_empty() {
                 continue;
             }
             assert!(

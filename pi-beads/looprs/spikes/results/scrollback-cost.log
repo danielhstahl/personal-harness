@@ -1,0 +1,59 @@
+# scrollback-cost — looprs-pdl.7
+# measured 2026-10-07T10:02:30Z, aarch64-apple-darwin (Apple Silicon), macOS, nightly rustc
+#
+# command:
+#   LOOPRS_MEASURE_CORPUS=~/.pi/agent/sessions/--Users-danielstahl-Documents-code-ml-personal-harness-pi-beads-looprs-- \
+#   LOOPRS_MEASURE_TICKETS=12 cargo test --bin looprs -- --ignored --nocapture --test-threads=1 measure
+#
+# The corpus is twelve real 'pi' passes from this repo's own beads loop, replayed
+# through the real flusher (render, wrap, highlight) at 100 columns with a
+# counting global allocator. This is the long-beads-pass working set that the
+# per-view scrollback cap in src/state/scrollback.rs is set from.
+
+corpus   : /Users/danielstahl/.pi/agent/sessions/--Users-danielstahl-Documents-code-ml-personal-harness-pi-beads-looprs--
+tickets  : 12 session files (oldest first)
+geometry : 100 cols, 40-row transcript band
+
+--- the pass, in the units the ticket asked for
+entries       : 1687   (3563.8 KiB of entry text)
+tool results  : 2078.2 KiB of it (58%), single largest 50.0 KiB
+longest line  : 2516 bytes
+
+--- the unbounded store, at 100 cols
+rendered rows : 30239
+row text      : 2589.3 KiB  (avg 88 B/row)
+cells         : 2622215
+row text len  : p50 55 B · p95 100 B · p99 463 B · max 42310 B
+live heap     : 171580.0 KiB = 4956.6 KiB transcript + 166623.4 KiB store rows
+churn         : 1134622.5 KiB of temporaries came and went
+
+--- with the cap the code sets (32768.0 KiB)
+kept          : 5738 rows · 486.2 KiB of row text · 19% of the pass's content
+dropped       : 16834 lines reported on the marker
+history       : 143.4 screens of 40 rows kept
+marker        : ⌄ scrollback trimmed: 16,834 earlier lines dropped
+
+(a) live heap per byte of row text: 64.35 — the reason the cap counts 
+     structure and not just text.
+(b) live heap per rendered row   : 5642 B — what `ROW_STRUCT_BYTES` is sized against.
+
+--- the journal's cost (disk, not memory)
+a pass of this shape writes about 3563.8 KiB of journal: the entry text, in order, with the parts the cap dropped still in it.
+window closed: live 62937.5 KiB · total 1312962.4 KiB
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 672 filtered out; finished in 19.78s
+
+
+## What the numbers set
+
+- `ROW_STRUCT_BYTES = 5_760` — line (b): 5,642 B of live heap per rendered row
+  against 88 B of row text. Rounded *up* rather than to the nearest KiB, because
+  a charge under the truth makes the cap larger than the number printed on it.
+- `DEFAULT_RETAINED_BYTES = 32 MiB` — the ceiling on one view's rendered
+  content. At the measured shape that is ~5.8k retained rows: ~144 screens of
+  scrollback at 40 rows a screen, ~0.5 MiB of visible text, about a fifth of a
+  long pass — against the 166 MiB the store held with no cap at all.
+- The journal costs ~3.5 MiB of *disk* per pass at this shape and no memory to
+  speak of, which is what makes it an acceptable home for everything the cap
+  throws away.

@@ -231,6 +231,19 @@ impl CharRange {
     }
 }
 
+/// What a trim did to a live selection. See
+/// [`Selection::entries_evicted`] for what each one means on the screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrimEffect {
+    /// The selection still has everything it had.
+    Untouched,
+    /// Its earlier end was trimmed; the selection now starts at the oldest
+    /// content that survives, and is shorter than the drag that made it.
+    Clamped,
+    /// All of it went, and there is no selection to clamp.
+    Dropped,
+}
+
 /// Which edge of the transcript band a pointer position is on.
 ///
 /// The *band*, not the drawn rows: the edge that matters is the edge of the
@@ -362,61 +375,99 @@ impl Selection {
     /// The transcript was compacted: follow the entry renumbering, the same
     /// mapping [`Scrollback::entries_evicted`] applies to the rows.
     ///
-    /// Returns whether the selection was *killed* by it — which is exactly
-    /// "the trim ate the anchor": the character the drag started on is gone,
-    /// so there is no left end to clamp to and the honest state is `None`.
-    /// A trim that only ate rows *above* the selection leaves it alone beyond
-    /// the renumbering, which is the case worth keeping: the user's selection
-    /// was not made of the bytes that got trimmed.
+    /// **This is where a trim meets a live selection, and the ticket is explicit
+    /// about what has to happen: it clamps, and it does not lie.** Three
+    /// outcomes, returned so the caller (and the test) can tell them apart:
     ///
-    /// Called with the same two arguments the store got, from the same event —
-    /// the two mappings must be the same mapping, or the selection points at
-    /// entries by one numbering and the rows carry another.
+    /// * [`TrimEffect::Untouched`] — nothing this selection is made of went
+    ///   anywhere; the entries just moved, and the mapping keeps them moved the
+    ///   same way the store moved its rows.
+    /// * [`TrimEffect::Clamped`] — one end of the selection was trimmed away.
+    ///   That end can only be the **earlier** one (trims come off the old end,
+    ///   and the ends are ordered by content), so it is set to the oldest thing
+    ///   that still exists and the selection goes on living, shorter than the
+    ///   drag that made it. Two things make that honest rather than a shrink
+    ///   behind the user's back: the highlight is re-derived from the range
+    ///   every frame ([`Selection::cells`]), so what the user sees selected *is*
+    ///   what will be copied; and the count on the copy toast is the count of
+    ///   the text that resolved, not the count of the drag, so the number that
+    ///   gets reported is the number that got copied. A selection that shrank
+    ///   *silently* between drag and paste is a lie about the clipboard, and
+    ///   that is the failure this branch exists to close.
+    /// * [`TrimEffect::Dropped`] — both ends went. There is no range left to
+    ///   clamp to, and a "selection" of content the user never pointed at is
+    ///   not a shorter selection, it is a wrong one. The state is cleared.
     ///
-    /// Nothing calls it yet because nothing evicts yet: the row/byte trim is
-    /// looprs-pdl.7's, and when it lands the one place it calls
-    /// `Scrollback::entries_evicted` has to call this right after with the same
-    /// pair. That is the whole wiring, and it is here so the wiring is a call
-    /// rather than a redesign under time pressure.
-    #[allow(dead_code)] // consumer: the bounded-scrollback trim (looprs-pdl.7); both mapping paths are tested meanwhile
-    pub fn entries_evicted(&mut self, removed: usize, notice_at: usize) -> bool {
+    /// Called with the same number the store got, from the same event — the two
+    /// mappings must be the same mapping, or the selection points at entries by
+    /// one numbering and the rows carry another.
+    pub fn entries_evicted(&mut self, removed: usize) -> TrimEffect {
         if removed == 0 || !self.is_live() {
-            return false;
+            return TrimEffect::Untouched;
         }
-        let map = |old: usize| -> Option<usize> {
-            if old < removed {
-                return None;
-            }
-            let shifted = old - removed;
-            Some(if shifted >= notice_at {
-                shifted + 1
-            } else {
-                shifted
-            })
+        // The same mapping the store applied, and nothing else: after `removed`
+        // entries come off the front, the oldest surviving entry is index 0, so
+        // the head of what is left is a fixed address in the new numbering.
+        let map = |old: usize| old.checked_sub(removed);
+        let head = CharRef {
+            entry: 0,
+            logical: 0,
+            start: 0,
+            end: 0,
         };
-        // The two ends move exactly as the rows they point at move: a
-        // renumbering of the selection is only correct if it is the *same*
-        // renumbering the store applied to the rows, so this uses the store's
-        // own mapping and no other.
         match self {
-            Selection::None => false,
+            Selection::None => TrimEffect::Untouched,
             Selection::Dragging { anchor, focus, .. } => {
-                let (Some(a), Some(f)) = (map(anchor.entry), map(focus.entry)) else {
-                    *self = Self::None;
-                    return true;
-                };
-                anchor.entry = a;
-                focus.entry = f;
-                false
+                match (map(anchor.entry), map(focus.entry)) {
+                    (Some(a), Some(f)) => {
+                        anchor.entry = a;
+                        focus.entry = f;
+                        TrimEffect::Untouched
+                    }
+                    // Exactly one end went, so that end becomes the head of what
+                    // is left — and the *surviving* end still has to be
+                    // renumbered in the same breath, or the clamped range pairs a
+                    // new head with an old address and copies the wrong text.
+                    // Neither arm assumes which end is the earlier one: a drag
+                    // upward puts the focus behind the anchor, and the clamp
+                    // follows whichever end actually went.
+                    (Some(a), None) => {
+                        anchor.entry = a;
+                        *focus = head;
+                        TrimEffect::Clamped
+                    }
+                    (None, Some(f)) => {
+                        focus.entry = f;
+                        *anchor = head;
+                        TrimEffect::Clamped
+                    }
+                    (None, None) => {
+                        *self = Self::None;
+                        TrimEffect::Dropped
+                    }
+                }
             }
             Selection::Selected(r) => {
-                let (Some(a), Some(b)) = (map(r.start.entry), map(r.end.entry)) else {
-                    *self = Self::None;
-                    return true;
-                };
-                r.start.entry = a;
-                r.end.entry = b;
-                false
+                match (map(r.start.entry), map(r.end.entry)) {
+                    (Some(a), Some(b)) => {
+                        r.start.entry = a;
+                        r.end.entry = b;
+                        TrimEffect::Untouched
+                    }
+                    (None, Some(b)) => {
+                        r.start = head;
+                        r.end.entry = b;
+                        TrimEffect::Clamped
+                    }
+                    // Not reachable through a front-trimming store (the later end
+                    // cannot go before the earlier one), but answered rather than
+                    // left to a `reachable!`: dropping is the honest answer if a
+                    // future trim ever works from the other end.
+                    (Some(_), None) | (None, None) => {
+                        *self = Self::None;
+                        TrimEffect::Dropped
+                    }
+                }
             }
         }
     }
@@ -545,6 +596,14 @@ impl Selection {
 /// mixing them up is the difference between "the middle rows are whole" and
 /// "the middle rows start at byte 43 of themselves", which is nothing at all.)
 fn span_on(row: &DisplayRow, r: &CharRange) -> Option<(usize, usize)> {
+    // The trim marker is chrome that happens to live in the store, and chrome is
+    // not transcript (ADR-0004 R16). Selecting it would put
+    // "scrollback trimmed: …" on the clipboard in the middle of the user's
+    // text — the one thing in the store that is not content, and so the one
+    // thing that must answer "nothing here" to both resolve and highlight.
+    if row.is_trim_marker() {
+        return None;
+    }
     let key = (row.entry, row.logical);
     let start_key = (r.start.entry, r.start.logical);
     let end_key = (r.end.entry, r.end.logical);
@@ -583,6 +642,13 @@ fn span_on(row: &DisplayRow, r: &CharRange) -> Option<(usize, usize)> {
 /// the drag is what the user's hand is aiming at, and for the *end* of a drag
 /// it means "through the end of the row" — not "nothing".
 pub fn hit(row: &DisplayRow, cell: usize) -> Option<CharRef> {
+    // Nothing to hit on the marker row, for the same reason there is nothing to
+    // hit on the status row: it is not content. A press there starts no
+    // selection, which leaves whatever was standing already standing alone —
+    // the same rule as a press on chrome.
+    if row.is_trim_marker() {
+        return None;
+    }
     let total = row.cells.cells();
     if total == 0 {
         return None;
@@ -1271,11 +1337,14 @@ mod tests {
 
     // ─────────────────────── the trim ───────────────────────
 
-    /// **The trim that ate the anchor clears it** (ticket's clear list), and
-    /// the mapping used is the store's own, so the selection and the rows
-    /// cannot end up numbered by two different schemes.
+    /// **A trim that ate the earlier end clamps it** (looprs-pdl.7): the
+    /// selection does not disappear because its left end got eaten, it starts
+    /// now at the oldest thing still there — and what it resolves to is exactly
+    /// that, which is what the copy reports. The test that matters is the pair:
+    /// the paste got shorter, and the *count of the paste* is the count of
+    /// what is in it, not the count of the drag.
     #[test]
-    fn a_trim_that_ate_the_anchor_clears_the_selection() {
+    fn a_trim_that_ate_the_earlier_end_clamps_it_and_the_paste_tells_the_truth() {
         let mut s = Scrollback::new(40);
         s.push(vec![hard(0, "aaaa"), hard(1, "bbbb"), hard(2, "cccc")]);
         let a = hit_at(s.rows(), 0, 2);
@@ -1283,21 +1352,40 @@ mod tests {
         let mut sel = Selection::default();
         sel.press(a);
         sel.drag(b);
-        assert_eq!(sel.paste(s.rows()), "aa\nbbbb\ncc");
+        let before = sel.paste(s.rows());
+        assert_eq!(before, "aa\nbbbb\ncc");
 
-        // Entries 0 and 1 go; the anchor's entry is among them.
-        s.entries_evicted(2, 1);
-        assert!(
-            sel.entries_evicted(2, 1),
-            "the trim ate the anchor, and says so"
+        // Entry 0 goes. The store's mapping and the selection's are the same one
+        // (`removed` in, `old - removed` out), so the surviving end still names
+        // the same content it named before the eviction.
+        s.entries_evicted(1, 1);
+        assert_eq!(
+            sel.entries_evicted(1),
+            TrimEffect::Clamped,
+            "the earlier end went, and the selection says so rather than clearing"
         );
-        assert_eq!(sel, Selection::None);
-        assert_eq!(sel.paste(s.rows()), "");
+        assert!(sel.is_live(), "a clamped selection is still a selection");
+        let after = sel.paste(s.rows());
+        assert_eq!(
+            after, "bbbb\ncc",
+            "what is left of it is exactly what is still on screen"
+        );
+        assert!(
+            after.chars().count() < before.chars().count(),
+            "shorter than the drag: the trim is visible in the copy, not hidden from it"
+        );
+        // The address it clamped to is the head of what the store still has.
+        assert_eq!(
+            sel.range()
+                .map(|r| (r.start.entry, r.start.logical, r.start.start)),
+            Some((0, 0, 0)),
+            "entry 0 of the *new* numbering — the oldest thing kept"
+        );
     }
 
-    /// …and a trim that only ate rows *above* the selection leaves the
-    /// selection alone beyond the renumbering: those bytes were never part of
-    /// what the user selected.
+    /// …and a trim that only ate rows *above* the selection leaves it alone
+    /// beyond the renumbering: those bytes were never part of what the user
+    /// selected.
     #[test]
     fn a_trim_above_the_selection_keeps_it_and_renumbers_it() {
         let mut s = Scrollback::new(40);
@@ -1309,24 +1397,113 @@ mod tests {
         sel.drag(b);
         assert_eq!(sel.paste(s.rows()), "keep me\nand");
 
-        // Entry 0 off the front, the notice landing at index 0: the store's own
-        // mapping, which is 1 → 1 and 2 → 2 here ([notice, 1, 2]).
-        s.entries_evicted(1, 0);
-        assert!(
-            !sel.entries_evicted(1, 0),
+        // Entry 0 off the front: the store's mapping is 1 → 0 and 2 → 1, and
+        // the selection is given the same one number.
+        s.entries_evicted(1, 1);
+        assert_eq!(
+            sel.entries_evicted(1),
+            TrimEffect::Untouched,
             "nothing of the selection was eaten"
         );
         assert!(sel.is_live());
         // The store's rows and the selection's addresses moved together, so
         // the paste is still the same text against the renumbered store.
+        let kept: Vec<(usize, String)> = s
+            .rows()
+            .iter()
+            .filter(|r| !r.is_trim_marker())
+            .map(|r| (r.entry, r.to_string()))
+            .collect();
         assert_eq!(
-            s.rows()
-                .iter()
-                .map(|r| (r.entry, r.to_string()))
-                .collect::<Vec<_>>(),
-            vec![(1, "keep me".to_string()), (2, "and me".to_string())]
+            kept,
+            vec![(0, "keep me".to_string()), (1, "and me".to_string())],
+            "the store renumbered the survivors the same way the selection did"
         );
         assert_eq!(sel.paste(s.rows()), "keep me\nand");
+    }
+
+    /// Both ends gone is not a short selection, it is no selection: clamping
+    /// both to the head would manufacture a range over content the user never
+    /// pointed at, which is the one thing worse than losing the selection.
+    #[test]
+    fn a_trim_that_ate_all_of_it_drops_the_selection() {
+        let mut s = Scrollback::new(40);
+        s.push(vec![hard(0, "one"), hard(1, "two"), hard(2, "three")]);
+        let mut sel = Selection::default();
+        sel.press(hit_at(s.rows(), 0, 0));
+        sel.drag(hit_at(s.rows(), 1, 1));
+
+        s.entries_evicted(2, 2);
+        assert_eq!(sel.entries_evicted(2), TrimEffect::Dropped);
+        assert_eq!(sel, Selection::None);
+        assert_eq!(sel.paste(s.rows()), "");
+    }
+
+    /// A drag can point its *earlier* end with the focus rather than the anchor
+    /// — dragging up and to the left. The clamp follows reading order, not the
+    /// order the two ends happened to be recorded in.
+    #[test]
+    fn a_drag_upward_into_trimmed_content_clamps_its_earlier_end() {
+        let mut s = Scrollback::new(40);
+        s.push(vec![hard(0, "gone"), hard(1, "kept"), hard(2, "also kept")]);
+        let mut sel = Selection::default();
+        // press on entry 2, drag back up into entry 0: the focus is the earlier end.
+        sel.press(hit_at(s.rows(), 2, 2));
+        sel.drag(hit_at(s.rows(), 0, 1));
+        assert_eq!(sel.paste(s.rows()), "one\nkept\nals");
+
+        s.entries_evicted(1, 1);
+        assert_eq!(sel.entries_evicted(1), TrimEffect::Clamped);
+        // The focus is what went, so the focus is what is set to the head, and
+        // the range the copy resolves is the kept part — not a mirrored one.
+        let r = sel.range().expect("still selected");
+        assert_eq!((r.start.entry, r.start.logical, r.start.start), (0, 0, 0));
+        assert_eq!(r.end.entry, 1, "the press point renumbered 2 → 1");
+        assert_eq!(sel.paste(s.rows()), "kept\nals");
+    }
+
+    /// The trim marker is chrome, and chrome is not transcript (ADR-0004 R16):
+    /// a range that spans it must not put the marker's own sentence on the
+    /// clipboard, and must not light it up as if it were content.
+    #[test]
+    fn the_trim_marker_is_not_selectable() {
+        // Room for the last two entries only, so the store ends up as
+        // [marker, "kept one", "kept two"] and a range can span the marker.
+        let cap = 2 * ("kept one".len() + crate::state::scrollback::ROW_STRUCT_BYTES) + 1;
+        let mut s = Scrollback::with_cap(40, cap);
+        s.push(vec![
+            hard(0, "a dropped line that was long"),
+            hard(1, "kept one"),
+        ]);
+        s.push(vec![hard(2, "kept two")]);
+        assert!(
+            s.rows()[0].is_trim_marker(),
+            "the trim put the marker at the head"
+        );
+        // A press on the marker hits nothing, so nothing starts there.
+        assert_eq!(hit(&s.rows()[0], 0), None);
+        assert_eq!(
+            hit_resting(s.rows(), 0, 0),
+            None,
+            "nothing above to rest on"
+        );
+
+        // And a range whose span *covers* the marker row contributes nothing
+        // from it: the paste is the content either side of it, never its text.
+        let mut sel = Selection::default();
+        sel.press(hit_at(s.rows(), 1, 0));
+        sel.drag(hit_at(s.rows(), 2, 3));
+        let text = sel.paste(s.rows());
+        assert_eq!(
+            text, "kept one\nkept",
+            "the end lands on the cell it landed on, and nothing of the marker"
+        );
+        assert!(!text.contains("scrollback trimmed"), "{text:?}");
+        let cells = sel.cells(s.rows());
+        assert!(
+            !cells.iter().any(|(i, _, _)| *i == 0),
+            "the highlight never lands on the marker row: {cells:?}"
+        );
     }
 
     // ─────────────────────── the Esc rule ───────────────────────
@@ -1489,7 +1666,7 @@ mod tests {
 
         // With the published content trimmed away, the answer is "nothing was
         // hit" rather than a guessed row — the store's own re-wrap rule.
-        s.entries_evicted(2, 1);
+        s.entries_evicted(2, 2);
         assert_eq!(
             snap.row_index(&s, 5),
             None,
