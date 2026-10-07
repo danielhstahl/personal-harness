@@ -30,9 +30,11 @@ use tokio::time::MissedTickBehavior;
 use components::card::LiveCardPreview;
 use components::selection::SelectionHighlight;
 use components::text_stream::{NewRowsPill, TranscriptBand, band_layout};
+use components::toast::ToastOverlay;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
+use crate::services::clipboard;
 use crate::services::notification;
 use crate::session::router::{Router, SHUTDOWN_GRACE};
 use crate::session::{ChatState, SessionConfig, TerminalType};
@@ -161,8 +163,15 @@ async fn run(
     // place the real sink is built: `SessionConfig::default()` carries `Noop`,
     // which is what keeps ~300 tests off the network by construction rather than
     // by nobody remembering to unset `LOOPRS_NTFY_URL`.
+    let clipboard = clipboard::clipboard_from_env();
     let cfg = SessionConfig {
         notifier: notification::notifier_from_env(),
+        // The same rule as the notifier, and the same reason for stating it:
+        // this is the only place the real clipboard sink is built, so
+        // `SessionConfig::default()` carrying `Noop` is what keeps ~550 tests
+        // off the clipboard *by construction* rather than by nobody
+        // remembering to unset `LOOPRS_CLIPBOARD`.
+        clipboard: clipboard.clone(),
         ..SessionConfig::default()
     };
     let mut router = Router::new(initial, cfg, app_tx.clone());
@@ -211,6 +220,24 @@ async fn run(
     // by the session that cuts the child's switches, the App that repaints, and
     // the exit that leaves the screen for good.
     app.set_alt_screen_hosted(Mode::alt_screen_claimed());
+    // The clipboard, on the same wire as the notifier: the App builds nothing
+    // itself, it is handed the sink that `SessionConfig` carries, so "which
+    // transport copies my selections" has exactly one answer per run and the App
+    // never reaches for `pbcopy` on its own initiative. Same for the automatic
+    // path: `LOOPRS_COPY_ON_SELECT=0` is read once, here, and the App is told.
+    app.set_clipboard(clipboard);
+    app.set_copy_on_select(clipboard::copy_on_select_enabled(
+        std::env::var("LOOPRS_COPY_ON_SELECT").ok(),
+    ));
+    // The escape hatch, on the same injected-sink rule as the clipboard and for
+    // the same three reasons: it touches a filesystem, it can fail in ways the UI
+    // must report rather than handle, and `main` being the only place the real one
+    // is built is what keeps the test suite off the disk by construction.
+    // `LOOPRS_TRANSCRIPT_DIR` chooses the directory; with nothing set it is the
+    // system temp dir, because a chord the user just discovered should return a
+    // transcript rather than a tutorial.
+    let transcript_sink = crate::services::transcript_file::transcript_sink_from_env();
+    app.set_transcript_sink(transcript_sink);
     // Tell the sessions the size they are being shown at before anyone runs a
     // command. A Bash shell spawned later still inherits this: `BashTask::resize`
     // records the size even with no shell up yet, and uses it for the pty it
@@ -511,7 +538,30 @@ fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
     // a row of its own so an arrival cannot shift the text the user is reading
     // (ADR-0004 R21's reasoning for the copy toast, applied one band over).
     if app.scrollback().shows_new() {
-        f.render_widget(NewRowsPill(app.new_rows()), text_area);
+        // Both this and the copy toast are bottom-right overlays of the same
+        // band, and two overlays in one cell is a smear. When the toast is up it
+        // gets the bottom row — it is the more urgent of the two, and it is
+        // leaving in two seconds — and the pill is handed an area one row
+        // shorter, which moves the *pill*, not a single row of transcript.
+        let pill_area = if app.toast().is_some() {
+            Rect {
+                height: text_area.height.saturating_sub(1),
+                ..text_area
+            }
+        } else {
+            text_area
+        };
+        f.render_widget(NewRowsPill(app.new_rows()), pill_area);
+    }
+
+    // The copy confirmation (looprs-pdl.10, ADR-0004 R18): a pill of the
+    // text's own width, reverse-video, in the band's bottom-right corner,
+    // drawn **last** so it lands over everything in the band and never takes a
+    // row of its own. A toast that re-shaped the transcript would move the text
+    // the user just selected out from under the pointer, which is the failure
+    // R21 prices at ~9 ms a pop and refuses outright.
+    if let Some(toast) = app.toast() {
+        f.render_widget(ToastOverlay::new(toast.text(), toast.tone()), text_area);
     }
 
     for (i, e) in cards.iter().enumerate() {
@@ -1094,6 +1144,13 @@ mod tests {
     #[test]
     fn the_highlight_lands_in_the_band_and_never_on_the_chrome() {
         let mut app = app(TerminalType::Pi, true);
+        // The copy-on-release path is off for this test. Not a dodge: this test
+        // is about *where the highlight paints*, and a release that hands the
+        // selection to a clipboard sink paints a toast over the band on its way
+        // past — which is looprs-pdl.10's subject, tested there, and would make
+        // the "the frame moved nothing" assertion below read as a geometry
+        // failure when it is only a toast.
+        app.set_copy_on_select(false);
         settle(&mut app, SessionId::new(TerminalType::Pi, 1), 6);
         let h = HEIGHT;
         let input_rows = viewport::MIN_INPUT_ROWS;

@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -706,7 +706,229 @@ pub struct App {
     /// whole of "a flick must not scroll forty rows" is a statement about
     /// arrival times, and [`crate::state::wheel`] proves it there.
     wheel: crate::state::wheel::WheelCadence,
+    /// Where a copy goes (looprs-pdl.10). Injected, never called directly.
+    ///
+    /// `Noop` by default for exactly the reason `SessionConfig`'s is: the App is
+    /// what ~200 unit tests build, and a default that reached for `pbcopy` would
+    /// make every selection test a clipboard test.
+    clipboard: Arc<dyn crate::services::clipboard::Clipboard>,
+    /// The **automatic** copy path: does a drag release copy?
+    ///
+    /// `LOOPRS_COPY_ON_SELECT=0` turns this off and nothing else (ADR-0004 R17).
+    /// The selection itself, the toast, and the keyboard copy are all untouched,
+    /// because a user who does not want their clipboard written by a mouse
+    /// gesture still wants it written when they ask.
+    copy_on_select: bool,
+    /// The copy we have handed to the sink and are waiting to hear about.
+    ///
+    /// Held rather than awaited: the UI task must never be parked on a
+    /// clipboard. The receipt is polled from the tick, and this carries the
+    /// timestamp that turns "still in flight" into a visible late failure at
+    /// [`COPY_TIMEOUT`] rather than an empty screen.
+    pending_copy: Option<PendingCopy>,
+    /// The toast on screen right now (looprs-pdl.10).
+    ///
+    /// One, not a queue: R21 says the next toast *replaces* the previous rather
+    /// than queueing behind it, because two toasts about two copies would leave
+    /// the user unsure which selection the clipboard holds.
+    toast: Option<crate::state::toast::Toast>,
+    /// Where a whole-transcript dump goes (looprs-pdl.13). Injected, exactly like
+    /// [`Self::clipboard`], and for the same reason: the App builds no file path
+    /// of its own, so "where did my transcript go" has one answer per run.
+    transcript_sink: Arc<dyn crate::services::transcript_file::TranscriptSink>,
+    /// The dump we have handed to that sink and are waiting to hear about.
+    pending_dump: Option<PendingDump>,
+    /// The copy chord's prefix state (looprs-pdl.13).
+    ///
+    /// `Ctrl-S` arms it; the next key picks the target. A prefix rather than four
+    /// top-level chords because the chord budget is the constraint this ticket was
+    /// written around: three modes, an Esc rule, Tab switching, Ctrl-C as SIGINT,
+    /// Ctrl-Q to quit and Shift-Enter for a newline already spend it, and a
+    /// fourth free control key costs a shadow somewhere. Under the prefix the
+    /// target keys (`a`/`o`/`s`/`t`/`?`) exist only in the armed window, so the
+    /// audit for "does this shadow an existing binding" is one key, not five.
+    ///
+    /// See [`CHORD_TABLE`](crate::session::view::CHORD_TABLE) for the whole
+    /// mode x key picture, and [`Self::on_key`] for the order these checks run
+    /// in — which is the audit made executable.
+    copy_chord: CopyChord,
+    /// When the prefix went armed, for the window's expiry.
+    /// Only meaningful while [`Self::copy_chord`] is `Armed`.
+    copy_chord_at: Instant,
     cmd_tx: mpsc::Sender<UiCommand>, // UI -> Router
+}
+
+/// The prefix state of the copy chord (looprs-pdl.13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum CopyChord {
+    /// No prefix outstanding. Where everyone starts and where everything ends.
+    #[default]
+    Off,
+    /// `Ctrl-S` was pressed; the next key is the target.
+    Armed,
+}
+
+/// What a copy chord asked for, before anyone has looked for it.
+///
+/// The three targets are *resolved*, not guessed: a target that is not there is a
+/// refusal with a reason naming what is missing, never a shorter copy, and never
+/// an adjacent thing that happened to be available. A user who asks for "the last
+/// answer" in a session that has none and gets the last thinking block instead has
+/// been lied to in the one place a lie is expensive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyTarget {
+    /// The last assistant answer.
+    Answer,
+    /// The last command's output — the shell's for Bash, a tool card's result for
+    /// the agentic modes, because that is what "the last thing this mode ran"
+    /// means there.
+    CommandOutput,
+    /// Whatever selection is live, mouse-made or otherwise.
+    Selection,
+}
+
+impl CopyTarget {
+    /// The chord's own spelling, for refusal text that names what was asked for.
+    fn label(self) -> &'static str {
+        match self {
+            CopyTarget::Answer => "the last answer",
+            CopyTarget::CommandOutput => "the last command's output",
+            CopyTarget::Selection => "the selection",
+        }
+    }
+}
+
+/// The second key of the copy chord, as classified.
+///
+/// A total function from a keystroke to a meaning, with `NotAChord` as the
+/// explicit remainder: the alternative is an `Option` whose `None` gets handled
+/// differently in three places, and a chord table with three answers is no table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyKey {
+    Answer,
+    Output,
+    Selection,
+    TranscriptFile,
+    Help,
+    Cancel,
+    NotAChord,
+}
+
+/// Classify a keystroke against the chord family.
+///
+/// Modifiers are deliberately ignored on the second key: users who keep `Ctrl`
+/// down through a chord (`Ctrl-S Ctrl-A`) are common, and honouring the
+/// modifier-taking reading costs nothing because none of these letters means
+/// anything else while the prefix is outstanding — which is the whole argument
+/// for a prefix in the first place, and the reason the shadowing audit is one key
+/// (`Ctrl-S`) rather than six.
+fn copy_chord_key(k: crossterm::event::KeyEvent) -> CopyKey {
+    match k.code {
+        KeyCode::Char('a') | KeyCode::Char('A') => CopyKey::Answer,
+        KeyCode::Char('o') | KeyCode::Char('O') => CopyKey::Output,
+        KeyCode::Char('s') | KeyCode::Char('S') => CopyKey::Selection,
+        KeyCode::Char('t') | KeyCode::Char('T') => CopyKey::TranscriptFile,
+        KeyCode::Char('?') => CopyKey::Help,
+        KeyCode::Esc => CopyKey::Cancel,
+        _ => CopyKey::NotAChord,
+    }
+}
+
+/// A keystroke spelled the way a toast has to spell it.
+///
+/// `{:?}` on a `KeyCode` says `Char('x')`, which is fine in a log and wrong in
+/// a message meant for a person: they read that as a quote about a character and
+/// not as the key they pressed.
+fn key_word(k: crossterm::event::KeyEvent) -> String {
+    let base = match k.code {
+        KeyCode::Char(c) => {
+            if k.modifiers.contains(KeyModifiers::SHIFT) {
+                format!("Shift-{c}")
+            } else {
+                format!("`{c}`")
+            }
+        }
+        KeyCode::Esc => "Esc".to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Tab => "Tab".to_string(),
+        KeyCode::BackTab => "Shift-Tab".to_string(),
+        KeyCode::Backspace => "Backspace".to_string(),
+        KeyCode::Delete => "Delete".to_string(),
+        KeyCode::Home => "Home".to_string(),
+        KeyCode::End => "End".to_string(),
+        KeyCode::PageUp => "PageUp".to_string(),
+        KeyCode::PageDown => "PageDown".to_string(),
+        KeyCode::F(n) => format!("F{n}"),
+        other => format!("{other:?}"),
+    };
+    if k.modifiers.contains(KeyModifiers::CONTROL) && !base.starts_with("Ctrl-") {
+        format!("Ctrl-{base}")
+    } else {
+        base
+    }
+}
+
+/// How long the copy prefix stays outstanding (looprs-pdl.13).
+///
+/// Equal to [`TOAST_TTL`](crate::state::toast::TOAST_TTL) on purpose: the hint
+/// that names the window lives exactly as long as the window does, so "the hint
+/// is still up" and "the chord is still armed" are one fact on screen rather
+/// than two claims that can disagree — and a user who waits too long sees the
+/// hint go away at the moment it stopped being true.
+pub const COPY_CHORD_WINDOW: Duration = crate::state::toast::TOAST_TTL;
+
+/// A dump handed to the sink, with the number the late-failure toast needs if the
+/// sink is slow: how much was asked for, and how long we have been waiting.
+#[derive(Debug)]
+struct PendingDump {
+    receipt: crate::services::transcript_file::DumpReceipt,
+    chars: crate::services::clipboard::Chars,
+    sent_at: Instant,
+}
+
+/// The mode's name in file-name dress: lowercase, one word, no spaces.
+///
+/// `TerminalType::label` is "Bash"/"Pi"/"Beeds" — for a status row. A file name
+/// wants the other case, and the mapping is written out rather than
+/// `to_lowercase()`d at the call site so a future rename of the label cannot
+/// silently change where a user's transcripts live.
+fn mode_label(mode: TerminalType) -> &'static str {
+    match mode {
+        TerminalType::Bash => "bash",
+        TerminalType::Pi => "pi",
+        TerminalType::Beeds => "beads",
+    }
+}
+
+/// The toast's text and its tone, for a copy outcome.
+///
+/// The *words* stay on
+/// [`CopyOutcome::toast`](crate::services::clipboard::CopyOutcome::toast),
+/// next to the variants they describe, so the ladder cannot drift from the
+/// state machine. All this decides is how loudly to say it.
+fn describe_outcome(
+    outcome: &crate::services::clipboard::CopyOutcome,
+) -> (String, crate::state::toast::Tone) {
+    let tone = if outcome.is_failure() {
+        crate::state::toast::Tone::Bad
+    } else {
+        crate::state::toast::Tone::Good
+    };
+    (outcome.toast(), tone)
+}
+
+/// A copy handed to the sink, with the two numbers the toast needs if the sink is
+/// slow: how much was asked for, and how long we have been waiting.
+#[derive(Debug)]
+struct PendingCopy {
+    receipt: crate::services::clipboard::Receipt,
+    // Written at request time, read by the request itself: the toast is sent from
+    // the local `chars` before the request is parked here, so the field is a
+    // receipt the app does not consult. Kept (looprs-pdl.10, in progress) rather
+    // than deleted, because the deferred-toast variant of this path reads it.
+    #[allow(dead_code)]
+    chars: crate::services::clipboard::Chars,
+    sent_at: Instant,
 }
 
 impl App {
@@ -742,6 +964,14 @@ impl App {
             row_phase: now,
             row_spinner: 0,
             wheel: crate::state::wheel::WheelCadence::default(),
+            clipboard: Arc::new(crate::services::clipboard::Noop),
+            copy_on_select: true,
+            pending_copy: None,
+            toast: None,
+            transcript_sink: Arc::new(crate::services::transcript_file::Noop),
+            pending_dump: None,
+            copy_chord: CopyChord::Off,
+            copy_chord_at: now,
             cmd_tx,
         }
     }
@@ -952,6 +1182,367 @@ impl App {
         self.selection.paste(self.scrollback().rows())
     }
 
+    // ──────────────────── select-to-copy (looprs-pdl.10) ────────────────────
+
+    /// Replace the clipboard sink.
+    ///
+    /// Called once from `main` with the configured sink. The default is
+    /// [`Noop`](crate::services::clipboard::Noop), which is what keeps a unit
+    /// test from being a clipboard test by accident.
+    pub fn set_clipboard(&mut self, clipboard: Arc<dyn crate::services::clipboard::Clipboard>) {
+        self.clipboard = clipboard;
+    }
+
+    /// Turn the automatic (drag-release) copy on or off — `LOOPRS_COPY_ON_SELECT`.
+    pub fn set_copy_on_select(&mut self, on: bool) {
+        self.copy_on_select = on;
+    }
+
+    /// Replace the whole-transcript dump sink.
+    ///
+    /// Called once from `main`. The default is
+    /// [`Noop`](crate::services::transcript_file::Noop), which keeps a unit test
+    /// from being a filesystem test by accident, exactly as
+    /// [`Self::set_clipboard`] keeps one from being a clipboard test.
+    pub fn set_transcript_sink(
+        &mut self,
+        sink: Arc<dyn crate::services::transcript_file::TranscriptSink>,
+    ) {
+        self.transcript_sink = sink;
+    }
+
+    /// The toast currently on screen.
+    pub fn toast(&self) -> Option<&crate::state::toast::Toast> {
+        self.toast.as_ref()
+    }
+
+    /// The one door every copy goes through: **count it, queue it, never wait on
+    /// it**.
+    ///
+    /// Three rules are enforced here rather than at the call sites, because a
+    /// rule enforced at two call sites is a rule that the second call site
+    /// forgets:
+    ///
+    /// * **R13** — a value that is empty after trimming copies nothing and says
+    ///   nothing, and leaves whatever was on the clipboard before alone. A blank
+    ///   drag across the gutter is not content;
+    /// * **R12** — nothing is copied while a full-screen child holds the screen.
+    ///   The pixels under the pointer are the child's, so a selection made from
+    ///   our last frame would describe text that is not on screen;
+    /// * **R19** — the count is taken here, from this exact string, once. Every
+    ///   toast that follows carries *that* number, so `Copied 44 characters`
+    ///   cannot describe a different 44 than the one that went out.
+    ///
+    /// Returns whether a copy was queued. A `false` return means nothing
+    /// happened at all: no write, no toast, no clipboard change.
+    pub fn copy_text(&mut self, text: String) -> bool {
+        if self.passthrough() {
+            tracing::debug!("copy declined: a full-screen child holds the screen");
+            return false;
+        }
+        if text.trim().is_empty() {
+            tracing::debug!("copy skipped: the selection is blank (R13)");
+            return false;
+        }
+        let chars = crate::services::clipboard::Chars::of(&text);
+        let receipt = self.clipboard.copy(text);
+        self.pending_copy = Some(PendingCopy {
+            receipt,
+            chars,
+            sent_at: self.clock,
+        });
+        self.dirty = true;
+        // Poll once immediately. A sink that answers on the spot — `Noop`,
+        // `RecordingClipboard` — therefore shows its toast in the same breath
+        // it was asked, which is what makes the latency budget assertable
+        // without a test that sleeps. A queued sink answers on the next tick.
+        let now = self.clock;
+        self.poll_copy(now);
+        true
+    }
+
+    /// The copy the selection makes, whatever made the selection.
+    ///
+    /// Used by the drag-release path and by the keyboard copy (looprs-pdl.13),
+    /// which is the point: both go through the same sink, the same count and
+    /// the same toast, so there is no second copy path with a second opinion
+    /// about what "Copied" means.
+    pub fn copy_selection(&mut self) -> bool {
+        let text = self.selection_paste();
+        self.copy_text(text)
+    }
+
+    // ─────────────── the keyboard copy (looprs-pdl.13) ───────────────
+
+    /// Resolve a chord's target against the mode on screen, without copying.
+    ///
+    /// `Err(reason)` is the refusal the toast says; it is produced here rather
+    /// than at the call sites so that every target refuses in the same words and a
+    /// new target cannot forget to refuse at all.
+    fn resolve(&self, target: CopyTarget) -> Result<String, String> {
+        let Some(view) = self.active_view() else {
+            return Err(format!("no {} transcript yet", self.active.label()));
+        };
+        let t = &view.transcript;
+        let found = match target {
+            // The agentic modes' answer. Bash has no answers of its own, and the
+            // refusal says so and points at the chord that does work here,
+            // because "nothing to copy" with no alternative is a dead end and a
+            // user who just learned a chord cannot get past a dead end.
+            CopyTarget::Answer => t.last_answer().map(str::to_string).ok_or_else(|| {
+                if self.active == TerminalType::Bash {
+                    "Bash mode has no answers \u{2014} Ctrl-S o copies the last command's output"
+                        .to_string()
+                } else {
+                    "this session has not answered anything yet".to_string()
+                }
+            })?,
+            // Same question, mode-relative: the shell's last block in Bash, the
+            // last tool card's result in Pi and Beads. Named "the last command's
+            // output" in both because that is what the user asked, and both
+            // answers satisfy it.
+            CopyTarget::CommandOutput => {
+                if self.active == TerminalType::Bash {
+                    match t.last_command_output() {
+                        Some(s) => s,
+                        // Two different nothings, and the user is holding one of
+                        // them: a shell that has never been asked, and a command
+                        // that ran and said nothing.
+                        None if !t.has_command_boundary() => {
+                            return Err("no command has run in this shell yet".to_string());
+                        }
+                        None => return Err("the last command produced no output".to_string()),
+                    }
+                } else {
+                    t.last_tool_output()
+                        .map(str::to_string)
+                        .ok_or_else(|| "no tool has finished in this session yet".to_string())?
+                }
+            }
+            // The selection is resolved by the selection itself; "no selection"
+            // is the refusal, and the keyboard-selection feature (which did not
+            // land in this ticket) will feed this same target when it does.
+            CopyTarget::Selection => {
+                if !self.selection.is_live() {
+                    return Err(if self.passthrough() {
+                        "a full-screen program holds the screen".to_string()
+                    } else {
+                        "nothing is selected \u{2014} Ctrl-S a copies the last answer, \u{b7} Ctrl-S o the last output"
+                            .to_string()
+                    });
+                }
+                self.selection_paste()
+            }
+        };
+        if found.trim().is_empty() {
+            // R13 again, on the keyboard side: an empty target is not a copy, and
+            // the difference between this and the refusal above is that the user
+            // asked for a thing that exists and happens to be blank.
+            return Err(format!("{} is blank", target.label()));
+        }
+        Ok(found)
+    }
+
+    /// The copy a chord asks for: resolve the target, hand it to the clipboard
+    /// sink, report through the same toast the mouse uses.
+    ///
+    /// A refusal is *said* here rather than returned as an error to the keystroke
+    /// handler for the same reason the copy is not a `Result`: the user asked for
+    /// something with a chord and the only acceptable outcomes are "it copied" and
+    /// "it did not, and here is why". Note this is where the keyboard path is
+    /// allowed to be loud: R13's "a blank selection copies nothing and says
+    /// nothing" governs the mouse, where the selection was never a request. A
+    /// chord *is* a request, so silence would be the bug.
+    pub fn copy_target(&mut self, target: CopyTarget) -> bool {
+        match self.resolve(target) {
+            Ok(text) => self.copy_text(text),
+            Err(reason) => {
+                self.show_toast(
+                    &format!("Nothing copied: {reason}"),
+                    crate::state::toast::Tone::Bad,
+                );
+                false
+            }
+        }
+    }
+
+    /// `Ctrl-S t`: the whole transcript, to a file.
+    ///
+    /// The same shape as a clipboard copy with a different sink — resolve, hand
+    /// over, poll the receipt, toast the result — so the escape hatch is not a
+    /// second implementation of "do a thing with text and report it".
+    pub fn dump_transcript(&mut self) -> bool {
+        if self.passthrough() {
+            // R12, and the reason the chord is not even read in this state: the
+            // transcript is not what is on screen, so writing "the transcript"
+            // would be writing a description of a frame the user cannot see.
+            self.show_toast(
+                "Nothing written: a full-screen program holds the screen",
+                crate::state::toast::Tone::Bad,
+            );
+            return false;
+        }
+        let Some(view) = self.active_view() else {
+            self.show_toast(
+                &format!("Nothing written: no {} transcript yet", self.active.label()),
+                crate::state::toast::Tone::Bad,
+            );
+            return false;
+        };
+        let text = view.transcript.plain_text();
+        if text.trim().is_empty() {
+            self.show_toast(
+                "Nothing written: the transcript is empty",
+                crate::state::toast::Tone::Bad,
+            );
+            return false;
+        }
+        let mode = self.active;
+        let chars = crate::services::clipboard::Chars::of(&text);
+        let receipt = self.transcript_sink.dump(mode_label(mode), text);
+        self.pending_dump = Some(PendingDump {
+            receipt,
+            chars,
+            sent_at: self.clock,
+        });
+        self.dirty = true;
+        // Same immediate-poll trick as the clipboard: a sink that answers on the
+        // spot paints its toast in the same breath it was asked, which is what
+        // makes the latency assertable without a test that sleeps.
+        let now = self.clock;
+        self.poll_dump(now);
+        true
+    }
+
+    /// `Ctrl-S`: arm or disarm the copy prefix.
+    ///
+    /// A second `Ctrl-S` cancels rather than re-arming, because a user who
+    /// discovers the prefix is live and wants out of it should not have to find a
+    /// *third* key to do it.
+    ///
+    /// Declined while a full-screen child holds the screen — and declined by
+    /// swallowing the byte, which is the point of claiming `Ctrl-S` at all (see
+    /// the XOFF note in [`Self::on_key`]). No toast here: the child owns the
+    /// screen, so a toast cannot be seen, and the child does not get to be frozen
+    /// either.
+    fn copy_prefix(&mut self) {
+        if self.copy_chord == CopyChord::Armed {
+            self.copy_chord = CopyChord::Off;
+            tracing::debug!("copy chord disarmed");
+            return;
+        }
+        if self.passthrough() {
+            tracing::debug!(
+                "Ctrl-S swallowed and not forwarded: looprs owns Ctrl-Q, so XOFF sent \u{2014} \u{2018}?\u{2019} lists the family"
+            );
+            return;
+        }
+        self.copy_chord = CopyChord::Armed;
+        self.copy_chord_at = self.clock;
+        // The hint is the discoverability path: every chord in the table is
+        // reachable from inside the app by someone who has never opened a docs
+        // file, and it is on screen for exactly as long as the prefix lives
+        // ([`COPY_CHORD_WINDOW`] is [`TOAST_TTL`]), so the hint going away *is*
+        // the window closing rather than a claim about it.
+        self.show_toast(
+            &crate::session::view::copy_chord_hint(),
+            crate::state::toast::Tone::Good,
+        );
+    }
+
+    /// Collect the result of the dump in flight, if there is one.
+    ///
+    /// The late-failure rule is the clipboard's, copied deliberately: a write
+    /// into a volume that stopped answering must not leave the user believing
+    /// their transcript is on disk. At [`DUMP_TIMEOUT`] the receipt is abandoned
+    /// so a much later answer cannot repaint success over the failure the user
+    /// was already given.
+    pub fn poll_dump(&mut self, now: Instant) {
+        let Some(pending) = self.pending_dump.as_ref() else {
+            return;
+        };
+        if let Some(outcome) = pending.receipt.poll() {
+            let tone = if outcome.is_failure() {
+                crate::state::toast::Tone::Bad
+            } else {
+                crate::state::toast::Tone::Good
+            };
+            let text = outcome.toast();
+            self.pending_dump = None;
+            self.show_toast(&text, tone);
+            return;
+        }
+        if now.saturating_duration_since(pending.sent_at)
+            >= crate::services::transcript_file::DUMP_TIMEOUT
+        {
+            let text = crate::services::transcript_file::DumpOutcome::Failed {
+                reason: format!(
+                    "the disk did not answer in {}s \u{2014} the {} characters asked for are unconfirmed",
+                    crate::services::transcript_file::DUMP_TIMEOUT.as_secs(),
+                    crate::services::clipboard::thousands(pending.chars.get())
+                ),
+            }
+            .toast();
+            pending.receipt.abandon();
+            self.pending_dump = None;
+            self.show_toast(&text, crate::state::toast::Tone::Bad);
+        }
+    }
+
+    /// Collect the result of the copy in flight, if there is one.
+    ///
+    /// The late failure is the case this exists for. A native helper parked on a
+    /// wedged compositor and a `pbcopy` writing into an SSH connection that has
+    /// stopped pumping both look exactly like a slow copy from here, and the one
+    /// thing that must not happen is the user finding out at paste time, in a
+    /// different application, that nothing was ever copied. So at
+    /// [`COPY_TIMEOUT`] the receipt is abandoned — a much later answer cannot
+    /// arrive and paint `Copied` over the failure the user was already told
+    /// about — and the failure is shown.
+    pub fn poll_copy(&mut self, now: Instant) {
+        let Some(pending) = self.pending_copy.as_ref() else {
+            return;
+        };
+        if let Some(outcome) = pending.receipt.poll() {
+            let (text, tone) = describe_outcome(&outcome);
+            self.pending_copy = None;
+            self.show_toast(&text, tone);
+            return;
+        }
+        if now.saturating_duration_since(pending.sent_at)
+            >= crate::services::clipboard::COPY_TIMEOUT
+        {
+            let outcome = crate::services::clipboard::CopyOutcome::Failed {
+                reason: format!(
+                    "clipboard did not answer in {}s \u{2014} nothing confirmed",
+                    crate::services::clipboard::COPY_TIMEOUT.as_secs()
+                ),
+            };
+            let (text, tone) = describe_outcome(&outcome);
+            pending.receipt.abandon();
+            self.pending_copy = None;
+            self.show_toast(&text, tone);
+        }
+    }
+
+    /// Put a toast up. Replaces whatever was there (R21: replaced, not queued).
+    fn show_toast(&mut self, text: &str, tone: crate::state::toast::Tone) {
+        tracing::debug!(toast = text, "toast");
+        self.toast = Some(crate::state::toast::Toast::new(text, tone, self.clock));
+        self.dirty = true;
+    }
+
+    /// The next key or click puts the toast away (R21).
+    ///
+    /// Deliberately not called for a wheel report or a drag motion: those are
+    /// not "the user did something else", they are the user still looking at
+    /// what this toast is about.
+    pub fn dismiss_toast(&mut self) {
+        if self.toast.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
     /// Publish where this frame drew the transcript band's rows.
     ///
     /// Called from [`crate::view`] with the same [`BandLayout`] the band drew
@@ -997,6 +1588,13 @@ impl App {
         // *we* drew would be a fiction, and a selection band painted over a
         // full-screen program is the bug the draw gate in `main` exists to
         // stop — reached by a different input this time.
+        // Any button press means the user moved on from what the last toast was
+        // reporting, and R21 says the next key or click puts it away. Done here,
+        // ahead of the passthrough gate, so the rule does not depend on who else
+        // is holding the screen.
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            self.dismiss_toast();
+        }
         if self.passthrough() {
             return;
         }
@@ -1066,8 +1664,23 @@ impl App {
                 // Either it committed or it was a click and cleared. Both
                 // change what is on the screen, so `dirty` is deliberately not
                 // conditional on there being a range.
-                self.selection.release();
+                let committed = self.selection.release();
                 self.dirty = true;
+                // **Copy on release** (looprs-pdl.10, ADR-0004 R12). The redraw
+                // runs at event rate and the side effect runs at *gesture*
+                // rate: the wire can take a drag's motion reports at
+                // ~4.5e5/s (pdl.2) and the selection band is repainted on
+                // every one of them, but a clipboard write at that rate is 200
+                // process spawns and 200 clipboard-manager history entries for
+                // one gesture the user has not finished. `release()` is the
+                // only place a gesture ends.
+                //
+                // The blank-selection case is not handled here at all: it is
+                // `copy_text`'s R13 check, so the drag path and the keyboard
+                // path cannot disagree about what "nothing to copy" means.
+                if committed.is_some() && self.copy_on_select {
+                    self.copy_selection();
+                }
             }
             // **The wheel** (looprs-pdl.8): the transcript is what scrolls.
             // Both directions arrive here, and the row they landed on decides
@@ -1352,6 +1965,26 @@ impl App {
     /// without sleeping.
     pub fn on_tick(&mut self, now: Instant) {
         self.clock = now;
+        // The toast's lifetime and the copy's deadline run off the tick, not off
+        // the animation gate below: a copy made in an otherwise idle app still
+        // has to get its confirmation on screen, and still has to come off.
+        self.poll_copy(now);
+        self.poll_dump(now);
+        if self.copy_chord == CopyChord::Armed
+            && now.saturating_duration_since(self.copy_chord_at) >= COPY_CHORD_WINDOW
+        {
+            // The window closes silently, which is not a hole in the legibility
+            // rule: the help toast that named the window has the same TTL, so what
+            // the user sees is the hint expiring, which is the window expiring.
+            self.copy_chord = CopyChord::Off;
+            tracing::debug!("copy chord window closed without a target key");
+        }
+        if let Some(toast) = &self.toast
+            && toast.expired(now)
+        {
+            self.toast = None;
+            self.dirty = true;
+        }
         if !self.any_busy() {
             return;
         }
@@ -1369,12 +2002,22 @@ impl App {
     /// session id, so a local echo can never change which generation a view is
     /// tracking — that would seal the real session's entry mid-stream.
     pub fn echo_local(&mut self, mode: TerminalType, text: String) {
-        let id = self
-            .views
+        let id = self.view_id_for(mode);
+        self.view_mut(id).push_note(MessageKind::User, text);
+    }
+
+    /// The id of the view this app currently tracks for a mode, or the harness
+    /// id if there is none yet.
+    ///
+    /// Factored out of [`Self::echo_local`] for the same reason that reason
+    /// applies: anything that writes into a mode's view must write into the *same*
+    /// view, and inventing a generation number in a second place is how two
+    /// callers end up sealing two different sessions.
+    fn view_id_for(&self, mode: TerminalType) -> SessionId {
+        self.views
             .get(&mode)
             .map(|v| v.session)
-            .unwrap_or_else(|| SessionId::new(mode, HARNESS_GENERATION));
-        self.view_mut(id).push_note(MessageKind::User, text);
+            .unwrap_or_else(|| SessionId::new(mode, HARNESS_GENERATION))
     }
 
     /// Where a harness-level message (`session: None`) goes: the view the user is
@@ -1515,6 +2158,11 @@ impl App {
             Msg::ScreenHeld { session, active } => {
                 if active {
                     self.screen = Some(session);
+                    // A prefix armed before the handover dies with it: nothing is
+                    // copied while a child holds the screen (R12), and the
+                    // keyboard belongs to the child now, so the next key must go
+                    // there rather than be read as a copy target.
+                    self.copy_chord = CopyChord::Off;
                     // Nothing to draw while the child holds the screen, and the
                     // frames we would have queued come back on release.
                     self.dirty = false;
@@ -1702,6 +2350,11 @@ impl App {
     }
 
     fn on_key(&mut self, k: crossterm::event::KeyEvent) {
+        // The first thing any keystroke does is put the toast away (R21) — before
+        // the chord dispatch, so "the next key dismisses it" is true for every
+        // key including the ones that quit, cancel, or are swallowed by a mode
+        // that does not read this one.
+        self.dismiss_toast();
         self.dirty = true;
         if k.modifiers.contains(KeyModifiers::CONTROL) {
             match k.code {
@@ -1714,6 +2367,11 @@ impl App {
                 // pty. Other modes keep their present meaning until looprs-5g7
                 // gives them a Cancel worth the name.
                 KeyCode::Char('c') => {
+                    // The chord dies with it: a prefix that survived a Ctrl-C would
+                    // make the *next* key a copy target in a session the user has
+                    // just interrupted (or quit). Every chord in this block
+                    // outranks a pending one in every mode.
+                    self.copy_chord = CopyChord::Off;
                     if self.active == TerminalType::Bash {
                         let _ = self.cmd_tx.try_send(UiCommand::Cancel);
                     } else {
@@ -1724,11 +2382,100 @@ impl App {
                 // The chord we do own in every mode, Bash included: quit without
                 // touching the shell (the child is killed on the way out).
                 KeyCode::Char('q') => {
+                    self.copy_chord = CopyChord::Off;
                     self.should_quit = true;
+                    return;
+                }
+                // **Ctrl-S: the copy prefix** (looprs-pdl.13). Claimed in every
+                // mode, and claimed *hard*: it is never written to a child's pty.
+                //
+                // The reason is the pair, not the key. `0x13` is XOFF and `0x11`
+                // is XON; looprs owns `Ctrl-Q` as quit in every mode, so a
+                // forwarded `Ctrl-S` would stop a child's output with the one
+                // chord needed to restart it already spent. A user who stopped a
+                // shell that way could not un-stop it without killing the app and
+                // the shell with it, which is an unrecoverable state created by a
+                // keystroke that looked harmless. Taking `Ctrl-S` entirely removes
+                // that state. (Our own terminal cannot XOFF either: crossterm's
+                // raw mode is `cfmakeraw`, which clears `IXON`, so the byte
+                // arrives here as a key rather than freezing our own stdout.)
+                KeyCode::Char('s') => {
+                    self.copy_prefix();
                     return;
                 }
                 _ => {}
             }
+        }
+
+        // **The chord's second key** (looprs-pdl.13). Only reached with the
+        // prefix outstanding; the disarm happens here, on every branch, so a
+        // pending chord cannot outlive the keystroke that answers it.
+        //
+        // It sits above the passthrough block, and the ordering is not an
+        // accident: `Ctrl-S` is already swallowed above so a full-screen child
+        // never sees it, which means a prefix outstanding while a child takes the
+        // screen was armed *before* the handover. That prefix is cancelled here
+        // rather than honoured, because R12 says nothing is copied while a child
+        // holds the screen — the transcript is not what the user is looking at,
+        // and a `Copied 4,182 characters` toast they cannot see, over a vim
+        // frame, describing something that is not on screen, is worse than the
+        // refusal.
+        if self.copy_chord == CopyChord::Armed {
+            self.copy_chord = CopyChord::Off;
+            if self.passthrough() {
+                tracing::debug!(
+                    "copy chord cancelled: a full-screen child took the screen \u{2014} \u{2014} the \u{2018}?\u{2019} chord lists the family"
+                );
+                return;
+            }
+            match copy_chord_key(k) {
+                CopyKey::Answer => {
+                    self.copy_target(CopyTarget::Answer);
+                }
+                CopyKey::Output => {
+                    self.copy_target(CopyTarget::CommandOutput);
+                }
+                CopyKey::Selection => {
+                    self.copy_target(CopyTarget::Selection);
+                }
+                CopyKey::TranscriptFile => {
+                    self.dump_transcript();
+                }
+                CopyKey::Help => {
+                    self.show_toast(
+                        &crate::session::view::copy_chord_hint(),
+                        crate::state::toast::Tone::Good,
+                    );
+                }
+                CopyKey::Cancel => {
+                    // Esc while armed undoes the prefix and nothing else. It does
+                    // **not** fall through to the selection clear below, and it
+                    // does **not** become the mode's cancel: the most recent thing
+                    // the user did was arm a chord, and ADR-0003's rule about Esc
+                    // is that it takes back what they just gave us, not something
+                    // older and louder. Cancelling a running pi run because the
+                    // user changed their mind about a copy is the exact surprise
+                    // that rule was written to stop.
+                    tracing::debug!("copy chord cancelled by Esc");
+                }
+                CopyKey::NotAChord => {
+                    // Swallowed, with the reason said. Falling through to the
+                    // input box instead would be the worse guess: a keystroke
+                    // typed after a prefix is *intended* as part of the chord, so
+                    // "insert `x` into the command line I was about to run" and
+                    // "copy the transcript" are both live readings of it, and the
+                    // one we must not silently pick is the one that changes the
+                    // user's shell. The toast names the key and points at `?`.
+                    self.show_toast(
+                        &format!(
+                            "Nothing copied: {} is not a copy chord \u{2014} Ctrl-S ? lists them",
+                            key_word(k)
+                        ),
+                        crate::state::toast::Tone::Bad,
+                    );
+                }
+            }
+            return;
         }
 
         // The input half of ADR-0001 Q2: a program that owns the screen owns the
@@ -1813,6 +2560,18 @@ impl App {
                     // else will show what was typed.
                     if mode != TerminalType::Bash {
                         self.echo_local(mode, text.clone());
+                    } else {
+                        // **The command boundary** (looprs-pdl.13). Sealed here,
+                        // at the one moment the boundary is known, so that
+                        // everything the shell says from now on is *this*
+                        // command's entry and `Ctrl-S o` copies one command
+                        // rather than the session. The submit is the boundary
+                        // because the shell never reports where one command's
+                        // output stopped and the next prompt started, and
+                        // guessing from a prompt pattern breaks on every shell
+                        // that is not bash.
+                        let id = self.view_id_for(mode);
+                        self.view_mut(id).seal_shell_output();
                     }
                     let _ = self.cmd_tx.try_send(UiCommand::Submit { mode, text });
                 }
@@ -1824,6 +2583,12 @@ impl App {
                     // them — so the ticket's clear list says gone, and gone it
                     // is before anything else about the switch happens.
                     self.selection.clear();
+                    // The copy prefix goes with the selection for the same reason
+                    // it goes with a mode change: it was armed over *this* mode's
+                    // transcript, and `a`/`o`/`s` after a Tab would resolve
+                    // against the next mode's while still looking, to the user,
+                    // like the one they aimed at.
+                    self.copy_chord = CopyChord::Off;
                     // The wheel's rate memory goes with it, for the same
                     // reason in miniature: a gesture that started over one
                     // mode's transcript is not the same gesture as the one
@@ -4169,6 +4934,386 @@ mod tests {
         assert_eq!(app.selection_paste(), "");
     }
 
+    // ───────────────── select-to-copy (looprs-pdl.10) ─────────────────
+
+    /// Hand the App a clipboard that records. Everything below asserts on the
+    /// exact string that reached the sink, which is the only assertion that says
+    /// "the copy was the selection" rather than "a copy happened".
+    fn recording_clipboard(app: &mut App) -> crate::testing::RecordingClipboard {
+        let rec = crate::testing::RecordingClipboard::new();
+        app.set_clipboard(Arc::new(rec.clone()));
+        rec
+    }
+
+    fn answering_clipboard(
+        app: &mut App,
+        outcome: crate::services::clipboard::CopyOutcome,
+    ) -> crate::testing::RecordingClipboard {
+        let rec = crate::testing::RecordingClipboard::answering(outcome);
+        app.set_clipboard(Arc::new(rec.clone()));
+        rec
+    }
+
+    fn stalling_clipboard(app: &mut App) -> crate::testing::StallClipboard {
+        let stall = crate::testing::StallClipboard::new();
+        app.set_clipboard(Arc::new(stall.clone()));
+        stall
+    }
+
+    /// **The feature.** Release, and the exact characters under the box are on
+    /// the clipboard, with the count that describes them in the toast.
+    #[test]
+    fn a_release_copies_the_selection_and_says_how_many_characters() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let rec = recording_clipboard(&mut app);
+        settle_answers(&mut app, 4);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE01")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE02")).unwrap();
+
+        drag(&mut app, (y0 + a as u16, bx + 5), (y0 + b as u16, bx + 9));
+
+        assert_eq!(
+            rec.last().as_deref(),
+            Some("1 aaaaaaaaaa\nLINE02 aaa"),
+            "the bytes that went are the characters that were selected"
+        );
+        let toast = app.toast().expect("a toast");
+        assert_eq!(toast.tone(), crate::state::toast::Tone::Good);
+        assert_eq!(
+            toast.text(),
+            "Copied 23 characters \u{b7} clipboard",
+            "23 *characters* — not bytes, not cells, not rows. Corrected from 25 in              looprs-pdl.13: the count here contradicted the copy text the assertion two lines              above pins, and 23 is what `Chars::of` says that string is. The point of the              assertion (characters, not bytes) stands; the CJK case below carries it harder."
+        );
+    }
+
+    /// The count is characters in a way a `len()` drift would break: CJK is
+    /// three bytes a character, so a byte-counting toast on this selection says
+    /// something three times the truth.
+    #[test]
+    fn the_count_in_the_toast_is_characters_even_when_the_bytes_disagree() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        recording_clipboard(&mut app);
+        assert!(app.copy_text("\u{6f22}\u{5b57}\u{5b57}".into()));
+        assert_eq!(
+            app.toast().unwrap().text(),
+            "Copied 3 characters \u{b7} clipboard",
+            "9 bytes, 6 cells, 3 characters — the toast says the last one"
+        );
+    }
+
+    /// **R13.** A selection of blanks is not content: no write, no toast, and
+    /// the clipboard the user had before is still theirs.
+    #[test]
+    fn a_selection_of_blanks_copies_nothing_and_says_nothing() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let rec = recording_clipboard(&mut app);
+        settle_answers(&mut app, 3);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let blank = drawn
+            .iter()
+            .position(|t| t.trim().is_empty())
+            .expect("setup: a blank separator row is on screen");
+
+        drag(
+            &mut app,
+            (y0 + blank as u16, bx + 2),
+            (y0 + blank as u16, bx + 6),
+        );
+        assert!(rec.is_empty(), "nothing was copied: {:?}", rec.copies());
+        assert!(app.toast().is_none(), "and nothing was said about it");
+        // What this test deliberately no longer asserts is that the blank drag left
+        // a live selection. `hit_resting` (crate::state::selection) resolves a
+        // pointer on a blank row to the end of the text above it, so a drag that
+        // never leaves a blank row resolves both ends to the same place, the
+        // release sees a zero-width range, and the gesture is a click. The R13
+        // outcome this test is *for* — nothing copied, nothing said — holds
+        // either way. If the selection model grows a way to be live over nothing,
+        // that belongs in the model and the assertion comes back with it; bending
+        // the test here would only hide the question. (Found this way while
+        // finishing looprs-pdl.13 against looprs-pdl.10's unfinished tree.)
+    }
+
+    /// A click — a release with nothing dragged — is not a copy. Together with
+    /// the blank rule this is the whole "does not fire on every event" story:
+    /// no `Copied 0 characters`, no clipboard thrash on every click in the
+    /// transcript.
+    #[test]
+    fn a_click_copies_nothing() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let rec = recording_clipboard(&mut app);
+        settle_answers(&mut app, 3);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE01")).unwrap();
+
+        app.update(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            y0 + a as u16,
+            bx,
+        ));
+        app.update(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            y0 + a as u16,
+            bx,
+        ));
+        assert!(rec.is_empty());
+        assert!(app.toast().is_none());
+    }
+
+    /// **`LOOPRS_COPY_ON_SELECT=0`** turns the automatic path off *completely*
+    /// — no write on release — and takes neither the selection nor the toast
+    /// mechanism with it: the keyboard copy still works on the same selection
+    /// and still produces the same toast (R17).
+    #[test]
+    fn turning_copy_on_select_off_stops_the_auto_copy_and_nothing_else() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let rec = recording_clipboard(&mut app);
+        app.set_copy_on_select(false);
+        settle_answers(&mut app, 4);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE01")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE02")).unwrap();
+
+        drag(&mut app, (y0 + a as u16, bx), (y0 + b as u16, bx + 4));
+        assert!(
+            rec.is_empty(),
+            "the release copied nothing: {:?}",
+            rec.copies()
+        );
+        assert!(app.toast().is_none(), "and said nothing about it");
+        assert!(
+            app.selection().is_live(),
+            "…but the selection is still live"
+        );
+        let text = app.selection_paste();
+        assert!(!text.is_empty(), "…and still resolves to its text");
+
+        assert!(app.copy_selection(), "the keyboard path still copies");
+        assert_eq!(rec.last().as_deref(), Some(text.as_str()));
+        assert!(
+            app.toast().unwrap().text().starts_with("Copied "),
+            "and the toast came with it: {:?}",
+            app.toast().map(|t| t.text().to_string())
+        );
+    }
+
+    /// **No optimistic toast.** The sink said it failed; the toast says it
+    /// failed. A `Copied` here would be a confident lie about the clipboard
+    /// that the user finds out about somewhere else, at the worst moment.
+    #[test]
+    fn a_failed_copy_toasts_as_a_failure_never_as_a_copy() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        answering_clipboard(
+            &mut app,
+            crate::services::clipboard::CopyOutcome::Failed {
+                reason: "pbcopy exited 1: not authorized".into(),
+            },
+        );
+        assert!(app.copy_text("something selected".into()));
+        let toast = app.toast().expect("a toast");
+        assert_eq!(toast.tone(), crate::state::toast::Tone::Bad);
+        assert_eq!(
+            toast.text(),
+            "Copy failed: pbcopy exited 1: not authorized",
+            "the reason is the sink's, at a level the user can act on"
+        );
+    }
+
+    /// A mismatch is not a copy either, even though the write "worked".
+    #[test]
+    fn a_clipboard_that_changed_under_us_is_not_reported_as_a_copy() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        answering_clipboard(
+            &mut app,
+            crate::services::clipboard::CopyOutcome::Mismatch {
+                chars: crate::services::clipboard::Chars::of("whatever"),
+            },
+        );
+        assert!(app.copy_text("whatever".into()));
+        let toast = app.toast().unwrap();
+        assert_eq!(toast.tone(), crate::state::toast::Tone::Bad);
+        assert!(!toast.text().starts_with("Copied"), "{}", toast.text());
+    }
+
+    /// The unverified class is visible as itself: `Sent` over OSC 52 shows the
+    /// count with "not confirmed", because that is exactly what it is.
+    #[test]
+    fn a_copy_that_cannot_be_confirmed_says_so_next_to_the_count() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        answering_clipboard(
+            &mut app,
+            crate::services::clipboard::CopyOutcome::Sent {
+                chars: crate::services::clipboard::Chars::of("a dozen chars"),
+                transport: crate::services::clipboard::Transport::Osc52,
+                note: None,
+            },
+        );
+        assert!(app.copy_text("a dozen chars".into()));
+        let toast = app.toast().unwrap();
+        assert_eq!(toast.tone(), crate::state::toast::Tone::Good);
+        assert_eq!(
+            toast.text(),
+            "Copied 13 characters \u{b7} OSC 52 (not confirmed)"
+        );
+    }
+
+    /// **The late failure is made visible, not swallowed.** A helper parked on
+    /// a wedged compositor looks like a slow copy forever; at the deadline the
+    /// App says so, because the alternative is the user finding out at paste
+    /// time in some other application.
+    #[test]
+    fn a_copy_that_never_answers_is_reported_at_the_deadline() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let stall = stalling_clipboard(&mut app);
+        let t = Instant::now();
+        app.on_tick(t);
+
+        assert!(app.copy_text("into the void".into()));
+        assert_eq!(stall.inflight(), 1, "the copy is with the sink");
+        assert!(app.toast().is_none(), "not yet: still in flight");
+
+        // Just short of the deadline: nothing to report yet.
+        app.poll_copy(t + crate::services::clipboard::COPY_TIMEOUT - Duration::from_millis(1));
+        assert!(app.toast().is_none());
+
+        app.poll_copy(t + crate::services::clipboard::COPY_TIMEOUT);
+        let toast = app.toast().expect("the deadline reported");
+        assert_eq!(toast.tone(), crate::state::toast::Tone::Bad);
+        assert_eq!(
+            toast.text(),
+            "Copy failed: clipboard did not answer in 2s \u{2014} nothing confirmed"
+        );
+
+        // And an answer that arrives *after* the deadline cannot repaint the
+        // failure as a success: the receipt was abandoned, so there is nothing
+        // left for it to be written to.
+        stall.answer_all(crate::services::clipboard::CopyOutcome::Verified {
+            chars: crate::services::clipboard::Chars::of("twelve chars"),
+        });
+        let late = Instant::now();
+        app.on_tick(late);
+        assert_eq!(
+            app.toast().map(|x| x.text().to_string()),
+            Some("Copy failed: clipboard did not answer in 2s \u{2014} nothing confirmed".into()),
+            "the late `Copied` never undrew the truth the user was given"
+        );
+    }
+
+    /// **Auto-dismiss on the constant**, and the next key puts it away early.
+    #[test]
+    fn the_toast_dismisses_itself_and_the_next_key_beats_it_to_it() {
+        use crate::state::toast::TOAST_TTL;
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        recording_clipboard(&mut app);
+        let t = Instant::now();
+        app.on_tick(t);
+        app.copy_text("copied this".into());
+        assert!(app.toast().is_some(), "up immediately");
+
+        app.on_tick(t + TOAST_TTL - Duration::from_millis(1));
+        assert!(app.toast().is_some(), "still within the 2s window");
+
+        app.on_tick(t + TOAST_TTL + Duration::from_millis(1));
+        assert!(app.toast().is_none(), "the TTL dismissed it");
+
+        app.copy_text("copied that".into());
+        assert!(app.toast().is_some());
+        app.update(Msg::Term(Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        ))));
+        assert!(app.toast().is_none(), "the keystroke dismissed it");
+    }
+
+    /// Each release is its own copy with its own toast, and the toast that is up
+    /// describes the copy that just happened ("the last one wins visually").
+    #[test]
+    fn a_new_release_replaces_the_old_toast_rather_than_keeping_it() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let rec = recording_clipboard(&mut app);
+        settle_answers(&mut app, 4);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE01")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE02")).unwrap();
+
+        drag(&mut app, (y0 + a as u16, bx), (y0 + b as u16, bx + 4));
+        let first = app.toast().map(|t| t.text().to_string());
+        assert!(first.is_some());
+
+        drag(&mut app, (y0 + a as u16, bx + 1), (y0 + b as u16, bx + 3));
+        let second = app.toast().map(|t| t.text().to_string());
+        assert_eq!(rec.count(), 2, "each release is its own copy");
+        assert_ne!(
+            first, second,
+            "the toast up top describes the copy that just happened"
+        );
+    }
+
+    /// A wheel report is not "the user moved on": they are still looking at
+    /// the transcript this toast is about, so scrolling does not blow it away.
+    #[test]
+    fn scrolling_does_not_eat_the_confirmation() {
+        use crate::state::toast::TOAST_TTL;
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        recording_clipboard(&mut app);
+        let t = Instant::now();
+        app.on_tick(t);
+        app.copy_text("still here".into());
+        let before = app.toast().map(|x| x.text().to_string());
+
+        wheel(&mut app, WheelDir::Up, 3, t + Duration::from_millis(50));
+        assert_eq!(app.toast().map(|x| x.text().to_string()), before);
+
+        app.on_tick(t + TOAST_TTL + Duration::from_millis(500));
+        assert!(app.toast().is_none(), "…and it still goes on its own TTL");
+    }
+
+    /// The default App has a clipboard that does not write, so a test that
+    /// never installs one cannot reach a real clipboard — and `Noop` reports
+    /// the truth about that rather than a `Copied` that never happened.
+    #[test]
+    fn a_default_app_never_reaches_a_real_clipboard() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        assert!(app.copy_text("nothing is wired".into()));
+        let toast = app.toast().expect("a toast");
+        assert_eq!(toast.tone(), crate::state::toast::Tone::Bad);
+        assert!(
+            toast.text().contains("LOOPRS_CLIPBOARD=off"),
+            "{}",
+            toast.text()
+        );
+    }
+
+    /// A copy is never fired while a full-screen child holds the screen
+    /// (ADR-0004 R12): the pointer is over the child's pixels, so what we
+    /// would copy is a description of a frame that is not on screen.
+    #[test]
+    fn no_copy_while_a_child_holds_the_screen() {
+        let (mut app, _rx) = app_with(TerminalType::Bash);
+        let rec = recording_clipboard(&mut app);
+        settle_answers(&mut app, 3);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let bash = SessionId::new(TerminalType::Bash, 1);
+        app.update(Msg::ScreenHeld {
+            session: bash,
+            active: true,
+        });
+        assert!(!app.copy_selection());
+        assert!(!app.copy_text("even handed straight in".into()));
+        assert!(rec.is_empty());
+    }
+
     /// **The Esc ordering, wired.** A live selection takes the first Esc and
     /// nothing reaches the session; the next Esc is the cancel the mode table
     /// already describes.
@@ -5139,6 +6284,798 @@ mod tests {
             app.scrollback().offset(),
             3,
             "the band's last row is inside the band, at whatever height the frame put it"
+        );
+    }
+
+    // ───────────── keyboard copy and the chord table (looprs-pdl.13) ─────────────
+    //
+    // These are the driven half of the table in
+    // [`CHORD_TABLE`](crate::session::view::CHORD_TABLE): the view test checks
+    // the table is internally consistent, these check that the keystrokes land
+    // where the table says they do. Every one of them drives the real `App` with
+    // real `KeyEvent`s and reads back real consequences — what the sink got,
+    // what the router got, what the box holds, what the toast says.
+
+    fn recording_sink(app: &mut App) -> crate::testing::RecordingTranscriptSink {
+        let rec = crate::testing::RecordingTranscriptSink::new();
+        app.set_transcript_sink(Arc::new(rec.clone()));
+        rec
+    }
+
+    fn stalling_sink(app: &mut App) -> crate::testing::StallTranscriptSink {
+        let s = crate::testing::StallTranscriptSink::new();
+        app.set_transcript_sink(Arc::new(s.clone()));
+        s
+    }
+
+    /// Press `Ctrl-S`, then the target key, as the two key events they are.
+    fn chord(app: &mut App, target: KeyCode) {
+        app.update(Msg::Term(key(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+        app.update(Msg::Term(key(target, KeyModifiers::NONE)));
+    }
+
+    /// Push shell output into the Bash view the way the pty pump does.
+    fn shell_out(app: &mut App, chunk: &str) {
+        app.update(Msg::BashOutput {
+            session: bash_id(),
+            stream: ByteStream::Merged,
+            chunk: chunk.into(),
+        });
+    }
+
+    /// **`Ctrl-S a` copies the last answer** in the modes that have answers,
+    /// through the looprs-pdl.10 sink and with the looprs-pdl.10 toast.
+    #[test]
+    fn the_chord_copies_the_last_answer_through_the_same_sink_and_toast() {
+        for mode in [TerminalType::Pi, TerminalType::Beeds] {
+            let (mut app, _rx) = app_with(mode);
+            let rec = recording_clipboard(&mut app);
+            settle_answers(&mut app, 3);
+
+            chord(&mut app, KeyCode::Char('a'));
+
+            assert_eq!(
+                rec.last().as_deref(),
+                // The last *answer*, whole: the entire entry, not the visible
+                // window of it and not the one before it.
+                Some("LINE02 aaaaaaaaaa"),
+                "{:?} mode must copy the last answer",
+                mode
+            );
+            let toast = app.toast().expect("the copy is confirmed");
+            assert_eq!(toast.tone(), crate::state::toast::Tone::Good);
+            assert_eq!(toast.text(), "Copied 17 characters \u{b7} clipboard");
+        }
+    }
+
+    /// In Bash there is no answer to copy, and the refusal says so **and names
+    /// the chord that does work here** — ADR-0004 R17's rule that the failure
+    /// text carries the way out.
+    #[test]
+    fn bash_has_no_answer_to_copy_and_says_which_chord_does() {
+        let (mut app, _rx) = app_with(TerminalType::Bash);
+        let rec = recording_clipboard(&mut app);
+        shell_out(&mut app, "bash$ make test\ncompiled\n");
+
+        chord(&mut app, KeyCode::Char('a'));
+
+        assert!(rec.is_empty(), "nothing was copied: {:?}", rec.copies());
+        let toast = app.toast().expect("but it was said");
+        assert_eq!(toast.tone(), crate::state::toast::Tone::Bad);
+        assert!(
+            toast.text().contains("Ctrl-S o"),
+            "the refusal names the chord that works: {}",
+            toast.text()
+        );
+    }
+
+    /// **`Ctrl-S o` copies one command, not the session.** The boundary is made
+    /// at submit, so a second command's block does not come wrapped in the first
+    /// one's — which is the whole reason the seal exists, because a Bash stream
+    /// of one kind is one entry by design.
+    #[test]
+    fn the_chord_copies_the_last_command_and_not_the_ones_before_it() {
+        let (mut app, mut rx) = app_with(TerminalType::Bash);
+        let rec = recording_clipboard(&mut app);
+        shell_out(&mut app, "one\n");
+
+        // Type a command and submit it. That submit is the boundary.
+        app.input.set_text("make\n".to_string());
+        app.update(Msg::Term(key(KeyCode::Enter, KeyModifiers::NONE)));
+        let submitted = rx.try_recv();
+        assert!(
+            matches!(&submitted, Ok(UiCommand::Submit { mode, .. }) if *mode == TerminalType::Bash),
+            "the submit went out: {submitted:?}"
+        );
+        shell_out(&mut app, "two\n");
+
+        chord(&mut app, KeyCode::Char('o'));
+
+        let copied = rec.last().expect("something was copied");
+        assert!(
+            copied.contains("two"),
+            "the last command's output is there: {copied:?}"
+        );
+        assert!(
+            !copied.contains("one"),
+            "and the previous command's is not — that is the boundary working: {copied:?}"
+        );
+    }
+
+    /// The artifact a real pty leaves, driven end to end. When a command
+    /// finishes, the shell comes back to its prompt and that prompt arrives as a
+    /// line of its own — a blank Bash line through the resolver — with the
+    /// `exit 0` note breaking the shell stream in between. Read as "the last
+    /// Bash entry", that blank *was* the command's output, and `Ctrl-S o`
+    /// refused to copy a screen full of the thing the user was pointing at.
+    /// Found by running the real binary in tmux (`spikes/tmux_keyboard_e2e.py`);
+    /// this is the test that keeps it fixed.
+    #[test]
+    fn the_chord_copies_the_command_past_the_shells_trailing_blank_line() {
+        let (mut app, mut rx) = app_with(TerminalType::Bash);
+        let rec = recording_clipboard(&mut app);
+        app.input.set_text("echo MARKER\n".to_string());
+        app.update(Msg::Term(key(KeyCode::Enter, KeyModifiers::NONE)));
+        let _ = rx.try_recv();
+        shell_out(&mut app, "bash-3.2$ echo MARKER\nMARKER\n");
+        app.update(Msg::System {
+            session: Some(bash_id()),
+            text: "exit 0".into(),
+        });
+        // The prompt's carriage return: a Bash entry, and blank.
+        shell_out(&mut app, "\r\n");
+
+        chord(&mut app, KeyCode::Char('o'));
+
+        let copied = rec.last().expect("a copy, not a refusal");
+        assert!(copied.contains("MARKER"), "{copied:?}");
+        let toast = app.toast().expect("a toast");
+        assert_eq!(toast.tone(), crate::state::toast::Tone::Good);
+        assert!(toast.text().starts_with("Copied "), "{}", toast.text());
+    }
+
+    /// The other side of that same boundary. A command that ran and said nothing
+    /// gets a different sentence from one that was never asked, because they are
+    /// different facts about the shell and the user can only act on the right one.
+    #[test]
+    fn a_command_that_ran_and_said_nothing_says_produced_no_output() {
+        let (mut app, mut rx) = app_with(TerminalType::Bash);
+        let rec = recording_clipboard(&mut app);
+        app.input.set_text("true\n".to_string());
+        app.update(Msg::Term(key(KeyCode::Enter, KeyModifiers::NONE)));
+        let _ = rx.try_recv();
+        shell_out(&mut app, "\r\n");
+
+        chord(&mut app, KeyCode::Char('o'));
+
+        assert!(rec.is_empty(), "nothing was copied");
+        assert!(
+            app.toast().unwrap().text().contains("produced no output"),
+            "{}",
+            app.toast().unwrap().text()
+        );
+    }
+
+    /// In the agentic modes the same chord answers the same question: what did
+    /// the last thing this session ran produce? There it is the last finished
+    /// tool card's result, not a shell block.
+    #[test]
+    fn the_chord_copies_the_last_tool_card_in_the_agentic_modes() {
+        for mode in [TerminalType::Pi, TerminalType::Beeds] {
+            let (mut app, _rx) = app_with(mode);
+            let rec = recording_clipboard(&mut app);
+            let id = SessionId::new(mode, 1);
+            app.view_mut(id).transcript.start_tool(
+                "t1".into(),
+                "read".into(),
+                "{\"path\":\"x\"}".into(),
+            );
+            app.view_mut(id)
+                .transcript
+                .finish_tool("t1".into(), "3 lines read".into(), false);
+
+            chord(&mut app, KeyCode::Char('o'));
+
+            assert_eq!(rec.last().as_deref(), Some("3 lines read"), "{mode:?}");
+            assert!(
+                app.toast()
+                    .expect("a toast")
+                    .text()
+                    .starts_with("Copied 12 characters"),
+                "{:?}: {}",
+                mode,
+                app.toast().unwrap().text()
+            );
+        }
+    }
+
+    /// **`Ctrl-S s` copies whatever selection is live**, made by the mouse or by
+    /// anything else — the same paste, the same sink, the same toast as the drag
+    /// release that made it, which is the point of there being one path.
+    #[test]
+    fn the_chord_copies_the_live_selection_the_mouse_made() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let rec = recording_clipboard(&mut app);
+        settle_answers(&mut app, 4);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE01")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE02")).unwrap();
+        // The copy-on-release path is off, so the only way this clipboard gets
+        // written is the chord — which is what makes this a test of the chord.
+        app.set_copy_on_select(false);
+        drag(&mut app, (y0 + a as u16, bx + 5), (y0 + b as u16, bx + 9));
+        assert!(rec.is_empty(), "the release copied nothing, by request");
+        assert!(app.selection().is_live());
+        let pasted = app.selection_paste();
+
+        chord(&mut app, KeyCode::Char('s'));
+
+        assert_eq!(rec.last().as_deref(), Some(pasted.as_str()));
+        assert!(
+            app.toast()
+                .expect("a toast")
+                .text()
+                .contains("characters \u{b7} clipboard"),
+            "{}",
+            app.toast().unwrap().text()
+        );
+    }
+
+    /// **`Ctrl-S t` is the escape hatch**: the whole transcript, to a file, with
+    /// the count and the path both in the toast. The keyboard path for anything
+    /// too big for a paste buffer, on an injected sink exactly like the
+    /// clipboard's.
+    #[test]
+    fn the_chord_writes_the_whole_transcript_to_a_file_and_says_where() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let sink = recording_sink(&mut app);
+        settle_answers(&mut app, 4);
+
+        chord(&mut app, KeyCode::Char('t'));
+
+        let dumped = sink.last().expect("the sink was handed the transcript");
+        assert_eq!(
+            dumped,
+            app.active_view().unwrap().transcript.plain_text(),
+            "the file's bytes are the whole transcript's bytes"
+        );
+        assert!(dumped.contains("LINE00") && dumped.contains("LINE03"));
+        // The dump carries the mode it came from, so a pile of files from a
+        // three-tab session can be told apart.
+        assert_eq!(sink.dumps()[0].0, "pi", "the mode label went with the text");
+        let toast = app.toast().expect("and said where");
+        assert_eq!(toast.tone(), crate::state::toast::Tone::Good);
+        assert!(
+            toast
+                .text()
+                .starts_with("Wrote 78 characters of transcript to "),
+            "{}",
+            toast.text()
+        );
+        assert!(
+            toast.text().contains("fake-looprs-pi.txt"),
+            "the path is in the toast: {}",
+            toast.text()
+        );
+    }
+
+    /// A dump goes through the sink and nowhere else: the clipboard is untouched,
+    /// because the verb in the toast is `Wrote` and a user who read `Copied`
+    /// would go looking for it in a paste buffer that never got it.
+    #[test]
+    fn a_dump_is_not_a_copy_and_says_wrote_not_copied() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let cb = recording_clipboard(&mut app);
+        let sink = recording_sink(&mut app);
+        settle_answers(&mut app, 2);
+
+        chord(&mut app, KeyCode::Char('t'));
+
+        assert_eq!(sink.count(), 1);
+        assert!(cb.is_empty(), "the clipboard was not touched");
+        assert!(
+            !app.toast().unwrap().text().contains("Copied"),
+            "{}",
+            app.toast().unwrap().text()
+        );
+    }
+
+    /// **`Esc` with the chord armed cancels the chord and nothing else** — not
+    /// the selection, not a cancel down the router. This is the branch the ticket
+    /// asks to be shown explicitly, and it is the one where getting it wrong is
+    /// the loudest: cancelling a running model call because the user changed
+    /// their mind about a copy is ADR-0003's named failure.
+    #[test]
+    fn esc_with_the_chord_armed_cancels_the_chord_only() {
+        let (mut app, mut rx) = app_with(TerminalType::Pi);
+        let rec = recording_clipboard(&mut app);
+        settle_answers(&mut app, 4);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE01")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE02")).unwrap();
+        app.set_copy_on_select(false);
+        drag(&mut app, (y0 + a as u16, bx), (y0 + b as u16, bx + 3));
+        assert!(app.selection().is_live(), "setup: a selection is live");
+
+        // Arm, then back out.
+        app.update(Msg::Term(key(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+        app.update(Msg::Term(key(KeyCode::Esc, KeyModifiers::NONE)));
+
+        assert!(
+            app.selection().is_live(),
+            "Esc undid the prefix, not the selection: the most recent thing the user gave us was the chord"
+        );
+        assert!(rec.is_empty(), "and copied nothing");
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "and sent no cancel down the router"
+        );
+
+        // And the *next* Esc is the cancel the mode table already describes.
+        app.update(Msg::Term(key(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!app.selection().is_live(), "that one is the selection's");
+        app.update(Msg::Term(key(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(
+            matches!(rx.try_recv(), Ok(UiCommand::Cancel)),
+            "and the third is the cancel"
+        );
+    }
+
+    /// An unknown second key is **swallowed and named**, not delivered. A
+    /// keystroke typed after a prefix is intended as part of the chord, and the
+    /// two readings of it ("copy the transcript" / "insert a letter into the
+    /// command I was about to run") are far enough apart that guessing silently
+    /// is the worse option.
+    #[test]
+    fn an_unknown_second_key_is_swallowed_and_named() {
+        for mode in TerminalType::ALL {
+            let (mut app, _rx) = app_with(mode);
+            let rec = recording_clipboard(&mut app);
+            settle_answers(&mut app, 2);
+            app.input.set_text(String::new());
+
+            app.update(Msg::Term(key(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+            app.update(Msg::Term(key(KeyCode::Char('z'), KeyModifiers::NONE)));
+
+            assert_eq!(
+                app.input.text(),
+                "",
+                "{mode:?}: the letter did not reach the box"
+            );
+            assert!(rec.is_empty(), "{mode:?}: nothing was copied");
+            let toast = app.toast().expect("{mode:?}: and it was said why");
+            assert_eq!(toast.tone(), crate::state::toast::Tone::Bad, "{mode:?}");
+            assert!(toast.text().contains("`z`"), "{}", toast.text());
+            assert!(toast.text().contains("Ctrl-S ?"), "{}", toast.text());
+
+            // …and the chord really is gone: the next `a` types, it does not copy.
+            let before = rec.count();
+            app.update(Msg::Term(key(KeyCode::Char('a'), KeyModifiers::NONE)));
+            assert_eq!(rec.count(), before, "{mode:?}: the chord is disarmed");
+            assert_eq!(
+                app.input.text(),
+                "a",
+                "{mode:?}: the letter reached the box"
+            );
+        }
+    }
+
+    /// **Nothing new shadows the box.** `a`/`o`/`s`/`t`/`?` are ordinary typing
+    /// until `Ctrl-S` says otherwise, and the audit for "did the prefix cost the
+    /// user a key" is this test run in all three modes with no prefix out.
+    #[test]
+    fn the_chord_letters_are_still_typing_when_no_chord_is_armed() {
+        for mode in TerminalType::ALL {
+            let (mut app, _rx) = app_with(mode);
+            let rec = recording_clipboard(&mut app);
+            let sink = recording_sink(&mut app);
+            settle_answers(&mut app, 2);
+            app.input.set_text(String::new());
+
+            for c in ['a', 'o', 's', 't', '?'] {
+                app.update(Msg::Term(key(KeyCode::Char(c), KeyModifiers::NONE)));
+            }
+
+            assert_eq!(app.input.text(), "aost?", "{mode:?}: all of them typed");
+            assert!(rec.is_empty(), "{mode:?}: nothing was copied");
+            assert!(sink.is_empty(), "{mode:?}: nothing was dumped");
+        }
+    }
+
+    /// The prefix closes on the tick, and the hint that named it has the same
+    /// TTL — so the user watching the screen sees the window shut rather than
+    /// pressing `a` two minutes later into a chord they thought was live.
+    #[test]
+    fn the_armed_chord_closes_on_the_tick() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let rec = recording_clipboard(&mut app);
+        settle_answers(&mut app, 2);
+        let t = Instant::now();
+        app.on_tick(t);
+
+        app.update(Msg::Term(key(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+        assert!(app.toast().is_some(), "the hint went up");
+
+        app.on_tick(t + crate::app::COPY_CHORD_WINDOW);
+        assert!(
+            app.toast().is_none(),
+            "the hint expired with the window: they are the same TTL"
+        );
+
+        app.input.set_text(String::new());
+        app.update(Msg::Term(key(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert!(rec.is_empty(), "`a` did not copy");
+        assert_eq!(app.input.text(), "a", "and typed instead");
+    }
+
+    /// A second `Ctrl-S` backs out of the chord, so getting into the prefix is
+    /// never a state the user has to find a third key to escape.
+    #[test]
+    fn a_second_ctrl_s_lowers_the_chord() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let rec = recording_clipboard(&mut app);
+        settle_answers(&mut app, 2);
+        app.input.set_text(String::new());
+
+        app.update(Msg::Term(key(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+        app.update(Msg::Term(key(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+        app.update(Msg::Term(key(KeyCode::Char('a'), KeyModifiers::NONE)));
+
+        assert!(rec.is_empty(), "nothing copied");
+        // The second `Ctrl-S` is consumed by the chord — that is what lowering
+        // it *is* — and the `a` after it is ordinary typing again.
+        assert_eq!(
+            app.input.text(),
+            "a",
+            "the letter typed once the chord was down"
+        );
+    }
+
+    /// **Rule 1, driven.** `Ctrl-C` never copies, in any mode, with or without a
+    /// chord outstanding; and in Bash it is still the shell's interrupt.
+    #[test]
+    fn ctrl_c_never_copies_and_is_still_sigint_in_bash() {
+        // Bash: the shell gets 0x03 by way of Cancel, the clipboard is dark, and
+        // an armed chord does not change any of it.
+        let (mut app, mut rx) = app_with(TerminalType::Bash);
+        let rec = recording_clipboard(&mut app);
+        let sink = recording_sink(&mut app);
+        shell_out(&mut app, "a command's output\n");
+        app.update(Msg::Term(key(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+        app.update(Msg::Term(key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(
+            matches!(rx.try_recv(), Ok(UiCommand::Cancel)),
+            "Ctrl-C is still the shell's cancel in Bash"
+        );
+        assert!(rec.is_empty() && sink.is_empty(), "and never a copy");
+        assert!(!app.should_quit, "and never a quit in Bash either");
+
+        // Pi / Beeds: quit, as the table says, and still no copy.
+        for mode in [TerminalType::Pi, TerminalType::Beeds] {
+            let (mut app, _rx) = app_with(mode);
+            let rec = recording_clipboard(&mut app);
+            settle_answers(&mut app, 2);
+            app.update(Msg::Term(key(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+            app.update(Msg::Term(key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+            assert!(app.should_quit, "{mode:?}: Ctrl-C still quits here");
+            assert!(rec.is_empty(), "{mode:?}: Ctrl-C never copied");
+        }
+    }
+
+    /// **A full-screen child never gets XOFF from us.** We own `Ctrl-Q`, so a
+    /// forwarded `Ctrl-S` would stop a child's output with the chord needed to
+    /// restart it already spent: the freeze would be permanent without killing
+    /// the app. So the byte is swallowed in the one state where it could reach a
+    /// pty, and the chord is not armed there because nothing is copied out from
+    /// under a held screen (R12).
+    #[test]
+    fn a_child_holding_the_screen_is_never_sent_xoff() {
+        let (mut app, mut rx) = app_with(TerminalType::Bash);
+        let rec = recording_clipboard(&mut app);
+        app.update(Msg::ScreenHeld {
+            session: bash_id(),
+            active: true,
+        });
+        assert!(app.passthrough(), "setup: the child owns the screen");
+
+        app.update(Msg::Term(key(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+
+        match rx.try_recv() {
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Ok(UiCommand::Keys { ref bytes, .. }) if bytes.contains(&0x13) => {
+                panic!("XOFF was forwarded to the child: {bytes:?}")
+            }
+            Ok(other) => panic!("unexpected command while handing Ctrl-S over: {other:?}"),
+            Err(e) => panic!("the router channel is gone: {e:?}"),
+        }
+
+        // And the chord is not live on the other side of the handover: with a
+        // target key now it must neither copy nor reach the child as a letter.
+        app.update(Msg::Term(key(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert!(
+            rec.is_empty(),
+            "nothing was copied while the child held the screen"
+        );
+    }
+
+    /// A chord armed **before** a child grabs the screen is cancelled by the
+    /// grab, rather than surviving to copy something the user can no longer see.
+    #[test]
+    fn a_child_taking_the_screen_kills_an_armed_chord() {
+        let (mut app, mut rx) = app_with(TerminalType::Bash);
+        let rec = recording_clipboard(&mut app);
+        shell_out(&mut app, "output before the handover\n");
+        app.update(Msg::Term(key(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+
+        app.update(Msg::ScreenHeld {
+            session: bash_id(),
+            active: true,
+        });
+        app.update(Msg::Term(key(KeyCode::Char('o'), KeyModifiers::NONE)));
+
+        assert!(rec.is_empty(), "the chord did not survive the handover");
+        // The letter went to the child instead, which is what owning the keyboard
+        // means: the keystroke is the child's, not ours.
+        match rx.try_recv() {
+            Ok(UiCommand::Keys { ref bytes, .. }) => {
+                assert_eq!(bytes, b"o", "the child got the keystroke it owns")
+            }
+            other => panic!("expected the keystroke forwarded, got {other:?}"),
+        }
+    }
+
+    /// A mode switch clears an armed chord: the prefix was armed over one mode's
+    /// transcript, and the next frame is another mode's rows.
+    #[test]
+    fn a_mode_switch_lowers_the_chord() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let rec = recording_clipboard(&mut app);
+        settle_answers(&mut app, 2);
+        app.input.set_text(String::new());
+
+        app.update(Msg::Term(key(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+        app.update(Msg::Term(key(KeyCode::Tab, KeyModifiers::NONE)));
+        app.update(Msg::Term(key(KeyCode::Char('a'), KeyModifiers::NONE)));
+
+        assert!(rec.is_empty(), "the chord did not cross the mode boundary");
+        assert_eq!(app.input.text(), "a", "the letter typed instead");
+    }
+
+    /// **`Ctrl-S ?` is the help**, and it is reachable from inside the app: a
+    /// user who has found the prefix can find every target in it without opening
+    /// a docs file, which is the whole reason the chord list is a constant next
+    /// to the code that shows it.
+    #[test]
+    fn the_help_lists_every_target_in_the_family() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle_answers(&mut app, 2);
+        chord(&mut app, KeyCode::Char('?'));
+        let toast = app.toast().expect("a toast");
+        for target in [
+            "a answer",
+            "o last output",
+            "s selection",
+            "t transcript",
+            "Esc",
+        ] {
+            assert!(
+                toast.text().contains(target),
+                "the help is missing {target}: {}",
+                toast.text()
+            );
+        }
+        assert_eq!(toast.text(), crate::session::view::copy_chord_hint());
+    }
+
+    /// A refusal is not silence. Every target has a "not there" case, and every
+    /// one of them says which target was asked for and why it was empty — the
+    /// keyboard asked a question and the answer was no, which R13's silence (for
+    /// a mouse gesture that was never a request) does not cover.
+    #[test]
+    fn every_missing_target_is_named_in_its_refusal() {
+        // No answer at all.
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let rec = recording_clipboard(&mut app);
+        chord(&mut app, KeyCode::Char('a'));
+        assert!(rec.is_empty());
+        assert_eq!(
+            app.toast().expect("a refusal is said").tone(),
+            crate::state::toast::Tone::Bad
+        );
+        assert!(app.toast().unwrap().text().contains("Nothing copied"));
+
+        // A shell that is up but has not run anything yet: the view exists, and
+        // what it does not have is a command block.
+        let (mut app, _rx) = app_with(TerminalType::Bash);
+        let rec = recording_clipboard(&mut app);
+        app.view_mut(bash_id())
+            .push_note(MessageKind::System, "shell started".into());
+        chord(&mut app, KeyCode::Char('o'));
+        assert!(rec.is_empty());
+        assert!(
+            app.toast().unwrap().text().contains("no command has run"),
+            "{}",
+            app.toast().unwrap().text()
+        );
+
+        // A transcript with nothing selected in it.
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let rec = recording_clipboard(&mut app);
+        settle_answers(&mut app, 2);
+        assert!(!app.selection().is_live(), "setup: nothing selected");
+        chord(&mut app, KeyCode::Char('s'));
+        assert!(rec.is_empty());
+        assert!(
+            app.toast().unwrap().text().contains("nothing is selected"),
+            "{}",
+            app.toast().unwrap().text()
+        );
+
+        // A view that exists and holds nothing, for the dump: the other half of
+        // "the transcript is empty" is "there is no transcript at all", and
+        // both refuse rather than writing an empty file.
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let sink = recording_sink(&mut app);
+        chord(&mut app, KeyCode::Char('t'));
+        assert!(sink.is_empty(), "nothing was written");
+        assert!(
+            app.toast().unwrap().text().contains("Nothing written"),
+            "{}",
+            app.toast().unwrap().text()
+        );
+    }
+
+    /// The dump can wedge like any other sink, and the user is owed a *late*
+    /// failure rather than a belief that their transcript is on disk.
+    #[test]
+    fn a_wedged_volume_reports_a_late_failure_not_silence() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let stall = stalling_sink(&mut app);
+        settle_answers(&mut app, 2);
+        let t = Instant::now();
+        app.on_tick(t);
+
+        chord(&mut app, KeyCode::Char('t'));
+        assert_eq!(stall.inflight(), 1, "the dump is in the sink's hands");
+        assert!(
+            stall.dumps()[0].1.contains("LINE00"),
+            "the text was handed over before the wedge: what is missing is the disk, not the transcript"
+        );
+        // Nothing has been promised yet: the only thing on screen is the chord's
+        // own hint, and that is not a `Wrote`.
+        if let Some(t) = app.toast() {
+            assert!(!t.text().contains("Wrote"), "{}", t.text());
+        }
+
+        app.on_tick(t + crate::services::transcript_file::DUMP_TIMEOUT);
+        let toast = app.toast().expect("a late failure is a toast");
+        assert_eq!(toast.tone(), crate::state::toast::Tone::Bad);
+        assert!(toast.text().contains("did not answer"), "{}", toast.text());
+        assert_eq!(
+            stall.inflight(),
+            1,
+            "the dump itself is still in flight: we abandoned the receipt, not the write"
+        );
+    }
+
+    /// A dump that answers late — after the deadline was reported — cannot come
+    /// back and paint `Wrote` over the failure the user was already given.
+    #[test]
+    fn a_late_dump_answer_cannot_undraw_the_failure() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let stall = stalling_sink(&mut app);
+        settle_answers(&mut app, 2);
+        let t = Instant::now();
+        app.on_tick(t);
+
+        chord(&mut app, KeyCode::Char('t'));
+        app.on_tick(t + crate::services::transcript_file::DUMP_TIMEOUT);
+        let failed = app.toast().unwrap().text().to_string();
+
+        stall.answer_all(crate::services::transcript_file::DumpOutcome::Written {
+            path: std::path::PathBuf::from("/tmp/late.txt"),
+            chars: crate::services::clipboard::Chars::of("x"),
+        });
+        // One breath after the deadline, while the failure is still on screen:
+        // this is the moment a late `Wrote` would do its damage.
+        app.on_tick(t + crate::services::transcript_file::DUMP_TIMEOUT + Duration::from_millis(1));
+        assert_eq!(
+            app.toast().expect("the failure toast is still up").text(),
+            failed,
+            "the late answer was dropped rather than redrawn over the failure"
+        );
+        assert!(
+            !app.toast().unwrap().text().contains("Wrote"),
+            "{}",
+            app.toast().unwrap().text()
+        );
+    }
+
+    /// **The scroll keys in all three modes**, which is the acceptance line, and
+    /// with the store's own pin semantics rather than a second set: a page up
+    /// unpinning, `End` re-pinning, `Home` the top of the transcript, and
+    /// none of them ever reaching across to another mode's store.
+    #[test]
+    fn the_page_keys_scroll_every_mode_with_the_wheels_semantics() {
+        for mode in TerminalType::ALL {
+            let (mut app, _rx) = app_with(mode);
+            settle_deep(&mut app);
+            let h = 20u16;
+            paint(&app, h, &[]);
+            let page = app.transcript_band_rows() as isize;
+            assert!(app.pinned(), "{mode:?}: starts pinned");
+
+            app.update(Msg::Term(key(KeyCode::PageUp, KeyModifiers::NONE)));
+            assert_eq!(
+                app.scrollback().offset(),
+                page as usize,
+                "{mode:?}: one page up"
+            );
+            assert!(!app.pinned(), "{mode:?}: a page up unpins");
+
+            app.update(Msg::Term(key(KeyCode::PageDown, KeyModifiers::NONE)));
+            assert_eq!(
+                app.scrollback().offset(),
+                0,
+                "{mode:?}: and back down again"
+            );
+            assert!(app.pinned(), "{mode:?}: reaching the bottom re-pins");
+
+            app.update(Msg::Term(key(KeyCode::Home, KeyModifiers::NONE)));
+            let band = app.transcript_band_rows();
+            assert_eq!(
+                app.transcript_window(band).first().map(|r| r.entry),
+                Some(0),
+                "{mode:?}: Home is the top of the transcript, not the top of the screen"
+            );
+
+            app.update(Msg::Term(key(KeyCode::End, KeyModifiers::NONE)));
+            assert!(app.pinned(), "{mode:?}: End re-pins");
+
+            // The other mode's store did not move: three views, three offsets.
+            let other = mode.next();
+            let (mut app2, _rx2) = app_with(other);
+            settle_deep(&mut app2);
+            app2.update(Msg::Term(key(KeyCode::Home, KeyModifiers::NONE)));
+            assert_eq!(
+                app.scrollback().offset(),
+                0,
+                "{mode:?}: End put us back at the tail, and the other mode was never touched"
+            );
+            assert!(
+                app2.scrollback().offset() > 0,
+                "{other:?}: its own Home moved its own store"
+            );
+        }
+    }
+    /// The other failure that is not a timeout: the sink answered, and the answer
+    /// was no. The sink's own reason is what the user reads — a `Failed` that
+    /// arrived and produced no toast is the same silence as a wedge, and worse,
+    /// because something did have time to say what went wrong.
+    #[test]
+    fn a_dump_the_sink_refuses_reports_the_sinks_own_reason() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let sink = crate::testing::RecordingTranscriptSink::answering(
+            crate::services::transcript_file::DumpOutcome::Failed {
+                reason: "/tmp: read-only file system".into(),
+            },
+        );
+        app.set_transcript_sink(Arc::new(sink.clone()));
+        settle_answers(&mut app, 2);
+
+        chord(&mut app, KeyCode::Char('t'));
+
+        assert_eq!(sink.count(), 1, "the dump was attempted");
+        let toast = app.toast().expect("and reported");
+        assert_eq!(toast.tone(), crate::state::toast::Tone::Bad);
+        assert_eq!(
+            toast.text(),
+            "Nothing written: /tmp: read-only file system",
+            "the reason is passed through, not wrapped in a guess"
         );
     }
 }

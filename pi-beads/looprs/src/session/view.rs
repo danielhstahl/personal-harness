@@ -286,6 +286,32 @@ impl SessionView {
         }
     }
 
+    /// Close off the shell output gathered so far, so the command about to run
+    /// starts a fresh transcript entry (looprs-pdl.13).
+    ///
+    /// This is the *making* of the command boundary that
+    /// [`Transcript::last_command_output`] reads. Without it a Bash session's
+    /// whole life is one entry, because a stream of one kind is one entry by
+    /// design, and "copy the last command's output" would silently mean
+    /// "everything since the shell started" — a copy that widens itself is worse
+    /// than one that refuses.
+    ///
+    /// The pending resolver line is flushed first and deliberately: it is almost
+    /// always the prompt the shell came back to, which belongs to the block that
+    /// just finished. Leaving it in the resolver and sealing underneath would let
+    /// it land at the *front* of the next command's entry, which is the same
+    /// bytes in the wrong place — the one mistake this file's whole
+    /// text-and-styles-travel-together rule exists to prevent.
+    ///
+    /// Called at submit rather than at command completion because submit is the
+    /// moment the boundary is known. The shell itself does not report where one
+    /// command ends and the next begins, and inferring it from a prompt pattern
+    /// would break on every shell that is not bash.
+    pub fn seal_shell_output(&mut self) {
+        self.flush_shell_pending();
+        self.transcript.seal_command();
+    }
+
     /// Rows that became final since the last call. Call once per frame, for the
     /// active view only; each one is also appended to
     /// [`Self::scrollback`](SessionView::scrollback), which is what the frame's
@@ -596,12 +622,1046 @@ impl SessionView {
     }
 }
 
+// ─────────────────── the chord table (looprs-pdl.13) ───────────────────
+//
+/// Every key the app claims, in every mode, in every state of the screen, with
+/// exactly one owner each. This is the table the ticket asks for, and it is data
+/// rather than prose for one reason: the rules written against it are tests, and a
+/// rule checked against a comment is a rule checked by nobody.
+///
+/// **The rows are the order of decision**, and [`App::on_key`] executes them in
+/// that same order: the control chords first (`Ctrl-C`, `Ctrl-Q`, `Ctrl-S`, all
+/// three claimed before anything else because all three have to survive every
+/// other state), then the armed chord's second key, then the passthrough handover,
+/// then `Esc`-clears-the-selection, then the scroll keys, then the input box.
+/// A row appearing above another row is the same statement as "handles the key
+/// first", which is what makes the no-shadowing audit mean something.
+///
+/// ```text
+/// MODE        KEY              STATE          OWNER     EFFECT
+/// Pi, Beads   Ctrl-C         plain          App       quit (no Cancel worth the name yet)
+/// Bash        Ctrl-C         plain          Shell     0x03 → SIGINT the foreground group
+/// all         Ctrl-Q         plain          App       quit
+/// all         Ctrl-S         plain          App       arm the copy chord (help toast is the window)
+/// all         a              armed          App       copy the last answer
+/// all         o              armed          App       copy the last command's output
+/// all         s              armed          App       copy the live selection
+/// all         t              armed          App       write the whole transcript to a file
+/// all         ?              armed          App       show the chord help
+/// all         Esc            armed          App       cancel the chord, and nothing else
+/// Bash        Ctrl-C         child holds    Shell     0x03 → SIGINT
+/// Bash        Ctrl-Q         child holds    App       quit
+/// Bash        Ctrl-S         child holds    App       swallowed: XOFF is never forwarded
+/// Bash        any other      child holds    Child     forwarded as the bytes the terminal sent
+/// all         Esc            selection live App       clear the selection, nothing sent
+/// all         Esc            plain          session   the mode's cancel (ADR-0003)
+/// all         Tab            plain          App       switch mode (clears selection, chord, throttle)
+/// all         Shift-Tab      plain          Box       newline
+/// all         Shift-Enter    plain          Box       newline
+/// all         Enter          plain          Box       submit
+/// all         PageUp         plain          App       one page up (unpins)
+/// all         PageDown       plain          App       one page down (re-pins at the tail)
+/// all         Home           plain          App       top of the transcript
+/// all         End            plain          App       bottom, and re-pin
+/// all         anything else  plain          Box       typing
+/// ```
+///
+/// The three rules the audit below runs against it are the ticket's:
+///
+/// 1. **`Ctrl-C` is not copy.** In Bash mode it is SIGINT and stays SIGINT. No
+///    row in this table may pair a `Ctrl-C` with a copy or a dump, in any mode.
+/// 2. **Nothing added may shadow an existing binding in the mode it is added
+///    to**, and the audit covers the modes' *differences*: the same key must
+///    have exactly one owner per (mode, state), which is why `Ctrl-C` gets two
+///    rows and why "the child holds the screen" is a state at all rather than a
+///    footnote.
+/// 3. **`Esc`'s branch is written down per state**, with the "was a selection
+///    live?" question explicit — and, since looprs-pdl.13 added one, with the
+///    pending-chord state ahead of it: `Esc` undoes the most recent thing the
+///    user gave us, never something older and louder.
+///
+/// The state of the screen a chord is being decided in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ChordState {
+    /// We hold the screen, nothing is outstanding, no selection is live.
+    Plain,
+    /// A selection is live (made by the mouse, or by any other means).
+    SelectionLive,
+    /// `Ctrl-S` is outstanding and the next key is the target.
+    ChordArmed,
+    /// A full-screen child holds the real terminal (ADR-0001 Q2).
+    ChildHolds,
+}
+
+/// Who ends up with the keystroke.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Owner {
+    /// looprs's own chord/scroll layer.
+    App,
+    /// The shell, by way of bytes down the pty.
+    Shell,
+    /// The mode's session (the cancel that ADR-0003 owns).
+    Session,
+    /// The input box.
+    Box,
+    /// A full-screen child program, forwarded verbatim.
+    Child,
+}
+
+impl Effect {
+    /// The noun `copy_chord_hint` pairs with this effect's sub-key: what arming
+    /// the prefix and pressing this target gets you. Only the copy family has a
+    /// hint; everything else in the table is not a thing the chord offers.
+    #[allow(dead_code)] // read only by `copy_chord_hint`, which is not on the hot path
+    fn hint(self) -> Option<&'static str> {
+        match self {
+            Effect::CopyAnswer => Some("answer"),
+            Effect::CopyLastOutput => Some("last output"),
+            Effect::CopySelection => Some("selection"),
+            Effect::DumpTranscriptFile => Some("transcript to file"),
+            Effect::CancelChord => Some("cancel"),
+            _ => None,
+        }
+    }
+}
+
+/// What the app does with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Effect {
+    Quit,
+    /// `0x03` to the pty master: SIGINT to the foreground process group.
+    SigInt,
+    /// The mode's own cancel.
+    CancelRun,
+    ClearSelection,
+    ArmChord,
+    CancelChord,
+    CopyAnswer,
+    CopyLastOutput,
+    CopySelection,
+    DumpTranscriptFile,
+    ChordHelp,
+    ScrollUp,
+    ScrollDown,
+    Top,
+    Tail,
+    SwitchMode,
+    Newline,
+    Submit,
+    Typing,
+    /// Forwarded raw to a full-screen child.
+    Forwarded,
+    /// Deliberately thrown away. The only one in the table is XOFF: we own
+    /// `Ctrl-Q`, so a `Ctrl-S` we forwarded could stop a child the user then had
+    /// no chord left to restart.
+    Swallowed,
+}
+
+/// A key, spelled the way the table spells it, and constructible into the real
+/// keystroke the driving tests send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeySym {
+    CtrlC,
+    CtrlQ,
+    CtrlS,
+    /// The chord's second keys.
+    TargetAnswer,
+    TargetOutput,
+    TargetSelection,
+    TargetTranscript,
+    Help,
+    Esc,
+    Tab,
+    ShiftTab,
+    Enter,
+    ShiftEnter,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    /// Any key not named above.
+    AnyOther,
+}
+
+impl KeySym {
+    /// The real keystroke this row talks about.
+    ///
+    /// #[allow(dead_code)] is below: the shipped binary never needs to turn a row
+    /// back into a KeyEvent — the driving tests do, which is how the table is
+    /// checked against the real handler instead of against a description of it.
+    #[allow(dead_code)] // test seam: driven tests replay the table's chords
+    /// For [`KeySym::AnyOther`] this is a plain `x`: the row's *meaning* is
+    /// "anything unnamed", and `x` is the representative the driving tests use —
+    /// chosen because nothing in the table names it, so a test that sends it is
+    /// really sending the fallback and not a chord that happens to match.
+    pub fn event(self) -> crossterm::event::KeyEvent {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
+        match self {
+            KeySym::CtrlC => KeyEvent::new(KeyCode::Char('c'), M::CONTROL),
+            KeySym::CtrlQ => KeyEvent::new(KeyCode::Char('q'), M::CONTROL),
+            KeySym::CtrlS => KeyEvent::new(KeyCode::Char('s'), M::CONTROL),
+            KeySym::TargetAnswer => KeyEvent::new(KeyCode::Char('a'), M::NONE),
+            KeySym::TargetOutput => KeyEvent::new(KeyCode::Char('o'), M::NONE),
+            KeySym::TargetSelection => KeyEvent::new(KeyCode::Char('s'), M::NONE),
+            KeySym::TargetTranscript => KeyEvent::new(KeyCode::Char('t'), M::NONE),
+            KeySym::Help => KeyEvent::new(KeyCode::Char('?'), M::NONE),
+            KeySym::Esc => KeyEvent::new(KeyCode::Esc, M::NONE),
+            KeySym::Tab => KeyEvent::new(KeyCode::Tab, M::NONE),
+            KeySym::ShiftTab => KeyEvent::new(KeyCode::BackTab, M::SHIFT),
+            KeySym::Enter => KeyEvent::new(KeyCode::Enter, M::NONE),
+            KeySym::ShiftEnter => KeyEvent::new(KeyCode::Enter, M::SHIFT),
+            KeySym::PageUp => KeyEvent::new(KeyCode::PageUp, M::NONE),
+            KeySym::PageDown => KeyEvent::new(KeyCode::PageDown, M::NONE),
+            KeySym::Home => KeyEvent::new(KeyCode::Home, M::NONE),
+            KeySym::End => KeyEvent::new(KeyCode::End, M::NONE),
+            KeySym::AnyOther => KeyEvent::new(KeyCode::Char('x'), M::NONE),
+        }
+    }
+
+    /// Is this a *copy* chord? Rule 1 is stated in terms of this: nothing whose
+    /// effect moves text out of the app may be reachable on `Ctrl-C`.
+    #[allow(dead_code)] // audit-only: rule 1 of the table audit is stated over this
+    pub fn is_copy(self) -> bool {
+        matches!(
+            self,
+            KeySym::TargetAnswer
+                | KeySym::TargetOutput
+                | KeySym::TargetSelection
+                | KeySym::TargetTranscript
+        )
+    }
+}
+
+/// One row of [`CHORD_TABLE`].
+///
+/// The shipped binary reads `state`, `keys` and `does` — that is what
+/// [`copy_chord_hint`] is built from. `mode`, `key`, `owner` and `note` exist so
+/// the audit in `tests` can state the rules over the whole row; the table is the
+/// artifact that gets checked, not a structure the key path walks.
+#[allow(dead_code)] // four of the seven columns are the audit's, three are production's
+pub struct ChordRow {
+    /// The mode this row applies to. Every row names one mode explicitly: a row
+    /// that said "all modes" would hide the fact that `Ctrl-C` does not mean the
+    /// same thing in all of them.
+    pub mode: TerminalType,
+    /// The key.
+    pub key: KeySym,
+    /// How it is spelled in the table above, and in a failure message.
+    pub keys: &'static str,
+    /// The state this row applies in.
+    pub state: ChordState,
+    /// Who ends up with it.
+    pub owner: Owner,
+    /// What happens.
+    pub does: Effect,
+    /// Why, in one line — the part a reader of the code needs and a reader of
+    /// the enum cannot carry.
+    pub note: &'static str,
+}
+
+/// The table. See the comment above it.
+pub const CHORD_TABLE: &[ChordRow] = &[
+    // ── the control chords, claimed before anything else ──
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::CtrlC,
+        keys: "Ctrl-C",
+        state: ChordState::Plain,
+        owner: Owner::Shell,
+        does: Effect::SigInt,
+        note: "the shell's own key: 0x03 to the pty master, the foreground group gets SIGINT, \
+               the app stays up — and it is never, in any mode, a copy",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::CtrlC,
+        keys: "Ctrl-C",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::Quit,
+        note: "quit for now: Pi mode has no Cancel worth the name until looprs-5g7, and a copy \
+               chord is not what Ctrl-C becomes",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::CtrlC,
+        keys: "Ctrl-C",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::Quit,
+        note: "same as Pi",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::CtrlQ,
+        keys: "Ctrl-Q",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::Quit,
+        note: "quit without touching the shell; this is also why Ctrl-S cannot be forwarded \u{2014} \u{2014} \u{2018} is ours",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::CtrlQ,
+        keys: "Ctrl-Q",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::Quit,
+        note: "quit in every mode",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::CtrlQ,
+        keys: "Ctrl-Q",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::Quit,
+        note: "quit in every mode",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::CtrlS,
+        keys: "Ctrl-S",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::ArmChord,
+        note: "the copy prefix: a prefix rather than four top-level chords, because the chord budget is the whole difficulty here",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::CtrlS,
+        keys: "Ctrl-S",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::ArmChord,
+        note: "the copy prefix, armed",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::CtrlS,
+        keys: "Ctrl-S",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::ArmChord,
+        note: "the copy prefix, armed",
+    },
+    // ── the chord's second key, armed only ──
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::TargetAnswer,
+        keys: "Ctrl-S a",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::CopyAnswer,
+        note: "in Bash this *refuses* (there are no answers here) and names the chord that works",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::TargetAnswer,
+        keys: "Ctrl-S a",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::CopyAnswer,
+        note: "the last answer, whole, through the looprs-pdl.10 sink and toast",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::TargetAnswer,
+        keys: "Ctrl-S a",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::CopyAnswer,
+        note: "the last answer, whole, through the looprs-pdl.10 sink and toast",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::TargetOutput,
+        keys: "Ctrl-S o",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::CopyLastOutput,
+        note: "the last sealed shell block: this command's echo, output and prompt, and nothing before it",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::TargetOutput,
+        keys: "Ctrl-S o",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::CopyLastOutput,
+        note: "the agentic modes' answer to the same question: the last finished tool card",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::TargetOutput,
+        keys: "Ctrl-S o",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::CopyLastOutput,
+        note: "the agentic modes' answer to the same question: the last finished tool card",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::TargetSelection,
+        keys: "Ctrl-S s",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::CopySelection,
+        note: "whatever selection is live; a keyboard-driven selection was *not* one of the things that landed in this ticket, and this target is ready for it",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::TargetSelection,
+        keys: "Ctrl-S s",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::CopySelection,
+        note: "whatever selection is live",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::TargetSelection,
+        keys: "Ctrl-S s",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::CopySelection,
+        note: "whatever selection is live",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::TargetTranscript,
+        keys: "Ctrl-S t",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::DumpTranscriptFile,
+        note: "the escape hatch: the whole transcript to a timestamped file, through an injected sink like the clipboard's",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::TargetTranscript,
+        keys: "Ctrl-S t",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::DumpTranscriptFile,
+        note: "the escape hatch",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::TargetTranscript,
+        keys: "Ctrl-S t",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::DumpTranscriptFile,
+        note: "the escape hatch",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::Help,
+        keys: "Ctrl-S ?",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::ChordHelp,
+        note: "the family, listed in a toast: the chords have to be reachable from inside the app",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::Help,
+        keys: "Ctrl-S ?",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::ChordHelp,
+        note: "the family, listed in a toast",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::Help,
+        keys: "Ctrl-S ?",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::ChordHelp,
+        note: "the family, listed in a toast",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::Esc,
+        keys: "Esc",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::CancelChord,
+        note: "undoes the prefix and nothing else \u{2014} it is deliberately not the mode's cancel",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::Esc,
+        keys: "Esc",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::CancelChord,
+        note: "undoes the prefix and nothing else",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::Esc,
+        keys: "Esc",
+        state: ChordState::ChordArmed,
+        owner: Owner::App,
+        does: Effect::CancelChord,
+        note: "undoes the prefix and nothing else",
+    },
+    // ── the child holds the screen ──
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::CtrlC,
+        keys: "Ctrl-C",
+        state: ChordState::ChildHolds,
+        owner: Owner::Shell,
+        does: Effect::SigInt,
+        note: "still SIGINT: a full-screen child does not take Ctrl-C away from the shell it is already in",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::CtrlQ,
+        keys: "Ctrl-Q",
+        state: ChordState::ChildHolds,
+        owner: Owner::App,
+        does: Effect::Quit,
+        note: "ours in every state; the child is killed on the way out",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::CtrlS,
+        keys: "Ctrl-S",
+        state: ChordState::ChildHolds,
+        owner: Owner::App,
+        does: Effect::Swallowed,
+        note: "never forwarded: XOFF into a pty whose XON (Ctrl-Q) we own is a freeze the user cannot undo",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::AnyOther,
+        keys: "anything else",
+        state: ChordState::ChildHolds,
+        owner: Owner::Child,
+        does: Effect::Forwarded,
+        note: "a program that owns the screen owns the keyboard (ADR-0001 Q2) \u{2014} Esc included, so vim leaves insert mode",
+    },
+    // ── the `Esc` branch, per mode, with the question the ticket asks shown ──
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::Esc,
+        keys: "Esc",
+        state: ChordState::SelectionLive,
+        owner: Owner::App,
+        does: Effect::ClearSelection,
+        note: "was a selection live? yes \u{2014} the first Esc unselects and sends nothing",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::Esc,
+        keys: "Esc",
+        state: ChordState::SelectionLive,
+        owner: Owner::App,
+        does: Effect::ClearSelection,
+        note: "was a selection live? yes \u{2014} the first Esc unselects and sends nothing",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::Esc,
+        keys: "Esc",
+        state: ChordState::SelectionLive,
+        owner: Owner::App,
+        does: Effect::ClearSelection,
+        note: "was a selection live? yes \u{2014} the first Esc unselects and sends nothing",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::Esc,
+        keys: "Esc",
+        state: ChordState::Plain,
+        owner: Owner::Session,
+        does: Effect::CancelRun,
+        note: "was a selection live? no \u{2014} the Esc is the cancel the mode table already describes",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::Esc,
+        keys: "Esc",
+        state: ChordState::Plain,
+        owner: Owner::Session,
+        does: Effect::CancelRun,
+        note: "was a selection live? no \u{2014} the cancel, and the queued text comes back to the box",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::Esc,
+        keys: "Esc",
+        state: ChordState::Plain,
+        owner: Owner::Session,
+        does: Effect::CancelRun,
+        note: "was a selection live? no \u{2014} the cancel",
+    },
+    // ── the rest of the table, uniform across modes ──
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::Tab,
+        keys: "Tab",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::SwitchMode,
+        note: "switch mode; the selection, the chord and the wheel throttle all clear with it",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::Tab,
+        keys: "Tab",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::SwitchMode,
+        note: "switch mode",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::Tab,
+        keys: "Tab",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::SwitchMode,
+        note: "switch mode",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::ShiftTab,
+        keys: "Shift-Tab",
+        state: ChordState::Plain,
+        owner: Owner::Box,
+        does: Effect::Newline,
+        note: "newline in the input box — Shift-Enter never sends a shell command",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::ShiftTab,
+        keys: "Shift-Tab",
+        state: ChordState::Plain,
+        owner: Owner::Box,
+        does: Effect::Newline,
+        note: "newline in the input box",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::ShiftTab,
+        keys: "Shift-Tab",
+        state: ChordState::Plain,
+        owner: Owner::Box,
+        does: Effect::Newline,
+        note: "newline in the input box",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::ShiftEnter,
+        keys: "Shift-Enter",
+        state: ChordState::Plain,
+        owner: Owner::Box,
+        does: Effect::Newline,
+        note: "a newline in the box, not a submit",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::ShiftEnter,
+        keys: "Shift-Enter",
+        state: ChordState::Plain,
+        owner: Owner::Box,
+        does: Effect::Newline,
+        note: "a newline in the box",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::ShiftEnter,
+        keys: "Shift-Enter",
+        state: ChordState::Plain,
+        owner: Owner::Box,
+        does: Effect::Newline,
+        note: "a newline in the box",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::Enter,
+        keys: "Enter",
+        state: ChordState::Plain,
+        owner: Owner::Box,
+        does: Effect::Submit,
+        note: "submit; in Bash this is also where the command boundary is sealed for Ctrl-S o",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::Enter,
+        keys: "Enter",
+        state: ChordState::Plain,
+        owner: Owner::Box,
+        does: Effect::Submit,
+        note: "submit",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::Enter,
+        keys: "Enter",
+        state: ChordState::Plain,
+        owner: Owner::Box,
+        does: Effect::Submit,
+        note: "submit",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::PageUp,
+        keys: "PageUp",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::ScrollUp,
+        note: "one page up, unpinning the tail (looprs-pdl.8's semantics, the same store)",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::PageUp,
+        keys: "PageUp",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::ScrollUp,
+        note: "one page up, unpinning the tail",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::PageUp,
+        keys: "PageUp",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::ScrollUp,
+        note: "one page up, unpinning the tail",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::PageDown,
+        keys: "PageDown",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::ScrollDown,
+        note: "one page down; reaching the bottom re-pins",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::PageDown,
+        keys: "PageDown",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::ScrollDown,
+        note: "one page down; reaching the bottom re-pins",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::PageDown,
+        keys: "PageDown",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::ScrollDown,
+        note: "one page down; reaching the bottom re-pins",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::Home,
+        keys: "Home",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::Top,
+        note: "top of the transcript",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::Home,
+        keys: "Home",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::Top,
+        note: "top of the transcript",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::Home,
+        keys: "Home",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::Top,
+        note: "top of the transcript",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::End,
+        keys: "End",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::Tail,
+        note: "bottom, and re-pin: what the \u{201c}N new\u{201d} affordance names",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::End,
+        keys: "End",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::Tail,
+        note: "bottom, and re-pin",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::End,
+        keys: "End",
+        state: ChordState::Plain,
+        owner: Owner::App,
+        does: Effect::Tail,
+        note: "bottom, and re-pin",
+    },
+    ChordRow {
+        mode: TerminalType::Bash,
+        key: KeySym::AnyOther,
+        keys: "anything else",
+        state: ChordState::Plain,
+        owner: Owner::Box,
+        does: Effect::Typing,
+        note: "typing, to whichever mode's box is up",
+    },
+    ChordRow {
+        mode: TerminalType::Pi,
+        key: KeySym::AnyOther,
+        keys: "anything else",
+        state: ChordState::Plain,
+        owner: Owner::Box,
+        does: Effect::Typing,
+        note: "typing",
+    },
+    ChordRow {
+        mode: TerminalType::Beeds,
+        key: KeySym::AnyOther,
+        keys: "anything else",
+        state: ChordState::Plain,
+        owner: Owner::Box,
+        does: Effect::Typing,
+        note: "typing",
+    },
+];
+
+/// The hint shown while the copy chord is armed, and what `Ctrl-S ?` prints.
+///
+/// Read out of the table rather than written again: the string the user reads and
+/// the table the audit checks are then the same data. A target added to the table
+/// shows up in the hint by itself; a target that is not in the table cannot be
+/// advertised.
+pub fn copy_chord_hint() -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for row in CHORD_TABLE
+        .iter()
+        .filter(|r| r.state == ChordState::ChordArmed)
+    {
+        let Some(noun) = row.does.hint() else {
+            continue;
+        };
+        // The table spells each chord out in full (`"Ctrl-S a"`); the hint wants
+        // the sub-key by itself next to the noun it gets you.
+        let sub = row.keys.rsplit(' ').next().unwrap_or(row.keys);
+        let item = format!("{sub} {noun}");
+        if !parts.contains(&item) {
+            parts.push(item);
+        }
+    }
+    format!("Copy: {}", parts.join(" \u{b7} "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn view(mode: TerminalType) -> SessionView {
         SessionView::new(SessionId::new(mode, 0))
+    }
+
+    // ─────────────── the chord table audit (looprs-pdl.13) ───────────────
+    //
+    // These are the ticket's three rules, run against `CHORD_TABLE` as data. What
+    // they cannot do is prove the *code* matches the table — that is what
+    // `app::tests`' driven chord tests are for, and each rule names the test that
+    // drives it. What they can do is make a hole in the table a build failure
+    // rather than a surprise at 1 a.m.
+
+    /// Rule 1: `Ctrl-C` is not copy, in any mode.
+    #[test]
+    fn ctrl_c_is_never_a_copy_in_any_mode() {
+        for row in CHORD_TABLE {
+            if row.key == KeySym::CtrlC {
+                assert!(
+                    !row.key.is_copy(),
+                    "{}/{}: a copy chord spelled as Ctrl-C in {}",
+                    row.mode.label(),
+                    row.keys,
+                    row.keys
+                );
+                assert!(
+                    matches!(row.does, Effect::SigInt | Effect::Quit),
+                    "{}: Ctrl-C must be SIGINT or quit, not {:?}",
+                    row.keys,
+                    row.does
+                );
+            }
+        }
+        // And positively: Bash's Ctrl-C is SIGINT, and stays SIGINT whatever else
+        // this table grows.
+        let bash = CHORD_TABLE
+            .iter()
+            .filter(|r| r.mode == TerminalType::Bash && r.key == KeySym::CtrlC);
+        assert!(bash.clone().count() >= 1, "Bash must have a Ctrl-C row");
+        for row in bash {
+            assert_eq!(
+                row.does,
+                Effect::SigInt,
+                "Bash Ctrl-C in state {:?} must be SIGINT",
+                row.state
+            );
+        }
+    }
+
+    /// Rule 2: no key has two owners in the same mode and state — which is what
+    /// "shadowing" is, spelled as a table constraint.
+    ///
+    /// The mode *differences* are covered by the fact that the triple includes
+    /// the mode: `Ctrl-C` is allowed to mean two different things because it is
+    /// two rows in two modes, and is not allowed to mean two things in one mode
+    /// because that would be two rows with the same triple.
+    #[test]
+    fn no_key_has_two_owners_in_the_same_mode_and_state() {
+        let mut seen: std::collections::HashMap<(TerminalType, KeySym, ChordState), (Owner, &str)> =
+            std::collections::HashMap::new();
+        for row in CHORD_TABLE {
+            let k = (row.mode, row.key, row.state);
+            if let Some(prev) = seen.insert(k, (row.owner, row.keys)) {
+                assert_eq!(
+                    prev,
+                    (row.owner, row.keys),
+                    "{:?} in {:?} is claimed twice: {:?} and {:?}",
+                    row.mode,
+                    row.state,
+                    prev,
+                    (row.owner, row.keys)
+                );
+            }
+        }
+    }
+
+    /// Rule 2, the other half: every mode must say something about every key in
+    /// the family the audit cares about. A missing cell is the failure mode a
+    /// table exists to catch — the binding nobody thought about, which is the
+    /// same thing as a binding nobody can find.
+    #[test]
+    fn every_mode_has_a_row_for_every_key_that_matters() {
+        let keys = [
+            KeySym::CtrlC,
+            KeySym::CtrlQ,
+            KeySym::CtrlS,
+            KeySym::TargetAnswer,
+            KeySym::TargetOutput,
+            KeySym::TargetSelection,
+            KeySym::TargetTranscript,
+            KeySym::Help,
+            KeySym::Esc,
+            KeySym::Tab,
+            KeySym::Enter,
+            KeySym::ShiftEnter,
+            KeySym::PageUp,
+            KeySym::PageDown,
+            KeySym::Home,
+            KeySym::End,
+            KeySym::AnyOther,
+        ];
+        for mode in TerminalType::ALL {
+            for key in keys {
+                let rows: Vec<_> = CHORD_TABLE
+                    .iter()
+                    .filter(|r| r.mode == mode && r.key == key)
+                    .collect();
+                assert!(
+                    !rows.is_empty(),
+                    "{} mode has no row for {:?}: an undocumented key is an unaudited key",
+                    mode.label(),
+                    key
+                );
+            }
+        }
+    }
+
+    /// Rule 3: `Esc`'s branch is written down per mode, with the "was a
+    /// selection live?" question explicit — and with the pending chord ahead of
+    /// it, because looprs-pdl.13 put a new "most recent thing" in front of both.
+    #[test]
+    fn the_esc_branch_is_written_down_per_mode() {
+        for mode in TerminalType::ALL {
+            let armed = CHORD_TABLE.iter().find(|r| {
+                r.mode == mode && r.key == KeySym::Esc && r.state == ChordState::ChordArmed
+            });
+            let live = CHORD_TABLE.iter().find(|r| {
+                r.mode == mode && r.key == KeySym::Esc && r.state == ChordState::SelectionLive
+            });
+            let plain = CHORD_TABLE
+                .iter()
+                .find(|r| r.mode == mode && r.key == KeySym::Esc && r.state == ChordState::Plain);
+            assert!(
+                armed.is_some_and(|r| r.does == Effect::CancelChord),
+                "{}: Esc with a chord armed must cancel the chord",
+                mode.label()
+            );
+            assert!(
+                live.is_some_and(|r| r.does == Effect::ClearSelection),
+                "{}: Esc with a live selection must clear the selection",
+                mode.label()
+            );
+            assert!(
+                plain.is_some_and(|r| r.does == Effect::CancelRun),
+                "{}: Esc with nothing live must be the mode's cancel",
+                mode.label()
+            );
+        }
+        // Bash adds the fourth state: the child holds Esc too.
+        let held = CHORD_TABLE
+            .iter()
+            .find(|r| r.mode == TerminalType::Bash && r.state == ChordState::ChildHolds);
+        assert!(
+            held.is_some_and(|r| r.owner == Owner::Child
+                || r.owner == Owner::Shell
+                || r.owner == Owner::App),
+            "Bash must say what happens to keys while a full-screen child holds the screen"
+        );
+    }
+
+    /// The table's own arithmetic: three modes, and every row names one of them.
+    #[test]
+    fn the_table_is_a_table() {
+        for row in CHORD_TABLE {
+            assert!(
+                TerminalType::ALL.contains(&row.mode),
+                "{:?} is not a mode",
+                row.mode
+            );
+            assert!(!row.keys.is_empty() && !row.note.is_empty());
+        }
+        // The copy family is exactly the four targets plus help, and each is in
+        // all three modes.
+        for key in [
+            KeySym::TargetAnswer,
+            KeySym::TargetOutput,
+            KeySym::TargetSelection,
+            KeySym::TargetTranscript,
+        ] {
+            assert!(key.is_copy(), "{:?} must be a copy key", key);
+            assert_eq!(
+                CHORD_TABLE.iter().filter(|r| r.key == key).count(),
+                3,
+                "{:?} must be in all three modes",
+                key
+            );
+        }
     }
 
     /// The flush invariant, stated as a test: monotonic. Note what the flusher's

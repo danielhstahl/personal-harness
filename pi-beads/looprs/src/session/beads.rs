@@ -3385,6 +3385,10 @@ mod tests {
             // defaulted-from-env so a `LOOPRS_MODES` in the developer's shell
             // cannot change what these table tests assert.
             alt_screen_hosted: false,
+            // Same reason as the notifier above: no test in this file copies
+            // anything, and a clipboard reached through a default would make
+            // that a matter of luck.
+            clipboard: Arc::new(crate::services::clipboard::Noop),
         };
         (
             BeadsLoop::new(SessionId::new(TerminalType::Beeds, 0), tx, ctl_tx, cfg),

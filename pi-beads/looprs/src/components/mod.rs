@@ -5,4 +5,5 @@ pub mod scrollback;
 pub mod selection;
 pub mod status;
 pub mod text_stream;
+pub mod toast;
 pub mod tool;

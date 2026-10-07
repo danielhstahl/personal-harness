@@ -83,6 +83,274 @@ impl crate::services::notification::Notifier for RecordingNotifier {
     }
 }
 
+/// A clipboard that remembers instead of writing (looprs-pdl.10).
+///
+/// The third sink shape this crate uses (`QueuedClipboard` in production, `Noop`
+/// by default, this in tests) and the reason for its existence is the same as
+/// [`RecordingNotifier`]'s: the *exact bytes* and the *exact count* have to be
+/// assertable. A clipboard that really wrote would make the assertion "the
+/// clipboard is non-empty", which is true whether or not the app copied what the
+/// user selected, and is untrue in CI for reasons that have nothing to do with
+/// the code under test.
+///
+/// Answers its receipt **on the spot**, so a test of the copy path never waits on
+/// a transport, and a test of the late-failure path is a test of
+/// `App::poll_copy`'s deadline rather than a two-second sleep.
+///
+/// Clone over a shared `Arc`, so the test and the App under test hold the same
+/// recording.
+#[derive(Clone, Debug)]
+pub struct RecordingClipboard {
+    copies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// What to answer with. `None` answers `Verified` with the count of the text
+    /// that was actually handed over, which is the "nothing went wrong" default:
+    /// a test that does not care about the failure ladder still gets a toast
+    /// whose number describes what was copied.
+    outcome: Option<crate::services::clipboard::CopyOutcome>,
+}
+
+impl Default for RecordingClipboard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RecordingClipboard {
+    /// Records, and answers `Verified`.
+    pub fn new() -> Self {
+        Self {
+            copies: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            outcome: None,
+        }
+    }
+
+    /// Records, and answers whatever the test says — the way to drive the
+    /// `Not copied` and `Copy failed` toast branches.
+    pub fn answering(outcome: crate::services::clipboard::CopyOutcome) -> Self {
+        Self {
+            copies: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            outcome: Some(outcome),
+        }
+    }
+
+    /// Every string this sink was handed, in order.
+    pub fn copies(&self) -> Vec<String> {
+        self.copies.lock().unwrap().clone()
+    }
+
+    pub fn last(&self) -> Option<String> {
+        self.copies.lock().unwrap().last().cloned()
+    }
+
+    pub fn count(&self) -> usize {
+        self.copies.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.copies.lock().unwrap().is_empty()
+    }
+}
+
+impl crate::services::clipboard::Clipboard for RecordingClipboard {
+    fn copy(&self, text: String) -> crate::services::clipboard::Receipt {
+        let chars = crate::services::clipboard::Chars::of(&text);
+        let outcome = self
+            .outcome
+            .clone()
+            .unwrap_or(crate::services::clipboard::CopyOutcome::Verified { chars });
+        self.copies.lock().unwrap().push(text);
+        crate::services::clipboard::Receipt::ready(outcome)
+    }
+
+    fn describe(&self) -> &'static str {
+        "recording"
+    }
+}
+
+/// A clipboard that takes the copy and never answers for it.
+///
+/// The sink the *late failure* path is tested against: a native helper parked on
+/// a wedged Wayland compositor, or an OSC 52 write into an SSH connection that
+/// has stopped pumping, both look exactly like this from the App's side — an
+/// accepted copy with no reply. Without a sink like it in the suite, the
+/// `App::poll_copy` deadline is code no test has ever run.
+///
+/// [`StallClipboard::answer_all`] delivers the reply the test wants *when the
+/// test asks*, which is how "the copy came back after the deadline" is a
+/// scenario rather than a paragraph.
+#[derive(Clone, Debug, Default)]
+pub struct StallClipboard {
+    copies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    pending: std::sync::Arc<
+        std::sync::Mutex<
+            Vec<tokio::sync::oneshot::Sender<crate::services::clipboard::CopyOutcome>>,
+        >,
+    >,
+}
+
+impl StallClipboard {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[allow(dead_code)] // seam kept for the stalled-copy tests: they assert the toast, not the sink's copy log
+    pub fn copies(&self) -> Vec<String> {
+        self.copies.lock().unwrap().clone()
+    }
+
+    /// How many copies are currently unanswered.
+    pub fn inflight(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+
+    /// Deliver `outcome` for every copy taken so far.
+    pub fn answer_all(&self, outcome: crate::services::clipboard::CopyOutcome) {
+        let senders: Vec<_> = self.pending.lock().unwrap().drain(..).collect();
+        for s in senders {
+            let _ = s.send(outcome.clone());
+        }
+    }
+}
+
+impl crate::services::clipboard::Clipboard for StallClipboard {
+    fn copy(&self, text: String) -> crate::services::clipboard::Receipt {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.copies.lock().unwrap().push(text);
+        self.pending.lock().unwrap().push(tx);
+        crate::services::clipboard::Receipt::stalled(rx)
+    }
+
+    fn describe(&self) -> &'static str {
+        "stalling"
+    }
+}
+
+/// A transcript dump sink that records what it was asked to write and answers on
+/// the spot.
+///
+/// The `RecordingClipboard` of the filesystem: a test asserting "the whole
+/// transcript reached the dump sink" does it against this rather than against a
+/// real file, which keeps the suite off the disk for the same reason
+/// `SessionConfig::default()` carries `Noop` — by construction, not by whoever
+/// last remembered to unset an environment variable.
+#[derive(Clone, Debug, Default)]
+pub struct RecordingTranscriptSink {
+    dumps: std::sync::Arc<std::sync::Mutex<Vec<(&'static str, String)>>>,
+    outcome: Option<crate::services::transcript_file::DumpOutcome>,
+}
+
+impl RecordingTranscriptSink {
+    /// Records, and answers `Written` into a fake path.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records, and answers whatever the test says — the way to drive the failed
+    /// and refused dump branches.
+    pub fn answering(outcome: crate::services::transcript_file::DumpOutcome) -> Self {
+        Self {
+            dumps: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            outcome: Some(outcome),
+        }
+    }
+
+    /// Every `(mode, text)` this sink was handed, in order.
+    pub fn dumps(&self) -> Vec<(&'static str, String)> {
+        self.dumps.lock().unwrap().clone()
+    }
+
+    pub fn last(&self) -> Option<String> {
+        self.dumps.lock().unwrap().last().map(|(_, t)| t.clone())
+    }
+
+    pub fn count(&self) -> usize {
+        self.dumps.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.dumps.lock().unwrap().is_empty()
+    }
+}
+
+impl crate::services::transcript_file::TranscriptSink for RecordingTranscriptSink {
+    fn dump(
+        &self,
+        mode: &'static str,
+        text: String,
+    ) -> crate::services::transcript_file::DumpReceipt {
+        use crate::services::transcript_file::{DumpOutcome, DumpReceipt};
+        let chars = crate::services::clipboard::Chars::of(&text);
+        let outcome = self
+            .outcome
+            .clone()
+            .unwrap_or_else(|| DumpOutcome::Written {
+                path: std::path::PathBuf::from(format!("/tmp/fake-looprs-{mode}.txt")),
+                chars,
+            });
+        self.dumps.lock().unwrap().push((mode, text));
+        DumpReceipt::ready(outcome)
+    }
+
+    fn describe(&self) -> &'static str {
+        "recording"
+    }
+}
+
+/// A dump sink that takes the text and never answers.
+///
+/// The `StallClipboard` of the filesystem: the volume that stopped answering,
+/// tested rather than described. Without a fake like it the `App::poll_dump`
+/// deadline is code no test has ever run.
+#[derive(Clone, Debug, Default)]
+pub struct StallTranscriptSink {
+    dumps: std::sync::Arc<std::sync::Mutex<Vec<(&'static str, String)>>>,
+    pending: std::sync::Arc<
+        std::sync::Mutex<
+            Vec<tokio::sync::oneshot::Sender<crate::services::transcript_file::DumpOutcome>>,
+        >,
+    >,
+}
+
+impl StallTranscriptSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn dumps(&self) -> Vec<(&'static str, String)> {
+        self.dumps.lock().unwrap().clone()
+    }
+
+    /// How many dumps are currently unanswered.
+    pub fn inflight(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+
+    /// Deliver `outcome` for every dump taken so far.
+    pub fn answer_all(&self, outcome: crate::services::transcript_file::DumpOutcome) {
+        let senders: Vec<_> = self.pending.lock().unwrap().drain(..).collect();
+        for s in senders {
+            let _ = s.send(outcome.clone());
+        }
+    }
+}
+
+impl crate::services::transcript_file::TranscriptSink for StallTranscriptSink {
+    fn dump(
+        &self,
+        mode: &'static str,
+        text: String,
+    ) -> crate::services::transcript_file::DumpReceipt {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.dumps.lock().unwrap().push((mode, text));
+        self.pending.lock().unwrap().push(tx);
+        crate::services::transcript_file::DumpReceipt::stalled(rx)
+    }
+
+    fn describe(&self) -> &'static str {
+        "stalling"
+    }
+}
+
 impl RecordingNotifier {
     /// Every completion announced so far, in order.
     pub fn completions(&self) -> Vec<crate::services::notification::BeadDone> {

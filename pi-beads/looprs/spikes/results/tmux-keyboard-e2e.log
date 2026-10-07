@@ -1,0 +1,68 @@
+note  tmux: tmux 3.7c
+note  TERM inside the pane: tmux-256color
+tmux session looprs-kbd-e2e (100x32); fakes and dump dir in /var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-tmux-kbd-s5hsciw0
+
+== 1. does 0x13 survive the trip ==
+PASS  Ctrl-S reaches the app as a key event (not swallowed as XOFF)
+note  hint row: Copy: a answer · o last output · s selection · t transcript to file · Esc cancel
+PASS  the hint lists every target the table arms
+note  tmux's own binding for C-s: none
+
+== 2. the page keys over a 200-row Bash transcript ==
+PASS  Tab reaches Bash mode
+PASS  End shows the last row of the transcript
+PASS  PageDown taken at the tail does not move (End re-pinned)
+PASS  Home shows the top of the transcript
+PASS  PageUp at the top does not move
+PASS  PageDown from the top moved the view
+note  rows visible at the top: 29 (pane is 32 rows)
+
+== 3. the copy family, in the modes that own each target ==
+PASS  Tab reaches Bash mode
+PASS  Bash: Ctrl-S o copies the last command's output
+note  toast: SCROLLROW-47                                          Copied 66 characters · OSC 52 (not confirmed)
+PASS  the toast counts characters
+PASS  the second copy is the second command, not the session so far
+note  counts: first=66 second=62
+PASS  Bash: Ctrl-S a refuses and names the chord that works
+PASS  Tab reaches Pi mode
+note  toast: Copied 48 characters · OSC 52 (not confirmed)
+PASS  Pi: Ctrl-S a copies the last answer
+PASS  Ctrl-S t reports with `Wrote`, not `Copied`
+PASS  the toast names a path
+PASS  the file exists and its character count is the toast's number
+PASS  the file holds the answer text the app was showing
+note  file: /tmp/lkbdhome/.cache/looprs/looprs-pi-1791358676328840.txt (133 chars, 13 lines)
+
+== 4. Ctrl-C is still the child's ==
+PASS  Tab reaches Bash mode
+PASS  Ctrl-C interrupts the child and the shell returns
+note  interrupt round trip: 0.04s
+PASS  Ctrl-C copied nothing
+PASS  the app is still alive and arms the chord after the interrupt
+
+== 5. a child holding the screen is never handed 0x13 ==
+PASS  Tab reaches Bash mode
+PASS  the child (vim) took the screen
+PASS  looprs's copy hint is not painted over the child
+PASS  Ctrl-S did not arm a chord over the child
+PASS  the child still repaints after our Ctrl-S (it was never stopped by XOFF)
+note  child's top row after typing: NOT-XOFFEDlocalhost
+PASS  the screen came back to looprs
+note  after the child: └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+== 6. Esc with the chord armed lowers the chord, nothing else ==
+PASS  Tab reaches Pi mode
+PASS  the chord is armed
+PASS  Esc removed the hint
+PASS  the letter after the cancelled chord typed instead of copying
+PASS  Esc with no chord armed did not quit
+PASS  and the app is still here after a second Esc
+
+== 7. the alternate screen through tmux, and the hand-back ==
+note  pane alternate_on while looprs runs: 1
+PASS  looprs holds the alternate screen inside tmux
+PASS  Ctrl-Q ends the tmux session (looprs exited, the pane closed)
+
+37/37 checks passed
+claims taken against the FAKE board this run: 1 (the real board was never touched)

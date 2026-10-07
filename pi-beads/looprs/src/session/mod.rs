@@ -369,6 +369,27 @@ pub struct SessionConfig {
     /// touched the network" a matter of luck. `main` is the only place that calls
     /// [`notifier_from_env`](crate::services::notification::notifier_from_env).
     pub notifier: Arc<dyn crate::services::notification::Notifier>,
+    /// Where a copy goes: the system clipboard, or nowhere
+    /// ([`services::clipboard`](crate::services::clipboard)).
+    ///
+    /// Carried and reasoned about exactly like [`Self::notifier`], because it is
+    /// the same shape of hazard: the UI must not touch the outside world
+    /// directly, and the thing it does to the outside world is a process spawn
+    /// (`pbcopy`) or a tty write that can stall. `copy` is a queue send; the
+    /// transport lives in the sink's own task, under its own deadline
+    /// (ADR-0004 R11).
+    ///
+    /// The default is [`Noop`](crate::services::clipboard::Noop) and **not**
+    /// the configured sink, for the same reason the notifier's default is:
+    /// ~550 tests build `SessionConfig::default()`, and a default that read the
+    /// environment would make "no test ever touched a clipboard" a matter of
+    /// luck rather than construction. `main` is the only caller of
+    /// [`clipboard_from_env`](crate::services::clipboard::clipboard_from_env).
+    // Read by the select-to-copy path being finished in looprs-pdl.10; the shipped
+    // binary gets its clipboard through `App::set_clipboard`, so nothing in this
+    // crate's compiled code touches the field yet.
+    #[allow(dead_code)]
+    pub clipboard: Arc<dyn crate::services::clipboard::Clipboard>,
     /// Is the **app** living in the alternate screen?
     ///
     /// The Bash session needs this one fact from the terminal mode ledger because it
@@ -389,6 +410,7 @@ impl Default for SessionConfig {
             bd_bin: std::env::var("LOOPRS_BD_BIN").unwrap_or_else(|_| "bd".to_string()),
             shell_bin: default_shell_bin(),
             notifier: Arc::new(crate::services::notification::Noop),
+            clipboard: Arc::new(crate::services::clipboard::Noop),
             alt_screen_hosted: crate::teardown::Mode::alt_screen_claimed(),
         }
     }
@@ -601,6 +623,7 @@ mod tests {
             shell_bin: "true".into(),
             notifier: Arc::new(crate::services::notification::Noop),
             alt_screen_hosted: false,
+            ..SessionConfig::default()
         };
         for (generation, mode) in TerminalType::ALL.into_iter().enumerate() {
             let spawned = spawn(mode, &cfg, generation as u64).expect("stub spawn must not fail");

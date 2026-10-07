@@ -81,11 +81,19 @@ pub struct Entry {
 #[derive(Default)]
 pub struct Transcript {
     pub entries: Vec<Entry>,
+    /// The entry index the last submitted Bash command's output starts at, set by
+    /// [`Transcript::seal_command`]. This is the command boundary the copy reads:
+    /// a Bash session is one long stream of one kind, so without an index there is
+    /// nothing that says where this command stops and the next one starts.
+    command_start: Option<usize>,
 }
 
 impl Transcript {
     pub fn new() -> Self {
-        Self { entries: vec![] }
+        Self {
+            entries: vec![],
+            command_start: None,
+        }
     }
     /// Streaming append. Same kind as the open entry extends it; a different kind
     /// closes it and starts a new one (thinking -> answer happens automatically).
@@ -295,11 +303,232 @@ impl Transcript {
             e.done = true;
         }
     }
+
+    // ─────────────── the keyboard copy targets (looprs-pdl.13) ───────────────
+    //
+    // These four resolvers are the whole of "what does this chord copy?". They are
+    // here, next to the entries they read, for the same reason `CopyOutcome::toast`
+    // lives next to its variants: the moment a second module has its own opinion
+    // about what "the last answer" is, there are two answers and no way to tell
+    // which one the clipboard holds.
+    //
+    // Every one of them reads the *entry*, not the rendered store, and that is
+    // deliberate. A drag selection has to be a cell rectangle over wrapped rows
+    // and therefore has to go through the store; a chord has no geometry to be
+    // wrong about, so the answer is the text itself, complete, whether or not it
+    // has ever been flushed to a screen and whether or not the view has been
+    // trimmed since. Copying "the last answer" out of the visible window would
+    // make the chord's result depend on where the user was scrolled to, which is
+    // a fact about the frame and not about the answer.
+
+    /// The text of the most recent assistant answer, whole.
+    ///
+    /// `None` when the session has not answered anything — which in Bash mode is
+    /// the normal case, and the caller is expected to say so rather than to copy
+    /// nothing in silence.
+    pub fn last_answer(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|e| e.kind == MessageKind::Answer)
+            .map(|e| e.text.as_str())
+    }
+
+    /// The text of the most recent shell block: everything the shell said for the
+    /// last command, and nothing before it.
+    ///
+    /// The boundary is not inferred here — it is *made* at submit time by
+    /// [`Self::seal_command`] (called through the view), which closes the open
+    /// Bash entry so the next command's output starts a new one. Without that
+    /// seal a whole Bash session is a single entry, because a stream of one kind
+    /// is one entry by design ([`Transcript::push_shell_lines`]), and "the last
+    /// command's output" would silently mean "every command since the mode was
+    /// entered". Choosing to widen the copy rather than fail would be the worse
+    /// lie, so the boundary is real and this returns the last entry only.
+    ///
+    /// What the entry holds is what the terminal held: the shell's own echo of the
+    /// line, the output, and the prompt it came back to. Trimming the prompt off
+    /// the end would mean guessing where output ends and shell furniture starts,
+    /// and ADR-0001 rule 1 is that the shell's bytes are not ours to reinterpret.
+    ///
+    /// Blank entries *inside* the block are kept — a command's output may
+    /// legitimately contain a blank line. A block whose whole content is blank is
+    /// `None`, and the difference between that and "no command has run"
+    /// ([`Self::has_command_boundary`]) is the difference between "it said
+    /// nothing" and "nothing was asked".
+    ///
+    /// Reading the *block* rather than "the last Bash entry" is not a preference.
+    /// A real pty leaves a trailing blank artifact: the next prompt arrives as a
+    /// bare `\r`, which is a Bash line of its own, and "the last Bash entry" made
+    /// `Ctrl-S o` answer "the last command's output is blank" about a screen
+    /// full of the command's output. Measured through tmux in
+    /// `spikes/tmux_keyboard_e2e.py`; this shape is what closes it.
+    pub fn last_command_output(&self) -> Option<String> {
+        let start = self.command_start?;
+        if start >= self.entries.len() {
+            return None;
+        }
+        let block: Vec<&str> = self.entries[start..]
+            .iter()
+            .filter(|e| e.kind == MessageKind::Bash && !e.text.trim().is_empty())
+            .map(|e| e.text.as_str())
+            .collect();
+        if block.is_empty() {
+            return None;
+        }
+        // The trailing newline each pushed line carries is stripped. A copy that
+        // ends in a newline is a copy that runs an extra command the moment it is
+        // pasted into a shell, and the user asked for the output, not for a
+        // keystroke. Blank lines *inside* the block survive; only the tail goes.
+        Some(block.join("\n").trim_end_matches('\n').to_string())
+    }
+
+    /// Whether a command boundary exists at all — which is how the refusal tells
+    /// "no command has run yet" apart from "the last command said nothing".
+    pub fn has_command_boundary(&self) -> bool {
+        self.command_start.is_some()
+    }
+
+    /// The result summary of the most recent *finished* tool card.
+    ///
+    /// This is the agentic modes' answer to the same question `Ctrl-S o` asks in
+    /// Bash — "what did the last thing I made this session do produce?". An
+    /// in-progress card is skipped: its `text` is empty until
+    /// [`Transcript::finish_tool`] fills it, and copying an empty string under a
+    /// `Copied` verb is exactly the confident wrong answer R20 is about.
+    pub fn last_tool_output(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|e| matches!(e.kind, MessageKind::Tool { .. }) && e.done && !e.text.is_empty())
+            .map(|e| e.text.as_str())
+    }
+
+    /// Close off the open entry so the next thing written starts a new one.
+    ///
+    /// The command boundary for the Bash copy (see
+    /// [`Transcript::last_command_output`]). Only streamed entries close, exactly
+    /// as in [`Transcript::finish_last`]: a running tool card is not closed by
+    /// whatever the user typed over the top of it, because parallel tools are
+    /// ordinary and a seal that ate an open card would lose the run's state.
+    ///
+    /// Idempotent, and never creates an entry: sealing an empty transcript leaves
+    /// an empty transcript, so a submit that produced nothing adds nothing.
+    pub fn seal_command(&mut self) {
+        self.finish_last();
+        // The boundary is the *next* entry: everything from here on is what this
+        // command produced. Recorded after the finish so a seal never points into
+        // an entry that belongs to the command before it.
+        self.command_start = Some(self.entries.len());
+    }
+
+    /// The whole transcript as plain text, entries joined by a blank line.
+    ///
+    /// The escape hatch for "anything bigger than a clipboard" (looprs-pdl.13):
+    /// the *content*, with no frame chrome, no line numbers and no band markers,
+    /// because the file's use is `grep` and a paste, and both are ruined by
+    /// decoration. Entries are separated by a blank line so a shell block does
+    /// not run into the answer that follows it; the text inside each entry is
+    /// verbatim, styles dropped (ADR-0004 R14 says a copy never carries a style;
+    /// a file copy is a copy).
+    pub fn plain_text(&self) -> String {
+        let mut out = String::with_capacity(self.byte_len() + self.entries.len() * 2);
+        for e in &self.entries {
+            // One blank between entries, whatever the entries happen to end with.
+            // Trailing blank runs *inside* an entry's tail are collapsed: a file
+            // with three blank lines where one entry stopped and the next started
+            // reads like something broke.
+            let body = e.text.trim_end_matches('\n');
+            if !out.is_empty() && !body.is_empty() {
+                out.push('\n');
+            }
+            if !body.is_empty() {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(body);
+                out.push('\n');
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn shell_line(text: &str) -> crate::utils::shelltext::StyledLine {
+        crate::utils::shelltext::StyledLine {
+            text: text.to_string(),
+            runs: vec![],
+            cells: text.chars().count(),
+        }
+    }
+
+    fn shell(t: &mut Transcript, lines: &[&str]) {
+        t.push_shell_lines(
+            &lines
+                .iter()
+                .map(|l| shell_line(l))
+                .collect::<Vec<crate::utils::shelltext::StyledLine>>(),
+        );
+    }
+
+    /// The block is what arrived since the last seal, and nothing before it.
+    #[test]
+    fn the_command_block_is_what_arrived_since_the_last_seal() {
+        let mut t = Transcript::new();
+        shell(&mut t, &["before the command"]);
+        t.seal_command();
+        shell(&mut t, &["$ make", "built"]);
+
+        assert_eq!(
+            t.last_command_output().as_deref(),
+            Some("$ make\nbuilt"),
+            "both lines of the block, neither of what came before"
+        );
+    }
+
+    /// The reason the read is a block and not "the last Bash entry": a real pty
+    /// ends a command with a blank line of its own — the carriage return of the
+    /// next prompt — and with the `exit 0` note breaking the stream behind it, the
+    /// last entry in the transcript was the blank. `Ctrl-S o` answered "the last
+    /// command's output is blank" about a screen full of the command's output.
+    /// Seen through tmux in `spikes/tmux_keyboard_e2e.py`.
+    #[test]
+    fn a_trailing_blank_shell_line_does_not_erase_the_command_that_ran() {
+        let mut t = Transcript::new();
+        t.seal_command();
+        shell(&mut t, &["$ echo MARKER", "MARKER"]);
+        t.push_done(MessageKind::System, "exit 0".into());
+        shell(&mut t, &["\r"]);
+
+        let got = t.last_command_output().expect("the command is still there");
+        assert!(got.contains("MARKER"), "{got:?}");
+        assert!(
+            !got.contains("exit 0"),
+            "our note is not the command's output"
+        );
+    }
+
+    /// The three nothings are distinguishable, because the user can only act on
+    /// the one that is actually true.
+    #[test]
+    fn no_boundary_and_no_output_are_different_facts() {
+        let mut t = Transcript::new();
+        assert!(
+            t.last_command_output().is_none() && !t.has_command_boundary(),
+            "nothing has been submitted"
+        );
+
+        t.seal_command();
+        shell(&mut t, &["\r", "   "]);
+        assert!(
+            t.last_command_output().is_none() && t.has_command_boundary(),
+            "a command ran and said nothing: a boundary exists, output does not"
+        );
+    }
+
     use crate::components::compaction::CompactionState;
 
     fn compaction_in(state: CompactionState) -> impl Fn(&&Entry) -> bool {

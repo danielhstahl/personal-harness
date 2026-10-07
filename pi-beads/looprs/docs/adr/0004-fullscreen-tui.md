@@ -891,3 +891,111 @@ Rule → measurement map, so no rule rests on an adjective:
 
 `./scripts/check.sh` is clean (fmt, `clippy --all-targets -D warnings`, 440 tests, 3 ignored) with
 the new example added and nothing else touched.
+
+## Landed — `pdl.13`, the copy chords, as built
+
+Keyboard parity: `PageUp`/`PageDown`/`Home`/`End` in all three modes on the
+wheel's own pin/unpin semantics (they were already the same store — `App::scroll_active`,
+`top_active`, `tail_active` — so this ticket *proved* the parity rather than
+building it), and a copy family that needs no mouse.
+
+**Why one leader chord instead of four chords.** The keyboard was already spoken
+for: `Ctrl-C`, `Ctrl-Q`, `Tab`, `Shift-Tab`, `Enter`, `Shift-Enter`, `Esc`, the
+four page keys, and every printable. Four more top-level control chords would have
+meant either stealing from a child terminal's own set or picking Alt chords, whose
+delivery is a per-emulator lottery. So `Ctrl-S` **arms** a window and the next key
+picks the target:
+
+| key | target | where it works |
+|---|---|---|
+| `Ctrl-S a` | the last answer | Pi, Beads (refused in Bash, naming `Ctrl-S o`) |
+| `Ctrl-S o` | the last command's output / last finished tool card | all three |
+| `Ctrl-S s` | the live selection | all three (mouse-made today — see *not done*) |
+| `Ctrl-S t` | the whole transcript, to a file | all three |
+| `Ctrl-S ?` | this list | all three |
+| `Esc` | lower the chord | all three |
+
+The window is `COPY_CHORD_WINDOW = TOAST_TTL`, deliberately the same number and
+not a coincidence: the hint toast that named the window expiring **is** the window
+expiring, so there is no moment where the app is waiting and the screen says
+nothing. Expiry is silent for that reason.
+
+**`Ctrl-S` is XOFF, and that is the whole hazard.** Raw mode via crossterm goes
+through `cfmakeraw`, which clears `IXON`, so looprs receives `0x13` as a key
+event instead of the terminal stopping its own output — that is why the chord is
+possible at all. The hazard is the other direction: `0x13` **must never be
+forwarded to a full-screen child**, because a child stopped with XOFF needs
+`0x11` to resume and `Ctrl-Q` is looprs's *quit*. So while a child holds the
+screen, `Ctrl-S` is swallowed rather than sent and the chord is not armed
+(`a_child_holding_the_screen_is_never_sent_xoff`), and a chord that was armed
+before the child took over is dropped (`a_child_taking_the_screen_kills_an_armed_chord`)
+rather than left to fire at content the user can no longer see.
+
+**The command boundary is made, not inferred.** A Bash session is one stream of
+one `MessageKind`, so "the last command's output" has no natural edge: the seal
+is taken at submit (`SessionView::seal_shell_output` → `Transcript::seal_command`)
+and records the entry index the command's output starts at. Reading *that block*
+rather than "the last Bash entry" is not taste. A real pty ends a command with a
+blank line of its own — the next prompt's carriage return — with looprs's own
+`exit 0` note breaking the shell stream behind it, so "the last Bash entry" was
+the blank and `Ctrl-S o` answered *"the last command's output is blank"* about a
+screen full of the command's output. Found by running the real binary in tmux
+(`spikes/tmux_keyboard_e2e.py`), not by the unit tests, which had been pushing
+shell output without the artifact. Three facts now stay separate: no boundary
+("no command has run"), a blank block ("produced no output"), and a copy.
+
+**The dump toast has to be readable, which moved the default directory.** The
+escape hatch writes to `$XDG_CACHE_HOME/looprs`, else `$HOME/.cache/looprs`,
+else the temp dir — because the toast has to *name the file* on a row the user can
+read, and macOS's `$TMPDIR` is 49 columns of directory before the name starts.
+Through tmux at 100 columns the toast came out cut mid-path: a toast whose whole
+job is "here is your file" that names nothing. The path is folded at `$HOME`
+(`~/.cache/looprs/looprs-pi-…txt`), the absolute path is what is actually written
+and what the startup `info` log carries. The verb is `Wrote`, never `Copied`,
+because the clipboard was not touched and a user who reads `Copied 38,000
+characters` and pastes gets whatever they had before.
+
+**The three refusals that are not silence.** A blank *mouse* selection stays quiet
+(R13: it was never a request). A keyboard copy that finds nothing is **loud** —
+the user pressed keys on purpose and is owed a reason — and the reason names the
+missing thing, and usually the chord that would have worked.
+
+### tmux and SSH, measured (`spikes/tmux_keyboard_e2e.py`, 37/37)
+
+The first spike of this kind in the repo: the app driven inside a live `tmux`
+3.7c session rather than a pty the harness owns. Fakes for `pi` and `bd` are
+mandatory, not tidiness — looprs boots into Beeds and the beads loop runs
+`bd update <id> --claim` before a Tab can reach it, so an unplanned
+`looprs` run moves the real board (it did, once, during this ticket; restored).
+
+- **`Ctrl-S` arrives.** tmux puts its client in a `cfmakeraw`-equivalent mode, so
+  `0x13` reaches the app as a key event: the arming hint paints. tmux has no
+  binding on `C-s`, and the app does not care if it did — the pane gets the byte.
+- **The page keys survive the hop** (`ESC[5~`/`ESC[6~`/`ESC[H`/`ESC[F`): `Home`
+  reaches row 1 of a 200-row transcript, `End` reaches row 200, and a `PageDown`
+  taken at the tail does not move — the pin `End` set.
+- **`Ctrl-C` is still the child's**: the interrupt round-trips in ~0.04 s and no
+  `Copied` toast appears anywhere on screen.
+- **A full-screen child is never XOFFed**: after our `Ctrl-S`, vim is driven into
+  insert mode and repaints (`NOT-XOFFED` on the top row). The check that matters,
+  because the failure mode is unrecoverable from inside the app.
+- **The alternate screen is clean through tmux**: `#{alternate_on}` is `1` while
+  looprs runs and `Ctrl-Q` closes the pane.
+- **The boundary is real from outside the process**: two same-shaped commands
+  copied back to back give **66 and 62 characters**, not 66 and ~130.
+- What tmux *cannot* test is a real drag: `send-keys` injects SGR reports through
+  the pane's input, which proves our parser and not the multiplexer's forwarding.
+  R17's shift-drag fall-through stays unmeasurable from a pty, as this ADR said
+  before the ticket started.
+
+### Not done, said out loud
+
+**Keyboard selection did not land.** `Ctrl-S s` copies the *live* selection,
+which today means one the mouse made; the ticket's "if a keyboard selection lands"
+is the hatch this stopped at. What was built instead is the seam: the target, the
+resolution, the refusal ("nothing is selected — `Ctrl-S a` copies the last
+answer, · `Ctrl-S o` the last output") and the same sink and toast the mouse uses,
+so a keyboard selection is a producer plugged into a target that already exists.
+
+`./scripts/check.sh` is clean (fmt, `clippy --all-targets -D warnings`, 636 tests,
+3 ignored), plus 37 tmux checks that the unit tests cannot make.
