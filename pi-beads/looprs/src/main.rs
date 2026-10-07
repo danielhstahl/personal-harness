@@ -18,7 +18,7 @@ use crossterm::event::{Event, EventStream};
 use futures::StreamExt;
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
+use ratatui::layout::{Rect, Size};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use std::io::{self, Stdout};
@@ -224,6 +224,11 @@ async fn run(
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60 fps cap
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // The backstop for the resize repaint. Why a poll exists next to a resize
+    // *event* is the whole doc on `viewport::WindowPoll` (looprs-pdl.15);
+    // three lines here, and the reason it is a type and not an `if` is that it
+    // has to remember that it gave up.
+    let mut window = viewport::WindowPoll::new();
 
     // The loop has one shape now: read a message, read a key, redraw if anything
     // changed. What is *not* here is the reason the old loop had four shapes —
@@ -246,6 +251,21 @@ async fn run(
                 }
             }
             _ = tick.tick() => {
+                // Adopt the window the terminal has, if the event never told us.
+                // Read *before* anything else in this arm so the width the tick
+                // goes on to wrap for is the width the `ioctl` just reported —
+                // the same one-number rule that makes `preview_active` and
+                // `input_band` be taken once per frame.
+                if let Some(sz) = window.poll(|| frame.size(), Size::new(app.width, app.height)) {
+                    tracing::debug!(
+                        "window adopted from the size ioctl: {}x{} -> {}x{}",
+                        app.width,
+                        app.height,
+                        sz.width,
+                        sz.height
+                    );
+                    app.set_window(sz.width, sz.height);
+                }
                 app.update(Msg::Tick); //spinner only atm
                 // A full-screen child had the canvas and gave it back. Our back
                 // buffer still describes the screen as it was before the child

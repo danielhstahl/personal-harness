@@ -278,6 +278,113 @@ impl<B: Backend> ScreenFrame<B> {
     }
 }
 
+/// Adopts the real window from the size `ioctl` once per tick, as a backstop to
+/// the `Event::Resize` path (looprs-pdl.15).
+///
+/// # The hole this closes
+///
+/// "The user drags the window while nothing is happening and the transcript
+/// re-wraps" used to have exactly one delivery channel, and every link in it is
+/// outside this app: `SIGWINCH` → crossterm's `EventStream` → `Event::Resize`
+/// → [`crate::App::set_window`]. The first link is the load-bearing one, and
+/// it is not a promise about *us*: `SIGWINCH` is not delivered to the process
+/// that is drawing on the terminal, it is delivered to the **foreground
+/// process group of the terminal's session** (`tty_ioctl(4)`). A process
+/// drawing into a pty it never made its controlling terminal — a piped
+/// harness, a test driver, a child of a script that forgot `setsid` — is not
+/// in that group, and hears nothing at all. Measured in
+/// `spikes/resize_e2e.py` (groups `untouched` and `attached`): the same idle `TIOCSWINSZ` costs
+/// **0 bytes** with no controlling terminal and **~1.2 KB** with one, on the
+/// same binary. The ticket this closes was filed off the zero, and the zero was
+/// never about the app's resize handling — which was, and is, correct.
+///
+/// # Why the poll is the fix, and what it costs
+///
+/// `TIOCGWINSZ` needs none of the process-group relationship. It asks about
+/// the file descriptor this process already holds, so it reports the new window
+/// whether or not the signal arrived, was coalesced, or was swallowed by a
+/// stream we do not control. Asking once per ~16 ms tick is one syscall of
+/// about a microsecond — the *same* call ratatui's `autoresize` makes on every
+/// draw, so the worst case added here is one extra `ioctl` per frame already
+/// painted. The event stays as the fast path; the poll is what turns a missed
+/// signal from "a stale frame until the next keystroke" into sixteen
+/// milliseconds.
+///
+/// It also reaches what the event alone never could during a passthrough: a
+/// full-screen child lives on a *different* pty, so nothing resizes the child's
+/// window but [`crate::App::forward_resize`] does. A drag with no `SIGWINCH`
+/// left vim inside looprs at a size the user was not using — `spikes/resize_e2e.py`
+/// group `held` asks the child itself, with `stty size`, and it agrees.
+///
+/// # The two guards, each of which is the whole reason to own this type
+///
+/// * **one unreadable size stops the poll, permanently.** crossterm's
+///   `terminal::size()` falls back to spawning `tput` when the `ioctl` fails
+///   (`crossterm::sys::unix::terminal::size`), and its own source comments
+///   that this "can take a really long time" — from an event loop's point of
+///   view. Polling that is a subprocess every sixteen milliseconds. A tty that
+///   cannot answer a size query once is not going to answer it later, so the
+///   poll gives up on the first error, says so once in the log, and gets out
+///   of the way.
+/// * **a degenerate size is never adopted.** `0 x 0` is what a pty reports
+///   while it is being torn down; adopting it would forward a zero-sized
+///   window to every child pty and lay the frame out on nothing. The event
+///   path has always had its own exposure there; this path does not add to it.
+#[derive(Debug, Default)]
+pub struct WindowPoll {
+    /// A read failed and the poll is over. `false` = still asking.
+    stopped: bool,
+}
+
+impl WindowPoll {
+    /// A poll that has not asked yet, and so has not failed yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `read` reports the window the terminal actually has (in practice
+    /// `|| frame.size()`); `adopted` is the window this app is currently
+    /// wrapping for.
+    ///
+    /// `Some(size)` means "this is the window now" — the caller adopts it the
+    /// same way it adopts `Event::Resize`, and only the difference between
+    /// `size` and `adopted` makes that worth doing. `None` means the poll
+    /// agrees with the app, saw nothing worth adopting, or has stopped.
+    pub fn poll<F>(&mut self, read: F, adopted: Size) -> Option<Size>
+    where
+        F: FnOnce() -> std::io::Result<Size>,
+    {
+        if self.stopped {
+            return None;
+        }
+        let size = match read() {
+            Ok(size) => size,
+            Err(e) => {
+                self.stopped = true;
+                tracing::warn!(
+                    "window poll stopped after a failed size query ({e}); \
+                     a resize now repaints only if SIGWINCH reaches us"
+                );
+                return None;
+            }
+        };
+        if size.width == 0 || size.height == 0 {
+            // Torn down, not resized. Nothing to lay a frame out in.
+            tracing::debug!("ignoring the degenerate window {size:?}");
+            return None;
+        }
+        (size != adopted).then_some(size)
+    }
+
+    /// Has the poll given up? `true` means every resize from here is riding on
+    /// the event stream alone — which is what the log says out loud when it
+    /// happens, and what the test below checks it said.
+    #[allow(dead_code)] // diagnostic seam: read by the test that proves the poll retires itself
+    pub fn stopped(&self) -> bool {
+        self.stopped
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -754,5 +861,105 @@ mod tests {
             );
             assert_eq!(input.bottom(), 12, "width={width}");
         }
+    }
+
+    // ------------------------------------------------------- the window poll
+    //
+    // looprs-pdl.15. The poll is the resize path that does not depend on a
+    // signal reaching us, and its whole contract is *when to speak and when to
+    // stop*. Four claims, each injected rather than waited for: the size source
+    // is a closure precisely so a test can be the terminal.
+
+    use std::cell::Cell as Counter;
+    use std::io;
+
+    fn ok_size(w: u16, h: u16) -> impl FnOnce() -> io::Result<Size> {
+        move || Ok(Size::new(w, h))
+    }
+
+    /// The one thing the poll exists to return: a window the app has not
+    /// adopted. And once the app *has* adopted it, the same reading is no
+    /// longer a change — which is what keeps the run loop from re-adopting a
+    /// size every tick for the rest of the run.
+    #[test]
+    fn a_window_the_app_does_not_have_is_reported_once() {
+        let mut poll = WindowPoll::new();
+        assert_eq!(
+            poll.poll(ok_size(80, 24), Size::new(60, 24)),
+            Some(Size::new(80, 24))
+        );
+        assert_eq!(poll.poll(ok_size(80, 24), Size::new(80, 24)), None);
+    }
+
+    /// The steady state is silence. Sixty ticks of an unchanged window must
+    /// ask for nothing: an idle app that repainted for a window that never
+    /// moved would be the exact regression this type is not allowed to cause
+    /// (see `spikes/resize_e2e.py`: the app goes back to zero bytes out
+    /// between drags).
+    #[test]
+    fn a_steady_window_asks_for_nothing_for_sixty_ticks() {
+        let mut poll = WindowPoll::new();
+        for _ in 0..60 {
+            assert_eq!(poll.poll(ok_size(120, 40), Size::new(120, 40)), None);
+        }
+        assert!(!poll.stopped(), "agreement is not a failure");
+    }
+
+    /// **The `tput` guard.** crossterm's `terminal::size()` falls back to
+    /// spawning `tput` when the `ioctl` fails. A poll that retried that would
+    /// fork twice a frame, forever, on a machine with no tty to ask. One
+    /// failed read retires the poll and it never touches the size source
+    /// again — counted here, because "stopped" without a count is a claim
+    /// about a promise rather than about a behaviour.
+    #[test]
+    fn a_size_that_cannot_be_read_retires_the_poll_for_good() {
+        let asks = Counter::new(0usize);
+        let mut poll = WindowPoll::new();
+        let first = poll.poll(
+            || {
+                asks.set(asks.get() + 1);
+                Err(io::Error::other("not a tty"))
+            },
+            Size::new(80, 24),
+        );
+        assert_eq!(first, None, "a failed read adopts nothing");
+        assert!(poll.stopped(), "a failed read ends the poll");
+
+        for _ in 0..10 {
+            assert_eq!(
+                poll.poll(
+                    || {
+                        asks.set(asks.get() + 1);
+                        Ok(Size::new(100, 30))
+                    },
+                    Size::new(80, 24),
+                ),
+                None,
+                "a retired poll reports nothing whatever the terminal says"
+            );
+        }
+        assert_eq!(asks.get(), 1, "asked once, failed, and never asked again");
+    }
+
+    /// A zero dimension is a pty coming apart, not a window arriving: adopting
+    /// it would forward `rows = 0` to every child pty and lay the four bands
+    /// out on nothing. Refused — and refused *without* retiring the poll,
+    /// because the read itself worked and the next one may be real.
+    #[test]
+    fn a_degenerate_window_is_refused_and_the_poll_survives_it() {
+        let mut poll = WindowPoll::new();
+        for bad in [Size::new(0, 0), Size::new(0, 40), Size::new(120, 0)] {
+            assert_eq!(
+                poll.poll(move || Ok(bad), Size::new(120, 40)),
+                None,
+                "{bad:?} must never be adopted"
+            );
+        }
+        assert!(!poll.stopped(), "a zero size is not a read failure");
+        assert_eq!(
+            poll.poll(ok_size(100, 30), Size::new(120, 40)),
+            Some(Size::new(100, 30)),
+            "and the next real window still gets through"
+        );
     }
 }

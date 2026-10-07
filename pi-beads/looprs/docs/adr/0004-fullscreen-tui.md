@@ -778,6 +778,85 @@ changed is that its output goes into a store with an offset instead of a vector
 that is always shown from the end. One new real-pty spike:
 `spikes/scrollback_e2e.py`, **23/23**.
 
+## Landed — `pdl.15`, the window is read, not heard
+
+The `pdl.6` entry closed with an admission: an **idle** app produced **zero bytes**
+for two seconds after a `TIOCSWINSZ`, so a window drag on a quiet session left
+the previous frame — with the transcript wrapped for a width that no longer
+existed — until something else made the app draw. `pdl.6` filed the discrepancy
+instead of explaining it. This is the explanation, and then the change.
+
+**The measurement was a harness artifact, and only half of one.** `SIGWINCH` is
+not delivered to the process that is drawing on a terminal. It is delivered to
+the **foreground process group of that terminal's session** (`tty_ioctl(4)`).
+Every spike in this directory spawns the app with `Popen(stdin=slave)` and never
+makes the pty the child's controlling terminal, so the signal went nowhere and
+the app heard nothing about a window it was being asked to repaint. Run the
+identical check against a child that did `setsid()` + `TIOCSCTTY`
+(`spikes/resize_e2e.py`, group `attached`) and the **pre-ticket binary repaints**.
+The bug was never `App::set_window`, never the `Event::Resize` arm, and never
+the `dirty` gate.
+
+It is still a bug, and the fix is not the one the ticket guessed ("force a
+repaint on `Resize`" — that already happened). Two halves:
+
+* **one delivery channel is not a design.** The app learned its own window from a
+  kernel signal, through a library event stream, onto a flag — none of it ours,
+  all of it load-bearing. A channel that can be silent is a channel that will be
+  silent: coalesced, blocked, swallowed, or, as here, never sent at all.
+* **the symptom is real whenever that channel is quiet**, and a real terminal only
+  hides it for as long as the chain holds.
+
+`viewport::WindowPoll` closes it at the root. Once per ~16 ms tick the run loop
+asks `TIOCGWINSZ` — which describes the descriptor this process already holds,
+with no process group, no signal and no emulator in the way — and adopts the
+answer when it differs. **The `ioctl` is the authority on the window;
+`Event::Resize` is a notice that says "look now", and it stays for its
+latency.** The cost is one syscall per frame already painted: it is the same
+call ratatui's `autoresize` makes inside `draw`.
+
+**This is not the poll `pdl.4` deleted.** That one existed because a resize
+landing while the key stream was stopped around an `ESC[6n` cursor query was
+never delivered at all, so the size had to be re-asked every tick to make up for
+a stream that kept being taken away. This poll has nothing to do with the cursor,
+which is never queried; it exists because the *signal* is not ours to receive.
+The distinction is worth keeping: if the event stream is ever proven to deliver
+everything, the event stays (it is faster) and the poll becomes belt-and-braces
+at one microsecond a frame.
+
+| | before | after |
+| --- | --- | --- |
+| how the app learns its window | `SIGWINCH` → crossterm `EventStream` → `Event::Resize`, or nothing | the `ioctl` every tick, plus the event for latency |
+| a drag with no signal delivered | the old frame, indefinitely; a full-screen child left at its old size | repainted within about one tick (**7.6 ms** in the committed run's bare harness), children resized |
+| ways to adopt a window | two, divergent: `App::set_window`, and an inline `self.width = w; self.height = h` in `Msg::Term(Event::Resize)` that told the children nothing and set no repaint flag | one: every route goes through `set_window` |
+
+The two guards in `WindowPoll` are load-bearing and are the reason it is a type
+rather than four lines in the loop. **One unreadable size retires the poll for
+the whole run**, because crossterm's `terminal::size()` falls back to spawning
+`tput` when the `ioctl` fails and a retrying poll would fork twice a frame; and
+**a `0 × 0` is never adopted**, because that is a pty coming apart rather than
+a window arriving, and adopting it would forward a zero-sized window to every
+child pty.
+
+**Raw shell lines are still not re-wrapped, and that is not this ticket.** The
+store re-wraps what it wrapped itself — `Answer`, `Thinking`, `User`, `Error`.
+A `MessageKind::Bash` row is ended by the *child*, and ADR-0001 rule 1 as
+re-made by ADR-0005 forbids re-wrapping it, so a shell line longer than the
+window is cut at the right edge at every width, before and after this change.
+Turning that cut into a wrap is a decision about ADR-0005 and not a resize fix;
+`spikes/resize_e2e.py` says so out loud in its `rewrap` group rather than
+testing only the prose and letting the contrast go unrecorded.
+
+**Measured.** `spikes/resize_e2e.py`, **53/53** across six groups. Control:
+the same script against the pre-ticket binary, **0 of its 5 repaint-claim checks
+pass** — nothing repaints in the bare harness at all, and the held full-screen
+child's own `stty size` still says the old size. On the fix: first byte
+**7.6 ms** after the `ioctl` in the committed run — the wait is one tick plus
+the draw, never the indefinite stall the ticket describes (5–21 ms across the
+runs so far, bare and attached) — the app back to **0 bytes out over 1.5 s**
+between drags (the poll is not a repaint loop), and a six-size burst ending at
+the **last** size rather than one from the middle.
+
 ## Proof
 
 A decision ticket's proof is the measurements it leans on and the fact that they can be re-run:

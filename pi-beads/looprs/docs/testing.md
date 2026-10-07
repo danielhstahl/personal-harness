@@ -487,6 +487,83 @@ reads the window at draw time), but the draw is gated on `app.dirty` in the run
 loop. That is `looprs-pdl.15`, filed from this measurement so the next one
 starts here.
 
+**Settled by `pdl.15`, and the measurement was the thing that was wrong.**
+That zero is not the app ignoring a resize: `SIGWINCH` goes to the foreground
+process group of the terminal's *session*, and a spike that `Popen`s into a pty
+without a `setsid`/`TIOCSCTTY` never puts the app in that group, so the signal
+never arrives. The same check against an attached child repaints on the
+pre-pdl.6 binary too. The app has since stopped depending on the signal at all —
+see the section below — and the paragraph above stays exactly as `pdl.6` wrote it,
+because it is the record of the measurement that filed the ticket.
+
+### A window drag on a quiet session (looprs-pdl.15)
+
+**What it proves:** the app adopts the real window whether or not a `SIGWINCH`
+reaches it, the adoption re-wraps the transcript, and it reaches the *children*
+too — the full-screen program on the other side of the passthrough gets its pty
+resized, which nothing but this app can do for it.
+
+| Layer | Where | What it pins |
+| --- | --- | --- |
+| the poll | `viewport::tests` | a window the app does not have is reported once, and the same window after adoption is not a change (`a_window_the_app_does_not_have_is_reported_once`); sixty ticks of an unchanged window ask for nothing (`a_steady_window_asks_for_nothing_for_sixty_ticks`); **one unreadable size retires the poll and it never touches the size source again** — the guard against crossterm's `tput` fallback forking twice a frame (`a_size_that_cannot_be_read_retires_the_poll_for_good`); `0 × 0` is refused without retiring the poll (`a_degenerate_window_is_refused_and_the_poll_survives_it`) |
+| the adoption | `app::tests` | the poll and the `Resize` event leave the same state *and* send the same `UiCommand::Resize` — so the poll cannot repaint the frame while leaving a child pty wrapped for a window that no longer exists (`the_size_poll_adopts_what_the_resize_event_adopts`); `Msg::Term(Event::Resize)` now routes through `set_window` instead of assigning the two fields inline, which is what makes that comparison a statement about one door rather than two |
+| the real pty | `spikes/resize_e2e.py` | **53 checks, 6 groups**, and a control whose 5 repaint claims all fail on the pre-ticket binary |
+
+```sh
+cargo build
+python3 spikes/resize_e2e.py                  | tee spikes/results/resize-e2e.log
+python3 spikes/resize_e2e.py drag held        # one group at a time
+
+# the control: the pre-looprs-pdl.15 binary, same script
+git worktree add --detach /tmp/looprs-pdl15-ctl HEAD
+(cd /tmp/looprs-pdl15-ctl/pi-beads/looprs && cargo build --target-dir /tmp/pdl15-target)
+LOOPRS_BIN=/tmp/pdl15-target/debug/looprs python3 spikes/resize_e2e.py --control \
+    | tee spikes/results/resize-e2e-control.log
+```
+
+**Why every group runs against two harnesses.** The ticket can only be settled
+by the difference between them. `bare` is `Popen(stdin=slave)` — the shape of
+every other spike here, and the one that filed this ticket; no `SIGWINCH` will
+ever arrive. `attached` is `setsid()` + `TIOCSCTTY`, the relationship a real
+terminal window has with the program inside it. In `attached` the pre-fix binary
+repaints, which is the evidence that `App::set_window`, the `Event::Resize` arm
+and the `dirty` gate were never the bug — so every check that group makes is
+`app`-kind and is *not* counted as evidence about the poll. In `bare` a repaint
+can only have come from the `ioctl`, which is what makes those checks mean
+something.
+
+| Group | What is dragged, and what has to be true after |
+| --- | --- |
+| `untouched` | the ticket's own case: idle, no controlling terminal, 100 → 120 columns; repaint inside one tick, the box border on the new edge, back to silence after |
+| `attached` | the same drag with the signal actually arriving — the control *on the harness* |
+| `rewrap` | settled prose that fits one row at 120 comes back as two at 60: the tail is no longer on the head's row, and is on a row below it |
+| `drag` | six sizes in ~250 ms, because a drag is a burst and the window has to be **read**, not accumulated; the frame ends at the last size, not one from the middle |
+| `scrolled` | the transcript is off the tail and idle; the drag repaints anyway, and `End` still gets back afterwards |
+| `held` | a full-screen child owns the screen; the child reports its **own** `stty size` on the way out, and it says the new window |
+
+**What the control caught, and what it taught the two checks that leaked.** The
+first control run reported two `adopt`-kind needles passing on the pre-fix
+binary. "`End` still reaches the tail across the resize" is true pre-fix because
+`End` is a keystroke, and a keystroke always made the app draw — that is the
+very mechanism the ticket says the resize had to wait behind, so it proves the
+app survived, not that the resize was seen. "The app repaints its own frame when
+the child hands the screen back" is true pre-fix because `repaint_all` already
+existed on that path and ratatui's `autoresize` picks the new frame area up by
+itself — chrome moves even when nothing wrapped does. Both are now `app`-kind,
+and the control's verdict is the thing that caught them.
+
+**What this spike cannot show, stated rather than skipped.** The `Screen` grid is
+a reconstruction, not a reflowing emulator, so "the user kept the line they
+were looking at" is not claimed here; it is claimed in
+`a_resize_keeps_the_line_the_user_was_looking_at_on_screen` (`src/main.rs`),
+where the screen model is ratatui's own buffer. And **raw shell output is not
+re-wrapped at any width**: `MessageKind::Bash` is ended by the child and
+ADR-0001 rule 1 / ADR-0005 forbid re-wrapping it, so a long shell line is cut
+at the right edge before this ticket and after it. The `rewrap` group therefore
+makes its claim on prose — the `Answer` kind, which is what
+`Scrollback::rewrap` re-renders — and leaves the contrast on the record instead
+of quietly testing only the case that passes.
+
 ## The mouse and the clipboard, measured before they are built (looprs-pdl.2)
 
 **What it proves:** the seven claims that looprs-pdl.8/.9/.10/.12 inherit — that a

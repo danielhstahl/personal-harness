@@ -15,14 +15,20 @@ three reasons those tests cannot reach:
      reader stopped on would be scored as a pass by a test that only looks at
      the count.
   3. **a resize taken while scrolled up does the app no damage, and what the
-     wire says about it is itself news.** Measured here: an **idle** app emits
-     no bytes at all on a resize — 0 over 2s, and the pre-pdl.6 binary at
-     195e3c0 measures the same — so a window drag on a quiet session does not
-     reach the frame until something else draws. The app survives the resize
-     mid-scroll and keeps taking keys and output afterwards, which is all this
-     harness can honestly assert. The *content-anchored* re-wrap this ticket is
-     about is proven where the screen model is real:
-     `a_resize_keeps_the_line_the_user_was_looking_at_on_screen`
+     wire says about it is itself news.** Measured here when this spike was
+     written: an **idle** app emitted no bytes at all on a resize — 0 over 2s,
+     and the pre-pdl.6 binary at 195e3c0 measured the same. That zero went on
+     to file `looprs-pdl.15`, and turned out to be a fact about this harness
+     rather than about the app: `SIGWINCH` is delivered to the foreground
+     process group of the terminal's *session*, and a `Popen(stdin=slave)` pty
+     is never the child's controlling terminal, so the signal never arrived.
+     Since pdl.15 the same measurement is non-zero, because the run loop reads
+     the window from the `ioctl` and does not wait for the signal —
+     `spikes/resize_e2e.py` is the spike that holds that claim, in both
+     harnesses. What this section still asserts is that the app survives a
+     resize taken mid-scroll and keeps taking keys and output afterwards. The
+     *content-anchored* re-wrap this ticket is about is proven where the screen
+     model is real: `a_resize_keeps_the_line_the_user_was_looking_at_on_screen`
      (`src/main.rs`), painted into ratatui's own buffer. This grid does not
      reflow, so the spike does not pretend to measure it.
 
@@ -292,7 +298,10 @@ def main():
         with d.lock:
             idle_bytes = len(d.raw) - idle0
         say(f"  idle resize emitted {idle_bytes} bytes in 2s "
-            "(0 = the app does not repaint on SIGWINCH alone; 195e3c0 measures the same)")
+            "(non-zero since pdl.15: the run loop reads the window from the "
+            "ioctl, so a drag repaints even in this harness, where no "
+            "SIGWINCH ever reaches the app. Before pdl.15 this was 0, and "
+            "that zero was the harness -- see spikes/resize_e2e.py)")
 
         # What this section can and cannot say.
         #

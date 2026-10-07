@@ -1413,9 +1413,15 @@ impl App {
                 self.on_tick(Instant::now());
             }
             Msg::Term(Event::Resize(w, h)) => {
-                self.width = w;
-                self.height = h;
-                self.dirty = true;
+                // Routed through [`Self::set_window`] rather than assigning the
+                // two fields inline (looprs-pdl.15). Adopting a window is one
+                // operation and it now has exactly three callers — the run
+                // loop's event arm, the run loop's size poll, and this — all
+                // of which go through the same door. An inline assignment here
+                // was a fourth way that quietly forgot two things the door
+                // remembers: the children must be told (ADR-0001 rule 6) and a
+                // passthrough in progress owes itself a full repaint.
+                self.set_window(w, h);
             }
             Msg::Term(Event::Key(k)) if k.kind == KeyEventKind::Press => {
                 self.dirty = true;
@@ -3912,6 +3918,53 @@ mod tests {
         assert!(
             app.input.text().is_empty(),
             "the box took none of them either"
+        );
+    }
+
+    /// A name for a command's shape. `UiCommand` is `Debug` but not `PartialEq`
+    /// — two actions are not "equal" in this crate — and a shape string is all
+    /// the comparison below needs.
+    fn shape(cmd: &UiCommand) -> String {
+        match cmd {
+            UiCommand::Resize { rows, cols } => format!("resize {rows}x{cols}"),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// **The size poll and the `Resize` event are one adoption, not two
+    /// implementations of it** (looprs-pdl.15).
+    ///
+    /// The run loop takes a resize from either source, so the two must leave
+    /// the same state behind: same width and height, a frame asked for, and —
+    /// the one worth pinning — the same `UiCommand::Resize` out to the
+    /// children. A poll that set `App::width` locally would repaint the frame
+    /// and leave every child pty wrapping for a window that no longer exists
+    /// (ADR-0001 rule 6), which is the bug this ticket exists to remove in
+    /// one place and would quietly reintroduce in another.
+    #[test]
+    fn the_size_poll_adopts_what_the_resize_event_adopts() {
+        let (mut by_event, mut ev_rx) = app_with(TerminalType::Bash);
+        let (mut by_poll, mut poll_rx) = app_with(TerminalType::Bash);
+
+        by_event.update(Msg::Term(Event::Resize(132, 43)));
+        // …what `main.rs`'s tick arm does with the poll's answer.
+        by_poll.set_window(132, 43);
+
+        assert_eq!((by_event.width, by_event.height), (132, 43));
+        assert_eq!((by_poll.width, by_poll.height), (132, 43));
+        assert!(by_event.dirty, "the event asks for a frame");
+        assert!(by_poll.dirty, "and so does the poll");
+
+        let from_event = ev_rx.try_recv().ok().map(|c| shape(&c));
+        let from_poll = poll_rx.try_recv().ok().map(|c| shape(&c));
+        assert_eq!(
+            from_event.as_deref(),
+            Some("resize 43x132"),
+            "rows first, as ADR-0001 rule 6 spells it"
+        );
+        assert_eq!(
+            from_event, from_poll,
+            "the children were told the same thing by both paths"
         );
     }
 
