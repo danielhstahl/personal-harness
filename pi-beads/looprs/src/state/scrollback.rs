@@ -169,14 +169,74 @@ impl fmt::Display for DisplayRow {
 /// `Line` and are simply not read here — the "the copy path drops them on the
 /// way out" half of the ADR-0005 decision — and ADR-0005 rule 6 is what makes
 /// "no control bytes can reach the paste" true rather than hoped for.
-#[allow(dead_code)] // consumer: select-to-copy (looprs-pdl.10); the rule lives here so "what you copy" has exactly one definition in the tree, as `StyledLine::copy_text` does
-pub fn paste_text<'a>(rows: impl IntoIterator<Item = &'a DisplayRow>) -> String {
-    let mut out = String::new();
-    for row in rows {
-        for span in &row.line.spans {
-            out.push_str(&span.content);
+/// A part of one display row: the bytes the selection actually covers.
+///
+/// The row is the unit the store keeps and the *slice* is the unit the user
+/// selects — a drag starts and ends mid-row more often than not. Putting the
+/// pair in its own type is what lets [`paste_slices`] be the one join rule for
+/// both "the whole row" and "twelve characters of it", instead of two
+/// functions that each remember the hard/soft rule and can each forget it
+/// differently (looprs-pdl.9, ADR-0004 R14).
+#[derive(Clone, Copy, Debug)]
+pub struct RowSlice<'a> {
+    /// The row this part of came from — styles and provenance included.
+    pub row: &'a DisplayRow,
+    /// First byte of the slice, relative to the row's own text.
+    pub from: usize,
+    /// Byte just past the slice.
+    pub to: usize,
+}
+
+impl<'a> RowSlice<'a> {
+    /// The whole row as a slice — what `paste_text` turns each row into.
+    pub fn whole(row: &'a DisplayRow) -> Self {
+        Self {
+            row,
+            from: 0,
+            to: row.cells.text_len(),
         }
-        if row.end == RowEnd::Hard {
+    }
+
+    /// The slice's text, styling dropped.
+    pub fn text(&self) -> String {
+        let full = crate::utils::render::plain(&self.row.line);
+        full[self.from.min(full.len())..self.to.min(full.len())].to_string()
+    }
+}
+
+/// The value of a run of rows when it is pasted (ADR-0004 R14, R15).
+///
+/// Soft-wrapped rows join with **nothing**; a hard end contributes **exactly one
+/// `\n`**; the trailing newline is dropped, because a paste that ends in a blank
+/// line is a paste that pressed Enter for you.
+///
+/// The wrap never reaches the paste. Neither do styles: they live on the row's
+/// `Line` and are simply not read here — the "the copy path drops them on the
+/// way out" half of the ADR-0005 decision — and ADR-0005 rule 6 is what makes
+/// "no control bytes can reach the paste" true rather than hoped for.
+///
+/// This is [`paste_slices`] over whole rows; the rule lives in one place so that
+/// "what you copy" has exactly one definition in the tree, as `StyledLine::copy_text`
+/// does.
+#[allow(dead_code)] // consumer: select-to-copy (looprs-pdl.10); `paste_slices` is the live half today, this is its whole-row wrapper
+pub fn paste_text<'a>(rows: impl IntoIterator<Item = &'a DisplayRow>) -> String {
+    paste_slices(rows.into_iter().map(RowSlice::whole))
+}
+
+/// [`paste_text`], one step finer: the join rule applied to *parts* of rows.
+///
+/// Same rule, same trailing-newline trim. The selection path (looprs-pdl.9)
+/// produces slices because a drag's endpoints are mid-row; only the rows in
+/// between are whole.
+///
+/// The order of `slices` *is* the paste order, so the caller owns the
+/// reading-order guarantee — see [`crate::state::selection::Selection::resolve`],
+/// which is what produces them.
+pub fn paste_slices<'a>(slices: impl IntoIterator<Item = RowSlice<'a>>) -> String {
+    let mut out = String::new();
+    for s in slices {
+        out.push_str(&s.text());
+        if s.row.end == RowEnd::Hard {
             out.push('\n');
         }
     }
@@ -246,9 +306,19 @@ impl CellMap {
         self.cells
     }
 
-    #[allow(dead_code)] // consumer: looprs-pdl.9; a row with no clusters occupies no cell, which is the difference between "empty row" and "row of one blank"
+    #[allow(dead_code)] // companion to `text_len`; read by the selection's "nothing to hit" rule and the cell-map tests
     pub fn is_empty(&self) -> bool {
         self.spans.is_empty()
+    }
+
+    /// How many bytes the row's text is — the length this map was built from.
+    ///
+    /// Not `plain(&row.line).len()` re-computed: the map *partitioned* that text,
+    /// so its last cluster's end **is** that length, and reading it here is what
+    /// keeps the row's two byte-based facts (its own length and the clusters
+    /// inside it) from being two different measurements of the same string.
+    pub fn text_len(&self) -> usize {
+        self.spans.last().map(|s| s.end).unwrap_or(0)
     }
 
     /// The cluster that owns `cell`, or `None` past the end of the row.
@@ -424,7 +494,7 @@ impl Scrollback {
             self.offset = 0;
             return;
         }
-        match anchor.and_then(|a| self.index_of_anchor(&a)) {
+        match anchor.and_then(|a| self.index_of(a)) {
             Some(i) => self.set_offset(self.rows.len().saturating_sub(i + 1)),
             // The anchored content is gone — its entry was evicted while the
             // user was looking away. There is no honest way to "keep" a position
@@ -456,7 +526,13 @@ impl Scrollback {
     }
 
     /// The row index a content anchor points at now, at this width.
-    fn index_of_anchor(&self, a: &ContentAnchor) -> Option<usize> {
+    ///
+    /// Also the way the drag hit-test turns a *screen* row back into a store row:
+    /// the frame publishes the content address of the first row it drew
+    /// ([`crate::state::selection::BandSnapshot`]), and counting down from
+    /// *that* index keeps the mapping on content rather than on a row number that
+    /// a trim or a re-wrap has already invalidated.
+    pub fn index_of(&self, a: ContentAnchor) -> Option<usize> {
         // The last row of that logical line that starts at or before the
         // anchored byte: that is the row the anchored character is drawn on.
         let mut first = None;

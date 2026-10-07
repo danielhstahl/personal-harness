@@ -53,25 +53,74 @@ impl<'a> TranscriptBand<'a> {
     }
 }
 
+/// Where the transcript band's rows land on the screen.
+///
+/// Split out of [`TranscriptBand::render`] for one reason: the drag hit-test
+/// (looprs-pdl.9) has to know where those rows are, and if it worked that out
+/// for itself it would be a **second opinion about the layout** — the exact
+/// failure this codebase keeps naming and deleting. A band that grew a row, or
+/// started one line later, would then paint one thing and select another, in a
+/// way that only shows up when the live tail is a certain height.
+///
+/// So the band computes this and draws from it, and the frame publishes it to
+/// the App (`App::record_band`), which is the only other reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BandLayout {
+    /// How many of the rows handed in were **not** drawn, off the front — so
+    /// `rows[skip]` is the first row that made it to the screen.
+    pub skip: usize,
+    /// Settled rows drawn, and the screen row the first of them is on.
+    pub settled: usize,
+    pub settled_y: u16,
+    /// Live-tail rows drawn, and the screen row the first of them is on.
+    /// `live_y` is one past the last settled row whether or not either exists.
+    pub live: usize,
+    pub live_y: u16,
+}
+
+/// The band's row layout: who gets what, bottom-up, when the content is taller
+/// than the space.
+///
+/// The live tail wins what it needs first — it is the newest thing there is —
+/// and the settled rows take the rest from their end, which is the newest end
+/// of those. What is left over above is padding, and that is what pins the
+/// content down.
+pub fn band_layout(area: Rect, settled_avail: usize, live_avail: usize) -> BandLayout {
+    if area.is_empty() {
+        return BandLayout {
+            skip: settled_avail,
+            settled: 0,
+            settled_y: area.top(),
+            live: 0,
+            live_y: area.top(),
+        };
+    }
+    let rows = area.height as usize;
+    let live = live_avail.min(rows);
+    let room = rows - live;
+    let settled = settled_avail.min(room);
+    // The bottom edge is the anchor: the block starts wherever it has to for its
+    // last row to land there.
+    let start = area.top() as usize + rows - (settled + live);
+    BandLayout {
+        skip: settled_avail - settled,
+        settled,
+        settled_y: start as u16,
+        live,
+        live_y: (start + settled) as u16,
+    }
+}
+
 impl Widget for TranscriptBand<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.is_empty() {
             return;
         }
-        let rows = area.height as usize;
-        // The live tail wins what it needs first — it is the newest thing there
-        // is — and the settled rows take the rest from their end, which is the
-        // newest end of those.
-        let live = self.live.len().min(rows);
-        let room = rows - live;
-        let settled = self.settled.len().min(room);
-        let live_slice = &self.live[self.live.len() - live..];
-        let settled_slice = &self.settled[self.settled.len() - settled..];
+        let lay = band_layout(area, self.settled.len(), self.live.len());
+        let settled_slice = &self.settled[lay.skip..];
+        let live_slice = &self.live[self.live.len() - lay.live..];
 
-        // Start where the block has to start for its *last* row to land on the
-        // band's bottom edge; whatever is left over above is padding, and that
-        // is what pins the content down.
-        let mut y = area.top() as usize + rows - (settled + live);
+        let mut y = lay.settled_y as usize;
         for row in settled_slice {
             (&row.line).render(one_row(area, y), buf);
             y += 1;
@@ -91,8 +140,10 @@ impl Widget for TranscriptBand<'_> {
             || live_slice.iter().any(|l| !l.to_string().trim().is_empty());
         if self.streaming && !said_anything {
             let frame = FRAMES[self.spinner % FRAMES.len()];
-            Line::styled(frame, Style::new().cyan())
-                .render(one_row(area, area.top() as usize + rows - 1), buf);
+            Line::styled(frame, Style::new().cyan()).render(
+                one_row(area, area.top() as usize + area.height as usize - 1),
+                buf,
+            );
         }
     }
 }

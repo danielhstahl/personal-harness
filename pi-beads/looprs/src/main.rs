@@ -28,7 +28,8 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 use components::card::LiveCardPreview;
-use components::text_stream::{NewRowsPill, TranscriptBand};
+use components::selection::SelectionHighlight;
+use components::text_stream::{NewRowsPill, TranscriptBand, band_layout};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
@@ -36,6 +37,7 @@ use crate::services::notification;
 use crate::session::router::{Router, SHUTDOWN_GRACE};
 use crate::session::{ChatState, SessionConfig, TerminalType};
 use crate::signals::ExitSignals;
+use crate::state::selection::BandSnapshot;
 use crate::state::transcript::Entry;
 use crate::teardown::{Mode, Teardown, install_panic_hook, panic_injected};
 
@@ -458,10 +460,31 @@ fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
     // the same order the band has always laid out, now measured against the store
     // that decides which rows exist.
     let room = text_area.height.saturating_sub(live.len() as u16).max(1) as usize;
+    let window = app.transcript_window(room);
     f.render_widget(
-        TranscriptBand::new(app.transcript_window(room), live, app.spinner, streaming),
+        TranscriptBand::new(window, live, app.spinner, streaming),
         text_area,
     );
+
+    // Publish where the band's rows landed, taken from the *same* layout the
+    // band just drew from, so the drag hit-test and the pixels cannot disagree
+    // about which row the pointer is on (looprs-pdl.9, `App::band`).
+    let lay = band_layout(text_area, window.len(), live.len());
+    app.record_band(BandSnapshot::new(
+        text_area,
+        lay.settled_y,
+        lay.settled,
+        window.get(lay.skip).map(|r| r.anchor()),
+    ));
+
+    // The selection band: reverse video over the cells the range covers. Drawn
+    // over the rows it selects (it is a restyle, never a re-layout) and
+    // **under** every piece of chrome, so chrome cannot come away highlighted
+    // whatever the range says (ADR-0004 R16).
+    let runs = app.selection().cells(window);
+    if !runs.is_empty() {
+        f.render_widget(SelectionHighlight::new(&runs, lay), text_area);
+    }
 
     // The "N new" affordance: a pill over the band's bottom row, saying the tail
     // moved and naming the one action that gets back to it. Overlaid rather than
@@ -506,9 +529,11 @@ mod tests {
     use crate::app::PiEvent;
     use crate::session::{BeadStep, SessionId, SessionStatus};
     use crate::state::transcript::MessageKind;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::CellWidth;
+    use ratatui::style::Modifier;
 
     /// The window the frame tests paint into: a 60-column, 24-row terminal — the
     /// `App::new` width the rest of this module already used, plus the height the
@@ -1000,6 +1025,112 @@ mod tests {
                 .unwrap()
                 .to_string()
                 .contains("MARK-7")
+        );
+    }
+
+    /// Paint the frame and hand the terminal back, so a test can read *cells*
+    /// rather than the text of them.
+    fn paint_cells(app: &App, h: u16, input_rows: u16) -> Terminal<TestBackend> {
+        let mut term = Terminal::new(TestBackend::new(WIDTH, h)).unwrap();
+        term.draw(|f| view(app, f, &[], input_rows)).unwrap();
+        term
+    }
+
+    fn reversed_cells(term: &Terminal<TestBackend>, area: Rect) -> usize {
+        let mut n = 0usize;
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if term
+                    .backend()
+                    .buffer()
+                    .cell((x, y))
+                    .is_some_and(|c| c.modifier.contains(Modifier::REVERSED))
+                {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn mreport(kind: MouseEventKind, row: u16, col: u16) -> Msg {
+        Msg::Term(Event::Mouse(MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+    }
+
+    /// **The highlight is a paint over the band, and the chrome does not see
+    /// it.**
+    ///
+    /// The frame-level version of two properties the widget test cannot reach:
+    /// the status row and the input box come out of the frame *identical*
+    /// before and after a selection is made — they are not transcript, and the
+    /// highlight must not smear across them — and the whole rendered frame is
+    /// otherwise unchanged, row for row, which is the no-reflow rule read off
+    /// the screen rather than asserted about a widget.
+    #[test]
+    fn the_highlight_lands_in_the_band_and_never_on_the_chrome() {
+        let mut app = app(TerminalType::Pi, true);
+        settle(&mut app, SessionId::new(TerminalType::Pi, 1), 6);
+        let h = HEIGHT;
+        let input_rows = viewport::MIN_INPUT_ROWS;
+        let [text, _, status, input] = viewport::frame_areas(
+            Rect::new(0, 0, WIDTH, h),
+            app.live_card_rows(),
+            app.input_band(WIDTH),
+        );
+
+        let before = paint_cells(&app, h, input_rows);
+        assert_eq!(
+            reversed_cells(&before, text),
+            0,
+            "setup: nothing in the band is reversed to begin with"
+        );
+
+        // Press on a settled row, drag two rows down, release.
+        let win = app.transcript_window(text.height as usize);
+        let lay = components::text_stream::band_layout(text, win.len(), 0);
+        assert!(lay.settled >= 4, "setup: enough drawn rows to drag over");
+        let y = lay.settled_y;
+        app.update(mreport(
+            MouseEventKind::Down(MouseButton::Left),
+            y + 1,
+            text.x + 2,
+        ));
+        app.update(mreport(
+            MouseEventKind::Drag(MouseButton::Left),
+            y + 3,
+            text.x + 9,
+        ));
+        app.update(mreport(
+            MouseEventKind::Up(MouseButton::Left),
+            y + 3,
+            text.x + 9,
+        ));
+        assert!(app.selection().is_live(), "setup: a live selection");
+
+        let after = paint_cells(&app, h, input_rows);
+        assert!(
+            reversed_cells(&after, text) > 0,
+            "the band took the highlight"
+        );
+        assert_eq!(
+            reversed_cells(&after, status),
+            reversed_cells(&before, status),
+            "the status row is byte-identical: it is not transcript"
+        );
+        assert_eq!(
+            reversed_cells(&after, input),
+            reversed_cells(&before, input),
+            "nor is the box"
+        );
+        assert_eq!(
+            rows(after.backend()),
+            rows(before.backend()),
+            "and the frame moved nothing: a highlight is a style, not a reflow"
         );
     }
 }

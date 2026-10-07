@@ -2,6 +2,7 @@ pub mod card;
 pub mod compaction;
 pub mod input;
 pub mod scrollback;
+pub mod selection;
 pub mod status;
 pub mod text_stream;
 pub mod tool;

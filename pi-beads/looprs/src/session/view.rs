@@ -196,6 +196,17 @@ pub struct SessionView {
     /// Dropped-line bookkeeping for the buffer cap (see [`DEFAULT_VIEW_BUFFER`]).
     dropped: usize,
     limit: usize,
+    /// Trims this view has applied that the app has not yet fed to the other
+    /// things that address the same store.
+    ///
+    /// [`Scrollback::entries_evicted`] renumbers rows by entry, and the drag
+    /// selection (looprs-pdl.9) speaks the same addresses — so it has to hear
+    /// about the trim in the same breath, or an eviction moves the entries out
+    /// from under a standing selection and the highlight silently starts
+    /// pointing at the message *after* the one the user selected. The pairs are
+    /// `(removed, notice_at)`, exactly as given to the store, and
+    /// [`Self::take_trims`] is how the App drains them.
+    pending_trims: Vec<(usize, usize)>,
     /// The resolver for this view's Bash output (see [`Self::push_bash`]).
     ///
     /// Per-view, and per-stream: shell output is not a string, it is a *stream*
@@ -231,6 +242,7 @@ impl SessionView {
             tokens: Tokens::default(),
             dropped: 0,
             limit,
+            pending_trims: Vec::new(),
             shell: LineResolver::new(),
         }
     }
@@ -560,6 +572,27 @@ impl SessionView {
         // now rather than vanishing on the next resize; the survivors get
         // renumbered so `entry` keeps naming the right thing.
         self.scrollback.entries_evicted(removed, at);
+        self.pending_trims.push((removed, at));
+    }
+
+    /// Drain the trims applied since the last call, as `(removed, notice_at)`
+    /// pairs in the order they happened.
+    ///
+    /// The consumer is the drag selection, which addresses rows by entry and so
+    /// must be renumbered by the same eviction the store was renumbered by
+    /// (looprs-pdl.9). Both calls take the same two numbers from the same
+    /// place, which is the only thing keeping "what the row is numbered" and
+    /// "what the selection thinks it is numbered" one fact rather than two.
+    pub fn take_trims(&mut self) -> Vec<(usize, usize)> {
+        std::mem::take(&mut self.pending_trims)
+    }
+
+    /// Set the byte cap. A test seam in the shipped shape: eviction is
+    /// otherwise reachable only by streaming [`DEFAULT_VIEW_BUFFER`] bytes, and
+    /// a test that does that is a slow test that nobody runs.
+    #[allow(dead_code)] // test seam: `app::tests` trips the buffer cap through this to test the selection's trim re-base
+    pub fn set_buffer_limit(&mut self, limit: usize) {
+        self.limit = limit;
     }
 }
 

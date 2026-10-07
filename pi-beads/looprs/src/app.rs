@@ -14,13 +14,15 @@ use crate::session::{
     ActiveBead, ByteStream, ChatState, ExitReason, SessionId, SessionStatus, TerminalType,
 };
 use crate::state::scrollback::{DisplayRow, Scrollback};
+use crate::state::selection::{BandSnapshot, Selection};
 use crate::state::transcript::MessageKind;
 use crate::viewport::{self};
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use serde::Deserialize;
 use serde_json::Value;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -613,6 +615,29 @@ pub struct App {
     pub height: u16,
     pub dirty: bool,
     pub should_quit: bool,
+    /// The live drag selection over the transcript band (looprs-pdl.9).
+    ///
+    /// One per App, not one per view, because the ticket's clear list settles it:
+    /// a mode switch clears it. There is therefore never a selection that is
+    /// live in a mode the user is not looking at, and no question of which
+    /// transcript a highlighted range belongs to.
+    ///
+    /// The state machine itself lives in [`Selection`]; this field is only the
+    /// handle the mouse handler, the Esc rule and the frame all read.
+    selection: Selection,
+    /// Where the **last drawn frame** put the transcript band's rows.
+    ///
+    /// A cell, written by the render path (`view` calls [`App::record_band`])
+    /// and read by the mouse handler, because a pointer position is a claim
+    /// about the pixels and the only honest answer to it is the one made by the
+    /// code that painted them. Re-deriving the layout at click time would mean
+    /// either re-rendering the live tail per motion event or guessing how many
+    /// live rows were in the frame the pointer is over — and a guess one row off
+    /// selects the wrong paragraph while drawing the box where the user aimed.
+    ///
+    /// `Cell` rather than a lock or a `RefCell` because it is `Copy` and small:
+    /// no borrow exists across a call that could re-enter and write it.
+    band: Cell<Option<BandSnapshot>>,
     /// The session whose child currently owns the real terminal screen, if any
     /// (ADR-0001 Q2). `Some` for as long as a full-screen program holds it.
     ///
@@ -695,6 +720,8 @@ impl App {
             height,
             dirty: true,
             should_quit: false,
+            selection: Selection::None,
+            band: Cell::new(None),
             spinner: 0,
             screen: None,
             screen_debt: crate::screen::ScreenDebt::new(),
@@ -777,8 +804,44 @@ impl App {
     /// for the caller that wants to know what arrived, not for the display.
     pub fn flush_active(&mut self, width: u16) -> Vec<RenderedRow> {
         match self.views.get_mut(&self.active) {
-            Some(v) => v.flush(width),
+            Some(v) => {
+                let rows = v.flush(width);
+                self.sync_selection_to_trims();
+                rows
+            }
             None => Vec::new(),
+        }
+    }
+
+    /// Re-base the drag selection against the trims the active view applied.
+    ///
+    /// The buffer cap evicts entries, the store renumbers its rows by entry,
+    /// and the selection speaks those same addresses. Without this the two
+    /// drift the first time the cap bites: the entries under a standing
+    /// selection shift down and the highlight starts pointing at the message
+    /// *after* the one the user dragged across, which is worse than losing the
+    /// selection. `Selection::entries_evicted` is the same mapping the store
+    /// was given, fed the same two numbers from the same place
+    /// (`SessionView::take_trims`), and it clears the selection when the
+    /// eviction ate the anchor — the ticket's "a trim that ate the anchor",
+    /// wired rather than promised.
+    ///
+    /// Called from [`Self::flush_active`], which the run loop calls inside the
+    /// draw branch, so the selection cannot be drawn with stale addresses; and
+    /// again at the end of `App::update`, so a consumer that reads it without
+    /// a frame in between (select-to-copy) sees the same truth.
+    ///
+    /// Only the active view's trims are applied: a selection cannot exist on a
+    /// view that is not on screen, and the mode switch that changes which view
+    /// that is clears the selection anyway. Inactive views' queues drain when
+    /// they become active, onto a selection that has just been cleared, which
+    /// is a no-op — so nothing accumulates and nothing is misapplied.
+    fn sync_selection_to_trims(&mut self) {
+        let Some(v) = self.views.get_mut(&self.active) else {
+            return;
+        };
+        for (removed, notice_at) in v.take_trims() {
+            self.selection.entries_evicted(removed, notice_at);
         }
     }
 
@@ -854,6 +917,144 @@ impl App {
         let visible = self.transcript_band_rows();
         if let Some(v) = self.views.get_mut(&self.active) {
             v.scrollback_mut().scroll_to_top(visible);
+        }
+    }
+
+    // ───────────────────── drag selection (looprs-pdl.9) ─────────────────────
+
+    /// The live drag selection, as the frame sees it.
+    pub fn selection(&self) -> &Selection {
+        &self.selection
+    }
+
+    /// What the live selection would copy, as characters (ADR-0004 R14, R15).
+    ///
+    /// Empty when nothing is selected, and empty for a selection of blanks —
+    /// which is R13's "a selection whose value is empty after trimming copies
+    /// nothing and says nothing" with half its work already done: the value is
+    /// resolved from the store's characters, not from the rows it was drawn
+    /// over. The transport, the count and the toast are looprs-pdl.10's; the
+    /// *shape* is here first so that "what was selected" has one definition in
+    /// the tree and the copy ticket cannot invent a second one under pressure.
+    #[allow(dead_code)] // consumer: select-to-copy (looprs-pdl.10)
+    pub fn selection_paste(&self) -> String {
+        self.selection.paste(self.scrollback().rows())
+    }
+
+    /// Publish where this frame drew the transcript band's rows.
+    ///
+    /// Called from [`crate::view`] with the same [`BandLayout`] the band drew
+    /// itself from, which is the point: the hit-test and the pixels come from
+    /// one computation, so they cannot disagree about which row the pointer is
+    /// on. See [`App::band`].
+    pub fn record_band(&self, snap: BandSnapshot) {
+        self.band.set(Some(snap));
+    }
+
+    /// The character under a screen position, in the transcript.
+    ///
+    /// `None` for anything that is not settled transcript text: the chrome
+    /// bands (not in the store, so not hittable at all), the padding above a
+    /// short band, and **the live tail** — which is not in the store yet, and
+    /// so is not selectable. That last one is a decision rather than an
+    /// omission: the live line is being rewritten as it arrives, and a selection
+    /// addressed into text that has no final form yet cannot promise what it
+    /// would copy. It becomes selectable the frame after it is flushed, which
+    /// is the frame after it stops changing.
+    fn hit(&self, screen_row: u16, screen_col: u16) -> Option<crate::state::selection::CharRef> {
+        let snap = self.band.get()?;
+        let idx = snap.row_index(self.scrollback(), screen_row)?;
+        let cell = snap.cell_of(screen_col);
+        // Through a blank line the pointer rests at the end of the line above
+        // rather than freezing (`selection::hit_resting`).
+        crate::state::selection::hit_resting(self.scrollback().rows(), idx, cell)
+    }
+
+    /// A mouse report arrived: the drag selection's three events.
+    ///
+    /// The left button drives the whole thing. Every other button and every
+    /// wheel report falls through untouched — an unbound button must not be
+    /// silently swallowed (looprs-pdl.8's rule), and middle-click is
+    /// looprs-pdl.11's territory.
+    pub fn on_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        // A child holding the real screen owns the pointer with it. The pixels
+        // under the cursor are the child's, so a hit against the last frame
+        // *we* drew would be a fiction, and a selection band painted over a
+        // full-screen program is the bug the draw gate in `main` exists to
+        // stop — reached by a different input this time.
+        if self.passthrough() {
+            return;
+        }
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // A press that cannot hit transcript starts nothing, and
+                // leaves whatever selection was standing alone: a click on
+                // chrome is not a statement about the transcript.
+                if let Some(at) = self.hit(m.row, m.column) {
+                    self.selection.press(at);
+                    self.dirty = true;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if !self.selection.is_dragging() {
+                    // A motion report with no press of ours behind it. Not our
+                    // gesture; do not start one.
+                    return;
+                }
+                let Some(snap) = self.band.get() else {
+                    return;
+                };
+                // Scroll **before** re-reading the pointer. The content under
+                // the cursor is what the band shows *after* the auto-scroll,
+                // so the focus has to be looked up against the scrolled view;
+                // doing it the other way round freezes the selection one row
+                // short and leaves the box chasing the mouse.
+                let step = self.selection.auto_scroll(snap.edge_at(m.row), self.clock);
+                if step != 0 {
+                    self.scroll_active(step);
+                    // …and re-publish where the band's rows are now. The view
+                    // moved and the screen has not been repainted yet, so
+                    // without this the next motion event maps the pointer to
+                    // the row it was on *before* the scroll, the focus lands
+                    // back where it already was, and the selection never
+                    // grows past the edge. This is the same relationship the
+                    // frame keeps — one layout, one truth about where row N is
+                    // — just advanced by the scroll instead of by a draw.
+                    let win = self.transcript_window(snap.rows);
+                    // Only re-publish while the drawn height is unchanged. If
+                    // the scroll ran out of content and the band now has fewer
+                    // rows, they would be bottom-pinned at a different `y`, and
+                    // re-deriving that here would be the frame's job, not the
+                    // mouse handler's — so the snapshot stays as it is. The
+                    // view cannot scroll further in that direction either, so
+                    // nothing is being asked of the stale mapping.
+                    if win.len() == snap.rows {
+                        let moved = BandSnapshot::new(
+                            snap.area,
+                            snap.first_row_y,
+                            snap.rows,
+                            win.first().map(|r| r.anchor()),
+                        );
+                        self.record_band(moved);
+                    }
+                }
+                if let Some(at) = self.hit(m.row, m.column)
+                    && self.selection.drag(at)
+                {
+                    self.dirty = true;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if !self.selection.is_dragging() {
+                    return;
+                }
+                // Either it committed or it was a click and cleared. Both
+                // change what is on the screen, so `dirty` is deliberately not
+                // conditional on there being a range.
+                self.selection.release();
+                self.dirty = true;
+            }
+            _ => {}
         }
     }
 
@@ -1079,7 +1280,21 @@ impl App {
         }
     }
 
+    /// The one door every state change comes through.
+    ///
+    /// The body is [`Self::update_inner`]; what this adds on top is the trim
+    /// re-base, and it sits outside that body on purpose. Any arm of that
+    /// match can push output, pushing output can trip the buffer cap, and the
+    /// cap moves the entries out from under a standing drag selection (see
+    /// [`Self::sync_selection_to_trims`). Putting the re-base after the match
+    /// instead of in each arm means the arm that returns early is not also
+    /// the arm that forgot.
     pub fn update(&mut self, msg: Msg) {
+        self.update_inner(msg);
+        self.sync_selection_to_trims();
+    }
+
+    fn update_inner(&mut self, msg: Msg) {
         match msg {
             Msg::Tick => {
                 if self.chat_state().is_streaming() {
@@ -1097,6 +1312,10 @@ impl App {
                 self.dirty = true;
                 self.on_key(k);
             }
+            // Mouse reports (looprs-pdl.9). The three mouse modes are on the
+            // ledger and these are the bytes they produce; nothing else reads
+            // them.
+            Msg::Term(Event::Mouse(m)) => self.on_mouse(m),
             Msg::Term(_) => {}
             Msg::Agent { session, event } => {
                 self.dirty = true;
@@ -1411,6 +1630,26 @@ impl App {
             return;
         }
 
+        // **The Esc ordering** (looprs-pdl.9): if a selection is live, the
+        // first Esc clears the selection and does nothing else; the next Esc
+        // is the cancel the mode table already describes (ADR-0003).
+        //
+        // Above every cancel below, and above the scroll keys, because the
+        // failure this prevents is the loud one: the user drags a paragraph,
+        // decides they did not mean it, presses Esc, and the app cancels a
+        // running model call instead of unselecting. That is exactly the class
+        // of surprise ADR-0003 exists to prevent, which is why the ticket
+        // refuses to leave it implicit and why it sits here, where every cancel
+        // has to go past it.
+        //
+        // Note it is *after* the passthrough block above: while a child holds
+        // the screen it holds Esc too, and that is a settled decision of its
+        // own (looprs-4hv) that a selection must not reach over.
+        if k.code == KeyCode::Esc && self.selection.clear_if_live() {
+            self.dirty = true;
+            return;
+        }
+
         // The scrollback keys (looprs-pdl.6). Chosen because nothing else in
         // this app claims them: `InputState::handle_key` ignores all four, so
         // taking them here moves no keystroke off the box, and a program that
@@ -1462,6 +1701,12 @@ impl App {
                 }
                 InputAction::SwitchMode { from, to } => {
                     let _ = self.cmd_tx.try_send(UiCommand::SwitchMode { from, to });
+                    // A selection does not cross a mode boundary. It is
+                    // addressed into one view's transcript, and the next frame
+                    // would be another mode's rows with a box still painted on
+                    // them — so the ticket's clear list says gone, and gone it
+                    // is before anything else about the switch happens.
+                    self.selection.clear();
                     // Move the render pointer optimistically, so the frame right
                     // after the keystroke is already the new mode. Both halves are
                     // driven by this one command, so they cannot diverge.
@@ -3618,5 +3863,613 @@ mod tests {
             "and `End` is all the way back"
         );
         assert!(app.pinned());
+    }
+
+    // ────────────── the drag selection, through the real frame (pdl.9) ──────────────
+
+    /// A mouse report, as the `Msg` the run loop would deliver for it.
+    fn mouse(kind: MouseEventKind, row: u16, col: u16) -> Msg {
+        Msg::Term(Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+    }
+
+    const W: u16 = 80;
+
+    /// Paint one frame through the real `crate::view`.
+    ///
+    /// The App learns where the transcript band's rows are only from the draw
+    /// (`App::record_band`), because a pointer position is a claim about the
+    /// pixels. So a test that drives the mouse has to go through the same door
+    /// the run loop goes through — otherwise it is testing a mapping the app
+    /// never built.
+    fn paint(app: &App, height: u16, preview: &[Line<'static>]) {
+        let backend = ratatui::backend::TestBackend::new(W, height);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| crate::view(app, f, preview, viewport::MIN_INPUT_ROWS))
+            .unwrap();
+    }
+
+    /// The band's geometry for the frame `paint` just drew, as plain values, so
+    /// the caller can then take `&mut App`.
+    ///
+    /// Returns `(band x, y of the first drawn row, the drawn rows' text)`.
+    fn geom(app: &App, height: u16) -> (u16, u16, Vec<String>) {
+        let [text, ..] = viewport::frame_areas(
+            Rect::new(0, 0, W, height),
+            app.live_card_rows(),
+            app.input_band(W),
+        );
+        let win = app.transcript_window(text.height as usize);
+        let lay = crate::components::text_stream::band_layout(text, win.len(), 0);
+        (
+            text.x,
+            lay.settled_y,
+            win[lay.skip..].iter().map(|r| r.to_string()).collect(),
+        )
+    }
+
+    /// `n` numbered answer entries, flushed. Two store rows each: the prose and
+    /// its blank separator.
+    fn settle_answers(app: &mut App, n: usize) {
+        let id = SessionId::new(app.active, 1);
+        for i in 0..n {
+            app.view_mut(id)
+                .push_note(MessageKind::Answer, format!("LINE{i:02} aaaaaaaaaa"));
+        }
+        app.flush_active(W);
+    }
+
+    fn drag(app: &mut App, from: (u16, u16), to: (u16, u16)) {
+        app.update(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            from.0,
+            from.1,
+        ));
+        app.update(mouse(MouseEventKind::Drag(MouseButton::Left), to.0, to.1));
+        app.update(mouse(MouseEventKind::Up(MouseButton::Left), to.0, to.1));
+    }
+
+    /// The whole gesture end to end: a press and a release around a drag put
+    /// the characters under the box into `selection_paste`, across a row
+    /// boundary, with the blank separator row the flusher adds counted as the
+    /// blank line the user saw.
+    #[test]
+    fn a_drag_across_two_rows_selects_the_characters_under_the_box() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle_answers(&mut app, 4);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn
+            .iter()
+            .position(|t| t.contains("LINE01"))
+            .expect("setup: LINE01 is on screen");
+        let b = drawn
+            .iter()
+            .position(|t| t.contains("LINE02"))
+            .expect("setup: LINE02 is on screen");
+
+        drag(&mut app, (y0 + a as u16, bx + 5), (y0 + b as u16, bx + 9));
+        assert!(app.selection().is_live());
+        // Cell 5 of "LINE01 aaaaaaaaaa" is the `1`, cell 9 of the LINE02 row
+        // the third `a`, and the blank separator row the flusher adds lands in
+        // between as the one newline that keeps the two messages apart: the
+        // paste is the characters, with the seam the user saw between them.
+        assert_eq!(
+            app.selection_paste(),
+            "1 aaaaaaaaaa\nLINE02 aaa",
+            "the selection is the characters under the box, across the row seam"
+        );
+    }
+
+    /// **A click clears.** Press and release with nothing between them is not a
+    /// selection, and it takes away the one that was standing.
+    #[test]
+    fn a_click_selects_nothing_and_clears_what_was_selected() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle_answers(&mut app, 3);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE01")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE02")).unwrap();
+
+        drag(&mut app, (y0 + a as u16, bx), (y0 + b as u16, bx + 4));
+        assert!(!app.selection_paste().is_empty(), "setup: a selection");
+
+        app.update(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            y0 + a as u16,
+            bx,
+        ));
+        app.update(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            y0 + a as u16,
+            bx,
+        ));
+        assert!(
+            !app.selection().is_live(),
+            "the click cleared the standing selection"
+        );
+        assert_eq!(app.selection_paste(), "");
+    }
+
+    /// **The Esc ordering, wired.** A live selection takes the first Esc and
+    /// nothing reaches the session; the next Esc is the cancel the mode table
+    /// already describes.
+    #[test]
+    fn esc_clears_the_selection_first_and_only_then_cancels() {
+        let (mut app, mut rx) = app_with(TerminalType::Pi);
+        settle_answers(&mut app, 3);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE01")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE02")).unwrap();
+        drag(&mut app, (y0 + a as u16, bx), (y0 + b as u16, bx + 4));
+        assert!(app.selection().is_live());
+
+        app.update(Msg::Term(key(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!app.selection().is_live(), "the first Esc unselected");
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "and sent no cancel: cancelling a run because the user wanted to \
+             unselect is the surprise ADR-0003 exists to prevent"
+        );
+
+        app.update(Msg::Term(key(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(
+            matches!(rx.try_recv(), Ok(UiCommand::Cancel)),
+            "and the next Esc is the cancel the mode table already describes"
+        );
+    }
+
+    /// **A mode switch clears.** The selection is addressed into one view's
+    /// transcript; the next frame is another mode's rows.
+    #[test]
+    fn a_mode_switch_clears_the_selection() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle_answers(&mut app, 3);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE01")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE02")).unwrap();
+        drag(&mut app, (y0 + a as u16, bx), (y0 + b as u16, bx + 4));
+        assert!(app.selection().is_live());
+
+        app.update(Msg::Term(key(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(
+            !app.selection().is_live(),
+            "the selection does not cross the mode boundary"
+        );
+    }
+
+    /// **Auto-scroll, wired.** Dragging off the top edge keeps extending the
+    /// selection by scrolling, at the throttled rate — and the selection
+    /// reaches rows that were never on screen at all.
+    #[test]
+    fn dragging_off_the_top_edge_scrolls_and_keeps_extending() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle_answers(&mut app, 40);
+        let h = 24u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let start = drawn.iter().position(|t| t.contains("LINE35")).unwrap();
+        let t0 = Instant::now();
+        app.on_tick(t0);
+        app.update(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            y0 + start as u16,
+            bx,
+        ));
+
+        let offset_before = app.scrollback().offset();
+        for i in 0..5u64 {
+            app.on_tick(t0 + Duration::from_millis(150 * (i + 1)));
+            app.update(mouse(MouseEventKind::Drag(MouseButton::Left), 0, bx));
+        }
+        assert_eq!(
+            app.scrollback().offset(),
+            offset_before + 5,
+            "five edge drags, five rows up — one per interval, no more"
+        );
+        let text = app.selection_paste();
+        assert!(
+            text.contains("LINE34") && text.contains("LINE28"),
+            "the selection kept growing as the view scrolled, reaching rows that \
+             were never on screen: {text:?}"
+        );
+        assert!(
+            !text.contains("LINE36"),
+            "and never reached below where the drag started: {text:?}"
+        );
+    }
+
+    /// The throttle in the wiring, not just in the model: 50 edge drags inside
+    /// one interval move nothing.
+    #[test]
+    fn a_fast_burst_of_edge_drags_does_not_outrun_the_pointer() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle_answers(&mut app, 40);
+        let h = 24u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let start = drawn.iter().position(|t| t.contains("LINE35")).unwrap();
+        let t0 = Instant::now();
+        app.on_tick(t0);
+        app.update(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            y0 + start as u16,
+            bx + 2,
+        ));
+        let offset = app.scrollback().offset();
+        for i in 1..50u64 {
+            app.on_tick(t0 + Duration::from_millis(i));
+            app.update(mouse(MouseEventKind::Drag(MouseButton::Left), 0, bx + 2));
+        }
+        assert_eq!(
+            app.scrollback().offset(),
+            offset + 1,
+            "one scroll for the whole burst; the rest were inside the interval"
+        );
+    }
+
+    /// **The live tail is not selectable.** It has no final form to address:
+    /// it is still arriving. The frame that flushes it is the frame that makes
+    /// it selectable, and that is the frame after it stops changing.
+    #[test]
+    fn the_live_tail_cannot_be_selected() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle_answers(&mut app, 3);
+        app.view_mut(SessionId::new(TerminalType::Pi, 1)).chat = ChatState::Chat;
+        let h = 20u16;
+        let preview = vec![Line::from("STILL-ARRIVING".to_string())];
+        paint(&app, h, &preview);
+        let [text, ..] = viewport::frame_areas(
+            Rect::new(0, 0, W, h),
+            app.live_card_rows(),
+            app.input_band(W),
+        );
+        // The live line is the band's last row.
+        let live_y = text.bottom() - 1;
+        app.update(mouse(MouseEventKind::Down(MouseButton::Left), live_y, 2));
+        app.update(mouse(MouseEventKind::Drag(MouseButton::Left), live_y, 8));
+        app.update(mouse(MouseEventKind::Up(MouseButton::Left), live_y, 8));
+        assert!(
+            !app.selection().is_live(),
+            "the live tail is not in the store, so it is not selectable"
+        );
+
+        // …and once flushed it is: the settled line is a store row like any other.
+        app.view_mut(SessionId::new(TerminalType::Pi, 1))
+            .push_note(MessageKind::Answer, "STILLED".to_string());
+        app.flush_active(W);
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let row = drawn.iter().position(|t| t.contains("STILLED")).unwrap();
+        drag(&mut app, (y0 + row as u16, bx), (y0 + row as u16, bx + 3));
+        assert_eq!(app.selection_paste(), "STIL");
+    }
+
+    /// **Chrome cannot be selected, and touching it does not disturb the
+    /// selection.** The status row is not in the store; there is nothing there
+    /// to hit.
+    #[test]
+    fn chrome_cannot_be_selected_and_leaves_the_selection_alone() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle_answers(&mut app, 3);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let [_text, _, status, input] = viewport::frame_areas(
+            Rect::new(0, 0, W, h),
+            app.live_card_rows(),
+            app.input_band(W),
+        );
+
+        // A press on the status row, then on the input box: nothing starts.
+        app.update(mouse(MouseEventKind::Down(MouseButton::Left), status.y, 2));
+        app.update(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            input.y + 1,
+            8,
+        ));
+        assert!(
+            !app.selection().is_live(),
+            "a drag that starts on chrome selects nothing"
+        );
+
+        // Now a real selection, then a press on chrome: it stands.
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE01")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE02")).unwrap();
+        drag(&mut app, (y0 + a as u16, bx), (y0 + b as u16, bx + 4));
+        let selected = app.selection_paste();
+        assert!(!selected.is_empty(), "setup: a selection stands");
+
+        app.update(mouse(MouseEventKind::Down(MouseButton::Left), status.y, 2));
+        app.update(mouse(MouseEventKind::Up(MouseButton::Left), status.y, 2));
+        assert_eq!(
+            app.selection_paste(),
+            selected,
+            "a press on chrome is not a statement about the transcript: it \
+             neither selects nor clears"
+        );
+    }
+
+    /// **The resize property, through the App.** The selection is addressed by
+    /// content, so a resize moves the rows and leaves the selection's own
+    /// coordinates alone; the highlight re-derives onto wherever those
+    /// characters ended up.
+    ///
+    /// The *range* is the invariant, deliberately, rather than the pasted
+    /// string: the store's wrap drops the space it broke a soft line on (see
+    /// the note on `RowEnd::Soft`), so a selection that spans a soft seam can
+    /// come back a space short of what it was. That is a defect in what the
+    /// wrap keeps, not in what the selection addresses — it is on the board
+    /// for the copy ticket, and asserting the range here is what keeps the two
+    /// concerns from getting welded together.
+    #[test]
+    fn a_resize_re_derives_the_cells_and_keeps_the_range() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let id = SessionId::new(TerminalType::Pi, 1);
+        for i in 0..6 {
+            app.view_mut(id).push_note(
+                MessageKind::Answer,
+                format!("LINE{i} {}", "word ".repeat(14)),
+            );
+        }
+        app.flush_active(80);
+        let h = 30u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE2")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE3")).unwrap();
+        drag(&mut app, (y0 + a as u16, bx), (y0 + b as u16, bx + 6));
+        let before = app.selection().range().expect("setup: a range");
+
+        // A narrower window: everything re-wraps, rows are added.
+        app.set_window(52, h);
+        app.flush_active(52);
+        assert!(
+            app.scrollback().len() > 12,
+            "setup: the narrower wrap made more rows"
+        );
+        assert_eq!(
+            app.selection().range(),
+            Some(before),
+            "the selection followed the characters, not the rows they were on"
+        );
+
+        // And the highlight re-derives: the box still lands somewhere, on the
+        // rows the same content is now drawn on.
+        paint(&app, h, &[]);
+        let (_bx2, _y1, drawn2) = geom(&app, h);
+        let runs = app.selection().cells(app.transcript_window(drawn2.len()));
+        assert!(!runs.is_empty(), "the box is still drawn somewhere");
+
+        // A selection inside one row is byte-identical across a resize: the
+        // seam problem above cannot touch it.
+        let same_row = drawn2
+            .iter()
+            .position(|t| t.to_string().split_whitespace().count() > 3)
+            .unwrap();
+        drag(
+            &mut app,
+            (y0 + same_row as u16, bx),
+            (y0 + same_row as u16, bx + 8),
+        );
+        let pinned = app.selection_paste();
+        app.set_window(46, h);
+        app.flush_active(46);
+        assert_eq!(
+            app.selection_paste(),
+            pinned,
+            "same eight characters, same place"
+        );
+    }
+
+    /// **Not cleared by a repaint, a tick, or new output.** The ticket's
+    /// other half: a selection is a fact about content, not about the frame
+    /// it happened to be made in. Repainting, a clock tick, and new output
+    /// arriving *below* the selection all leave it standing with the same
+    /// characters — only the four things on the clear list take it away.
+    #[test]
+    fn a_selection_survives_a_repaint_a_tick_and_new_output() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle_answers(&mut app, 3);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE01")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE02")).unwrap();
+        drag(&mut app, (y0 + a as u16, bx + 1), (y0 + b as u16, bx + 4));
+        let selected = app.selection_paste();
+        assert!(!selected.is_empty(), "setup: something selected");
+
+        // A tick: the spinner turns, the clock moves.
+        app.on_tick(Instant::now() + Duration::from_millis(120));
+        assert_eq!(app.selection_paste(), selected, "a tick keeps it");
+
+        // New output, flushed into the store below the selection.
+        app.view_mut(SessionId::new(TerminalType::Pi, 1))
+            .push_note(MessageKind::Answer, "arrived after the drag".to_string());
+        app.flush_active(W);
+        assert_eq!(
+            app.selection_paste(),
+            selected,
+            "new output does not take the selection away"
+        );
+
+        // A repaint, which re-derives the band geometry from scratch.
+        paint(&app, h, &[]);
+        assert_eq!(
+            app.selection_paste(),
+            selected,
+            "and neither does drawing the frame again"
+        );
+        assert!(app.selection().is_live(), "still live, still selectable");
+    }
+
+    /// **A trim that ate the anchor clears it — wired, not promised.** The
+    /// buffer cap evicts entries from the front of the transcript and the
+    /// store renumbers its rows by entry; the selection speaks the same
+    /// addresses, so it has to hear about the eviction with the same numbers
+    /// or the entries shift out from under it.
+    #[test]
+    fn a_trim_that_eats_the_anchor_clears_the_selection() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle_answers(&mut app, 6);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE01")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE02")).unwrap();
+        drag(&mut app, (y0 + a as u16, bx), (y0 + b as u16, bx + 4));
+        assert!(app.selection_paste().contains("LINE01"), "setup");
+
+        // Trip the cap and stream enough to evict the selected entries.
+        let id = SessionId::new(TerminalType::Pi, 1);
+        app.view_mut(id).set_buffer_limit(300);
+        for _ in 0..30 {
+            app.view_mut(id)
+                .push_note(MessageKind::Answer, "z".repeat(60));
+        }
+        app.flush_active(W);
+        assert!(
+            !app.selection().is_live(),
+            "the entries the selection addressed are gone, and it went with them"
+        );
+        assert_eq!(app.selection_paste(), "");
+    }
+
+    /// The same eviction with the selection *above* the water line: the entries
+    /// survive, and the selection follows them down the renumbered store to
+    /// the same text it had before. This is the case a silent drift would turn
+    /// into a highlight pointing at the message after the one that was
+    /// selected, which is a worse bug than losing the selection.
+    #[test]
+    fn a_trim_above_the_selection_renumbers_it_onto_the_same_text() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        let id = SessionId::new(TerminalType::Pi, 1);
+        for i in 0..10 {
+            app.view_mut(id).push_note(
+                MessageKind::Answer,
+                format!("LINE{i:02} {}", "y".repeat(40)),
+            );
+        }
+        app.flush_active(W);
+        let h = 30u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE08")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE09")).unwrap();
+        drag(&mut app, (y0 + a as u16, bx), (y0 + b as u16, bx + 12));
+        let before = app.selection_paste();
+        assert!(
+            before.contains("LINE08") && before.contains("LINE09"),
+            "setup: the tail two entries selected: {before:?}"
+        );
+
+        // A cap trip that eats the *front* of the transcript, not this selection.
+        app.view_mut(id).set_buffer_limit(420);
+        for i in 10..13 {
+            app.view_mut(id).push_note(
+                MessageKind::Answer,
+                format!("LINE{i:02} {}", "y".repeat(40)),
+            );
+        }
+        app.flush_active(W);
+        assert!(
+            app.scrollback()
+                .rows()
+                .iter()
+                .any(|r| r.to_string().contains("LINE09")),
+            "setup: the trim stopped short of the entries this selection wants"
+        );
+        assert_eq!(
+            app.selection_paste(),
+            before,
+            "the selection followed its entries down the renumbered store"
+        );
+    }
+
+    /// A motion report with no press of ours behind it is not our gesture, and
+    /// a release with nothing pressed is not either.
+    #[test]
+    fn a_drag_without_a_press_is_nothing() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle_answers(&mut app, 3);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE01")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE02")).unwrap();
+        app.update(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            y0 + a as u16,
+            bx,
+        ));
+        app.update(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            y0 + b as u16,
+            bx + 4,
+        ));
+        app.update(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            y0 + b as u16,
+            bx + 4,
+        ));
+        assert!(!app.selection().is_live());
+    }
+
+    /// The other buttons are left alone: an unbound button must not be silently
+    /// swallowed (pdl.8's rule), and the middle click is pdl.11's.
+    #[test]
+    fn the_other_buttons_do_not_drive_the_selection() {
+        let (mut app, _rx) = app_with(TerminalType::Pi);
+        settle_answers(&mut app, 3);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE01")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE02")).unwrap();
+        for btn in [MouseButton::Right, MouseButton::Middle] {
+            app.update(mouse(MouseEventKind::Down(btn), y0 + a as u16, bx));
+            app.update(mouse(MouseEventKind::Drag(btn), y0 + b as u16, bx + 4));
+            app.update(mouse(MouseEventKind::Up(btn), y0 + b as u16, bx + 4));
+        }
+        assert!(
+            !app.selection().is_live(),
+            "a right- or middle-drag does not select"
+        );
+    }
+
+    /// A drag taken while a full-screen child holds the real terminal is a
+    /// fiction: the pixels under the pointer are not ours, so nothing is
+    /// selected against the last frame we painted.
+    #[test]
+    fn no_selection_while_a_child_holds_the_screen() {
+        let (mut app, _rx) = app_with(TerminalType::Bash);
+        settle_answers(&mut app, 3);
+        let h = 20u16;
+        paint(&app, h, &[]);
+        let bash = SessionId::new(TerminalType::Bash, 1);
+        app.update(Msg::ScreenHeld {
+            session: bash,
+            active: true,
+        });
+        let (bx, y0, drawn) = geom(&app, h);
+        let a = drawn.iter().position(|t| t.contains("LINE01")).unwrap();
+        let b = drawn.iter().position(|t| t.contains("LINE02")).unwrap();
+        drag(&mut app, (y0 + a as u16, bx), (y0 + b as u16, bx + 4));
+        assert!(
+            !app.selection().is_live(),
+            "the pointer is over someone else's screen"
+        );
     }
 }
