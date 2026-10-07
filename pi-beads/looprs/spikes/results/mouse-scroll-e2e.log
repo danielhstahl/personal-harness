@@ -1,0 +1,64 @@
+[  0.00s] --- 1000+1002+1006 on by default, once each, off once each ---
+[  1.51s] PASS  the app boots with no LOOPRS_MODES set
+[  1.51s] PASS  ?1000 (button report) switched on exactly once at startup
+[  1.51s] PASS  ?1002 (drag report) switched on exactly once at startup
+[  1.51s] PASS  ?1006 (SGR coordinates) switched on exactly once at startup
+[  1.51s] PASS  …and none of them switched off while the app is still running
+[  1.62s] PASS  Ctrl-Q quits
+[  1.62s] PASS  ?1000 switched off exactly once, at the leave
+[  1.62s] PASS  ?1002 switched off exactly once, at the leave
+[  1.62s] PASS  ?1006 switched off exactly once, at the leave
+[  1.62s] --- LOOPRS_MODES=-mouse: the default mouse is declined, as a unit ---
+[  3.12s] PASS  the app boots with the mouse declined
+[  3.12s] PASS  no ?1000h written (and none to take off: 0)
+[  3.12s] PASS  no ?1002h written (and none to take off: 0)
+[  3.12s] PASS  no ?1006h written (and none to take off: 0)
+[  5.55s] PASS  …and the app still works: keyboard, screen, quit
+[  5.61s] PASS  …and the shell still answers
+[  7.12s] PASS  …and it quits cleanly
+[  7.12s] --- one wheel notch over the band moves the transcript three rows ---
+[  9.54s] PASS  the app reached Bash mode
+[  9.59s] PASS  60 lines of transcript are in
+[ 10.11s] PASS  a transcript marker to track (FLOOD38)
+[ 10.11s] PASS  the marker FLOOD38 is on screen
+[ 10.62s]       rows the notch moved: 3
+[ 10.62s] PASS  a notch moved exactly 3 rows (toward the past)
+[ 11.25s]       rows the return notch moved: -3
+[ 11.25s] PASS  a notch toward the tail moved the same three rows back
+[ 11.25s] --- a trackpad-shaped burst is rate-limited in the wall clock ---
+[ 13.68s] PASS  the app reached Bash mode
+[ 13.80s] PASS  60 lines of transcript are in
+[ 14.31s] PASS  a transcript marker to track (FLOOD38)
+[ 14.31s] PASS  the marker FLOOD38 is on screen
+[ 15.12s]       reports injected: 40
+[ 15.12s]       gesture duration: 299 ms
+[ 15.12s]       rows scrolled: 15
+[ 15.12s]       rows per second: 50.2
+[ 15.12s] PASS  the burst moved more than one notch's worth (so the reports arrived)
+[ 15.12s]       bound the rate admits for that duration: 5 steps x 3 = 15 rows
+[ 15.12s] PASS  …and no more than the rate admits (15 rows)
+[ 15.12s] PASS  …and nowhere near one row per report (40 rows)
+[ 15.12s] --- events over the input box / status band do not scroll the transcript ---
+[ 17.54s] PASS  the app reached Bash mode
+[ 17.60s] PASS  60 lines of transcript are in
+[ 18.11s] PASS  chrome rows were found
+[ 18.77s] PASS  wheel over the status row scrolled nothing
+[ 19.43s] PASS  wheel over the input box scrolled nothing
+[ 19.94s] PASS  …while the same report over the band still scrolls it
+[ 19.94s] --- no idle frame cost when the mouse is still ---
+[ 22.37s] PASS  the app reached Bash mode
+[ 22.42s] PASS  60 lines of transcript are in
+[ 25.44s]       bytes emitted in 2s with the mouse still: 0
+[ 25.44s] PASS  a still mouse emitted nothing
+[ 26.05s]       bytes emitted over the same window with one notch: 467
+[ 26.05s] PASS  …and the wheel's own work does reach the wire
+[ 29.06s]       bytes emitted in 2s after the gesture drained: 0
+[ 29.06s] PASS  …and nothing is owed after the gesture drained
+[ 29.06s] --- buttons other than the wheel are reported, not swallowed ---
+[ 31.48s] PASS  the app reached Bash mode
+[ 31.59s] PASS  60 lines of transcript are in
+[ 32.71s] PASS  a middle-click or right-click scrolled nothing
+[ 33.01s]       log lines naming the unbound buttons: 2
+[ 33.01s] PASS  …and the app logged each one, with the button it was
+[ 33.01s] PASS  …naming middle-click as one of them
+[ 33.01s] 45/45 checks passed

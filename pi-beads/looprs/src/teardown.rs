@@ -183,8 +183,8 @@ impl Mode {
     ];
 
     /// What the app switches on to run: the alternate screen the frame is drawn
-    /// on, the cursor we hide while we draw it, and the raw tty both of them
-    /// need.
+    /// on, the cursor we hide while we draw it, the raw tty both of them need,
+    /// and the mouse.
     ///
     /// The alternate screen is in the default set because of ADR-0004 R1 — the
     /// full-screen frame (looprs-pdl.4) owns the whole window, and the promise
@@ -193,10 +193,30 @@ impl Mode {
     /// requirement because the ledger is what decides the hand-back, and "a mode
     /// in the set is a mode that gets left" is the property worth keeping.
     ///
-    /// `LOOPRS_MODES` *adds* to this rather than replacing it (see
-    /// [`Mode::parse_all`]), so a run that asks for the mouse still gets a raw
-    /// tty, a screen of its own, and a cursor that comes back.
-    pub const DEFAULT: &'static [Mode] = &[Mode::Raw, Mode::AltScreen, Mode::CursorHidden];
+    /// **The three mouse modes are in the default set since looprs-pdl.8**, and
+    /// being *in the ledger* is what makes that safe rather than brave: the wheel
+    /// has a transcript to move now, the drag is reportable, and every one of the
+    /// three is handed back by the same `restore` that hands back the screen, on
+    /// every path including the panic one. What it costs is stated in the ticket
+    /// and not hidden here: while we hold `?1000/?1002/?1006` the terminal's own
+    /// drag-to-select is ours to give, not the user's to use, and shift-drag as a
+    /// way around it is a per-terminal unknown that pdl.2 #5b could not measure.
+    /// That is a real regression window, and it is why [`Mode::apply_spec`]
+    /// accepts `-mouse` — the hatch has to be one environment variable wide or it
+    /// is not a hatch.
+    ///
+    /// `LOOPRS_MODES` adds to this, and removes the mouse from it (see
+    /// [`Mode::apply_spec`]), so a run that asks for the mouse still gets a raw
+    /// tty, a screen of its own, and a cursor that comes back — and a run that
+    /// gives the pointer back still gets a working app.
+    pub const DEFAULT: &'static [Mode] = &[
+        Mode::Raw,
+        Mode::AltScreen,
+        Mode::CursorHidden,
+        Mode::MouseReport,
+        Mode::MouseDrag,
+        Mode::MouseSgr,
+    ];
 
     /// The name of the mode, as it appears in `LOOPRS_MODES` and in the log.
     pub fn label(self) -> &'static str {
@@ -241,21 +261,38 @@ impl Mode {
 
     /// The three mouse modes, spelled together, because "turn the mouse on" is a
     /// single wish and half a mouse is worse than none.
-    const MOUSE: &'static [Mode] = &[Mode::MouseReport, Mode::MouseDrag, Mode::MouseSgr];
-
-    /// Parse a `LOOPRS_MODES`-style spec: `"alt_screen,mouse"`, `"all"`, `""`.
-    /// An unknown name is an error rather than something quietly skipped — a typo
-    /// in a mode list that means "nothing" is how a proof passes with the thing
-    /// unproven.
     ///
-    /// The result is sorted into [`Mode::BOOT_ORDER`] no matter what order the
-    /// tokens came in, because the enable order is what the unwind order is
-    /// derived from and a spec should not be able to scramble it.
-    pub fn parse_all(spec: &str) -> Result<Vec<Mode>, String> {
-        let mut out: Vec<Mode> = Vec::new();
+    /// Not a stylistic grouping. `?1000` without `?1002` reports a press and
+    /// never the drag; `?1002` without `?1006` addresses coordinates in the old
+    /// byte encodings, which stop at column 223 and wrap silently on a wide
+    /// window. Every place the mouse is switched on or off goes through this list
+    /// so that neither half-mouse is expressible.
+    pub const MOUSE: &'static [Mode] = &[Mode::MouseReport, Mode::MouseDrag, Mode::MouseSgr];
+
+    /// Resolve a `LOOPRS_MODES`-style spec against `base`.
+    ///
+    /// `"alt_screen,mouse"` adds, `"all"` adds everything in
+    /// [`Mode::BOOT_ORDER`], `"-mouse"` **removes** — and the minus form exists
+    /// because the default set now includes the mouse, and a default that cannot
+    /// be given back is not a default, it is a hostage. An unknown name is an
+    /// error rather than something quietly skipped: a typo in a mode list that
+    /// means "nothing" is how a proof passes with the thing unproven.
+    ///
+    /// Removals are applied in the order the tokens came in, so `"mouse,-mouse"`
+    /// and `"-mouse,mouse"` mean what they read as, and the result is sorted
+    /// into [`Mode::BOOT_ORDER`] whichever order they arrived in — the enable
+    /// order is what the unwind order is derived from, and a spec must not be
+    /// able to scramble it.
+    pub fn apply_spec(base: &[Mode], spec: &str) -> Result<Vec<Mode>, String> {
+        let mut out: Vec<Mode> = base.to_vec();
         for token in spec.split([',', ' ', '\t', '\n']) {
             let token = token.trim();
             if token.is_empty() {
+                continue;
+            }
+            if let Some(neg) = token.strip_prefix('-') {
+                let group = Self::resolve_group(neg, token)?;
+                out.retain(|m| !group.contains(m));
                 continue;
             }
             if token == "all" {
@@ -272,7 +309,7 @@ impl Mode {
                 .find(|m| m.label() == token)
                 .ok_or_else(|| {
                     format!(
-                        "unknown terminal mode {token:?} (known: {}; \"mouse\" for all three mouse modes; \"all\" for everything)",
+                        "unknown terminal mode {token:?} (known: {}; \"mouse\" for all three mouse modes; \"all\" for everything; a `-` prefix removes a mode the default set switched on)",
                         Mode::BOOT_ORDER
                             .iter()
                             .map(|m| m.label())
@@ -292,13 +329,56 @@ impl Mode {
         Ok(out)
     }
 
-    /// The mode set the app starts with: [`Mode::DEFAULT`] plus whatever
-    /// `LOOPRS_MODES` asks for.
+    /// What a `-`-prefixed token names, or why it cannot be taken back.
     ///
-    /// `LOOPRS_MODES` exists so the modes past the default set — the mouse and
-    /// bracketed paste — can be proved on a real pty; `spikes/shutdown_e2e.py`
-    /// sets it to `all`. A mode nobody asked for is a mode nobody is testing,
-    /// which is the other half of why unknown names are an error.
+    /// **Only the mouse is offered back**, and only as a whole. The rest of the
+    /// default set is load-bearing in a way the mouse is not: without raw mode
+    /// there is no byte-at-a-time tty to draw through, and without the alternate
+    /// screen the full-screen frame (looprs-pdl.4) paints over the user's own
+    /// scrollback with nothing left to erase it — the app has no shape without
+    /// them, so promising that `-alt_screen` works would be a lie told by a
+    /// command-line flag. The mouse is the one thing whose absence leaves a
+    /// working app with a less capable pointer.
+    ///
+    /// And the mouse cannot be taken a third at a time: that is the whole reason
+    /// [`Mode::MOUSE`] exists as a type-level unit rather than as three modes
+    /// somebody might remember to switch together. A half-mouse is not a slightly
+    /// worse mouse — `1002` without `1006` is coordinates that wrap past column
+    /// 223, which is a drag selecting the wrong paragraph on a wide window.
+    fn resolve_group(neg: &str, token: &str) -> Result<&'static [Mode], String> {
+        if neg == "mouse" {
+            return Ok(Mode::MOUSE);
+        }
+        if Mode::MOUSE.iter().any(|m| m.label() == neg) {
+            return Err(format!(
+                "{token:?} takes the mouse apart: 1000+1002+1006 are one unit (a mouse without SGR \
+                 coordinates wraps past column 223). Use \"-mouse\" to give the whole pointer back \
+                 to the terminal."
+            ));
+        }
+        Err(format!(
+            "{token:?} cannot be taken back: this app has no shape without it. The only mode set \
+             `-` accepts is \"-mouse\" (all three mouse modes together)."
+        ))
+    }
+
+    /// The mode set the app starts with: [`Mode::DEFAULT`] with `LOOPRS_MODES`
+    /// applied to it — added to, and (for the mouse) taken back out of.
+    ///
+    /// `LOOPRS_MODES` exists so the modes past the default set — bracketed paste,
+    /// and anything not yet in the default set — can be proved on a real pty;
+    /// `spikes/shutdown_e2e.py` sets it to `all`. A mode nobody asked for is a
+    /// mode nobody is testing, which is the other half of why unknown names are
+    /// an error. `-mouse` is the one removal on offer, and the reason for it is
+    /// in [`Mode::DEFAULT`]: the mouse is on by default now, so the option to
+    /// decline it is not a nicety.
+    pub fn startup_set() -> Result<Vec<Mode>, String> {
+        Self::apply_spec(
+            Mode::DEFAULT,
+            &std::env::var("LOOPRS_MODES").unwrap_or_default(),
+        )
+    }
+
     /// Did this process claim the alternate screen at startup?
     ///
     /// The one question from the startup set that anything *else* in the app has to
@@ -311,21 +391,6 @@ impl Mode {
         Self::startup_set()
             .map(|modes| modes.contains(&Mode::AltScreen))
             .unwrap_or(false)
-    }
-
-    pub fn startup_set() -> Result<Vec<Mode>, String> {
-        let mut modes = Mode::DEFAULT.to_vec();
-        modes.extend(Mode::parse_all(
-            &std::env::var("LOOPRS_MODES").unwrap_or_default(),
-        )?);
-        modes.sort_by_key(|m| {
-            Mode::BOOT_ORDER
-                .iter()
-                .position(|x| x == m)
-                .unwrap_or(u8::MAX as usize)
-        });
-        modes.dedup();
-        Ok(modes)
     }
 }
 
@@ -1166,28 +1231,33 @@ mod tests {
         );
     }
 
+    /// The spec on its own, with no default set behind it: what `LOOPRS_MODES`
+    /// asks for before the app's own defaults are added. The app's door is
+    /// [`Mode::apply_spec`] with [`Mode::DEFAULT`] as the base, and
+    /// `startup_set_with` below is that one.
+    fn parse(spec: &str) -> Result<Vec<Mode>, String> {
+        Mode::apply_spec(&[], spec)
+    }
+
     #[test]
     fn a_mode_spec_is_parsed_into_boot_order_whatever_order_it_came_in() {
-        let modes = Mode::parse_all("mouse_sgr,alt_screen").unwrap();
+        let modes = parse("mouse_sgr,alt_screen").unwrap();
         assert_eq!(modes, vec![Mode::AltScreen, Mode::MouseSgr]);
-        assert_eq!(Mode::parse_all("").unwrap(), Vec::<Mode>::new());
-        assert_eq!(Mode::parse_all("  \n").unwrap(), Vec::<Mode>::new());
+        assert_eq!(parse("").unwrap(), Vec::<Mode>::new());
+        assert_eq!(parse("  \n").unwrap(), Vec::<Mode>::new());
     }
 
     #[test]
     fn a_mouse_is_three_modes_and_all_is_everything() {
         assert_eq!(
-            Mode::parse_all("mouse").unwrap(),
+            parse("mouse").unwrap(),
             vec![Mode::MouseReport, Mode::MouseDrag, Mode::MouseSgr]
         );
-        assert_eq!(Mode::parse_all("all").unwrap(), Mode::BOOT_ORDER.to_vec());
+        assert_eq!(parse("all").unwrap(), Mode::BOOT_ORDER.to_vec());
         // Duplicated names are one mode, not two, however they are spelled.
+        assert_eq!(parse("all,all").unwrap(), Mode::BOOT_ORDER.to_vec());
         assert_eq!(
-            Mode::parse_all("all,all").unwrap(),
-            Mode::BOOT_ORDER.to_vec()
-        );
-        assert_eq!(
-            Mode::parse_all("mouse,mouse_sgr").unwrap(),
+            parse("mouse,mouse_sgr").unwrap(),
             vec![Mode::MouseReport, Mode::MouseDrag, Mode::MouseSgr]
         );
     }
@@ -1196,13 +1266,13 @@ mod tests {
     /// thing unproven, so it is an error, and it says what the names were.
     #[test]
     fn an_unknown_mode_is_an_error_that_names_the_names() {
-        let err = Mode::parse_all("alt_scren").unwrap_err();
+        let err = parse("alt_scren").unwrap_err();
         assert!(err.contains("alt_scren"), "{err}");
         assert!(err.contains("alt_screen"), "{err}");
         assert!(err.contains("bracketed_paste"), "{err}");
     }
 
-    /// The startup set always keeps the two modes the app cannot run without, no
+    /// The startup set always keeps the modes the app cannot run without, no
     /// matter what `LOOPRS_MODES` asks for on top. Losing raw mode because somebody
     /// typed `LOOPRS_MODES=alt` would be a worse failure than the typo itself.
     #[test]
@@ -1217,15 +1287,146 @@ mod tests {
         assert_eq!(startup_set_with(""), Mode::DEFAULT.to_vec());
     }
 
+    /// **The mouse is on by default, as one unit** (looprs-pdl.8). All three
+    /// modes are in the set the app enables through the ledger, which is the
+    /// only reason "and all three come back off, exactly once" is a statement
+    /// about them rather than a hope: they are on the ledger, so `restore` owns
+    /// them like it owns the screen.
+    #[test]
+    fn the_mouse_is_in_the_default_set_as_one_unit() {
+        for m in Mode::MOUSE {
+            assert!(
+                Mode::DEFAULT.contains(m),
+                "{} is a default mode: the wheel has to move the transcript \
+                 without anybody remembering to ask for it",
+                m.label()
+            );
+        }
+        // The three are contiguous in the default set: "the mouse" is one block
+        // that was switched on together, not three modes sprinkled down the list.
+        let idx: Vec<usize> = Mode::MOUSE
+            .iter()
+            .filter_map(|m| Mode::DEFAULT.iter().position(|d| d == m))
+            .collect();
+        let default = Mode::DEFAULT;
+        assert_eq!(idx.len(), 3);
+        assert_eq!(
+            idx[2] - idx[0],
+            2,
+            "the three mouse modes are adjacent in DEFAULT: {default:?}"
+        );
+    }
+
+    /// The hatch that makes a default-on mouse honest: `LOOPRS_MODES=-mouse`
+    /// gives the whole pointer back to the terminal, in one variable, while the
+    /// rest of the default set stays exactly as it was.
+    #[test]
+    fn minus_mouse_gives_the_whole_pointer_back() {
+        let got = startup_set_with("-mouse");
+        for m in Mode::MOUSE {
+            assert!(
+                !got.contains(m),
+                "{} is gone: the terminal has its mouse back",
+                m.label()
+            );
+        }
+        assert_eq!(
+            got,
+            vec![Mode::Raw, Mode::AltScreen, Mode::CursorHidden],
+            "…and only the mouse came out of the default set"
+        );
+        // Order is still BOOT_ORDER with the removal in the middle of the list.
+        assert_eq!(
+            startup_set_with("bracketed_paste,-mouse"),
+            vec![
+                Mode::Raw,
+                Mode::AltScreen,
+                Mode::CursorHidden,
+                Mode::BracketedPaste
+            ]
+        );
+    }
+
+    /// **The unit rule, enforced on the way out as well as the way in.** A
+    /// removal that takes one of the three is not a smaller mouse, it is a
+    /// broken one: `1002` without `1006` addresses a wide window with byte
+    /// encodings that wrap at column 223. So the request is refused rather than
+    /// half-granted.
+    #[test]
+    fn the_mouse_cannot_be_taken_apart() {
+        for m in Mode::MOUSE {
+            let err = Mode::apply_spec(Mode::DEFAULT, &format!("-{}", m.label())).unwrap_err();
+            assert!(
+                err.contains(m.label()) && err.contains("-mouse"),
+                "{} refused with a way out: {err}",
+                m.label()
+            );
+        }
+    }
+
+    /// Everything else in the default set is load-bearing, and a flag that
+    /// promised `alt_screen` could be declined would be a flag lying: the
+    /// full-screen frame paints the user's scrollback with nothing left to
+    /// erase it. Refusing is the honest answer.
+    #[test]
+    fn the_modes_that_cannot_be_given_back_say_so() {
+        for name in [
+            "raw",
+            "alt_screen",
+            "cursor_hidden",
+            "bracketed_paste",
+            "all",
+        ] {
+            let err = Mode::apply_spec(Mode::DEFAULT, &format!("-{name}")).unwrap_err();
+            assert!(err.contains(name), "{name}: {err}");
+            assert!(err.contains("-mouse"), "{name} names the way out: {err}");
+        }
+    }
+
+    /// **The mouse comes back with the screen.** looprs-pdl.2 #7 measured that
+    /// a `vim` with `mouse=a` switches all three of the app's mouse modes off
+    /// on its way out, leaving the app convinced it still had a pointer it no
+    /// longer had. That was a latent gap while the mouse was opt-in; since
+    /// looprs-pdl.8 the three are on by default, so the re-assert list the App
+    /// writes when a child hands the screen back has to carry all three — a
+    /// list that left them out would kill the wheel after every vim, quietly.
+    ///
+    /// What it must *not* carry is the alternate screen: re-sending `?1049h`
+    /// while already in it saves whatever is on screen as the user's main
+    /// screen, which is not ours to lose (that exclusion is in
+    /// [`Teardown::reassert_bytes`], and it is asserted here rather than taken
+    /// on faith because this is the byte string that goes out unsupervised).
+    #[test]
+    fn the_reassert_carry_carries_the_mouse_and_not_the_screen() {
+        let (t, _buf) = teardown();
+        for m in Mode::MOUSE {
+            t.enable(*m).unwrap();
+        }
+        t.enable(Mode::CursorHidden).unwrap();
+        let re = String::from_utf8(t.reassert_bytes()).unwrap();
+        for m in Mode::MOUSE {
+            let on = std::str::from_utf8(m.on_bytes().unwrap()).unwrap();
+            assert!(
+                re.contains(on),
+                "{} is not in the re-assert: {re:?}",
+                m.label()
+            );
+        }
+        assert!(
+            !re.contains("1049"),
+            "the alternate screen is never re-sent: {re:?}"
+        );
+        assert!(
+            !re.contains("2004"),
+            "a mode never taken is not put back: {re:?}"
+        );
+    }
+
     /// [`Mode::startup_set`] reads the process environment, which is shared by
     /// every test in this binary, so the tests set it through this instead and only
     /// this touches it.
     fn startup_set_with(spec: &str) -> Vec<Mode> {
-        let mut modes = Mode::DEFAULT.to_vec();
-        modes.extend(Mode::parse_all(spec).unwrap());
-        modes.sort_by_key(|m| Mode::BOOT_ORDER.iter().position(|x| x == m).unwrap());
-        modes.dedup();
-        modes
+        Mode::apply_spec(Mode::DEFAULT, spec).unwrap()
     }
 
     /// A sink whose every write fails, for the case where the terminal stopped

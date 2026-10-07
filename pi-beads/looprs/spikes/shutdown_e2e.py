@@ -482,12 +482,24 @@ def scenario_child_holds_screen():
             tail == "",
             f"tail after the leave: {tail!r}",
         )
-    # The app's own ledger, plus the screen it inherited and paid for. The mouse
-    # and paste modes are deliberately not in this set: nothing switched them on in
-    # this scenario, and the child here does not switch them on either -- a real
-    # `vim` does, and that leftover is a separate gap, recorded in
+    # The app's own ledger, plus the screen it inherited and paid for.
+    #
+    # Since looprs-pdl.8 this set includes the three mouse modes: the app
+    # switches `?1000/?1002/?1006` on by default through the ledger, so they are
+    # on this list here too, and "left exactly once" is asserted of them on the
+    # child-held-screen path as much as anywhere else -- which is the path where a
+    # mode left on behind a child is most expensive.
+    #
+    # Bracketed paste stays out: nothing switched it on in this scenario, and the
+    # child here does not switch it on either -- a real `vim` does, and that
+    # leftover is a separate gap, recorded in
     # docs/adr/0006-terminal-mode-ledger.md.
-    check_ledger_handed_back(full, {"cursor_hidden", "alt_screen"}, "child-held screen")
+    check_ledger_handed_back(
+        full,
+        {"cursor_hidden", "alt_screen",
+         "mouse_report", "mouse_drag", "mouse_sgr"},
+        "child-held screen",
+    )
     check("the tty is cooked again after exit", d.tty_is_cooked())
     leftovers = [
         m for m in ("mouse_report", "mouse_drag", "mouse_sgr", "bracketed_paste")

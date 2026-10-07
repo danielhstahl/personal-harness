@@ -676,6 +676,21 @@ impl BandSnapshot {
         column.saturating_sub(self.area.x) as usize
     }
 
+    /// Is this screen row inside the band the frame drew — i.e. is it
+    /// transcript rather than chrome?
+    ///
+    /// The wheel's first question (looprs-pdl.8), and answered here rather
+    /// than at the call site because the band's extent is the frame's
+    /// knowledge: it is the same `area` the band drew itself into, so a report
+    /// over the input box, the status row or the card band cannot be
+    /// mis-classified as transcript by a second guess at the geometry. The
+    /// columns are not asked about: the band spans the window's width, and
+    /// "over the transcript, in some column" is the whole of the question a
+    /// scroll report needs answered.
+    pub fn contains_row(&self, row: u16) -> bool {
+        row >= self.area.top() && row < self.area.bottom()
+    }
+
     /// Which edge of the band this screen row is on, for auto-scroll.
     pub fn edge_at(&self, row: u16) -> Edge {
         if self.area.height == 0 {

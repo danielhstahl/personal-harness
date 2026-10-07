@@ -75,6 +75,37 @@ Logs this table is read from:
    merged. If a flick ever exceeds that, it will not be the wire that stops it.
    The unknown that `looprs-pdl.8` needs is still the flick's own burst shape.
 
+## Addendum, looprs-pdl.8: what the wheel was built against
+
+The mouse is switched on by default from looprs-pdl.8 onward, so claim #4 is no
+longer only a ceiling: it is load-bearing for the scroll rate the user sees. The
+numbers that row left open were measured as far as a harness without a hand can
+take them, in `spikes/mouse_scroll_e2e.py`
+(log: `spikes/results/mouse-scroll-e2e.log`):
+
+| measurement | value | what it settles |
+| --- | --- | --- |
+| one wheel notch, injected as `ESC[<64;x;yM` over the band | **3 rows**, and **3 rows** back toward the tail | the wire's report reaches the store as the whole-number delta the app asked for; nothing rounded it |
+| a timed burst of 40 reports (the harness's own write pace, **299 ms** of wall clock) | **15 rows = 5 applied steps = 50.2 rows/s** | the throttle holds in real time, not just in an instant loop; 40 reports are not 40 rows |
+| the app idle, mouse still, 2 s | **0 bytes** on the wire, and **0 bytes** again after a gesture drained | "no idle frame cost" measured off the transport rather than off a dirty flag |
+| `?1000 / ?1002 / ?1006` with `LOOPRS_MODES` unset | each written **once** at entry and **once** at the leave | the trio is on as one unit through the ledger, and handed back as one unit |
+| the same with `LOOPRS_MODES=-mouse` | **none written**, app boots, shell answers, quits clean | the default can be declined in one variable, which is the price of taking native selection away |
+
+**Still not measured: the shape of a real trackpad flick** (#4b, unchanged —
+"no finger on this path"). The 40-report burst above is a *cadence chosen on the
+harness side*, not a finger, so it bounds the app but does not describe the
+input. What closes the gap without another spike is the app's own accounting:
+`WheelCadence` logs every gesture's report count, duration and rows applied at
+`debug`, so
+
+```sh
+grep 'wheel gesture closed' looprs.log
+```
+
+after a few real flicks in a real terminal is the row #4b wanted, and the
+constants in `src/state/wheel.rs` (`WHEEL_ROWS_PER_STEP`,
+`WHEEL_STEP_INTERVAL`) are the two knobs it would retune.
+
 ## Filling the gaps, when someone with hands and other terminals is here
 
 ```sh
