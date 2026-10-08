@@ -51,11 +51,14 @@
 //!    compaction, capped at [`MAX_TOOL_ROWS`].
 //! 3. **the kanban band** — the beads board (epic looprs-5o4): three columns
 //!    sharing one header row, plus a footer row that is never omitted while the
-//!    band is drawn (ADR-0007 §4). How tall it gets is [`kanban_rows`], and it
-//!    is **zero rows** in every frame that is not drawing it — see
-//!    [`KanbanBudget::Off`], which is what the gate hands every non-beads frame
-//!    (`crate::App::kanban_budget`, looprs-5o4.5). Reserving rows for a band
-//!    nobody paints is a hole in the frame, not a band.
+//!    band is drawn (ADR-0007 §4, `docs/adr/0007-kanban-board.md`). How tall it
+//!    gets is [`kanban_rows`], and it is **zero rows** in every frame that is
+//!    not drawing it — see [`KanbanBudget::Off`], which is what the gate hands
+//!    every non-beads frame (`crate::App::kanban_budget`, looprs-5o4.5).
+//!    Reserving rows for a band nobody paints is a hole in the frame, not a
+//!    band. What a reader sees in it, and the knobs that control it, are in
+//!    `docs/kanban.md`; the column mapping itself is ADR-0007 §1 and is not
+//!    repeated here.
 //! 4. **the status row** — one row, [`STATUS_ROWS`], see
 //!    [`crate::components::status`].
 //! 5. **the input box** — [`NO_INPUT_ROWS`] when the active session is not
@@ -106,8 +109,12 @@
 //!    a second opinion about what the frame is showing, which is the one thing
 //!    [`crate::session::view`] exists to prevent.
 //!
-//! That is the list. There is no fourth step about where the band sits on the
-//! real screen, because there is nothing above it, below it, or beside it.
+//! That is the list of *code*. There is no fourth step about where the band sits
+//! on the real screen, because there is nothing above it, below it, or beside
+//! it — but a band the operator can see, or turn off, owes a line in the docs:
+//! its knobs go with the others that already have a home (`docs/kanban.md` for
+//! the board's, and the ADR that decided it), not onto a second list that will
+//! disagree with the first.
 
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Layout, Rect, Size};

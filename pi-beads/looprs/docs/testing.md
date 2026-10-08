@@ -587,6 +587,32 @@ makes its claim on prose — the `Answer` kind, which is what
 `Scrollback::rewrap` re-renders — and leaves the contrast on the record instead
 of quietly testing only the case that passes.
 
+### The kanban band (looprs-5o4)
+
+**What it proves:** the board in the frame is a rendering of one consistent `bd`
+read in which every bead is counted exactly once, it is paid for out of the
+transcript's surplus and nobody else's, and it is **zero rows** — not hidden,
+not blank — in every frame that is not beads mode. The user-facing half is
+[`docs/kanban.md`](kanban.md); this is the half about how it gets checked
+without a board, a database or a clock.
+
+| Layer | Where | What it pins |
+| --- | --- | --- |
+| the mapping | `state::board::tests` | the mapping **is** ADR-0007 §1's table, asserted rather than assumed (`the_status_to_column_mapping_is_the_adrs_table`); invariant I1 — every bead in the read counted exactly once (`every_bead_in_the_read_is_counted_exactly_once`); `deferred` is a count and never a row (`deferred_is_a_count_and_never_a_row`); a bead with no `status` field is a marked `?`, not an `open` (`a_bead_with_no_status_field_is_a_marked_unknown_not_an_open_row`); empty / never-loaded / broken are three values, not one look (`loading_an_empty_board_and_a_broken_bd_are_three_different_values`); the header count is the column's true total (`the_header_count_is_the_columns_true_total`) |
+| the poller | `services::board_poller::tests` | the knobs resolve leniently and **loudly**, default 5 s and floor 250 ms (`the_poll_interval_knob_resolves_leniently_and_loudly`, `the_default_is_the_adrs_five_seconds_and_a_bd_on_the_path`); only an explicit `0/off/no/false` takes the board off (`only_an_explicit_no_turns_the_board_off`); the env is read once, from one binary (`the_environment_configures_the_board_it_is_read_from_and_once`) — against `tests/fixtures/fake_bd.sh`, never a real board |
+| the row budget | `viewport::tests` | zero or a whole board, never a stub (`the_band_is_zero_or_a_whole_board_never_a_stub`), the threshold and the ceiling (`the_board_appears_at_its_threshold_and_stops_at_its_ceiling`), and the failure that must be unrepresentable: turning the board on costs **only** the transcript's surplus — the box, the cards and the status row keep their rows and their places (`turning_the_board_on_only_ever_costs_the_transcript_its_surplus`) |
+| the widget | `components::kanban::tests`, against a `TestBackend` | the overflow marker is honest at 1, 2, 3 and 5 rows (`the_overflow_marker_is_honest_at_one_two_three_and_five_rows`), the marker survives the width cut (`at_one_column_wide_the_marker_is_what_survives`), every read state says its own thing in the footer (`every_read_state_says_its_own_thing_in_the_footer`), and a failed read keeps and dims the last good rows (`a_failed_read_keeps_the_last_good_rows_and_says_its_own_words`) |
+| the wiring | `src/main.rs` tests | the band sits directly above the status row and below the cards (`the_band_sits_directly_above_the_status_row_and_below_the_cards`), `Off` outside beads mode leaves the frame byte-identical (`the_band_is_zero_rows_outside_beads_mode_and_leaves_the_frame_untouched`), a tab out and back restores it exactly (`tab_out_of_beads_takes_the_band_off_and_tab_back_puts_it_exactly_back`), and **an unchanged poll draws nothing** while a moved board draws once (`an_unchanged_poll_draws_nothing_and_a_moved_board_draws_once`) — the repaint half of the poller's contract, enforced where the snapshot is adopted |
+
+**No clock, no sleep, no board.** Every test above hands in its own `Instant` and
+its own `Duration` (`BoardSnapshot::stamped_at` / `restamp_age`,
+`KanbanBudget::from_raw(Option<&str>)`, `kanban_rows(h, tools, input, budget)`),
+and the `bd` in the loop is `tests/fixtures/fake_bd.sh`. "How old is this read"
+and "how tall is the band" are therefore functions of their arguments, so the
+aging behaviour the footer shows is testable without waiting five seconds for it —
+and the `LOOPRS_*` branches are all reachable without mutating a process the
+rest of the suite shares.
+
 ## The mouse and the clipboard, measured before they are built (looprs-pdl.2)
 
 **What it proves:** the seven claims that looprs-pdl.8/.9/.10/.12 inherit — that a

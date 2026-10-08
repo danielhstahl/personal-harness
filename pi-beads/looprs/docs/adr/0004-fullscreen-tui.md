@@ -640,6 +640,15 @@ screen at startup and every cell of the window is the frame's. The four bands ti
 the whole window instead of "the room above the pane", and the tiling is a pure
 function of the area it is handed.
 
+> **Amended 2026-10-08 (looprs-5o4.6).** The frame has **five** bands now: the
+> beads kanban band landed between the tool rows and the status row
+> ([ADR-0007](0007-kanban-board.md), user page `docs/kanban.md`), and it is
+> **zero rows** in every frame that is not drawing it. "Four bands" above is
+> what the frame was at pdl.4; `src/viewport.rs`'s own header is the live
+> description of the five, and the fifth is paid for the way described in
+> "What a fifth band costs a contributor" below — out of the transcript's
+> surplus, last on the ladder, and nothing else's rows.
+
 **What went out, and what replaced it.**
 
 | Gone | Replaced by |
@@ -662,17 +671,32 @@ queries: 0 in the frame and 0 on the exit path, proved by a `Probe` backend that
 counts `get_cursor_position` calls and fails the test if the frame makes one
 (`viewport::tests::the_frame_never_asks_the_terminal_where_the_cursor_is`).
 
-**What a fifth band costs a contributor** — three places, in this order:
+**What a fifth band costs a contributor** — three places, in this order. The
+kanban band (looprs-5o4) is the fifth band this describes, and the list below is
+that build's corrected version:
 
 1. `viewport::bands` — grant the rows and say who pays. The ladder is the entire
    policy: the input box is paid in full, the tool wall gives way before it, the
    transcript absorbs what the ladder did not spend, and `MIN_TEXT_ROWS` is the
-   floor nothing goes below.
+   floor nothing goes below. **The one correction the fifth band forced:** a band
+   that ranks *below* the transcript's floor must not be a term inside `bands` at
+   all, or "the board shrank my input box" becomes representable. The board is
+   granted afterwards, out of the surplus `bands` leaves, by
+   `viewport::kanban_rows` — so the ladder as built is the box > the cards > the
+   transcript's floor > the board.
 2. `viewport::frame_areas` — one more `Constraint` and one more entry in the
-   returned array. This is the only place the tiling is written, and it is pure,
+   returned value. This is the only place the tiling is written, and it is pure,
    so a band that is the wrong size is a bug in `bands`, never in the layout.
+   Updated since pdl.4: the returned value is a **named** `FrameAreas` struct
+   rather than an array, so the compile-checked thing at a draw site is the band's
+   *name* (`areas.kanban`) and not an index whose meaning nobody can read.
 3. `main.rs::view` — draw into the area `frame_areas` handed back. The band does
    not know the window and the frame does not know what the bands contain.
+
+And a fourth thing that is not code: a band the operator can see, or turn off,
+gets documented where the other knobs already live — `docs/kanban.md` for the
+board, plus the ADR that decided it. A second list of the same knobs is a
+future disagreement.
 
 The tests that keep that ordering honest are
 `viewport::tests::the_bands_tile_the_window_at_every_size` (above the

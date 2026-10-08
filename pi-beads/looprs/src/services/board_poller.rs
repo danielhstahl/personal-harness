@@ -1,5 +1,6 @@
 //! The board poller: one task, one read per tick, one **newest** snapshot
-//! (looprs-5o4.2, under ADR-0007 — `docs/adr/0007-kanban-board.md`).
+//! (looprs-5o4.2, under ADR-0007 — `docs/adr/0007-kanban-board.md`; the
+//! operator-facing page for what this feeds is `docs/kanban.md`).
 //!
 //! The user's ask was "it could have its own thread that periodically checks for
 //! bead status". In this codebase that is a `tokio` task, and the precedent is
@@ -45,6 +46,46 @@
 //! generation counter and no in-flight flag here to get wrong: the task *is*
 //! the mutex. `Delay` is what keeps the *schedule* honest underneath it, so a
 //! board that takes longer than the tick pays in staleness rather than in load.
+//!
+//! # The three rules this file exists to keep
+//!
+//! The contract, stated once, each with the failure it is there to prevent. A
+//! later editor who breaks one of these breaks the band in a way no test of the
+//! widget will explain.
+//!
+//! 1. **Latest-wins, never one bus message per poll.** The channel is a
+//!    [`tokio::sync::watch`], not [`crate::bus`]. The failure prevented: a
+//!    replayed backlog of old boards. The bus deliberately never drops or merges
+//!    a non-`BashOutput` message — a board snapshot would be exactly such a
+//!    message — so one message per poll would queue every snapshot the poll
+//!    outran and deliver them *in order*: a user watching a board that polls
+//!    faster than the frame drains would see last minute's board arrive one row
+//!    at a time. Nothing about a poll is an event worth keeping; only the newest
+//!    value means anything. (§"What it publishes, and why not onto the bus"
+//!    below has the long version.)
+//! 2. **An error retains the last good snapshot.** A failed read publishes the
+//!    error over the previous value rather than replacing it, and the band dims
+//!    what it still has and says what went wrong. The failure prevented: a
+//!    populated board going blank because `bd` hiccuped — "bd is broken" read
+//!    as "the board is empty", which is looprs-037's conflation rebuilt one
+//!    layer up. (§"What it never does" below.)
+//! 3. **A poll that changed nothing paints nothing.** The poller still
+//!    *publishes* every tick — it has to, because the value carries
+//!    [`fetched_at`](crate::state::board::BoardSnapshot::fetched_at) and the
+//!    footer's `bd ok · Ns ago` is a fact the frame re-reads rather than news —
+//!    but it must not *cost a frame*. That half is enforced on the consumer's
+//!    side, in [`crate::App::adopt_board`], which compares the incoming
+//!    snapshot with [`BoardSnapshot::same_paint_as`]: the drawn fields — the
+//!    read's state, the columns, the deferred count — and deliberately **not**
+//!    the two clocks. The failure prevented: a board that has not moved making
+//!    an untouched terminal repaint every tick forever, which is the exact
+//!    opposite of the "the band costs nothing while nothing happens" claim it is
+//!    sold on, and a busy loop next to a session that is trying to use the CPU.
+//!
+//!    Deduplicating in the **poller** is the tempting wrong shape: suppress the
+//!    publish and the footer freezes at the age of the last *change*, so the
+//!    freshness marker starts telling the opposite of the truth about how long
+//!    it has been since anybody looked. Publish the age; let the paint decide.
 //!
 //! # What it never does
 //!
