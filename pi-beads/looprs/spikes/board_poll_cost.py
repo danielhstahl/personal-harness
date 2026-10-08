@@ -36,7 +36,6 @@ import sys
 import tempfile
 import time
 from collections import Counter
-from urllib.parse import urlparse  # noqa: F401  (kept out of the way of shell quoting)
 
 BD = os.environ.get("LOOPRS_SPIKE_BD", "bd")
 N = int(os.environ.get("LOOPRS_SPIKE_N", "7"))
