@@ -77,6 +77,16 @@
 //! before and after the re-wrap, while a row index means nothing across it.
 //! See [`Scrollback::resting_anchor`] for why the anchor is the bottom-most
 //! visible row rather than the top-most.
+//!
+//! What gets re-rendered is not the whole transcript, though. The store is the
+//! one that trims, and a rebuild that hands it everything makes it pay for the
+//! whole source before it gets to say it can only keep a slice of it — 133–151
+//! MiB of transient to retain 32, measured in `spikes/results/resize-transient.log`.
+//! So [`SessionView::rewrap`](crate::session::view::SessionView::rewrap) cuts
+//! the *source* at the newest slice that fits this store's cap first, and tells
+//! this store what it cut so the marker still counts it
+//! ([`Scrollback::note_source_dropped`]): content that leaves by never being
+//! made again is a trim like any other, and has to be as loud as one.
 
 use std::fmt;
 
@@ -142,6 +152,18 @@ pub const DEFAULT_RETAINED_BYTES: usize = 32 * 1024 * 1024;
 /// makes the cap a bound on the heap the store actually holds rather than on
 /// the text it happens to contain.
 pub const ROW_STRUCT_BYTES: usize = 5_760;
+
+/// What a row costs the cap, given the length of its rendered text.
+///
+/// One definition rather than two, because there are now two places that have to
+/// price a row *before* it exists: the store prices the rows it holds
+/// ([`DisplayRow::charged`]), and the rewrap budget prices rows it is about to
+/// ask the renderer for ([`crate::session::view::SessionView`]'s source slice).
+/// A row priced two ways is a cap that means one thing on the way in and another
+/// on the way out — which is the failure this whole module is a reply to.
+pub const fn row_charge(text_len: usize) -> usize {
+    text_len + ROW_STRUCT_BYTES
+}
 
 /// What a row **is**: transcript, or the store's own bookkeeping about the
 /// transcript.
@@ -257,7 +279,7 @@ impl DisplayRow {
         if self.is_trim_marker() {
             0
         } else {
-            self.cells.text_len() + ROW_STRUCT_BYTES
+            row_charge(self.cells.text_len())
         }
     }
 
@@ -509,6 +531,39 @@ impl CellMap {
     }
 }
 
+/// One entry's share of the store, as the last render paid for it.
+///
+/// The three numbers a re-render has to be priced from, measured rather than
+/// modelled: how many rows the entry made, how many of the store's
+/// text-bytes they carry, and how many *logical* lines sit inside them — the
+/// last because a narrower band adds at most one extra row per logical line to
+/// a row count that already exists, and nothing else here says how many lines
+/// that is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EntryShape {
+    /// The transcript entry these rows came from.
+    pub entry: usize,
+    /// Display rows rendered from it, separators included.
+    pub rows: usize,
+    /// **Non-empty** logical lines within those rows: one soft-wrapped paragraph
+    /// is one, and a blank separator row is none.
+    ///
+    /// This is the count a narrower band adds rows *to* — one per line, worst
+    /// case — so blank rows are deliberately left out of it. Charging a blank
+    /// row for the rounding a line it is not on might introduce is how an
+    /// estimate ends up costing twice what it renders.
+    pub lines: usize,
+    /// Rows that carry no text at all: the blank the renderer puts after each
+    /// entry, and nothing else.
+    ///
+    /// Kept apart from `rows` because a blank row costs the same one row at any
+    /// width: it must not be scaled by a width ratio that describes how *text*
+    /// re-flows.
+    pub blank: usize,
+    /// Rendered text bytes, styling dropped.
+    pub text: usize,
+}
+
 /// The store: rendered rows plus the scroll state over them.
 #[derive(Debug)]
 pub struct Scrollback {
@@ -595,6 +650,89 @@ impl Scrollback {
     #[allow(dead_code)] // consumer: crate::measure and this module's cap tests
     pub fn retained_bytes(&self) -> usize {
         self.retained
+    }
+
+    /// The cap itself, in retained bytes (`0` = unbounded).
+    ///
+    /// Read by the rewrap source budget ([`crate::session::view::SessionView`]),
+    /// which has to size the work it asks the renderer for against the same
+    /// number the store later trims to. A rebuild bounded by a *different*
+    /// number than the one the store enforces is a rebuild that is not bounded.
+    pub fn cap_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// What this store's rows say each entry costs to render, oldest entry first.
+    ///
+    /// The rewrap estimator's price list. The alternative — estimating from the
+    /// entry's text — is a guess about what a markdown pass will do; these are
+    /// the receipts from the last one, at a known width. That is what makes a
+    /// "does this fit?" question answerable before paying for the render.
+    ///
+    /// Entries the store holds no rows for are simply absent, and the caller has
+    /// to treat them as unknown rather than free: they left by a trim, which is
+    /// why the walk over older entries stops at the first gap.
+    pub fn entry_shapes(&self) -> Vec<EntryShape> {
+        let mut out: Vec<EntryShape> = Vec::new();
+        for r in self.rows.iter().filter(|r| !r.is_trim_marker()) {
+            if !out.last().is_some_and(|s| s.entry == r.entry) {
+                out.push(EntryShape {
+                    entry: r.entry,
+                    ..Default::default()
+                });
+            }
+            let len = r.cells.text_len();
+            if let Some(s) = out.last_mut() {
+                s.rows += 1;
+                s.text += len;
+                // One row per logical line *starts*: `start == 0` is the row the
+                // line begins on, however many soft continuations follow it —
+                // and only if that line has something on it.
+                if r.start == 0 && len > 0 {
+                    s.lines += 1;
+                }
+                if len == 0 {
+                    s.blank += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Count the content a re-render is **skipping at the source** as dropped.
+    ///
+    /// A trim removes rows that exist; the source cut in
+    /// [`crate::session::view::SessionView::rewrap`] removes rows that would
+    /// otherwise have been made again, and never are. Nothing in the store ever
+    /// sees that loss on its way past `trim`, so it would leave the store with
+    /// less history and a marker that says nothing — the silent half-start that
+    /// the marker row exists to prevent.
+    ///
+    /// `from_entry` is the oldest entry the rebuild covers; `lines` is what the
+    /// caller counted off the transcript for the entries below it. The store's
+    /// own rows are the floor of that figure, in the same `max` shape
+    /// [`Self::entries_evicted`] uses: the caller knows how much content left
+    /// even where this store never rendered it, and this store knows how much it
+    /// actually had. Neither may under-report.
+    ///
+    /// Call **before** the swap that discards the rows: it is the last moment
+    /// they are still here to be counted.
+    pub fn note_source_dropped(&mut self, from_entry: usize, lines: usize) {
+        if from_entry == 0 {
+            return;
+        }
+        let m = usize::from(self.rows.first().is_some_and(|r| r.is_trim_marker()));
+        let cut = m + self.rows[m..]
+            .iter()
+            .take_while(|r| r.entry < from_entry)
+            .count();
+        let here = self.count_dropped(m, cut);
+        self.dropped += lines.max(here);
+        // The rows themselves go with the swap, so nothing is drained here —
+        // but the marker is refreshed now rather than left to the rebuild's own
+        // `trim`, which will not run at all when the cut kept the store under
+        // its cap.
+        self.sync_marker();
     }
 
     /// Say where the trimmed-away content can still be read. Appears on the
@@ -1784,5 +1922,103 @@ mod tests {
         assert_eq!(s.window(0).len(), 0, "a zero-height band gets nothing");
         let empty = Scrollback::new(20);
         assert!(empty.window(10).is_empty());
+    }
+
+    // ────── what a re-render costs, priced from the last one (looprs-zie) ──────
+
+    /// The rewrap budget is only as good as this report, so the report is a
+    /// test: rows, the non-empty logical lines a narrower band adds rows *to*,
+    /// the separators that do not re-flow, and the text bytes they carry.
+    #[test]
+    fn entry_shapes_report_what_the_rows_actually_cost() {
+        let mut s = Scrollback::new(40);
+        // One logical line wrapped over two rows (a `Soft` row continued by a
+        // `Hard` one), the blank the renderer puts after every entry, and a
+        // second entry of one row.
+        s.push(vec![
+            soft(0, "aaaa"),
+            hard(0, "bbbb"),
+            hard(0, ""),
+            hard(1, "cc"),
+        ]);
+        let shapes = s.entry_shapes();
+        assert_eq!(shapes.len(), 2, "one shape per entry, marker excluded");
+        assert_eq!(shapes[0].entry, 0);
+        assert_eq!(shapes[0].rows, 3, "two rows of text and the separator");
+        assert_eq!(
+            shapes[0].lines, 1,
+            "one non-empty logical line: the soft row is a continuation, not a line"
+        );
+        assert_eq!(
+            shapes[0].blank, 1,
+            "the separator row costs one row at any width"
+        );
+        assert_eq!(shapes[0].text, 8);
+        assert_eq!(
+            shapes[1],
+            EntryShape {
+                entry: 1,
+                rows: 1,
+                lines: 1,
+                blank: 0,
+                text: 2
+            }
+        );
+    }
+
+    /// The marker must say what a source cut threw away — and the count of that
+    /// is a `max` between the caller, who knows what left the transcript, and
+    /// the store, who knows what it ever rendered.
+    #[test]
+    fn a_source_cut_reports_the_larger_of_the_two_counts_it_can_make() {
+        let mut s = Scrollback::new(40);
+        s.push(vec![hard(0, "one"), hard(1, "two"), hard(2, "three")]);
+        assert_eq!(s.dropped_lines(), 0, "nothing lost yet");
+
+        // A rebuild that covers entries 2.. leaves 0 and 1 behind. The caller
+        // counted 4 lines off the transcript; the store had rows for 2.
+        s.note_source_dropped(2, 4);
+        assert_eq!(s.dropped_lines(), 4);
+        assert!(
+            s.rows().first().is_some_and(|r| r.is_trim_marker()),
+            "and the head of the store says so"
+        );
+    }
+
+    /// The other side of the same `max`: a caller that undercounts does not get
+    /// to under-report what this store actually held.
+    #[test]
+    fn a_source_cut_never_under_reports_what_the_store_had() {
+        let mut s = Scrollback::new(40);
+        s.push(vec![hard(0, "one"), hard(1, "two"), hard(2, "three")]);
+        s.note_source_dropped(2, 1);
+        assert_eq!(
+            s.dropped_lines(),
+            2,
+            "two entries of rows here beats a caller that said one"
+        );
+    }
+
+    /// Nothing below the cut, nothing lost, nothing to report.
+    #[test]
+    fn a_source_cut_at_the_head_reports_nothing() {
+        let mut s = Scrollback::new(40);
+        s.push(vec![hard(0, "one"), hard(1, "two")]);
+        s.note_source_dropped(0, 99);
+        assert_eq!(s.dropped_lines(), 0);
+        assert!(!s.rows().first().is_some_and(|r| r.is_trim_marker()));
+    }
+
+    /// The cap the rebuild is budgeted against has to be the cap the store
+    /// enforces, read rather than restated.
+    #[test]
+    fn cap_bytes_is_the_number_the_trim_uses() {
+        assert_eq!(Scrollback::with_cap(40, 1234).cap_bytes(), 1234);
+        assert_eq!(
+            Scrollback::with_cap(40, 0).cap_bytes(),
+            0,
+            "unbounded reads as zero, the same convention the view buffer uses"
+        );
+        assert_eq!(Scrollback::new(40).cap_bytes(), DEFAULT_RETAINED_BYTES);
     }
 }

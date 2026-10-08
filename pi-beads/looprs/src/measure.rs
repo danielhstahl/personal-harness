@@ -61,6 +61,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 pub struct CountingAlloc;
 
 static LIVE: AtomicI64 = AtomicI64::new(0);
+static PEAK: AtomicI64 = AtomicI64::new(0);
 static TOTAL: AtomicU64 = AtomicU64::new(0);
 static ON: AtomicBool = AtomicBool::new(false);
 
@@ -71,15 +72,32 @@ static COUNTER: CountingAlloc = CountingAlloc;
 impl CountingAlloc {
     /// Open a window. Counters are zeroed here, so every window is
     /// self-contained and no earlier allocation leaks into the report.
-    fn begin() {
+    pub fn begin() {
         LIVE.store(0, Ordering::Relaxed);
+        PEAK.store(0, Ordering::Relaxed);
         TOTAL.store(0, Ordering::Relaxed);
         ON.store(true, Ordering::SeqCst);
     }
 
     /// `(live, total)` as of now, counting still on.
-    fn peek() -> (i64, u64) {
+    pub fn peek() -> (i64, u64) {
         (LIVE.load(Ordering::Relaxed), TOTAL.load(Ordering::Relaxed))
+    }
+
+    /// The high-water mark of live bytes since [`Self::begin`].
+    ///
+    /// `live` answers "what is held at the end of the operation"; the transient
+    /// cost of an operation — the thing that OOMs a working app and is invisible
+    /// in the final footprint — is only visible in the maximum. That is what
+    /// [`crate::session::view`]'s rewrap budget is measured against: a rebuild
+    /// that ends at 32 MiB after passing through 164 MiB is not bounded by 32.
+    ///
+    /// The read is racy by construction (load-then-store, no CAS): concurrent
+    /// threads can interleave a peak past the recorded maximum, so this is an
+    /// **under**-count under concurrency and exact on a single thread. Measure
+    /// peaks with `--test-threads=1`.
+    pub fn peak() -> i64 {
+        PEAK.load(Ordering::Relaxed)
     }
 
     /// Close the window.
@@ -87,7 +105,7 @@ impl CountingAlloc {
     /// Every window in this file is a build-up with no frees across its end, so
     /// `live` is the footprint of what the window constructed rather than a
     /// number drifting as the test tears itself down.
-    fn end() -> (i64, u64) {
+    pub fn end() -> (i64, u64) {
         ON.store(false, Ordering::SeqCst);
         Self::peek()
     }
@@ -97,7 +115,13 @@ unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let p = unsafe { System.alloc(layout) };
         if ON.load(Ordering::Relaxed) && !p.is_null() {
-            LIVE.fetch_add(layout.size() as i64, Ordering::Relaxed);
+            let now =
+                LIVE.fetch_add(layout.size() as i64, Ordering::Relaxed) + layout.size() as i64;
+            // Cheap max, no CAS loop: a lost update here can only understate the
+            // peak, never invent one. See [`Self::peak`].
+            if now > PEAK.load(Ordering::Relaxed) {
+                PEAK.store(now, Ordering::Relaxed);
+            }
             TOTAL.fetch_add(layout.size() as u64, Ordering::Relaxed);
         }
         p
@@ -467,6 +491,144 @@ fn a_long_beads_pass_measured_through_the_real_render_path() {
         "window closed: live {} · total {}",
         kib(live_end as f64),
         kib(total_end as f64)
+    );
+}
+
+/// The **resize transient**, measured the same way (looprs-zie).
+///
+/// The ticket's complaint is not about what the store ends up holding — it is
+/// about what a resize passes *through* on the way there. A `rewrap` that
+/// re-renders the whole transcript and trims afterwards peaks at the cost of
+/// the transcript; the bound that matters is the peak, not the footprint, and a
+/// footprint of 32 MiB is compatible with passing through 164 MiB.
+///
+/// So this measures peaks:
+///
+/// * **the bounded shape** — a rewrap through the source slice the cap can
+///   afford, at a sweep of widths;
+/// * **the unbounded shape** — the same transcript rendered whole through a
+///   store with no cap, which is what the old one-door rewrap cost on every
+///   width change, and what a view with its store cap turned off costs today.
+///
+/// The store cap is the shipped default ([`DEFAULT_RETAINED_BYTES`]). The
+/// transcript buffer is the shipped [`DEFAULT_VIEW_BUFFER`] unless
+/// `LOOPRS_MEASURE_BUFFER=0` is set, which is how the numbers behind the
+/// ticket's own figures (a 1.2 MB transcript on a view nobody capped) get
+/// reproduced.
+#[test]
+#[ignore = "resize transient measurement (looprs-zie): LOOPRS_MEASURE_CORPUS=<pi session dir>; see spikes/results/resize-transient.log"]
+fn a_resize_transient_measured_against_the_cap_it_is_supposed_to_have() {
+    let root = match corpus_root() {
+        Some(r) => r,
+        None => {
+            println!(
+                "no LOOPRS_MEASURE_CORPUS — nothing measured. Point it at real `pi` session \
+                 .jsonl files (a directory works too)."
+            );
+            return;
+        }
+    };
+    let files = corpus_files(&root);
+    let buffer = std::env::var("LOOPRS_MEASURE_BUFFER")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(crate::session::view::DEFAULT_VIEW_BUFFER);
+
+    // Same warm-up reason as the working-set run: syntect's multi-megabyte syntax
+    // set must not be reported as this operation's transient.
+    {
+        let mut warm = SessionView::new(beads());
+        warm.push_delta(MessageKind::Answer, "```rust\nfn warm() {}\n```\n");
+        warm.flush(100);
+    }
+
+    /// Replay the corpus into a view and flush it at `width`.
+    fn replay(files: &[std::path::PathBuf], buffer: usize, width: u16) -> SessionView {
+        let mut view = SessionView::with_buffer(beads(), buffer);
+        for f in files {
+            for it in load_session(f).unwrap_or_default() {
+                match it.kind {
+                    Kind::User => view.push_note(MessageKind::User, it.text.clone()),
+                    Kind::Thinking => view.push_delta(MessageKind::Thinking, &it.text),
+                    Kind::Answer => view.push_delta(MessageKind::Answer, &it.text),
+                    Kind::Tool => {
+                        let (name, args) = it.call.clone().unwrap_or_default();
+                        view.start_tool("id".into(), name, args);
+                        view.finish_tool("id".into(), it.text.clone(), false);
+                    }
+                }
+            }
+        }
+        view.flush(width);
+        view
+    }
+
+    println!("=== looprs-zie \u{00b7} the resize transient ===");
+    println!("corpus   : {}", root.display());
+    println!("tickets  : {} session files", files.len());
+    println!(
+        "caps     : store {} \u{00b7} transcript buffer {}",
+        kib(DEFAULT_RETAINED_BYTES as f64),
+        if buffer == 0 {
+            "unbounded".to_string()
+        } else {
+            kib(buffer as f64)
+        }
+    );
+    println!();
+
+    // The bounded shape: one real view, driven through a sweep of widths, with
+    // the counting window open across each rebuild so the peak is that rebuild's
+    // and not the build-up's.
+    let mut view = replay(&files, buffer, 100);
+    println!(
+        "--- rewrap at the cap the code sets ({}), peak live bytes during the rebuild",
+        kib(DEFAULT_RETAINED_BYTES as f64)
+    );
+    println!(
+        "start    : {} rows \u{00b7} {} retained \u{00b7} {} entries in the transcript",
+        view.scrollback().rows().len(),
+        kib(view.scrollback().retained_bytes() as f64),
+        view.transcript.entries.len()
+    );
+    for width in [120u16, 100, 80, 60, 40, 30] {
+        let _ = CountingAlloc::end();
+        CountingAlloc::begin();
+        let added = view.flush(width);
+        let peak = CountingAlloc::peak();
+        println!(
+            "  w={width:>3}: peak {} \u{00b7} {:>4.0}% of cap \u{00b7} {} rows retained \u{00b7} {added} rows new",
+            kib(peak as f64),
+            100.0 * peak as f64 / DEFAULT_RETAINED_BYTES as f64,
+            view.scrollback().rows().len(),
+        );
+    }
+    let _ = CountingAlloc::end();
+
+    // The shape the ticket is a reply to: the same corpus, the same widths, with
+    // the source NOT cut — every entry rendered again on every width change.
+    let mut unbounded = replay(&files, buffer, 100);
+    unbounded.set_store_cap(0);
+    println!();
+    println!("--- the same corpus with no store cap: what rendering the whole source costs");
+    for width in [120u16, 100, 80, 60, 40, 30] {
+        let _ = CountingAlloc::end();
+        CountingAlloc::begin();
+        let _ = unbounded.flush(width);
+        let peak = CountingAlloc::peak();
+        println!(
+            "  w={width:>3}: peak {} \u{00b7} {} rows retained (cap: {})",
+            kib(peak as f64),
+            unbounded.scrollback().rows().len(),
+            kib(DEFAULT_RETAINED_BYTES as f64),
+        );
+    }
+    let (live, total) = CountingAlloc::end();
+    println!();
+    println!(
+        "window closed: live {} \u{00b7} total {}",
+        kib(live as f64),
+        kib(total as f64)
     );
 }
 

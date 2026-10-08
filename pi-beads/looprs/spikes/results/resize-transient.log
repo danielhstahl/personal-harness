@@ -1,0 +1,92 @@
+# resize-transient — looprs-zie
+# measured 2026-10-08, aarch64-apple-darwin (Apple Silicon), macOS, debug profile
+#
+# commands:
+#   # the shipped configuration: store cap 32 MiB, per-view transcript buffer 256 KiB
+#   LOOPRS_MEASURE_CORPUS=~/.pi/agent/sessions/--Users-danielstahl-Documents-code-ml-personal-harness-pi-beads-looprs-- \
+#   cargo test --bin looprs -- --ignored --nocapture --test-threads=1 resize_transient
+#
+#   # the ticket's configuration: transcript buffer off, so the whole pass stays in
+#   # memory the way an uncapped view holds it
+#   LOOPRS_MEASURE_BUFFER=0 LOOPRS_MEASURE_CORPUS=~/.pi/agent/sessions/--Users-danielstahl-Documents-code-ml-personal-harness-pi-beads-looprs-- \
+#   cargo test --bin looprs -- --ignored --nocapture --test-threads=1 resize_transient
+#
+# "peak" is the high-water mark of live heap *inside* the rebuild, counted by the
+# same CountingAllocator the pdl.7 run used, with the window opened after the
+# build-up: the row that matters is what one width change adds on top of what was
+# already resident, because that is what a window drag pays. The new rows are all
+# made before the old ones are freed, so the peak is the sum of both, which is
+# the transient under measurement rather than a footprint after it.
+#
+# The two sections are the same corpus at the same widths:
+#   * "rewrap at the cap the code sets" — the source cut (this ticket's fix):
+#     only the newest slice of the transcript that the cap can afford is
+#     re-rendered.
+#   * "the same corpus with no store cap" — what rendering the whole source
+#     costs, which is the old shape's transient too: the trim runs after the
+#     render, so a cap on the store does not cap the peak of a full re-render.
+#
+# FINDING: a rewrap of this corpus cost 133–151 MiB of transient to keep 32 MiB.
+# With the source cut it costs 9–25 MiB, and it does not grow with the length of
+# the transcript. In the shipped configuration (256 KiB view buffer) the cap is
+# not reached at all by this corpus, so both shapes read the same: the ticket is
+# about the case that *does* reach it — a long transcript, or short dense lines,
+# where the old code paid the transcript's cost and threw most of it away.
+
+test measure::a_resize_transient_measured_against_the_cap_it_is_supposed_to_have ... === looprs-zie · the resize transient ===
+corpus   : /Users/danielstahl/.pi/agent/sessions/--Users-danielstahl-Documents-code-ml-personal-harness-pi-beads-looprs--
+tickets  : 12 session files
+caps     : store 32768.0 KiB · transcript buffer 256.0 KiB
+
+--- rewrap at the cap the code sets (32768.0 KiB), peak live bytes during the rebuild
+start    : 2946 rows · 16784.2 KiB retained · 187 entries in the transcript
+  w=120: peak 11483.9 KiB ·   35% of cap · 2775 rows retained · 38 rows new
+  w=100: peak 11953.1 KiB ·   36% of cap · 2946 rows retained · 41 rows new
+  w= 80: peak 12693.8 KiB ·   39% of cap · 3203 rows retained · 48 rows new
+  w= 60: peak 11687.2 KiB ·   36% of cap · 3652 rows retained · 60 rows new
+  w= 40: peak 10712.3 KiB ·   33% of cap · 3535 rows retained · 82 rows new
+  w= 30: peak 9136.3 KiB ·   28% of cap · 3520 rows retained · 108 rows new
+
+--- the same corpus with no store cap: what rendering the whole source costs
+  w=120: peak 11483.9 KiB · 2775 rows retained (cap: 32768.0 KiB)
+  w=100: peak 11953.1 KiB · 2946 rows retained (cap: 32768.0 KiB)
+  w= 80: peak 12693.8 KiB · 3203 rows retained (cap: 32768.0 KiB)
+  w= 60: peak 11687.2 KiB · 3652 rows retained (cap: 32768.0 KiB)
+  w= 40: peak 12952.0 KiB · 4581 rows retained (cap: 32768.0 KiB)
+  w= 30: peak 12317.0 KiB · 5634 rows retained (cap: 32768.0 KiB)
+
+window closed: live -697.4 KiB · total 69514.2 KiB
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 690 filtered out; finished in 15.14s
+
+
+### second run: LOOPRS_MEASURE_BUFFER=0 (uncapped transcript — the ticket's shape)
+
+test measure::a_resize_transient_measured_against_the_cap_it_is_supposed_to_have ... === looprs-zie · the resize transient ===
+corpus   : /Users/danielstahl/.pi/agent/sessions/--Users-danielstahl-Documents-code-ml-personal-harness-pi-beads-looprs--
+tickets  : 12 session files
+caps     : store 32768.0 KiB · transcript buffer unbounded
+
+--- rewrap at the cap the code sets (32768.0 KiB), peak live bytes during the rebuild
+start    : 5739 rows · 32762.5 KiB retained · 1687 entries in the transcript
+  w=120: peak 25317.4 KiB ·   77% of cap · 5313 rows retained · 38 rows new
+  w=100: peak 15040.7 KiB ·   46% of cap · 3578 rows retained · 41 rows new
+  w= 80: peak 14119.1 KiB ·   43% of cap · 3583 rows retained · 48 rows new
+  w= 60: peak 11825.6 KiB ·   36% of cap · 3696 rows retained · 60 rows new
+  w= 40: peak 10712.3 KiB ·   33% of cap · 3535 rows retained · 82 rows new
+  w= 30: peak 9136.3 KiB ·   28% of cap · 3520 rows retained · 108 rows new
+
+--- the same corpus with no store cap: what rendering the whole source costs
+  w=120: peak 133018.4 KiB · 28158 rows retained (cap: 32768.0 KiB)
+  w=100: peak 139840.0 KiB · 30240 rows retained (cap: 32768.0 KiB)
+  w= 80: peak 148942.6 KiB · 33480 rows retained (cap: 32768.0 KiB)
+  w= 60: peak 135103.0 KiB · 39149 rows retained (cap: 32768.0 KiB)
+  w= 40: peak 151451.8 KiB · 51292 rows retained (cap: 32768.0 KiB)
+  w= 30: peak 142096.6 KiB · 64547 rows retained (cap: 32768.0 KiB)
+
+window closed: live -9072.9 KiB · total 675188.7 KiB
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 690 filtered out; finished in 55.40s
+
