@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use ratatui::text::Line;
 
 use super::{SessionId, TerminalType};
-use crate::components::scrollback::{Flusher, RenderedRow};
+use crate::components::scrollback::Flusher;
 use crate::session::ActiveBead;
 use crate::session::{BeadStep, SessionStatus};
 use crate::state::scrollback::Scrollback;
@@ -51,6 +51,15 @@ use crate::utils::shelltext::LineResolver;
 /// ([`DEFAULT_RETAINED_BYTES`](crate::state::scrollback::DEFAULT_RETAINED_BYTES)):
 /// rendered rows carry styling and a cell map and cost several times their text.
 pub const DEFAULT_VIEW_BUFFER: usize = 256 * 1024;
+
+/// Floor on what [`SessionView::trim_open_entry`] leaves inside the entry it cuts.
+///
+/// Only binds for deliberately tiny caps. The default budget halves to 128 KiB,
+/// which is thousands of times this, so the floor is invisible in a real run — it
+/// exists so a 128-byte test cap still retains a line or two rather than cutting
+/// the entry to nothing, which would be a trim with no content left for its own
+/// marker to be the boundary of.
+pub const MIN_OPEN_KEEP: usize = 64;
 
 /// What the live (not-yet-final) region of one session is showing.
 ///
@@ -206,6 +215,7 @@ pub struct SessionView {
     /// gets copied, journalled and counted as content. This number feeds the log
     /// and the store's line count.
     dropped: usize,
+    /// The byte cap. See [`DEFAULT_VIEW_BUFFER`].
     limit: usize,
     /// Trims this view has applied that the app has not yet fed to the other
     /// things that address the same store.
@@ -218,6 +228,22 @@ pub struct SessionView {
     /// the number of transcript entries that came off the front, exactly as
     /// given to the store, and [`Self::take_trims`] is how the App drains them.
     pending_trims: Vec<usize>,
+    /// Whether the journal file already holds the **beginning** of the entry the
+    /// walk is standing on.
+    ///
+    /// `false` is every ordinary case: entries go to the file whole, so the walk
+    /// is always at an entry boundary. The one thing that sets it is
+    /// [`Self::trim_open_entry`] cutting the head off a still-open entry: the
+    /// head is written, the entry stays open, and "did the file already start
+    /// this entry?" stops being answerable from the entry index alone.
+    ///
+    /// It is a flag rather than a byte count because the cut *removes* those bytes
+    /// from the entry — the retained text is entirely not-yet-journalled — so the
+    /// only fact worth keeping is whether the next piece continues a sentence the
+    /// file has already begun. A continuation must not get the between-entries
+    /// blank line; that is what makes `head + retained` the same bytes the
+    /// uncapped journal would have written for that entry.
+    journal_continued: bool,
     /// The journal cursor: the index of the first transcript entry that has not
     /// been handed to the journal yet.
     ///
@@ -280,6 +306,7 @@ impl SessionView {
             active_bead: None,
             tokens: Tokens::default(),
             dropped: 0,
+            journal_continued: false,
             limit,
             pending_trims: Vec::new(),
             journalled: 0,
@@ -401,19 +428,32 @@ impl SessionView {
     /// ([`Self::rewrap`]) before anything new goes in, because a store that is
     /// half one width and half another renders as text that stops making sense at
     /// the seam — which is why this is one door and not two.
-    pub fn flush(&mut self, width: u16) -> Vec<RenderedRow> {
-        let rows = self.flusher.drain_rows(&self.transcript, width);
-        let out = rows.clone();
+    ///
+    /// How many rows **became final** on this call and went into the store.
+    ///
+    /// It used to hand back the rows themselves, cloned. That clone was the whole
+    /// batch, every frame, at the store's own measured 5,760 bytes of heap per
+    /// row — and nothing on the display ever read it: the band draws from
+    /// [`App::transcript_window`], which is the store's own window, and the run
+    /// loop calls this for the side effect and drops the value. A count carries
+    /// the same fact ("N rows arrived") at no cost, and a caller that wants the
+    /// text reads the store that already owns it.
+    ///
+    /// On a width change the store is *rebuilt* rather than extended; the count
+    /// stays "what the flusher finalized this call", which is the question the
+    /// caller asks, not "how big is the store now".
+    pub fn flush(&mut self, width: u16) -> usize {
         if self.scrollback.width() != width {
             // Every stored row is wrapped for a window that no longer exists. The
-            // rows just drained are already right for the new width, but they
-            // are a tail on a body of old ones, so the whole store is made
-            // again — including this tail, which is why it is not pushed here.
-            self.rewrap(width);
-        } else {
-            self.scrollback.push(rows);
+            // rows that would have been pushed here are already part of what the
+            // rebuild makes again, so the rebuild is the one drain — it used to
+            // be two, one of them for a return value nobody read.
+            return self.rewrap(width);
         }
-        out
+        let rows = self.flusher.drain_rows(&self.transcript, width);
+        let added = rows.len();
+        self.scrollback.push(rows);
+        added
     }
 
     /// This view's scrollable store.
@@ -442,13 +482,24 @@ impl SessionView {
     /// and paying one re-render per frame for a scrollback that stays where the
     /// user was looking is the trade ADR-0004 signed up for when it made the
     /// transcript ours to scroll.
-    pub fn rewrap(&mut self, width: u16) {
+    /// Re-make the whole store at a new width, and report how many of the rows it
+    /// produced were **not yet emitted** before the rebuild.
+    ///
+    /// "Not yet emitted" is taken from the flusher's own position *before* it is
+    /// reseated to the head: everything it had already rendered stays rendered,
+    /// and the rest is what this call newly finalised. Counting it after the fact
+    /// is not possible — the rebuild trims as it goes, so the store's length says
+    /// what was kept, not what arrived.
+    pub fn rewrap(&mut self, width: u16) -> usize {
         if self.scrollback.width() == width {
-            return;
+            return 0;
         }
+        let unseen_from = self.flusher.consumed();
         self.flusher.reseat(0);
         let rows = self.flusher.drain_rows(&self.transcript, width);
+        let added = rows.iter().filter(|r| r.entry >= unseen_from).count();
         self.scrollback.rewrap(width, rows);
+        added
     }
 
     /// The not-yet-final tail, for the live preview region.
@@ -740,10 +791,17 @@ impl SessionView {
             }
             let body = e.text.trim_end_matches('\n');
             self.journalled += 1;
+            // The entry is in the file now, whole or finish-it-off: whatever comes
+            // next starts a new entry and gets the ordinary between-entries join.
+            self.journal_continued = false;
             if body.is_empty() {
                 continue;
             }
-            if self.journalled_any {
+            // No separator on a *continuation*: this entry already began in the
+            // file as the head of a cut that `trim_open_entry` made, and putting
+            // a blank line in the middle of it would make the journal a
+            // different document from the transcript it is meant to be.
+            if self.journalled_any && !self.journal_continued {
                 // Two newlines, because that is the join `plain_text` uses: the
                 // entry's own line ending plus a blank line between entries.
                 // Matching it exactly is the point — the journal of a whole run
@@ -799,27 +857,176 @@ impl SessionView {
             lines += gone.text.lines().count();
             removed += 1;
         }
-        if removed == 0 {
+        if removed > 0 {
+            self.dropped += dropped;
+            // The eviction shifted the transcript; the render cursor follows it.
+            self.flusher.reseat(first.saturating_sub(removed));
+            // …and so does the journal cursor, for the same reason: it addresses the
+            // same list by index. It never points *below* zero (`saturating_sub`),
+            // and if it had not caught up to the eviction it means the journal is
+            // behind by the entries the cap took — which is why `after_write`
+            // journals first.
+            let was = self.journalled;
+            self.journalled = self.journalled.saturating_sub(removed);
+            // A *saturated* decrement means the entry the walk was standing on was
+            // itself in the evicted range. If that entry had a head already in the
+            // file (`journal_continued`), the flag now describes an entry that is
+            // gone, so the next chunk must go back to the ordinary join rather
+            // than continue a sentence whose entry nobody has any more.
+            if was < removed {
+                self.journal_continued = false;
+            }
+            // The store indexes rows by entry, and the entries just moved underneath
+            // it. Rows rendered from a gone entry cannot be re-rendered, so they go
+            // now rather than vanishing on the next resize; the survivors get
+            // renumbered so `entry` keeps naming the right thing.
+            self.scrollback.entries_evicted(removed, lines);
+            self.pending_trims.push(removed);
+            tracing::debug!(
+                "view buffer cap: {dropped} bytes over {removed} entries dropped ({} lines)",
+                lines
+            );
+        }
+        // The loop above cannot reach the shape that actually overflows: one
+        // long-running stream inside a single still-open entry. Ask that question
+        // here, whether or not the loop managed to remove anything — "removed
+        // nothing because only one entry exists" *is* the case.
+        self.trim_open_entry();
+    }
+
+    /// Cap a single **open** entry, which whole-entry eviction cannot reach.
+    ///
+    /// Why this is a second question rather than more of the first: the loop's
+    /// unit is the entry, and it deliberately keeps one entry so that an empty
+    /// transcript with the cursor past the end is never handed downstream. But
+    /// every append path writes into the *tail* entry
+    /// ([`Transcript::push_delta`], [`Transcript::push_shell_lines`]), and
+    /// [`Self::seal_shell_output`] closes the block at **submit** only — so one
+    /// running command *is* one open entry for its whole life. `tail -f`, `watch`,
+    /// `npm run dev`, a big build. Measured before this existed: a 4 KiB cap held
+    /// 1.2 MB of transcript and gave the journal none of it.
+    ///
+    /// The cut is made at a **line boundary** — never mid-line, mid style-run or
+    /// mid UTF-8 character — and down to half the remaining budget rather than
+    /// exactly to it, because cutting at the cap would re-enter this function on
+    /// the next write, forever.
+    ///
+    /// Four things the cut keeps straight, because each one addresses the bytes
+    /// being thrown away:
+    ///
+    /// * **the journal** gets the head before memory loses it, and only while the
+    ///   walk stands on this very entry — writing a later entry's piece ahead of
+    ///   an earlier one would reorder the document it is meant to be;
+    /// * **the style runs** are byte ranges into this entry's own text, so they
+    ///   are dropped or re-based against the cut, never left pointing into bytes
+    ///   that are no longer there;
+    /// * **the flusher** is adjusted in place and never *reseated* — a reseat
+    ///   rewinds to the head of the entry and would re-emit lines the store
+    ///   already has. `preview` slices `text[scan..]`, so a stale cursor here is
+    ///   not a stale render, it is an out-of-range slice;
+    /// * **entry indices do not move.** That is why neither the store nor a
+    ///   standing drag selection needs renumbering from this path. What can be
+    ///   eaten is a selection's `(logical, byte)` anchor *inside* this entry, on
+    ///   the next re-wrap — the same fail-safe an ordinary trim already has: the
+    ///   anchor does not resolve, the selection clears, and no wrong text gets
+    ///   copied.
+    fn trim_open_entry(&mut self) {
+        let Some(idx) = self.transcript.entries.len().checked_sub(1) else {
+            return;
+        };
+        // Only the tail entry can grow, and only while it is open. A closed entry
+        // is the whole-entry loop's business, not this one's.
+        if self.transcript.entries[idx].done {
             return;
         }
-        self.dropped += dropped;
-        // The eviction shifted the transcript; the render cursor follows it.
-        self.flusher.reseat(first.saturating_sub(removed));
-        // …and so does the journal cursor, for the same reason: it addresses the
-        // same list by index. It never points *below* zero (`saturating_sub`),
-        // and if it had not caught up to the eviction it means the journal is
-        // behind by the entries the cap took — which is why `after_write`
-        // journals first.
-        self.journalled = self.journalled.saturating_sub(removed);
-        // The store indexes rows by entry, and the entries just moved underneath
-        // it. Rows rendered from a gone entry cannot be re-rendered, so they go
-        // now rather than vanishing on the next resize; the survivors get
-        // renumbered so `entry` keeps naming the right thing.
-        self.scrollback.entries_evicted(removed, lines);
-        self.pending_trims.push(removed);
+        let tail_len = self.transcript.entries[idx].text.len();
+        // Cut against the *view's* budget, not the entry's share of it: the rest
+        // of the transcript is still here and still counted.
+        let target = self
+            .limit
+            .saturating_sub(self.transcript.byte_len() - tail_len);
+        if target == 0 || tail_len <= target {
+            return;
+        }
+        // Half the budget, so the next cut is a whole budget of growth away. The
+        // floor is for test-sized caps: a trim that cut an entry to nothing would
+        // leave nothing for the marker to be the boundary *of*.
+        let keep = (target / 2).max(MIN_OPEN_KEEP);
+        let want = tail_len.saturating_sub(keep);
+        // Snap *forward* to the end of the next complete line. Never backward: a
+        // retained row that starts halfway through a line is a paragraph with its
+        // head missing, and no marker apologises for that properly.
+        let cut = match self.transcript.entries[idx].text[want..].find('\n') {
+            Some(nl) => want + nl + 1,
+            // One unfinished line left: there is no cut to make that is a line.
+            None => return,
+        };
+        if cut >= tail_len {
+            return; // the retained remainder would be empty
+        }
+        // Take the head before anything below moves the bytes under it.
+        let head = self.transcript.entries[idx].text[..cut].to_string();
+
+        // Journal the head before memory loses it — the same rule the whole-entry
+        // path runs on, for the same reason.
+        //
+        // By the time a cut is possible the walk is always standing on this very
+        // entry: the eviction loop above gets under the cap by taking everything
+        // else off the front, which leaves the open tail as the only entry and the
+        // cursor on it. Asserted rather than assumed, because the alternative —
+        // writing this piece somewhere else in the file — is not an option: the
+        // document's order is the whole reason it can be read.
+        debug_assert_eq!(
+            self.journalled, idx,
+            "open-entry trim of entry {idx} with the walk at {}: the head cannot \
+             be journalled in order",
+            self.journalled
+        );
+        if self.journalled == idx {
+            let mut chunk = String::with_capacity(head.len() + 2);
+            // The first piece of an entry gets the ordinary between-entries join;
+            // a later piece of an entry the file has already started gets none,
+            // so head + retained is byte-for-byte the entry the uncapped journal
+            // would have written.
+            if self.journalled_any && !self.journal_continued {
+                chunk.push_str("\n\n");
+            }
+            chunk.push_str(&head);
+            self.journal.append(self.session.mode.label(), chunk);
+            self.journal_continued = true;
+        } else {
+            // Reachable only if the eviction invariant above stops holding. The
+            // bytes still have to go — memory is the emergency — but not quietly:
+            // a cap that eats content and says nothing is the failure ADR-0004 R2
+            // was written against.
+            tracing::error!(
+                "open-entry trim: {cut} bytes cut from entry {idx} could not be \
+                 journalled in order (walk held at {}) — they are gone from the \
+                 file as well as from memory",
+                self.journalled
+            );
+        }
+
+        // Re-base the presentation against the bytes going away. A run wholly
+        // inside the head goes; a run straddling the cut keeps the part that is
+        // still here, which is exactly what saturating the start does.
+        let e = &mut self.transcript.entries[idx];
+        e.text.drain(..cut);
+        if !e.styles.is_empty() {
+            e.styles.retain(|s| s.end > cut);
+            for s in e.styles.iter_mut() {
+                s.start = s.start.saturating_sub(cut);
+                s.end -= cut;
+            }
+        }
+        // The flusher reads this entry from a byte offset; follow the bytes down.
+        if self.flusher.consumed() == idx {
+            self.flusher.cut_front(cut);
+        }
+        self.dropped += cut;
         tracing::debug!(
-            "view buffer cap: {dropped} bytes over {removed} entries dropped ({} lines)",
-            lines
+            "open-entry cap: {cut} bytes cut from entry {idx}, {} retained against a {target} budget",
+            self.transcript.entries[idx].text.len()
         );
     }
 
@@ -2071,25 +2278,54 @@ mod tests {
     /// own contract is — a prose block is rendered when it *closes* (blank line or
     /// `done`), not on every newline — so these assertions are about the cursor,
     /// not about line counts.
+    /// Flush and return **exactly the rows this flush appended**, as text.
+    ///
+    /// `flush` hands back a count now rather than the batch: the batch was cloned
+    /// every real frame for a caller that did not exist (the band reads the
+    /// store), so the only reader of those rows was the test suite. The count
+    /// names the same rows precisely — the store's tail of that length *is* what
+    /// was just pushed, since the trim marker, if there is one, sits at the head
+    /// and never at the tail.
+    fn flush_new(v: &mut SessionView, w: u16) -> Vec<String> {
+        let added = v.flush(w);
+        let rows = v.scrollback().rows();
+        rows[rows.len() - added..]
+            .iter()
+            .map(|r| r.to_string())
+            .collect()
+    }
+
+    /// Every row the store holds, as text — for assertions that do not care
+    /// which flush produced the row.
+    fn store_text(v: &SessionView) -> String {
+        v.scrollback()
+            .rows()
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn flush_is_monotonic_per_view() {
         let mut v = view(TerminalType::Pi);
         v.transcript.push_delta(MessageKind::Answer, "line one\n\n");
         let first = v.flush(60);
-        assert!(!first.is_empty(), "a closed block must flush");
+        assert_ne!(first, 0, "a closed block must flush");
 
-        assert!(
-            v.flush(60).is_empty(),
+        assert_eq!(
+            v.flush(60),
+            0,
             "a second drain with no new content must emit nothing"
         );
 
         v.transcript
             .push_delta(MessageKind::Answer, "second para\n\n");
         let second = v.flush(60);
-        assert!(!second.is_empty(), "the new block must flush");
+        assert_ne!(second, 0, "the new block must flush");
 
         // And nothing is re-emitted: two closed blocks in, then silence.
-        assert!(v.flush(60).is_empty());
+        assert_eq!(v.flush(60), 0);
     }
 
     /// The stall this ticket is about: an open entry that is never sealed blocks the
@@ -2100,18 +2336,24 @@ mod tests {
         let mut v = view(TerminalType::Beeds);
         v.transcript
             .push_delta(MessageKind::Answer, "partial answer, no newline");
-        assert!(
-            v.flush(60).is_empty(),
+        assert_eq!(
+            v.flush(60),
+            0,
             "an unterminated, undone entry is not flushed"
         );
 
         v.seal();
         let after = v.flush(60);
         assert!(
-            after.iter().any(|l| !l.line.spans.is_empty()),
-            "sealing must release the tail: {after:?}"
+            after > 0
+                && v.scrollback()
+                    .rows()
+                    .iter()
+                    .any(|l| !l.line.spans.is_empty()),
+            "sealing must release the tail: {after} rows / {}",
+            store_text(&v)
         );
-        assert!(v.flush(60).is_empty(), "and only once");
+        assert_eq!(v.flush(60), 0, "and only once");
     }
 
     /// The same stall from a card rather than from prose — and a card is where it
@@ -2128,13 +2370,15 @@ mod tests {
         v.transcript
             .push_delta(MessageKind::Answer, "said after both\n");
 
-        assert!(
-            v.flush(60).is_empty(),
+        assert_eq!(
+            v.flush(60),
+            0,
             "the open cards hold the cursor, as they should while the session lives"
         );
 
         v.seal();
-        let out: String = v.flush(60).iter().map(|l| l.to_string()).collect();
+        let _ = v.flush(60);
+        let out = store_text(&v);
         assert!(out.contains("said after both"), "{out:?}");
         assert!(
             out.contains("compaction aborted"),
@@ -2167,16 +2411,17 @@ mod tests {
 
         let pi_lines = pi.flush(60);
         let beads_lines = beads.flush(60);
-        assert!(!pi_lines.is_empty(), "pi's closed block must appear");
-        assert!(!beads_lines.is_empty(), "beads' system line must appear");
-        assert!(pi.flush(60).is_empty());
-        assert!(beads.flush(60).is_empty());
+        assert_ne!(pi_lines, 0, "pi's closed block must appear");
+        assert_ne!(beads_lines, 0, "beads' system line must appear");
+        assert_eq!(pi.flush(60), 0);
+        assert_eq!(beads.flush(60), 0);
 
         // Pi keeps streaming; the beads view must not budge, and must not gain pi's text.
         pi.transcript.push_delta(MessageKind::Answer, "more pi\n\n");
-        assert!(!pi.flush(60).is_empty());
-        assert!(
-            beads.flush(60).is_empty(),
+        assert_ne!(pi.flush(60), 0);
+        assert_eq!(
+            beads.flush(60),
+            0,
             "the beads view consumed nothing it was not given"
         );
     }
@@ -2336,7 +2581,7 @@ mod tests {
         for i in 0..8 {
             v.push_note(MessageKind::System, format!("line {i} {}", "x".repeat(24)));
             // Flushed every round, i.e. these are lines the terminal already has.
-            emitted.extend(v.flush(60).iter().map(|l| l.to_string()));
+            emitted.extend(flush_new(&mut v, 60));
         }
         assert!(
             v.transcript.byte_len() <= 128,
@@ -2381,7 +2626,7 @@ mod tests {
         let mut seen: Vec<String> = Vec::new();
         for i in 0..24 {
             v.push_note(MessageKind::System, format!("unique line {i}"));
-            seen.extend(v.flush(60).iter().map(|l| l.to_string()));
+            seen.extend(flush_new(&mut v, 60));
         }
         assert!(
             v.dropped_bytes() > 0,
@@ -2394,7 +2639,7 @@ mod tests {
             .iter()
             .map(|e| e.text.clone())
             .collect();
-        let after: Vec<String> = v.flush(60).iter().map(|l| l.to_string()).collect();
+        let after: Vec<String> = flush_new(&mut v, 60);
         for line in &after {
             let t = line.trim();
             if t.is_empty() || t.contains("bytes dropped") {
@@ -2419,13 +2664,19 @@ mod tests {
         let mut v = view(TerminalType::Bash);
         v.push_bash("first-line\u{1b}[", 60); // ends mid-escape-sequence
         v.seal();
-        let first = v.flush(60);
+        let _ = v.flush(60);
+        let first: Vec<String> = v
+            .scrollback()
+            .rows()
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
 
         v.push_bash("second-line\n", 60); // the next stream, which must be unaffected
         v.seal();
-        let second = v.flush(60);
+        let second: Vec<String> = flush_new(&mut v, 60);
 
-        let joined: String = second.iter().map(|l| l.to_string()).collect();
+        let joined: String = second.join("");
         assert!(
             joined.contains("second-line"),
             "the next stream arrived intact: {joined:?}"
@@ -2451,13 +2702,12 @@ mod tests {
         }
         assert!(v.dropped_bytes() > 0);
         v.push_note(MessageKind::System, "after the eviction".into());
-        let out = v.flush(60);
+        let out = flush_new(&mut v, 60).join("\n");
         assert!(
-            out.iter()
-                .any(|l| l.to_string().contains("after the eviction")),
+            out.contains("after the eviction"),
             "post-eviction content still reaches the terminal: {out:?}"
         );
-        assert!(v.flush(60).is_empty(), "and only once");
+        assert_eq!(v.flush(60), 0, "and only once");
     }
 
     // ─────────── the store behind the scrollback (looprs-pdl.6) ───────────
@@ -2516,15 +2766,11 @@ mod tests {
             MessageKind::Answer,
             "MARKER the answer is long enough to wrap in a narrow window and so takes several rows at forty columns but noticeably fewer at eighty columns".into(),
         );
-        let wide_rows = v.flush(80);
-        assert!(!wide_rows.is_empty(), "the answer rendered");
+        assert_ne!(v.flush(80), 0, "the answer rendered");
         let at_wide = v.scrollback().len();
 
         // A resize with nothing new to say: the store is made again at 40.
-        assert!(
-            v.flush(40).is_empty(),
-            "nothing was finalised since the last flush"
-        );
+        assert_eq!(v.flush(40), 0, "nothing was finalised since the last flush");
         let at_narrow = v.scrollback().len();
         assert_eq!(v.scrollback().width(), 40, "the store is wrapped for 40");
         assert!(
@@ -2579,6 +2825,177 @@ mod tests {
             v.scrollback().offset(),
             band + 2,
             "and the gap grew by that"
+        );
+    }
+
+    // ──────── the one entry that never closes is the shape that overflows ────────
+    //
+    // Everything above caps a transcript of *closed* entries: whole entries come
+    // off the front, the journal already had them, everybody goes home. The shape
+    // that actually overflows a running app is a **single entry that never
+    // closes** — `tail -f`, `watch`, `npm run dev`, a long build — because the
+    // Bash command boundary is made at *submit*, not at completion, so one
+    // running command *is* one open entry for its whole life. Measured before
+    // `trim_open_entry` existed: a 4 KiB cap held 1.2 MB of transcript, and the
+    // journal got **0 bytes** of it, because the prefix walk stops at the first
+    // `!done` entry. Both halves of that matter — the OOM, and the escape hatch
+    // missing exactly the case that needed it.
+
+    /// **Memory is bounded while the stream never ends — and the file is still the
+    /// whole document.**
+    ///
+    /// Deliberately no `flush` anywhere in this test: a view that is not on screen
+    /// is never flushed, and "cap the buffered output while hidden" is the exact
+    /// consequence ADR-0002 is asking for. The strongest available assertion is
+    /// used for the file half — not "contains the lines" but *the exact bytes an
+    /// uncapped run would have written*, cut boundaries and all.
+    #[test]
+    fn an_endless_open_entry_is_capped_and_the_journal_is_still_the_whole_document() {
+        const CAP: usize = 4096;
+        let mut v = SessionView::with_buffer(SessionId::new(TerminalType::Bash, 0), CAP);
+        let j = Arc::new(RecordingJournal::default());
+        with_journal(&mut v, j.clone());
+
+        // One command boundary, then output forever. Nothing closes it until the
+        // very end, which is what a running command actually looks like.
+        v.seal_shell_output();
+        let mut expected = String::new();
+        let mut peak = 0usize;
+        for i in 0..600 {
+            let line = format!("tail -f  line {i:04} of a stream that never ends");
+            expected.push_str(&line);
+            expected.push('\n');
+            v.push_bash(&format!("{line}\n"), 80);
+            peak = peak.max(v.transcript.byte_len());
+        }
+
+        // 600 lines x ~45 bytes is ~27 KB against a 4 KiB cap. Uncapped it rides
+        // straight through, so the ceiling on the peak is the whole test.
+        assert!(
+            peak <= CAP + 512,
+            "an open entry rode through the cap: peaked at {peak} against a {CAP} cap"
+        );
+        assert!(
+            v.dropped_bytes() > 0,
+            "and the trim counted what it took out of memory"
+        );
+
+        v.seal_shell_output();
+        assert_eq!(
+            j.text(),
+            expected,
+            "the journal must be the whole transcript across every cut boundary \
+             (memory holds {} bytes, the file holds {})",
+            v.transcript.plain_text().len(),
+            j.text().len()
+        );
+    }
+
+    /// **The cut moves the render cursor down instead of leaving it running past
+    /// the end, and never re-emits what it removed.**
+    ///
+    /// Two failure shapes live here and this catches both: a *reseat* would rewind
+    /// the entry to its head and duplicate every row the store already has, and a
+    /// cursor left high against shortened text is an out-of-range slice in the
+    /// middle of a frame. Flushing every round while the cap cuts underneath is
+    /// how both get exercised rather than argued about.
+    #[test]
+    fn a_cut_open_entry_is_never_re_emitted_and_its_cursor_stays_in_range() {
+        let mut v = SessionView::with_buffer(SessionId::new(TerminalType::Bash, 0), 512);
+        v.seal_shell_output();
+
+        let mut seen: Vec<String> = Vec::new();
+        for i in 0..300 {
+            v.push_bash(&format!("line {i:04} of a stream that never ends\n"), 80);
+            seen.extend(flush_new(&mut v, 80));
+            let text = v.transcript.entries.last().unwrap().text.len();
+            assert!(
+                v.flusher.emitted() <= text,
+                "the flusher cursor ({}) is past the end of the text it reads ({text})",
+                v.flusher.emitted()
+            );
+        }
+
+        let joined = seen.join("\n");
+        for i in (0..300).step_by(7) {
+            let needle = format!("line {i:04}");
+            assert_eq!(
+                joined.matches(&needle).count(),
+                1,
+                "each line reaches the store exactly once: {needle}"
+            );
+        }
+        assert!(
+            v.dropped_bytes() > 0,
+            "the cap was biting throughout, which is what this is testing"
+        );
+    }
+
+    /// **Styles are byte ranges into their own entry, and they move with the cut.**
+    ///
+    /// Not a cosmetic concern: every colour downstream is read out of those
+    /// ranges, so an un-rebased run paints the style of a line that has left the
+    /// building onto whatever characters slid into its place.
+    #[test]
+    fn styles_are_rebased_onto_the_text_that_is_left() {
+        let mut v = SessionView::with_buffer(SessionId::new(TerminalType::Bash, 0), 256);
+        v.seal_shell_output();
+        for i in 0..200 {
+            v.push_bash(
+                &format!("\u{1b}[31mred {i:04} padding padding padding\u{1b}[0m\n"),
+                80,
+            );
+        }
+
+        let e = v.transcript.entries.last().unwrap();
+        assert!(
+            !e.styles.is_empty(),
+            "the stream carried styles at all, or this test proves nothing"
+        );
+        assert!(
+            e.text.len() < 1200,
+            "the entry was capped, not left to grow: {} bytes",
+            e.text.len()
+        );
+        for s in &e.styles {
+            assert!(
+                s.end <= e.text.len(),
+                "a style run points past the end of the text it belongs to: {:?} of {}",
+                s,
+                e.text.len()
+            );
+            assert!(s.start < s.end, "a style run collapsed to nothing: {s:?}");
+            assert!(
+                e.text[s.start..s.end].contains("red"),
+                "the run now styles something that was never styled: {:?} -> {:?}",
+                s,
+                &e.text[s.start..s.end]
+            );
+        }
+    }
+
+    /// `preview` reads `text[scan..]` of the open entry on every frame the view is
+    /// live. After the front of that entry is gone, a cursor that did not move
+    /// with it is an out-of-range panic in the draw path — so this just asks for
+    /// the preview a lot, with the cutting happening underneath.
+    #[test]
+    fn a_cut_open_entry_still_previews_without_slicing_past_its_end() {
+        let mut v = SessionView::with_buffer(SessionId::new(TerminalType::Bash, 0), 256);
+        v.seal_shell_output();
+        for i in 0..150 {
+            v.push_bash(&format!("tail {i:03} of a stream that never ends\n"), 60);
+            let p = v.preview(60);
+            assert!(
+                p.len() <= 2,
+                "the live tail stayed a live tail: {} rows",
+                p.len()
+            );
+            let _ = v.flush(60);
+        }
+        assert!(
+            v.transcript.byte_len() <= 512,
+            "and it stayed capped while previewing: {}",
+            v.transcript.byte_len()
         );
     }
 }

@@ -54,7 +54,6 @@ fn init_logging() -> anyhow::Result<WorkerGuard> {
     tracing_subscriber::fmt()
         .with_writer(writer)
         .with_ansi(false)
-        //.with_max_level(Level::DEBUG)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
         )

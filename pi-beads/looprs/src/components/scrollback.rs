@@ -99,6 +99,36 @@ impl Flusher {
         self.first
     }
 
+    /// How far into the entry this flusher is *currently* reading it has already
+    /// rendered, in bytes.
+    ///
+    /// Only meaningful together with [`Self::consumed`]: `scan` is state of the
+    /// entry `first` points at, which is why the buffer cap asks the two of a
+    /// pair before it cuts anything. The bytes past this mark have not reached
+    /// the store yet.
+    #[allow(dead_code)] // measurement seam: `view::tests` asserts this never runs past the text the entry still has after a cut
+    pub fn emitted(&self) -> usize {
+        self.cur.scan
+    }
+
+    /// Lower the read cursor by `n` bytes because the front of the entry being
+    /// read no longer exists.
+    ///
+    /// This is **not** [`Self::reseat`], and the difference is the whole point:
+    /// a reseat rewinds to the head of an entry and would re-emit lines the
+    /// store already has, duplicating everything on screen. Here the lines
+    /// before the cursor stay emitted and the cursor simply follows the bytes
+    /// down. `block` is kept under `scan`, which is the invariant
+    /// `drain_stream` relies on for the open prose block.
+    ///
+    /// The caller owns the precondition that `first` indexes the entry whose
+    /// front was cut; this type cannot check it, which is why only the buffer
+    /// cap calls it, immediately after asking `consumed()`.
+    pub fn cut_front(&mut self, n: usize) {
+        self.cur.scan = self.cur.scan.saturating_sub(n);
+        self.cur.block = self.cur.block.saturating_sub(n);
+    }
+
     /// Everything that became final since the last call, with provenance. Call
     /// once per frame, before drawing.
     ///

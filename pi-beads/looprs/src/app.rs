@@ -8,7 +8,6 @@
 
 use crate::components::compaction::{CompactionState, token_delta};
 use crate::components::input::{InputAction, InputState, inner_width};
-use crate::components::scrollback::RenderedRow;
 use crate::session::view::SessionView;
 use crate::session::{
     ActiveBead, ByteStream, ChatState, ExitReason, SessionId, SessionStatus, TerminalType,
@@ -1061,17 +1060,18 @@ impl App {
     /// The per-frame flush, for the active view only (Q5 rule 4: inactive views
     /// buffer, and their backlog goes out as one burst when they become active).
     ///
-    /// Returns the rows that just became final; they are already in the store
-    /// ([`Self::scrollback`]) by the time this returns, so the return value is
-    /// for the caller that wants to know what arrived, not for the display.
-    pub fn flush_active(&mut self, width: u16) -> Vec<RenderedRow> {
+    /// Returns how many rows were appended to the store's tail; the rows
+    /// themselves stay in the store, which is where the band already reads them
+    /// from ([`Self::transcript_window`]). Handing them back too meant cloning the
+    /// whole batch every frame for a caller that did not exist.
+    pub fn flush_active(&mut self, width: u16) -> usize {
         match self.views.get_mut(&self.active) {
             Some(v) => {
-                let rows = v.flush(width);
+                let added = v.flush(width);
                 self.sync_selection_to_trims();
-                rows
+                added
             }
-            None => Vec::new(),
+            None => 0,
         }
     }
 
@@ -2933,6 +2933,23 @@ mod tests {
         SessionId::new(TerminalType::Pi, 1)
     }
 
+    /// Flush the active view and read back **what the store now holds**, as text.
+    ///
+    /// `flush_active` used to hand the rows themselves back so tests could read
+    /// them. It returns a count now: the band draws from the store, the run loop
+    /// drops the return value, and the only reader of those cloned rows was the
+    /// test suite — a whole-batch clone every frame, bought for nobody. These
+    /// tests read the same store the display reads, which is the stronger claim.
+    fn flush_text(app: &mut App) -> String {
+        app.flush_active(60);
+        app.scrollback()
+            .rows()
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn text_of(app: &App, mode: TerminalType) -> String {
         app.view(mode)
             .map(|v| {
@@ -3344,7 +3361,7 @@ mod tests {
             "and nothing is left spinning over work that has finished"
         );
 
-        let flushed: String = app.flush_active(60).iter().map(|l| l.to_string()).collect();
+        let flushed: String = flush_text(&mut app);
         assert!(flushed.contains("context compacted"), "{flushed:?}");
         assert!(
             flushed.contains("150.0k → 32.0k"),
@@ -3367,7 +3384,7 @@ mod tests {
                 result: None,
             },
         );
-        let aborted: String = app.flush_active(60).iter().map(|l| l.to_string()).collect();
+        let aborted: String = flush_text(&mut app);
         assert!(aborted.contains("compaction aborted"), "{aborted:?}");
         assert!(aborted.contains("manual"), "{aborted:?}");
 
@@ -3380,7 +3397,7 @@ mod tests {
                 result: None,
             },
         );
-        let failed: String = app.flush_active(60).iter().map(|l| l.to_string()).collect();
+        let failed: String = flush_text(&mut app);
         assert!(
             failed.contains("provider refused the summary"),
             "pi's own words, not a shrug: {failed:?}"
@@ -3406,7 +3423,7 @@ mod tests {
                 result: None,
             },
         );
-        let flushed: String = app.flush_active(60).iter().map(|l| l.to_string()).collect();
+        let flushed: String = flush_text(&mut app);
         assert!(
             flushed.contains("context compacted · overflow"),
             "the reason comes off the end record when there was no start to say it: {flushed:?}"
@@ -3435,7 +3452,7 @@ mod tests {
             },
         );
         assert!(
-            app.flush_active(60).is_empty(),
+            app.flush_active(60) == 0,
             "the open card is the cursor, and nothing past it goes out yet"
         );
 
@@ -3448,7 +3465,7 @@ mod tests {
                 result: None,
             },
         );
-        let flushed: String = app.flush_active(60).iter().map(|l| l.to_string()).collect();
+        let flushed: String = flush_text(&mut app);
         assert!(flushed.contains("context compacted"), "{flushed:?}");
         assert!(
             flushed.contains("text after the summary"),
@@ -3514,7 +3531,7 @@ mod tests {
             },
         });
         assert!(
-            app.flush_active(60).is_empty(),
+            app.flush_active(60) == 0,
             "an open entry is not flushed while it is still open"
         );
 
@@ -3522,11 +3539,9 @@ mod tests {
             session: beads_id(),
             reason: ExitReason::Crashed { code: Some(2) },
         });
-        let lines = app.flush_active(60);
+        let lines = flush_text(&mut app);
         assert!(
-            lines
-                .iter()
-                .any(|l| l.to_string().contains("unterminated answer")),
+            lines.contains("unterminated answer"),
             "sealing on death must release the tail: {lines:?}"
         );
         let v = app.view(TerminalType::Beeds).unwrap();
@@ -3554,11 +3569,9 @@ mod tests {
             },
         });
         app.view_mut(new); // the respawn arrives without any SessionDown
-        let lines = app.flush_active(60);
+        let lines = flush_text(&mut app);
         assert!(
-            lines
-                .iter()
-                .any(|l| l.to_string().contains("from the corpse")),
+            lines.contains("from the corpse"),
             "adoption must seal what it replaces: {lines:?}"
         );
         assert_eq!(app.view(TerminalType::Pi).unwrap().session, new);
@@ -3573,7 +3586,7 @@ mod tests {
             text: "buffered while hidden".into(),
         });
         assert!(
-            app.flush_active(60).is_empty(),
+            app.flush_active(60) == 0,
             "nothing has been said to the beads view"
         );
         assert!(
@@ -3582,11 +3595,9 @@ mod tests {
         );
 
         app.active = TerminalType::Pi;
-        let lines = app.flush_active(60);
+        let lines = flush_text(&mut app);
         assert!(
-            lines
-                .iter()
-                .any(|l| l.to_string().contains("buffered while hidden")),
+            lines.contains("buffered while hidden"),
             "switching in flushes the backlog as one burst: {lines:?}"
         );
     }
@@ -3866,10 +3877,7 @@ mod tests {
                 },
             },
         });
-        assert!(
-            !app.flush_active(60).is_empty(),
-            "a closed answer must flush"
-        );
+        assert!(app.flush_active(60) != 0, "a closed answer must flush");
     }
 
     /// **Esc's restore lands in the box** — the whole point of pulling the queued
