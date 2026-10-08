@@ -67,6 +67,29 @@ The policy is written out at the top of
 `#![allow(dead_code)]` used to sit. An allow without a reason is a warning deleted
 rather than answered.
 
+**A reason can go stale, and that is the failure mode a lint cannot see.** An allow
+that names a ticket as its reader is a promise; when that ticket lands and reads
+something else, the comment keeps asserting a reader that is not there, which reads
+as coverage. `./scripts/dead_audit.py` is the check for the half of that which is
+mechanical:
+
+```sh
+./scripts/dead_audit.py            # every allow, its verdict, and its stated reason
+./scripts/dead_audit.py --gate     # quiet; fails if any allow covers live code
+```
+
+It runs `cargo clippy --all-targets -- --force-warn=dead_code`, which reports the
+dead items *through* the `allow`s, and then asks of each attribute whether the code
+under it is still dead. An allow over live code is redundant and fails the gate —
+run without `--gate` for the list of what is still dead and what each one claims,
+which is the part a human has to keep true. `./scripts/check.sh` runs `--gate`.
+
+looprs-2nd was that pass over the `looprs-pdl.9` promises: the drag selection
+routed through `CellMap::at` / `bytes_at` / `cell_of_byte`, which made those
+three live (their allows are gone), and left `snap_bytes`, `CellMap::is_empty`,
+`DisplayRow::crosses` and `CharRef::anchor` promising a reader that had already
+landed elsewhere — those four are deleted, comments and tests with them.
+
 ---
 
 ## The fakes

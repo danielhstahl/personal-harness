@@ -1375,7 +1375,6 @@ impl Effect {
     /// The noun `copy_chord_hint` pairs with this effect's sub-key: what arming
     /// the prefix and pressing this target gets you. Only the copy family has a
     /// hint; everything else in the table is not a thing the chord offers.
-    #[allow(dead_code)] // read only by `copy_chord_hint`, which is not on the hot path
     fn hint(self) -> Option<&'static str> {
         match self {
             Effect::CopyAnswer => Some("answer"),

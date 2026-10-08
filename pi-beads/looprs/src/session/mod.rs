@@ -23,6 +23,16 @@
 //! (looprs-guh's status row is the usual suspect). An allow without a reason is a
 //! warning we deleted rather than answered; `cargo clippy --all-targets -- -D
 //! warnings` is the gate that keeps that list honest.
+//!
+//! Naming a ticket on an allow is a **promise**, and a promise is the part that
+//! rots: the ticket lands, routes somewhere else, and the comment goes on
+//! asserting a reader that does not exist. That reads as coverage, which is worse
+//! than no comment at all. So the rule is that when the named ticket closes, the
+//! allow is settled the same day — wired to the reader that turned out to want it,
+//! or deleted with the comment. `./scripts/dead_audit.py` asks the compiler,
+//! through the allow (`--force-warn=dead_code`), whether the guarded code is
+//! still dead; a redundant allow fails it, and `./scripts/check.sh` runs that
+//! gate. looprs-2nd is that pass over the pdl.9 promises.
 
 pub mod bash;
 pub mod beads;

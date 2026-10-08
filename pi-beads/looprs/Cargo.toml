@@ -43,6 +43,8 @@ unused_dependencies = "allow"
 # The exceptions are *not* declared here. They are per-item `#[allow(dead_code)]`s
 # in the source, each carrying the reason it stays and the thing that will read it —
 # the policy is written out in the "Dead code" section of `src/session/mod.rs`,
-# and `./scripts/check.sh` is the command that keeps the list honest.
+# and `./scripts/check.sh` is the command that keeps the list honest. The half of
+# that a lint cannot check — an allow whose promised reader landed somewhere else —
+# is what `./scripts/dead_audit.py --gate` runs, as step 4 of that script.
 [lints.clippy]
 all = { level = "deny", priority = -1 }

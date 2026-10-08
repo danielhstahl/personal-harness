@@ -209,13 +209,15 @@ pub struct DisplayRow {
     ///
     /// The flag ADR-0004 R14 is stated in: joining two soft rows must insert
     /// nothing and two logical lines exactly one `\n`.
-    #[allow(dead_code)]
-    // consumer: `paste_text` below (select-to-copy, looprs-pdl.10); nothing in this ticket's draw path reads it
+    ///
+    /// Read where the rule is *applied* — [`paste_slices`] below, on the way to
+    /// the clipboard — and nowhere in the draw path, which never joins rows.
     pub end: RowEnd,
     /// The rendered line, styles included.
     pub line: Line<'static>,
-    /// Where this row's clusters land in cells.
-    #[allow(dead_code)] // consumer: the drag hit-test (looprs-pdl.9); see `CellMap`
+    /// Where this row's clusters land in cells: what the drag hit-test reads on
+    /// every motion (looprs-pdl.9), and so the reason the row carries a map at
+    /// all. See [`CellMap`].
     pub cells: CellMap,
 }
 
@@ -281,16 +283,6 @@ impl DisplayRow {
         } else {
             row_charge(self.cells.text_len())
         }
-    }
-
-    /// Does the given row come from a different entry than this one?
-    ///
-    /// The test a drag selection needs first: a selection that crosses an entry
-    /// boundary crosses a mode boundary, and ADR-0004 R16 says it does not
-    /// happen.
-    #[allow(dead_code)] // consumer: the drag hit-test (looprs-pdl.9), which is the reason the row carries a cell map at all
-    pub fn crosses(&self, other: &DisplayRow) -> bool {
-        self.entry != other.entry
     }
 
     /// This row as content-addressed scroll state.
@@ -464,14 +456,12 @@ impl CellMap {
     }
 
     /// How many cells the row occupies.
-    #[allow(dead_code)] // consumer: looprs-pdl.9 (a drag cannot extend past the row's last cell); read by the cell-map tests meanwhile
+    ///
+    /// This is the "nothing to hit" test as well as the drag's right edge: a row
+    /// with no cells has nothing a pointer can land on
+    /// ([`hit`](crate::state::selection::hit) clamps to it and gives up on 0).
     pub fn cells(&self) -> usize {
         self.cells
-    }
-
-    #[allow(dead_code)] // companion to `text_len`; read by the selection's "nothing to hit" rule and the cell-map tests
-    pub fn is_empty(&self) -> bool {
-        self.spans.is_empty()
     }
 
     /// How many bytes the row's text is — the length this map was built from.
@@ -485,7 +475,9 @@ impl CellMap {
     }
 
     /// The cluster that owns `cell`, or `None` past the end of the row.
-    #[allow(dead_code)] // consumer: looprs-pdl.9; also the body under `bytes_at`/`snap_bytes` below
+    ///
+    /// The one place "which character is under this cell" is answered; every
+    /// other cell question on this type is a projection of it.
     pub fn at(&self, cell: usize) -> Option<&CellSpan> {
         // Clusters are contiguous in cells, so the answer is the last cluster
         // starting at or before `cell`, and it owns `cell` by construction.
@@ -494,36 +486,21 @@ impl CellMap {
         (cell < s.cell + s.cells).then_some(s)
     }
 
-    /// Byte range of the whole cluster under `cell`.
-    #[allow(dead_code)] // consumer: looprs-pdl.9 (a click selects a whole character, never half a wide glyph)
+    /// Byte range of the whole cluster under `cell` — [`Self::at`] with the
+    /// span's identity dropped, which is exactly what a selection needs: a click
+    /// selects a whole character, never half a wide glyph.
+    ///
+    /// [`hit`](crate::state::selection::hit) is the caller; it wants the bytes,
+    /// not the `CellSpan`.
     pub fn bytes_at(&self, cell: usize) -> Option<(usize, usize)> {
         self.at(cell).map(|s| (s.start, s.end))
-    }
-
-    /// Snap the cell range `[from, to)` out to whole clusters and return the
-    /// bytes that covers.
-    ///
-    /// The snapping is this type's whole function: a drag that starts on the
-    /// second cell of a wide glyph starts at that glyph's *first* byte, and one
-    /// that ends inside a ZWJ sequence ends at the sequence's end. An
-    /// un-snapped range is not a slightly worse selection, it is a corrupted
-    /// string.
-    #[allow(dead_code)] // consumer: looprs-pdl.9 (a cell range snapped to whole clusters, so no ZWJ sequence is ever cut in half)
-    pub fn snap_bytes(&self, from: usize, to: usize) -> Option<(usize, usize)> {
-        if to <= from {
-            return None;
-        }
-        let start = self.at(from)?.start;
-        let end = self.at(to.saturating_sub(1))?.end;
-        Some((start, end))
     }
 
     /// The cell the given byte offset is drawn in.
     ///
     /// The inverse of [`Self::bytes_at`]: the store needs both directions to keep
-    /// a re-wrap honest — content addressing walks byte→row, and a
-    /// column-preserving anchor needs byte→cell.
-    #[allow(dead_code)] // consumer: looprs-pdl.9; the round trip is checked by the cell-map tests meanwhile
+    /// a re-wrap honest — content addressing walks byte→row, and the highlight a
+    /// selection paints walks byte→cell.
     pub fn cell_of_byte(&self, byte: usize) -> Option<usize> {
         let i = self.spans.partition_point(|s| s.start <= byte);
         let s = i.checked_sub(1).map(|i| &self.spans[i])?;
@@ -748,8 +725,9 @@ impl Scrollback {
         self.width
     }
 
-    /// Every row in the store, oldest first.
-    #[allow(dead_code)] // consumer: looprs-pdl.9 (a selection spans rows); the store's own tests read it meanwhile
+    /// Every row in the store, oldest first — the slice a selection is resolved
+    /// against (looprs-pdl.9), because the extent of a selection is a fact
+    /// about the content and not about the visible window.
     pub fn rows(&self) -> &[DisplayRow] {
         &self.rows
     }
@@ -769,8 +747,9 @@ impl Scrollback {
         self.pinned
     }
 
-    /// Rows between the bottom of the view and the tail.
-    #[allow(dead_code)] // consumer: looprs-pdl.8 (a wheel step is a delta against this); `resting_anchor` and the tests read it meanwhile
+    /// Rows between the bottom of the view and the tail — the number a wheel
+    /// step is a delta against (looprs-pdl.8) and the thing the run loop
+    /// compares before and after a scroll to decide whether anything moved.
     pub fn offset(&self) -> usize {
         self.offset
     }
@@ -1400,8 +1379,6 @@ mod tests {
             "the soft continuation is the second half of logical 0; the next hard \
              row is a new logical line; the entry boundary is honoured"
         );
-        assert!(r[2].crosses(&r[3]), "the entry boundary is visible");
-        assert!(!r[0].crosses(&r[1]), "a soft wrap is not a boundary");
     }
 
     /// ADR-0004 R14, spelled as the trap it exists to close.
@@ -1436,14 +1413,6 @@ mod tests {
         assert_eq!(m.bytes_at(2), Some((3, 6)));
         assert_eq!(m.bytes_at(6), None, "past the end of the row");
 
-        assert_eq!(m.snap_bytes(1, 5), Some((0, 9)));
-        assert_eq!(m.snap_bytes(3, 4), Some((3, 6)), "exactly one glyph");
-        assert_eq!(
-            m.snap_bytes(2, 2),
-            None,
-            "an empty cell range selects nothing"
-        );
-
         // A ZWJ sequence is ONE cluster: 5 chars, 2 cells, 18 bytes.
         let fam = CellMap::of("\u{1f469}\u{200d}\u{1f469}\u{200d}\u{1f466} tail");
         assert_eq!(fam.cells(), 7, "the family is 2 cells, ' tail' is 5");
@@ -1453,8 +1422,6 @@ mod tests {
             "the second cell of the family is still the whole family"
         );
         assert_eq!(fam.bytes_at(2), Some((18, 19)));
-        assert_eq!(fam.snap_bytes(0, 2), Some((0, 18)));
-        assert_eq!(fam.snap_bytes(1, 3), Some((0, 19)));
     }
 
     /// A combining mark is part of the character it follows, not its own cell.
@@ -1464,7 +1431,6 @@ mod tests {
         assert_eq!(m.cells(), 2);
         assert_eq!(m.bytes_at(0), Some((0, 3)));
         assert_eq!(m.bytes_at(1), Some((3, 4)));
-        assert_eq!(m.snap_bytes(0, 1), Some((0, 3)));
         assert_eq!(m.cell_of_byte(2), Some(0), "the mark lives in cell 0");
         assert_eq!(m.cell_of_byte(3), Some(1));
     }
@@ -1472,8 +1438,11 @@ mod tests {
     #[test]
     fn a_row_of_nothing_has_no_cells() {
         let m = CellMap::of("");
-        assert!(m.is_empty());
-        assert_eq!(m.cells(), 0);
+        assert_eq!(
+            m.cells(),
+            0,
+            "nothing to hit, and the drag's right edge is 0"
+        );
         assert_eq!(m.at(0), None);
     }
 

@@ -484,7 +484,7 @@ impl Ledger {
     /// back to the terminal before a full-screen child takes over, say. Returns
     /// `false` if we were not holding it, so a caller can tell "given back" from
     /// "never ours" instead of assuming.
-    #[allow(dead_code)] // seam for looprs-pdl.12: handing the mouse back before a full-screen child takes the screen. A ledger that can only be emptied all at once is the wrong shape for that, so the seam is kept and tested rather than deleted.
+    #[allow(dead_code)] // Pre-provisioned per ADR-0006 ("kept and tested now, so the handover ticket does not have to build it"), and looprs-pdl.12 landed without building it: cutting the child's own alt-screen switch means there is no mid-run moment at which the mouse is ours to hand back. It stays because a ledger that can only be emptied all at once is the wrong shape for a mid-run hand-back, and because the alternative is the next ticket re-writing this one. Nothing reads it today — that is the honest state, not a coverage claim.
     pub fn release(&self, mode: Mode) -> bool {
         let mut held = self.guard();
         let Some(pos) = held.iter().position(|m| *m == mode) else {
@@ -641,7 +641,7 @@ impl Teardown {
     }
 
     /// Give one mode back before the exit, and forget it.
-    #[allow(dead_code)] // see Ledger::release: the mid-run hand-back the full-screen handover needs
+    #[allow(dead_code)] // the hand-back `Ledger::release` documents: pre-provisioned, nothing calls it yet
     pub fn release(&self, mode: Mode) -> bool {
         self.ledger.release(mode)
     }

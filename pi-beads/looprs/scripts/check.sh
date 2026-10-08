@@ -6,9 +6,21 @@
 #   1. `cargo fmt --check`   — formatted, or not
 #   2. `cargo clippy -D warnings` — no lint left warning, and no blanket `allow`
 #   3. `cargo test`          — everything green, with no network and no model calls
+#   4. `scripts/dead_audit.py --gate` — every `#[allow(dead_code)]` still covers
+#         dead code
 #
 # The order is deliberate: fmt and clippy are seconds-long and explain themselves, so
 # they run before the ~20s test suite rather than after it.
+#
+# Step 4 is not covered by step 2. `-D warnings` stops a *new* unjustified allow
+# from being added; it says nothing about the ones already in the tree, and an
+# allow whose stated reason has gone stale keeps warning nobody while reading as
+# coverage (looprs-2nd: nine allows promised pdl.9 as their consumer, and pdl.9
+# landed reading something else). The audit asks the compiler — through the
+# allow, with `--force-warn=dead_code` — whether the guarded item is still dead.
+# A redundant one fails here. Whether a *still-dead* item's reason is true is a
+# question about prose, so that part prints rather than fails; run without
+# `--gate` for the full list.
 #
 # CI runs exactly this file (.github/workflows/looprs-gate.yml at the repo root), so
 # "passes locally" and "passes in CI" are the same statement. `cargo test --test
@@ -36,5 +48,8 @@ cargo clippy --all-targets -- -D warnings
 echo "==> cargo test"
 cargo test
 
+echo "==> dead-code allow audit"
+python3 "$(dirname "${BASH_SOURCE[0]}")/dead_audit.py" --gate
+
 echo
-echo "gate: clean (fmt, clippy -D warnings, tests)"
+echo "gate: clean (fmt, clippy -D warnings, tests, dead-code audit)"

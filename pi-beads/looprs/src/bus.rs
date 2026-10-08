@@ -507,9 +507,8 @@ impl Budget {
         }
     }
 
-    /// Tokens available right now. Diagnostic.
-    // Consumer: this module's Debug impl and the outside-the-process spike.
-    #[allow(dead_code)]
+    /// Tokens available right now. Diagnostic: this module's `Debug` impl prints
+    /// it, and the outside-the-process spike reads it through there.
     pub fn available(&self) -> usize {
         self.inner.tokens.lock().unwrap().unwrap_or(0)
     }

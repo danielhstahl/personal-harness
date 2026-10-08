@@ -156,24 +156,6 @@ pub struct CharRef {
 }
 
 impl CharRef {
-    /// The same address without the width — for anything that only needs to know
-    /// *which character*, not how many bytes it is.
-    ///
-    /// This is the seam between the two addressings in this module: the ends of a
-    /// drag are `CharRef`s (whole characters), and the store speaks
-    /// `ContentAnchor`s. Nothing in today's draw path needs the narrower form,
-    /// so it is asserted rather than used — see
-    /// `a_selection_end_is_a_store_address`, which round-trips it through
-    /// `Scrollback::index_of`.
-    #[allow(dead_code)] // consumer: anything that has to hand a selection end back to the store (pdl.7's trim hooks, pdl.13's keyboard selection); proven round-trip today
-    pub fn anchor(&self) -> ContentAnchor {
-        ContentAnchor {
-            entry: self.entry,
-            logical: self.logical,
-            byte: self.start,
-        }
-    }
-
     /// The ordering key: a character's position in reading order.
     ///
     /// Deliberately not `end` — two `CharRef`s naming the same character agree
@@ -632,10 +614,11 @@ fn span_on(row: &DisplayRow, r: &CharRange) -> Option<(usize, usize)> {
 /// The character under a cell of a display row, snapped to the whole cluster.
 ///
 /// This is the one place a pointer position becomes content, and it delegates
-/// the hard part: [`CellMap::at`](crate::state::scrollback::CellMap::at) answers any cell with the *whole* cluster
-/// that owns it, so a cell on the trailing half of `日` answers with all of
-/// `日`, and a cell inside a ZWJ family answers with the family. A row with no
-/// clusters (a blank separator) has nothing to hit and answers `None`.
+/// the hard part: [`CellMap::bytes_at`](crate::state::scrollback::CellMap::bytes_at)
+/// answers any cell with the *bytes of the whole cluster* that owns it, so a
+/// cell on the trailing half of `日` answers with all of `日`, and a cell
+/// inside a ZWJ family answers with the family. A row with no clusters (a
+/// blank separator) has nothing to hit and answers `None`.
 ///
 /// A cell past the end of the row's text is clamped to the last cluster: a
 /// press in the blank tail of a row means "at the end of this row", which in
@@ -654,12 +637,12 @@ pub fn hit(row: &DisplayRow, cell: usize) -> Option<CharRef> {
         return None;
     }
     let cell = cell.min(total - 1);
-    let span = row.cells.at(cell)?;
+    let (from, to) = row.cells.bytes_at(cell)?;
     Some(CharRef {
         entry: row.entry,
         logical: row.logical,
-        start: row.start + span.start,
-        end: row.start + span.end,
+        start: row.start + from,
+        end: row.start + to,
     })
 }
 
@@ -1719,38 +1702,5 @@ mod tests {
             end: 1,
         };
         assert!(later_entry > b);
-        // And `anchor()` is the same address without the width.
-        assert_eq!(
-            a.anchor(),
-            ContentAnchor {
-                entry: 0,
-                logical: 0,
-                byte: 3
-            }
-        );
-    }
-
-    /// `CharRef::anchor` round-trips into the store's own addressing, which is
-    /// what lets a selection's end be found again by `Scrollback::index_of`.
-    #[test]
-    fn a_selection_end_is_a_store_address() {
-        let rows = entry(0, &["one", " two"]);
-        let c = hit_at(&rows, 1, 1);
-        assert_eq!(
-            c.anchor(),
-            ContentAnchor {
-                entry: 0,
-                logical: 0,
-                byte: 4
-            },
-            "the second row starts at byte 3, so its second character is byte 4"
-        );
-        let mut s = Scrollback::new(40);
-        s.push(laid(0, &["one", " two"]));
-        assert_eq!(
-            s.index_of(c.anchor()),
-            Some(1),
-            "the store finds the row this character is drawn on"
-        );
     }
 }

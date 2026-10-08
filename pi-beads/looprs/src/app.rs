@@ -103,8 +103,10 @@ pub enum Msg {
         /// distinction that does not exist — worse than not having one. Kept
         /// because the day a split (non-pty) backend lands, this is the field that
         /// makes the row able to say which pipe a line came from.
-        // wire-format record; would surface as: "stderr" on the row, if a split backend ever lands
-        #[allow(dead_code)]
+        ///
+        /// Not dead in the meantime: the bus reads it on every coalesce
+        /// ([`mergeable`](crate::bus::mergeable)) so that two streams are never
+        /// merged into one another's transcript.
         stream: ByteStream,
         chunk: String,
     },
@@ -1199,7 +1201,9 @@ impl App {
     /// over. The transport, the count and the toast are looprs-pdl.10's; the
     /// *shape* is here first so that "what was selected" has one definition in
     /// the tree and the copy ticket cannot invent a second one under pressure.
-    #[allow(dead_code)] // consumer: select-to-copy (looprs-pdl.10)
+    ///
+    /// Live on both copy paths today — the drag release and the keyboard chord
+    /// (looprs-pdl.13) go through here via [`App::copy_selection`].
     pub fn selection_paste(&self) -> String {
         self.selection.paste(self.scrollback().rows())
     }
