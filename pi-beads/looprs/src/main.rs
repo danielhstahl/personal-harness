@@ -1,4 +1,5 @@
 mod app;
+mod bus;
 mod components;
 #[cfg(test)]
 mod measure;
@@ -151,7 +152,17 @@ async fn run(
     // come from cmd_tx and are received on cmd_rx
     let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>(16);
     // any app state changes come from app_tx and are received on app_rx
-    let (app_tx, mut app_rx) = mpsc::unbounded_channel::<Msg>();
+    //
+    // Bounded, and coalescing, on purpose (looprs-6cj). This line used to be
+    // `mpsc::unbounded_channel::<Msg>()`: every producer wrote into a queue
+    // with no ceiling and one task read it, so a producer that could out-write
+    // the UI did not get slowed down — it got *stored*, in this process's RAM,
+    // until the machine stopped. The instrumented run had 1.8 M messages in
+    // here (~400 MB) while the UI had consumed 24 MB of what was produced.
+    // `crate::bus` is the answer: a byte ceiling, `BashOutput` merged instead
+    // of dropped, every other class queued whole and never coalesced, and a
+    // producer past the ceiling waits — which is what has to reach the source.
+    let (app_tx, mut app_rx) = bus::channel(bus::DEFAULT_CAP_BYTES);
 
     // The Router owns every backend from here: one session per terminal state, and
     // only this task's copy of `cmd_tx` can ask it for anything.
@@ -173,6 +184,10 @@ async fn run(
         // off the clipboard *by construction* rather than by nobody
         // remembering to unset `LOOPRS_CLIPBOARD`.
         clipboard: clipboard.clone(),
+        // The byte producers are paced by the UI's own drain, through the bus.
+        // Handed down here, at the one place the real config is built, so a
+        // session cannot choose its own ceiling (looprs-6cj).
+        output_budget: app_tx.budget(),
         ..SessionConfig::default()
     };
     let mut router = Router::new(initial, cfg, app_tx.clone());
@@ -262,6 +277,8 @@ async fn run(
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60 fps cap
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Set once the bus reports every producer gone. See the `app_rx` arm.
+    let mut bus_closed = false;
     // The backstop for the resize repaint. Why a poll exists next to a resize
     // *event* is the whole doc on `viewport::WindowPoll` (looprs-pdl.15);
     // three lines here, and the reason it is a type and not an `if` is that it
@@ -275,7 +292,27 @@ async fn run(
     loop {
         tokio::select! {
             //app_rx receives events that require state updates
-            Some(ev) = app_rx.recv() => app.update(ev),
+            //
+            // A whole batch per wake, not one message (looprs-6cj). `App::update`
+            // pays per-message work that has nothing per-message about it — the
+            // selection resync at the end of every `update` is the obvious one —
+            // so one message per `select!` arm made the consumer's cost scale
+            // with the *number of read buffers* the shell produced. Draining
+            // merged chunks makes the same bytes an order of magnitude cheaper
+            // per message, and the flush stays where it belongs: once per frame,
+            // in the tick arm that actually draws.
+            batch = app_rx.recv_batch(bus::DRAIN_MAX_ENTRIES), if !bus_closed => {
+                if batch.is_empty() {
+                    // Every producer is gone. Nothing more will ever arrive on
+                    // this bus, so take the arm out of the select instead of
+                    // re-arming a future that returns empty forever.
+                    bus_closed = true;
+                } else {
+                    for msg in batch {
+                        app.update(msg);
+                    }
+                }
+            }
             Some(Ok(ev)) = keys.next() => {
                 if let Event::Resize(w, h) = ev {
                     // The frame picks the new window up itself on the next draw
@@ -476,7 +513,7 @@ async fn run(
 /// so nothing about it is "lost" by the exit — and dumping a session the user
 /// walked away from into *their scrollback* at the worst possible moment was its
 /// own kind of noise. It is dropped with the view.
-async fn drain_sessions(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Msg>) {
+async fn drain_sessions(app: &mut App, rx: &mut bus::Receiver) {
     loop {
         app.flush_active(app.width);
         match rx.recv().await {

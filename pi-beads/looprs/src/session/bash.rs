@@ -56,6 +56,14 @@ const MARKER_PREFIX: &str = "looprs:exit:";
 /// marker, and holding them would be a slow leak, so they are emitted as output.
 const MARKER_BUFFER_MAX: usize = 4096;
 
+/// How many pty read buffers may be sitting between the reader thread and the
+/// session task (looprs-6cj).
+///
+/// A *bound*, not a tuning knob: with the reader charging the UI's output budget
+/// one token per read, this is the other half of the ceiling on how far ahead of
+/// the screen a shell is ever allowed to run. 8 × 8 KiB = 64 KiB.
+pub(crate) const BYTE_LANE_DEPTH: usize = 8;
+
 /// How long a `kill` gets to land before we stop waiting for the child.
 const KILL_WAIT: Duration = Duration::from_secs(2);
 
@@ -119,11 +127,7 @@ struct Shell {
 }
 
 impl Shell {
-    fn spawn(
-        cfg: &SessionConfig,
-        size: PtySize,
-        tx: mpsc::UnboundedSender<BashCmd>,
-    ) -> Result<Self> {
+    fn spawn(cfg: &SessionConfig, size: PtySize, tx: mpsc::Sender<ByteLane>) -> Result<Self> {
         let integration = write_integration()?;
         let pty = native_pty_system();
         let pair = pty
@@ -165,9 +169,10 @@ impl Shell {
             .take_writer()
             .map_err(|e| anyhow!("could not write the pty master: {e}"))?;
 
+        let budget = cfg.output_budget.clone();
         std::thread::Builder::new()
             .name("looprs-bash-reader".into())
-            .spawn(move || read_master(reader, tx))
+            .spawn(move || read_master(reader, tx, budget))
             .map_err(|e| anyhow!("could not start the pty reader thread: {e}"))?;
 
         Ok(Self {
@@ -234,26 +239,66 @@ impl Drop for Shell {
     }
 }
 
+/// The byte lane out of the pty: a read buffer, or the end of the stream.
+enum ByteLane {
+    /// One `read(2)` of the master. Bounded by the reader's own buffer.
+    Chunk(Vec<u8>),
+    /// EOF or a read error: nothing more will ever come.
+    Eof,
+}
+
 /// The reader thread: blocking `read` on the master, bytes into the session task.
 ///
 /// Ends at EOF (the child died, or we closed the master) or on a write error to a
 /// mailbox nobody is reading any more.
-fn read_master(mut reader: Box<dyn Read + Send>, tx: mpsc::UnboundedSender<BashCmd>) {
+///
+/// **This thread is where the byte bound is enforced** (looprs-6cj). Every read
+/// takes a token from the UI's supply first, and only one token per read means
+/// only one read buffer can be outstanding per token the UI has given back. When
+/// the UI stops draining, the tokens stop coming back, this thread parks here,
+/// the pty's kernel buffer fills, and the child blocks in `write(2)`. That is
+/// the whole reason the bound has to live this far upstream: a ceiling that sits
+/// in front of the UI but behind the producer does not stop the producer, it
+/// just chooses a different place for the backlog to grow.
+///
+/// It parks on a *blocking* send supply rather than a channel, deliberately: the
+/// control lane (`BashCmd`) is shared with `Interrupt`, and a bound that can
+/// keep `Ctrl-C` queued behind 400 MB of `yes` output is worse than no bound at
+/// all. Here, waiting costs the interrupt nothing.
+fn read_master(
+    mut reader: Box<dyn Read + Send>,
+    tx: mpsc::Sender<ByteLane>,
+    budget: crate::bus::Budget,
+) {
     let mut buf = [0u8; 8192];
     loop {
+        // Charged *before* the read so a slow consumer stops us producing,
+        // not after we already have the bytes. A closed supply means the UI is
+        // gone; there is nobody left to read for.
+        if !budget.acquire_blocking() {
+            let _ = tx.blocking_send(ByteLane::Eof);
+            return;
+        }
         match reader.read(&mut buf) {
             Ok(0) => {
-                let _ = tx.send(BashCmd::StreamEnd);
+                let _ = tx.blocking_send(ByteLane::Eof);
                 return;
             }
             Ok(n) => {
-                if tx.send(BashCmd::Bytes(buf[..n].to_vec())).is_err() {
+                if tx
+                    .blocking_send(ByteLane::Chunk(buf[..n].to_vec()))
+                    .is_err()
+                {
+                    budget.release();
                     return; // the session is gone; nothing to read for
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                budget.release();
+                continue;
+            }
             Err(_) => {
-                let _ = tx.send(BashCmd::StreamEnd);
+                let _ = tx.blocking_send(ByteLane::Eof);
                 return;
             }
         }
@@ -278,10 +323,6 @@ enum BashCmd {
     /// and no interpretation. This is what makes `Esc` be `Esc` inside vim
     /// instead of `0x03`.
     Keys(Vec<u8>),
-    /// Raw bytes off the pty master.
-    Bytes(Vec<u8>),
-    /// The reader hit EOF — the shell is gone or going.
-    StreamEnd,
     /// The real terminal changed shape; ADR-0001 rule 6: the child gets the real
     /// size, not a virtual 80x24.
     Resize { rows: u16, cols: u16 },
@@ -301,6 +342,15 @@ enum BashCmd {
 struct BashTask {
     id: SessionId,
     cfg: SessionConfig,
+    /// The producing end of the pty byte lane, kept so a respawned shell's
+    /// reader thread can be pointed at the same lane (looprs-6cj).
+    ///
+    /// It is a **bounded** lane, and that is the point: the reader thread parks
+    /// when the lane is full, which is what lets a fast producer be throttled at
+    /// the file descriptor instead of in memory. It is *separate* from
+    /// [`BashCmd`] for the same reason: nothing the user types may ever queue
+    /// behind output, and the control lane stays unbounded and polled first.
+    bytes_tx: mpsc::Sender<ByteLane>,
     ev_tx: mpsc::UnboundedSender<SessionEvent>,
     cmd: mpsc::UnboundedSender<BashCmd>,
     shell: Option<Shell>,
@@ -336,6 +386,13 @@ struct BashTask {
     stall_reported: bool,
     /// Unconsumed marker bytes (a marker can straddle two reads).
     pending: Vec<u8>,
+    /// How many `BashOutput` events this task has emitted, ever.
+    ///
+    /// Used to answer one question per pty read: did this chunk become a
+    /// message or not? If it did not, no downstream stage will ever hand the
+    /// reader its credit back, so this task has to (see the byte arm of the
+    /// task loop).
+    output_emitted: u64,
     /// Who owns the real terminal screen, read out of the child's own bytes
     /// (ADR-0001 Q2). The watcher is the single source of truth: `is_held()` is
     /// the answer the whole app obeys.
@@ -412,7 +469,7 @@ impl BashTask {
             return Ok(());
         }
         let respawning = self.had_shell;
-        let shell = Shell::spawn(&self.cfg, self.size, self.cmd.clone())?;
+        let shell = Shell::spawn(&self.cfg, self.size, self.bytes_tx.clone())?;
         self.shell = Some(shell);
         self.had_shell = true;
         // A new shell is an unread shell: no prompt has come from it yet.
@@ -694,6 +751,7 @@ impl BashTask {
         let (text, rest) = split_complete_utf8(held);
         self.utf8 = rest;
         if !text.is_empty() {
+            self.output_emitted += 1;
             self.emit(SessionEvent::BashOutput {
                 stream: ByteStream::Merged,
                 chunk: text,
@@ -900,6 +958,40 @@ fn split_complete_utf8(buf: Vec<u8>) -> (String, Vec<u8>) {
     }
 }
 
+/// One turn of the pty byte lane.
+///
+/// Returns `false` once the stream has ended, so the task can stop polling that
+/// arm.
+///
+/// The credit bookkeeping is the whole reason this is a function and not inline:
+/// a read that produced **no** output message — a chunk that was all exit marker,
+/// or one that landed entirely inside a partial UTF-8 sequence — will never have
+/// its token handed back downstream, because there is no message for the pump to
+/// hand it back with. Without this release the reader would spend a token and
+/// never get it back, and after `OUTPUT_BUDGET_TOKENS` such chunks the shell
+/// would freeze mid-sentence. That is the failure mode of credit-based flow
+/// control, so it is named where it is handled.
+/// One pty read buffer through the marker/screen pipeline, with its credit.
+fn handle_chunk(task: &mut BashTask, bytes: Vec<u8>) {
+    let before = task.output_emitted;
+    task.on_bytes(bytes);
+    if task.output_emitted == before {
+        task.cfg.output_budget.release();
+    }
+}
+
+/// Take everything the reader has already handed over, **without** acting on
+/// the end of the stream: the callers that drain for ordering reasons report the
+/// exit themselves, and the session's exit must be said exactly once.
+fn drain_lane_now(task: &mut BashTask, rx: &mut mpsc::Receiver<ByteLane>) {
+    while let Ok(lane) = rx.try_recv() {
+        match lane {
+            ByteLane::Chunk(b) => handle_chunk(task, b),
+            ByteLane::Eof => break,
+        }
+    }
+}
+
 /// Handle onto the Bash session.
 pub struct BashSession {
     id: SessionId,
@@ -926,12 +1018,20 @@ impl BashSession {
     ) -> Result<(Self, mpsc::UnboundedReceiver<SessionEvent>)> {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<BashCmd>();
+        // The pty byte lane, bounded (looprs-6cj). Depth is deliberately small:
+        // it is one of the two places a runaway `while true; do echo; done` can
+        // be standing when the UI stops draining, and the other one is the UI's
+        // own bus. Eight read buffers is 64 KiB — about half a frame of output
+        // at the rate the app can actually draw, which is the right amount of
+        // rope: enough that a producer that keeps up never notices the bound.
+        let (bytes_tx, mut bytes_rx) = mpsc::channel::<ByteLane>(BYTE_LANE_DEPTH);
         let status = Arc::new(StdMutex::new(SessionStatus::NotStarted));
         let task_status = status.clone();
 
         let mut task = BashTask {
             id,
             cfg: cfg.clone(),
+            bytes_tx: bytes_tx.clone(),
             ev_tx: ev_tx.clone(),
             cmd: cmd_tx.clone(),
             shell: None,
@@ -943,6 +1043,7 @@ impl BashSession {
             interrupt_attempt: 0,
             stall_reported: false,
             pending: Vec::new(),
+            output_emitted: 0,
             // The one place the session learns who owns the alternate screen. With
             // the app in the alternate screen, the child's own enter/leave pair is
             // cut out of the stream here rather than teed (ADR-0001 amendment 4),
@@ -970,32 +1071,80 @@ impl BashSession {
         let mut published = SessionStatus::NotStarted;
 
         tokio::spawn(async move {
-            while let Some(cmd) = cmd_rx.recv().await {
-                match cmd {
-                    BashCmd::Submit(text) => task.submit(text),
-                    BashCmd::Interrupt => task.interrupt(),
-                    BashCmd::InterruptStalled { attempt } => task.interrupt_stalled(attempt),
-                    BashCmd::Keys(b) => task.write_keys(b),
-                    BashCmd::Bytes(b) => task.on_bytes(b),
-                    BashCmd::StreamEnd => task.stream_end(),
-                    BashCmd::Resize { rows, cols } => task.resize(rows, cols),
-                    BashCmd::Sync(tx) => {
-                        // Publish the mirror before the ack, so a test that waits
-                        // on the seam then reads `status()` sees the state as of
-                        // that ack rather than one command stale.
-                        let s = task.status();
-                        *task_status.lock().unwrap() = s;
-                        publish_liveness(&mut published, s, &ev_tx);
-                        let _ = tx.send(());
+            // Two lanes, polled in a fixed priority (looprs-6cj).
+            //
+            // `biased` puts the control lane first, every turn, and that ordering
+            // is the reason a bounded output path is safe to have at all: while
+            // the shell is pouring out more than the screen can take, `Esc`,
+            // Ctrl-C, the resize and the exit still get answered immediately.
+            // Before this, the same flood that filled the queue also decided when
+            // the cancel would be looked at.
+            'task: loop {
+                tokio::select! {
+                    biased;
+                    cmd = cmd_rx.recv() => {
+                        // `None` is the mailbox closing: the app let go of its
+                        // senders. That ends this task exactly as the old
+                        // `while let Some(cmd)` ended, and it has to be said
+                        // here — a select arm whose pattern does not match is
+                        // *removed*, and with the byte lane already at EOF
+                        // there would be nothing left to poll.
+                        let Some(cmd) = cmd else { break 'task };
+                        match cmd {
+                            BashCmd::Submit(text) => task.submit(text),
+                            BashCmd::Interrupt => task.interrupt(),
+                            BashCmd::InterruptStalled { attempt } => task.interrupt_stalled(attempt),
+                            BashCmd::Keys(b) => task.write_keys(b),
+                            BashCmd::Resize { rows, cols } => task.resize(rows, cols),
+                            BashCmd::Sync(tx) => {
+                                // Take everything the reader thread has already
+                                // handed over before acking: the seam promises
+                                // "every command queued before this one has been
+                                // handled", and the output that command is
+                                // waiting on now arrives on the *other* lane.
+                                drain_lane_now(&mut task, &mut bytes_rx);
+                                // Publish the mirror before the ack, so a test that waits
+                                // on the seam then reads `status()` sees the state as of
+                                // that ack rather than one command stale.
+                                let s = task.status();
+                                *task_status.lock().unwrap() = s;
+                                publish_liveness(&mut published, s, &ev_tx);
+                                let _ = tx.send(());
+                            }
+                            BashCmd::Shutdown => {
+                                // Take the output that is already on the wire
+                                // before going down. The exit drain's whole job
+                                // is that a session gets its parting word in,
+                                // and since looprs-6cj the bytes of that word
+                                // ride the other lane, so a shutdown that went
+                                // straight to `task.shutdown()` would drop the
+                                // last thing the child said.
+                                drain_lane_now(&mut task, &mut bytes_rx);
+                                task.shutdown();
+                                *task_status.lock().unwrap() = SessionStatus::Dead;
+                                let _ = ev_tx.send(SessionEvent::Exited {
+                                    reason: ExitReason::Shutdown,
+                                });
+                                break 'task;
+                            }
+                        }
                     }
-                    BashCmd::Shutdown => {
-                        task.shutdown();
-                        *task_status.lock().unwrap() = SessionStatus::Dead;
-                        let _ = ev_tx.send(SessionEvent::Exited {
-                            reason: ExitReason::Shutdown,
-                        });
-                        break;
-                    }
+                    // The byte lane, always armed. A read EOF ends *this* shell's
+                    // stream, not the lane: the next command respawns a shell
+                    // whose reader feeds the same lane, and an arm that stayed
+                    // disabled after the first EOF would leave the restarted
+                    // shell running with its output going nowhere.
+                    lane = bytes_rx.recv() => match lane {
+                        Some(ByteLane::Chunk(b)) => handle_chunk(&mut task, b),
+                        Some(ByteLane::Eof) => task.stream_end(),
+                        // Only reachable once every byte-lane sender is gone,
+                        // which includes this task's own copy — so the task is
+                        // already on its way out.
+                        None => {
+                            task.stream_end();
+                            break 'task;
+                        }
+                    },
                 }
                 let s = task.status();
                 *task_status.lock().unwrap() = s;

@@ -3377,6 +3377,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let (ctl_tx, _ctl_rx) = mpsc::unbounded_channel::<BeadsCmd>();
         let cfg = SessionConfig {
+            output_budget: crate::bus::Budget::unbounded(),
             pi_bin: "/bin/true".into(),
             bd_bin: "/bin/true".into(),
             shell_bin: "/bin/true".into(),

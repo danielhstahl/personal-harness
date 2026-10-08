@@ -401,6 +401,20 @@ pub struct SessionConfig {
     /// same startup list the ledger was loaded from — so the session and the ledger
     /// cannot disagree about who owns the screen.
     pub alt_screen_hosted: bool,
+    /// The credit supply that paces the byte-stream producers against the UI's
+    /// drain rate (looprs-6cj).
+    ///
+    /// Built by the UI bus and handed through here because this is the one value
+    /// that reaches every session, and because the direction of the dependency
+    /// is the point: the *consumer* owns the ceiling and the producer asks
+    /// permission. A session that could size its own output queue is a session
+    /// that can outrun the screen again. See [`crate::bus::Budget`].
+    ///
+    /// The default is a supply that never runs out, on the same rule as the
+    /// notifier's and the clipboard's defaults: `SessionConfig::default()` is
+    /// what ~550 tests build, and a default that could block would turn every
+    /// test with no UI draining the far end into a hang.
+    pub output_budget: crate::bus::Budget,
 }
 
 impl Default for SessionConfig {
@@ -411,6 +425,7 @@ impl Default for SessionConfig {
             shell_bin: default_shell_bin(),
             notifier: Arc::new(crate::services::notification::Noop),
             clipboard: Arc::new(crate::services::clipboard::Noop),
+            output_budget: crate::bus::Budget::unbounded(),
             alt_screen_hosted: crate::teardown::Mode::alt_screen_claimed(),
         }
     }

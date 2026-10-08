@@ -13,7 +13,7 @@
 //! ```text
 //!   crossterm EventStream ──> run() loop ──keys──> App.input ──UiCommand──> cmd_tx
 //!                                                     │                      (mpsc, 16)
-//!   app_tx (unbounded Msg) <───────────────────────────┘                        │
+//!   app_tx (crate::bus: capped Msg, coalescing) <────────┘                      │
 //!       │                                                                       │
 //!       │   ┌───────────────────────── Router task (the only owner) ────────────┘
 //!       │   │  sessions: HashMap<TerminalType, Managed{ id, Box<dyn Session>, pump }>
@@ -21,10 +21,16 @@
 //!       │   │   pump(id, rx) ── SessionEvent ──wrap(id, .)──> Msg ──┐
 //!       │   │   pump(id, rx) ── SessionEvent ──wrap(id, .)──> Msg ──┼──> app_tx
 //!       │   │   pump(id, rx) ── SessionEvent ──wrap(id, .)──> Msg ──┘
+//!       │   │        └── and returns one output-budget token per BashOutput,
+//!       │   │           which is what paces the pty reader (looprs-6cj)
 //!       │   └───────────────────────────────────────────────────────┘
 //!       ▼
-//!   run() loop: Msg -> App.update(view state) -> flush -> frame (band/cards/status/input)
+//!   run() loop: batch of Msg -> App.update(view state) -> flush -> frame (band/cards/status/input)
 //! ```
+//!
+//! The bus and the token supply are the two halves of looprs-6cj: see
+//! [`crate::bus`]. Nothing in this diagram is unbounded any more in the direction
+//! a producer can outrun the UI in.
 //!
 //! Three rules fall out of it:
 //!
@@ -112,7 +118,7 @@ pub(crate) struct Managed {
 pub struct Router {
     factory: SessionFactory,
     /// Every `Msg` produced by a session goes here, into the UI loop.
-    app_tx: mpsc::UnboundedSender<Msg>,
+    app_tx: crate::bus::Sender,
     active: TerminalType,
     sessions: HashMap<TerminalType, Managed>,
     /// The last size we were told, kept so that a session created *after* the last
@@ -128,11 +134,7 @@ pub struct Router {
 
 impl Router {
     /// The production router: real backends from [`default_factory`].
-    pub fn new(
-        active: TerminalType,
-        cfg: SessionConfig,
-        app_tx: mpsc::UnboundedSender<Msg>,
-    ) -> Self {
+    pub fn new(active: TerminalType, cfg: SessionConfig, app_tx: crate::bus::Sender) -> Self {
         Self::with_factory(active, app_tx, default_factory(cfg))
     }
 
@@ -140,7 +142,7 @@ impl Router {
     /// test uses this to drive real policy with sessions whose behavior it controls.
     pub fn with_factory(
         active: TerminalType,
-        app_tx: mpsc::UnboundedSender<Msg>,
+        app_tx: crate::bus::Sender,
         factory: SessionFactory,
     ) -> Self {
         Self {
@@ -221,7 +223,7 @@ impl Router {
     /// did — just owned now, instead of hand-wired in `main`.
     pub async fn boot(&mut self) -> Result<()> {
         let mode = self.active;
-        self.ensure(mode)?;
+        self.ensure(mode).await?;
         if let Some(m) = self.sessions.get_mut(&mode) {
             m.session.set_active(true)?;
         }
@@ -248,22 +250,31 @@ impl Router {
             UiCommand::Submit { mode, text } => {
                 if mode != self.active {
                     tracing::debug!(?mode, active = ?self.active, "submit raced a switch; dropped");
-                    let _ = self.app_tx.send(Msg::System {
-                        session: None,
-                        text: format!("switched modes; the {} message was not sent", mode.label()),
-                    });
+                    let _ = self
+                        .app_tx
+                        .send(Msg::System {
+                            session: None,
+                            text: format!(
+                                "switched modes; the {} message was not sent",
+                                mode.label()
+                            ),
+                        })
+                        .await;
                     return Ok(());
                 }
-                let id = self.ensure(mode)?;
+                let id = self.ensure(mode).await?;
                 let session = &mut self.sessions.get_mut(&mode).expect("just ensured").session;
                 if let Err(e) = session.send_text(text) {
                     // A stub backend refusing (`ctn`/`553`) or a child that will
                     // not take it: the user pressed Enter, so the answer goes on
                     // their screen, attributed.
-                    let _ = self.app_tx.send(Msg::Error {
-                        session: Some(id),
-                        text: format!("{}: {e:#}", mode.label()),
-                    });
+                    let _ = self
+                        .app_tx
+                        .send(Msg::Error {
+                            session: Some(id),
+                            text: format!("{}: {e:#}", mode.label()),
+                        })
+                        .await;
                 }
                 Ok(())
             }
@@ -287,10 +298,13 @@ impl Router {
                         let id = m.id;
                         let session = &mut m.session;
                         if let Err(e) = session.abort() {
-                            let _ = self.app_tx.send(Msg::Error {
-                                session: Some(id),
-                                text: format!("cancel: {e:#}"),
-                            });
+                            let _ = self
+                                .app_tx
+                                .send(Msg::Error {
+                                    session: Some(id),
+                                    text: format!("cancel: {e:#}"),
+                                })
+                                .await;
                         }
                         Ok(())
                     }
@@ -309,10 +323,13 @@ impl Router {
                     Some(m) => {
                         let id = m.id;
                         if let Err(e) = m.session.send_bytes(bytes) {
-                            let _ = self.app_tx.send(Msg::Error {
-                                session: Some(id),
-                                text: format!("keys: {e:#}"),
-                            });
+                            let _ = self
+                                .app_tx
+                                .send(Msg::Error {
+                                    session: Some(id),
+                                    text: format!("keys: {e:#}"),
+                                })
+                                .await;
                         }
                         Ok(())
                     }
@@ -378,11 +395,14 @@ impl Router {
             tracing::warn!(mode = ?from, ?policy, "set_active(false) failed: {e:#}");
         }
         self.active = to;
-        if let Err(e) = self.ensure(to) {
-            let _ = self.app_tx.send(Msg::Error {
-                session: None,
-                text: format!("could not open {}: {e:#}", to.label()),
-            });
+        if let Err(e) = self.ensure(to).await {
+            let _ = self
+                .app_tx
+                .send(Msg::Error {
+                    session: None,
+                    text: format!("could not open {}: {e:#}", to.label()),
+                })
+                .await;
             return Err(e);
         }
         if let Some(m) = self.sessions.get_mut(&to)
@@ -391,10 +411,13 @@ impl Router {
             tracing::warn!(mode = ?to, "set_active(true) failed: {e:#}");
         }
         let id = self.sessions[&to].id;
-        let _ = self.app_tx.send(Msg::System {
-            session: Some(id),
-            text: format!("── switched to {} ──", to.label()),
-        });
+        let _ = self
+            .app_tx
+            .send(Msg::System {
+                session: Some(id),
+                text: format!("── switched to {} ──", to.label()),
+            })
+            .await;
         Ok(())
     }
 
@@ -461,10 +484,13 @@ impl Router {
                 break;
             }
             if let Err(e) = self.handle(cmd).await {
-                let _ = self.app_tx.send(Msg::Error {
-                    session: None,
-                    text: format!("router: {e:#}"),
-                });
+                let _ = self
+                    .app_tx
+                    .send(Msg::Error {
+                        session: None,
+                        text: format!("router: {e:#}"),
+                    })
+                    .await;
             }
         }
         self.shutdown_all(SHUTDOWN_GRACE).await
@@ -477,7 +503,7 @@ impl Router {
     /// existing session is reused *unless* it is `Dead`, in which case the corpse is
     /// retired first and the new generation gets a fresh id — which is what makes a
     /// stale event distinguishable rather than merely unlikely.
-    fn ensure(&mut self, mode: TerminalType) -> Result<SessionId> {
+    async fn ensure(&mut self, mode: TerminalType) -> Result<SessionId> {
         let mut replaced: Option<SessionId> = None;
         if let Some(m) = self.sessions.get(&mode) {
             if !matches!(m.session.status(), SessionStatus::Dead) {
@@ -529,10 +555,13 @@ impl Router {
         // in between to say they are the same pane — which reads as a crash rather
         // than a restart. (looprs-553: "restart it with a visible notice".)
         if let Some(old) = replaced {
-            let _ = self.app_tx.send(Msg::System {
-                session: Some(id),
-                text: format!("{old} was gone; started {id} in its place"),
-            });
+            let _ = self
+                .app_tx
+                .send(Msg::System {
+                    session: Some(id),
+                    text: format!("{old} was gone; started {id} in its place"),
+                })
+                .await;
         }
         Ok(id)
     }
@@ -554,19 +583,36 @@ impl Router {
         mut rx: mpsc::UnboundedReceiver<SessionEvent>,
     ) -> JoinHandle<()> {
         let tx = self.app_tx.clone();
+        // The same supply the pty reader is charging. Returning a token here,
+        // once the message is into the UI's queue rather than merely produced,
+        // is what makes the shell's own write rate be the UI's drain rate
+        // (looprs-6cj).
+        let budget = self.app_tx.budget();
         tokio::spawn(async move {
             let mut exited = false;
             while let Some(ev) = rx.recv().await {
                 exited |= matches!(ev, SessionEvent::Exited { .. });
-                if tx.send(wrap(id, ev)).is_err() {
+                // Only the byte stream carries a token: it is the only class
+                // whose producer can outrun the UI. Coalescing means one queued
+                // `Msg` may stand for several reads, and a merged chunk returns
+                // one token for more than one acquired — which is exactly the
+                // case the budget is clamped against, so the bound loosens by at
+                // most its own size instead of inflating.
+                let is_stream = matches!(ev, SessionEvent::BashOutput { .. });
+                if tx.send(wrap(id, ev)).await.is_err() {
                     return; // UI is gone; nothing to forward to
+                }
+                if is_stream {
+                    budget.release();
                 }
             }
             if !exited {
-                let _ = tx.send(Msg::SessionDown {
-                    session: id,
-                    reason: ExitReason::Unknown,
-                });
+                let _ = tx
+                    .send(Msg::SessionDown {
+                        session: id,
+                        reason: ExitReason::Unknown,
+                    })
+                    .await;
             }
         })
     }
@@ -578,15 +624,15 @@ mod tests {
     use crate::session::BeadStep;
     use crate::testing::{FakeBackend, fake};
 
-    fn router_with(active: TerminalType) -> (Router, mpsc::UnboundedReceiver<Msg>, FakeBackend) {
-        let (tx, rx) = mpsc::unbounded_channel::<Msg>();
+    fn router_with(active: TerminalType) -> (Router, crate::bus::Receiver, FakeBackend) {
+        let (tx, rx) = crate::bus::channel(crate::bus::DEFAULT_CAP_BYTES);
         let backend = FakeBackend::new();
         let router = Router::with_factory(active, tx, backend.factory());
         (router, rx, backend)
     }
 
     /// Drain whatever has arrived so far, as stable strings.
-    fn drain(rx: &mut mpsc::UnboundedReceiver<Msg>) -> Vec<String> {
+    fn drain(rx: &mut crate::bus::Receiver) -> Vec<String> {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
             out.push(match m {
@@ -637,7 +683,7 @@ mod tests {
     #[test]
     fn wrap_stamps_the_origin_on_every_session_message() {
         let id = SessionId::new(TerminalType::Beeds, 3);
-        let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
+        let (tx, _rx) = crate::bus::channel(crate::bus::DEFAULT_CAP_BYTES);
         let router = Router::new(TerminalType::Beeds, SessionConfig::default(), tx);
 
         // `Agent` is the variant looprs-msj is about: it must name its producer.
@@ -716,7 +762,7 @@ mod tests {
     #[tokio::test]
     async fn a_quietly_dropped_stream_still_produces_one_session_down() {
         let id = SessionId::new(TerminalType::Pi, 9);
-        let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+        let (tx, mut rx) = crate::bus::channel(crate::bus::DEFAULT_CAP_BYTES);
         let router = Router::new(TerminalType::Pi, SessionConfig::default(), tx);
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
 
@@ -739,7 +785,7 @@ mod tests {
     #[tokio::test]
     async fn an_orderly_exit_is_not_duplicated() {
         let id = SessionId::new(TerminalType::Bash, 1);
-        let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+        let (tx, mut rx) = crate::bus::channel(crate::bus::DEFAULT_CAP_BYTES);
         let router = Router::new(TerminalType::Bash, SessionConfig::default(), tx);
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
 
@@ -1082,7 +1128,7 @@ mod tests {
         let (mut router, _rx, backend) = router_with(TerminalType::Pi);
         let mut seen = Vec::new();
         for _ in 0..3 {
-            let id = router.ensure(TerminalType::Pi).unwrap();
+            let id = router.ensure(TerminalType::Pi).await.unwrap();
             seen.push(id.generation);
             backend.set_status(id, SessionStatus::Dead);
         }
@@ -1097,8 +1143,8 @@ mod tests {
     #[tokio::test]
     async fn ensure_reuses_a_live_session() {
         let (mut router, _rx, backend) = router_with(TerminalType::Bash);
-        let a = router.ensure(TerminalType::Bash).unwrap();
-        let b = router.ensure(TerminalType::Bash).unwrap();
+        let a = router.ensure(TerminalType::Bash).await.unwrap();
+        let b = router.ensure(TerminalType::Bash).await.unwrap();
         assert_eq!(a, b);
         assert_eq!(backend.spawn_count(TerminalType::Bash), 1);
     }
@@ -1108,9 +1154,9 @@ mod tests {
     /// is refused rather than filed away.
     #[tokio::test]
     async fn a_factory_that_lies_about_the_mode_is_refused() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
+        let (tx, _rx) = crate::bus::channel(crate::bus::DEFAULT_CAP_BYTES);
         let mut router = Router::with_factory(TerminalType::Pi, tx, fake(TerminalType::Bash));
-        let err = router.ensure(TerminalType::Pi).unwrap_err();
+        let err = router.ensure(TerminalType::Pi).await.unwrap_err();
         assert!(err.to_string().contains("factory produced"), "{err}");
         assert!(router.sessions.is_empty(), "a liar is not registered");
     }
@@ -1122,11 +1168,11 @@ mod tests {
     #[tokio::test]
     async fn replacing_a_dead_generation_is_announced() {
         let (mut router, mut rx, backend) = router_with(TerminalType::Bash);
-        let old = router.ensure(TerminalType::Bash).unwrap();
+        let old = router.ensure(TerminalType::Bash).await.unwrap();
         drain(&mut rx);
         backend.set_status(old, SessionStatus::Dead);
 
-        let new = router.ensure(TerminalType::Bash).unwrap();
+        let new = router.ensure(TerminalType::Bash).await.unwrap();
         assert_ne!(old, new, "a replacement is a new generation");
         let msgs = drain(&mut rx);
         assert!(
@@ -1146,7 +1192,7 @@ mod tests {
     async fn a_resize_reaches_every_live_session() {
         let (mut router, _rx, backend) = router_with(TerminalType::Beeds);
         router.boot().await.unwrap();
-        router.ensure(TerminalType::Bash).unwrap();
+        router.ensure(TerminalType::Bash).await.unwrap();
         backend.clear_log();
 
         router
@@ -1214,7 +1260,7 @@ mod tests {
             backend.log()
         );
 
-        router.ensure(TerminalType::Bash).unwrap();
+        router.ensure(TerminalType::Bash).await.unwrap();
         let log = backend.log();
         assert!(
             log.iter()
@@ -1255,7 +1301,7 @@ mod tests {
     /// A session that never reports its exit must not be able to hang the exit.
     #[tokio::test]
     async fn a_wedged_session_cannot_prevent_quit() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
+        let (tx, _rx) = crate::bus::channel(crate::bus::DEFAULT_CAP_BYTES);
         let silent = FakeBackend::new().with_silent_exit();
         let mut router = Router::with_factory(TerminalType::Pi, tx, silent.factory());
         router.boot().await.unwrap();
@@ -1277,7 +1323,7 @@ mod tests {
     /// that pays for all of them.
     #[tokio::test]
     async fn wedged_sessions_share_one_grace_period() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
+        let (tx, _rx) = crate::bus::channel(crate::bus::DEFAULT_CAP_BYTES);
         let wedged = FakeBackend::new().with_silent_exit();
         let mut router = Router::with_factory(TerminalType::Beeds, tx, wedged.factory());
         router.boot().await.unwrap();
@@ -1308,7 +1354,7 @@ mod tests {
     /// kills the child; the pump just has to stop being a route to the UI.
     #[tokio::test]
     async fn a_wedged_sessions_pump_is_cut_rather_than_left_running() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
+        let (tx, _rx) = crate::bus::channel(crate::bus::DEFAULT_CAP_BYTES);
         let wedged = FakeBackend::new().with_silent_exit();
         let mut router = Router::with_factory(TerminalType::Pi, tx, wedged.factory());
         router.boot().await.unwrap();
@@ -1350,7 +1396,7 @@ mod tests {
     #[tokio::test]
     async fn a_quit_command_shuts_the_sessions_down_without_closing_the_channel() {
         let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>(16);
-        let (app_tx, mut app_rx) = mpsc::unbounded_channel::<Msg>();
+        let (app_tx, mut app_rx) = crate::bus::channel(crate::bus::DEFAULT_CAP_BYTES);
         let backend = FakeBackend::new();
         let mut router = Router::with_factory(TerminalType::Beeds, app_tx, backend.factory());
         router.boot().await.unwrap();
@@ -1392,7 +1438,7 @@ mod tests {
     #[tokio::test]
     async fn run_serves_commands_and_then_leaves_cleanly() {
         let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>(16);
-        let (app_tx, mut app_rx) = mpsc::unbounded_channel::<Msg>();
+        let (app_tx, mut app_rx) = crate::bus::channel(crate::bus::DEFAULT_CAP_BYTES);
         let backend = FakeBackend::new();
         let router = Router::with_factory(TerminalType::Pi, app_tx, backend.factory());
         let task = tokio::spawn(router.run(cmd_rx));
