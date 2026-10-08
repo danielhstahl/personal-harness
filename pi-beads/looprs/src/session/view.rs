@@ -163,14 +163,14 @@ impl Tokens {
     /// of the message length, and it looks plausible right up until it doesn't.
     /// `message_end` lands once per API call, which is every bit as live as the row
     /// needs and impossible to double-count.
-    pub fn add(&mut self, u: &crate::app::Usage) {
+    pub fn add(&mut self, u: &crate::wire::Usage) {
         self.input += u.input;
         self.output += u.output;
         self.cache += u.cache_read + u.cache_write;
     }
 
     /// Nothing reported yet — which is not the same fact as "zero spent", per
-    /// [`crate::app::Usage`]'s optionality. The row shows no segment for it.
+    /// [`crate::wire::Usage`]'s optionality. The row shows no segment for it.
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }

@@ -14,8 +14,9 @@ mod testing;
 mod theme;
 mod utils;
 mod viewport;
+mod wire;
 use anyhow::Result;
-use app::{App, Msg, UiCommand};
+use app::App;
 use components::input::InputState;
 use crossterm::event::{Event, EventStream};
 use futures::StreamExt;
@@ -29,6 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
+use wire::{Msg, UiCommand};
 
 use components::card::LiveCardPreview;
 use components::selection::SelectionHighlight;
@@ -653,9 +655,9 @@ fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::PiEvent;
     use crate::session::{BeadStep, SessionId, SessionStatus};
     use crate::state::transcript::MessageKind;
+    use crate::wire::PiEvent;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;

@@ -35,12 +35,12 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::app::{PiEvent, parse};
 use crate::services::pi::{PiRpc, disposition_of, queued_text, succeeded};
 use crate::session::{
     ExitReason, Session, SessionConfig, SessionEvent, SessionId, SessionStatus, Spawned, cancel,
     publish_liveness,
 };
+use crate::wire::{PiEvent, parse};
 
 /// How long an orderly `close stdin -> pi disposes itself` gets before we SIGKILL.
 ///
@@ -680,9 +680,9 @@ impl Session for PiChatSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::AssistantEvent;
     use crate::session::TerminalType;
     use crate::testing::{BdFake, EMPTY_BOARD, Fakes, PiFake, kill_pid, process_alive};
+    use crate::wire::AssistantEvent;
     use std::time::Instant;
 
     /// Generous, bounded: a hang is a failure of this ticket and must report as one.

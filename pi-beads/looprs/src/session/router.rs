@@ -48,11 +48,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::app::{Msg, UiCommand};
 use crate::session::{
     ExitReason, Session, SessionConfig, SessionEvent, SessionFactory, SessionId, SessionStatus,
     TerminalType, default_factory,
 };
+use crate::wire::{Msg, UiCommand};
 
 /// How long [`Router::shutdown_all`] waits for a session to say goodbye before it
 /// stops waiting. Exact numbers are looprs-ecr's; this is the placeholder that keeps
@@ -688,11 +688,11 @@ mod tests {
 
         // `Agent` is the variant looprs-msj is about: it must name its producer.
         let Msg::Agent { session, event } =
-            wrap(id, SessionEvent::Agent(crate::app::PiEvent::AgentSettled))
+            wrap(id, SessionEvent::Agent(crate::wire::PiEvent::AgentSettled))
         else {
             panic!("Agent must map to Msg::Agent");
         };
-        assert!(matches!(event, crate::app::PiEvent::AgentSettled));
+        assert!(matches!(event, crate::wire::PiEvent::AgentSettled));
         assert_eq!(session, id);
 
         let Msg::BashOutput {
@@ -1090,7 +1090,7 @@ mod tests {
 
         // The corpse tries to speak.
         old_events
-            .send(SessionEvent::Agent(crate::app::PiEvent::AgentSettled))
+            .send(SessionEvent::Agent(crate::wire::PiEvent::AgentSettled))
             .ok();
         old_events
             .send(SessionEvent::System("I am still here".into()))

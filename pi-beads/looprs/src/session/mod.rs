@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::app::PiEvent;
+use crate::wire::PiEvent;
 
 pub use bash::BashSession;
 pub use beads::BeadsSession;
@@ -238,7 +238,7 @@ pub enum ExitReason {
 
 /// The one event type every session emits, regardless of backend.
 ///
-/// A session never sees [`crate::app::Msg`]: it knows nothing about ticks, resize
+/// A session never sees [`crate::wire::Msg`]: it knows nothing about ticks, resize
 /// events, or which mode is on screen. The router's pump ([`Router::pump`]) is the
 /// single place that stamps the [`SessionId`] and turns this into a `Msg`, so a
 /// missing origin is a compile error rather than a 3 a.m. bug.

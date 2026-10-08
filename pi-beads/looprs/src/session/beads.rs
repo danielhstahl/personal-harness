@@ -95,7 +95,6 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::app::{AssistantEvent, PiEvent, parse};
 use crate::services::bd::{Bead, BeadStatus, claim_with, list_status_with, ready_with, show_with};
 use crate::services::notification::BeadDone;
 use crate::services::pi::PiRpc;
@@ -104,6 +103,7 @@ use crate::session::{
     ActiveBead, BeadStep, ExitReason, Session, SessionConfig, SessionEvent, SessionId,
     SessionStatus, Spawned, cancel, publish_liveness,
 };
+use crate::wire::{AssistantEvent, PiEvent, parse};
 
 use serde_json::Value;
 

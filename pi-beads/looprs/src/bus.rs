@@ -56,7 +56,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-use crate::app::Msg;
+use crate::wire::Msg;
 
 /// The bus's ceiling, in queued bytes.
 ///
