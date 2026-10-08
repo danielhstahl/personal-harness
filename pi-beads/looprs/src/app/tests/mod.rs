@@ -102,7 +102,9 @@ fn paint(app: &App, height: u16, preview: &[Line<'static>]) {
 ///
 /// Returns `(band x, y of the first drawn row, the drawn rows' text)`.
 fn geom(app: &App, height: u16) -> (u16, u16, Vec<String>) {
-    let [text, ..] = viewport::frame_areas(
+    let viewport::FrameAreas {
+        transcript: text, ..
+    } = viewport::frame_areas(
         Rect::new(0, 0, W, height),
         app.live_card_rows(),
         app.input_band(W),

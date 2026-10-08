@@ -503,7 +503,9 @@ fn the_live_tail_cannot_be_selected() {
     let h = 20u16;
     let preview = vec![Line::from("STILL-ARRIVING".to_string())];
     paint(&app, h, &preview);
-    let [text, ..] = viewport::frame_areas(
+    let viewport::FrameAreas {
+        transcript: text, ..
+    } = viewport::frame_areas(
         Rect::new(0, 0, W, h),
         app.live_card_rows(),
         app.input_band(W),
@@ -539,7 +541,12 @@ fn chrome_cannot_be_selected_and_leaves_the_selection_alone() {
     settle_answers(&mut app, 3);
     let h = 20u16;
     paint(&app, h, &[]);
-    let [_text, _, _, status, input] = viewport::frame_areas(
+    let viewport::FrameAreas {
+        transcript: _text,
+        status,
+        input,
+        ..
+    } = viewport::frame_areas(
         Rect::new(0, 0, W, h),
         app.live_card_rows(),
         app.input_band(W),

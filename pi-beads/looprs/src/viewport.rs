@@ -51,12 +51,11 @@
 //!    compaction, capped at [`MAX_TOOL_ROWS`].
 //! 3. **the kanban band** — the beads board (epic looprs-5o4): three columns
 //!    sharing one header row, plus a footer row that is never omitted while the
-//!    band is drawn (ADR-0007 §4). How tall it gets is
-//!    [`kanban_rows`], and it is **zero rows** in every frame that is not
-//!    drawing it — see [`KanbanBudget::Off`], which is what every frame passes
-//!    today, before the widget (looprs-5o4.4) and the beads-mode gate
-//!    (looprs-5o4.5) exist. Reserving rows for a band nobody paints is a hole
-//!    in the frame, not a band.
+//!    band is drawn (ADR-0007 §4). How tall it gets is [`kanban_rows`], and it
+//!    is **zero rows** in every frame that is not drawing it — see
+//!    [`KanbanBudget::Off`], which is what the gate hands every non-beads frame
+//!    (`crate::App::kanban_budget`, looprs-5o4.5). Reserving rows for a band
+//!    nobody paints is a hole in the frame, not a band.
 //! 4. **the status row** — one row, [`STATUS_ROWS`], see
 //!    [`crate::components::status`].
 //! 5. **the input box** — [`NO_INPUT_ROWS`] when the active session is not
@@ -97,8 +96,11 @@
 //!    paid the way [`kanban_rows`] pays it, from the surplus, and is not in
 //!    [`bands`] at all);
 //! 2. add one `Constraint::Length` to the [`Layout`] in [`frame_areas`], in the
-//!    order the band sits in, and leave the transcript band's `Constraint::Min`
-//!    absorbing the rest;
+//!    order the band sits in, leave the transcript band's `Constraint::Min`
+//!    absorbing the rest, and add the matching field to [`FrameAreas`] — the
+//!    named struct is the thing that stops a draw site from guessing which band
+//!    it is painting into, and the compiler reads a new field at every site
+//!    that has to decide what to do with it;
 //! 3. draw into the new [`Rect`] in [`crate::view`], from state that the frame
 //!    was already handed — a band whose contents are re-derived at draw time is
 //!    a second opinion about what the frame is showing, which is the one thing
@@ -390,6 +392,40 @@ pub fn bands(tool_rows: u16, input_rows: u16, frame_rows: u16) -> (u16, u16) {
     (tools, input)
 }
 
+/// The frame's five bands, top to bottom, **named**.
+///
+/// A struct rather than a `[Rect; N]` because the bands are five
+/// differently-behaved things, not N of one thing: one is a `Min` that absorbs
+/// the remainder, one is a wall, one is zero outside a single mode, one is a
+/// fixed row and one is a box that grows. A tuple makes every one of those
+/// differences invisible at the call site and encodes the position of each band
+/// in every destructuring pattern, so adding or reordering a band is a
+/// find-and-replace across the crate that the compiler can only check one index
+/// at a time — and `[Rect; 5]` indexing (`small[4]`) says nothing at all about
+/// which band it is.
+///
+/// With fields, the compile-checked thing is the *name*: `areas.status` cannot
+/// silently become the input box, and a band added to the struct shows up as a
+/// missing field at every site that must decide what to do with it.
+///
+/// The field order is the draw order, top to bottom, so reading a
+/// `FrameAreas` value reads the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameAreas {
+    /// Band 1: the transcript, and the frame's `Constraint::Min`.
+    pub transcript: Rect,
+    /// Band 2: the live cards (tool calls, open compaction).
+    pub cards: Rect,
+    /// Band 3: the beads board. **Zero rows** in every frame that is not
+    /// drawing it — see [`KanbanBudget::Off`].
+    pub kanban: Rect,
+    /// Band 4: the status row.
+    pub status: Rect,
+    /// Band 5: the input box. [`NO_INPUT_ROWS`] when the session took the
+    /// keyboard.
+    pub input: Rect,
+}
+
 /// The frame's five bands, top to bottom: transcript, tool rows, kanban,
 /// status, input.
 ///
@@ -400,21 +436,35 @@ pub fn bands(tool_rows: u16, input_rows: u16, frame_rows: u16) -> (u16, u16) {
 /// that made the two disagree would show up as blank rows inside the frame,
 /// which is a bug nobody can trace from a screenshot.
 ///
-/// The kanban band is [`KanbanBudget::Off`] for every caller until the widget
-/// and its beads-mode gate land, which is what keeps this frame's four
-/// original bands exactly where they have always been: a zero-length
-/// `Constraint::Length(0)` is a band that occupies no row at all.
-pub fn frame_areas(area: Rect, tool_rows: u16, input_rows: u16, kanban: KanbanBudget) -> [Rect; 5] {
+/// The kanban band's height is whatever `kanban` buys: [`kanban_rows`] returns
+/// `0` for [`KanbanBudget::Off`], and a zero-length `Constraint::Length(0)` is
+/// a band that occupies no row at all, which is what keeps every other band
+/// exactly where it was before the band existed. The *gate* — beads mode only —
+/// is not this function's call; it lives with the mode
+/// ([`crate::App::kanban_budget`]), and this function is given the answer.
+pub fn frame_areas(
+    area: Rect,
+    tool_rows: u16,
+    input_rows: u16,
+    kanban: KanbanBudget,
+) -> FrameAreas {
     let (tools, input) = bands(tool_rows, input_rows, area.height);
     let board = kanban_rows(area.height, tool_rows, input_rows, kanban);
-    Layout::vertical([
+    let [transcript, cards, kanban, status, input] = Layout::vertical([
         Constraint::Min(MIN_TEXT_ROWS),
         Constraint::Length(tools),
         Constraint::Length(board),
         Constraint::Length(STATUS_ROWS),
         Constraint::Length(input),
     ])
-    .areas(area)
+    .areas(area);
+    FrameAreas {
+        transcript,
+        cards,
+        kanban,
+        status,
+        input,
+    }
 }
 
 /// The whole window, owned outright: the `Terminal` under the frame.
@@ -707,8 +757,13 @@ mod tests {
                 for input in [MIN_INPUT_ROWS, MAX_INPUT_ROWS, NO_INPUT_ROWS] {
                     for budget in BUDGETS {
                         let area = Rect::new(0, 0, W as u16, mode_rows);
-                        let [text, card, board, status, box_band] =
-                            frame_areas(area, tools, input, budget);
+                        let FrameAreas {
+                            transcript: text,
+                            cards: card,
+                            kanban: board,
+                            status,
+                            input: box_band,
+                        } = frame_areas(area, tools, input, budget);
                         let tag = format!(
                             "rows={mode_rows} tools={tools} input={input} board={budget:?}"
                         );
@@ -799,10 +854,20 @@ mod tests {
             for tools in [0u16, 1, 4, 9] {
                 for input in [MIN_INPUT_ROWS, MAX_INPUT_ROWS, NO_INPUT_ROWS] {
                     let area = Rect::new(0, 0, W as u16, total);
-                    let [text_off, cards_off, board_off, status_off, box_off] =
-                        frame_areas(area, tools, input, KanbanBudget::Off);
-                    let [text_on, cards_on, board_on, status_on, box_on] =
-                        frame_areas(area, tools, input, KanbanBudget::Auto);
+                    let FrameAreas {
+                        transcript: text_off,
+                        cards: cards_off,
+                        kanban: board_off,
+                        status: status_off,
+                        input: box_off,
+                    } = frame_areas(area, tools, input, KanbanBudget::Off);
+                    let FrameAreas {
+                        transcript: text_on,
+                        cards: cards_on,
+                        kanban: board_on,
+                        status: status_on,
+                        input: box_on,
+                    } = frame_areas(area, tools, input, KanbanBudget::Auto);
                     let tag = format!("rows={total} tools={tools} input={input}");
 
                     assert_eq!(board_off.height, 0, "{tag}: Off still took rows");
@@ -1100,8 +1165,11 @@ mod tests {
         // A window that cannot fit both: the wall shrinks, the box does not.
         let tall = MAX_INPUT_ROWS;
         for total in (STATUS_ROWS + tall + MIN_TEXT_ROWS)..=40u16 {
-            let [_, card, _, _, box_band] =
-                frame_areas(Rect::new(0, 0, W as u16, total), 4, tall, KanbanBudget::Off);
+            let FrameAreas {
+                cards: card,
+                input: box_band,
+                ..
+            } = frame_areas(Rect::new(0, 0, W as u16, total), 4, tall, KanbanBudget::Off);
             assert_eq!(
                 box_band.height, tall,
                 "rows={total}: the box was cut before the tool wall was"
@@ -1152,7 +1220,12 @@ mod tests {
     fn a_hidden_input_box_leaves_the_status_row_on_the_bottom_edge() {
         for total in 1u16..=60 {
             for tools in [0u16, 1, 4, 9] {
-                let [_, card, _, status, box_band] = frame_areas(
+                let FrameAreas {
+                    cards: card,
+                    status,
+                    input: box_band,
+                    ..
+                } = frame_areas(
                     Rect::new(0, 0, W as u16, total),
                     tools,
                     NO_INPUT_ROWS,
@@ -1180,7 +1253,9 @@ mod tests {
     #[test]
     fn the_transcript_band_keeps_its_floor_against_the_chrome() {
         for total in (STATUS_ROWS + MIN_INPUT_ROWS + MIN_TEXT_ROWS)..=60u16 {
-            let [text, _, _, _, _] = frame_areas(
+            let FrameAreas {
+                transcript: text, ..
+            } = frame_areas(
                 Rect::new(0, 0, W as u16, total),
                 MAX_TOOL_ROWS,
                 MAX_INPUT_ROWS,
@@ -1218,33 +1293,33 @@ mod tests {
             MAX_INPUT_ROWS,
             KanbanBudget::Off,
         );
-        assert_eq!(small[4].height, MIN_INPUT_ROWS);
+        assert_eq!(small.input.height, MIN_INPUT_ROWS);
         assert_eq!(
-            big[4].height, MAX_INPUT_ROWS,
+            big.input.height, MAX_INPUT_ROWS,
             "the box got every row it asked for"
         );
         assert_eq!(
-            small[4].bottom(),
-            big[4].bottom(),
+            small.input.bottom(),
+            big.input.bottom(),
             "the frame did not grow to fit the box: the rows came from above"
         );
         assert!(
-            big[0].height >= MIN_TEXT_ROWS,
+            big.transcript.height >= MIN_TEXT_ROWS,
             "the transcript lost its floor to the box: {} rows",
-            big[0].height
+            big.transcript.height
         );
         // With the wall affordable, the transcript is what pays — which is the
         // difference between "the transcript absorbs the rest" and "the wall
         // always pays", and only one of them is the ladder.
         assert_eq!(
-            big[1].height, small[1].height,
+            big.cards.height, small.cards.height,
             "the wall kept its rows because it could afford to"
         );
         assert!(
-            big[0].height < small[0].height,
+            big.transcript.height < small.transcript.height,
             "nobody paid for the box: {} -> {}",
-            small[0].height,
-            big[0].height
+            small.transcript.height,
+            big.transcript.height
         );
     }
 
@@ -1265,7 +1340,10 @@ mod tests {
         // no margin above it to keep visible and no pane below it to save room
         // for. A 120-row window spends all 120.
         let big = Rect::new(0, 0, 80, 120);
-        let [big_text, _, _, _, _] = frame_areas(big, 0, MIN_INPUT_ROWS, KanbanBudget::Off);
+        let FrameAreas {
+            transcript: big_text,
+            ..
+        } = frame_areas(big, 0, MIN_INPUT_ROWS, KanbanBudget::Off);
         assert_eq!(
             big_text.height,
             120 - STATUS_ROWS - MIN_INPUT_ROWS,
@@ -1501,7 +1579,13 @@ mod tests {
     #[test]
     fn a_narrow_window_still_tiles() {
         for width in 1u16..40 {
-            let [text, card, _, status, input] = frame_areas(
+            let FrameAreas {
+                transcript: text,
+                cards: card,
+                status,
+                input,
+                ..
+            } = frame_areas(
                 Rect::new(0, 0, width, 12),
                 MAX_TOOL_ROWS,
                 MAX_INPUT_ROWS,

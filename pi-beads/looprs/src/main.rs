@@ -33,6 +33,7 @@ use tokio::time::MissedTickBehavior;
 use wire::{Msg, UiCommand};
 
 use components::card::LiveCardPreview;
+use components::kanban::Kanban;
 use components::selection::SelectionHighlight;
 use components::text_stream::{NewRowsPill, TranscriptBand, band_layout};
 use components::toast::ToastOverlay;
@@ -229,11 +230,13 @@ async fn run(
     //
     // Both ends are held here for the length of the run: the handle because a
     // poller with no readers stops itself, the poller because dropping it is the
-    // shutdown (see the exit path below). What is *not* wired yet is the band —
-    // handing the handle to the frame is looprs-5o4.5. What *is* wired is the
-    // knob: `LOOPRS_KANBAN`, `LOOPRS_KANBAN_POLL_MS` and `LOOPRS_BD_BIN` are
-    // read once, here, and `spawn` logs what they resolved to.
-    let (board, board_handle) =
+    // shutdown (see the exit path below). The handle is read in two places and
+    // nowhere else: once here, to seed the band with the `reading the board…`
+    // snapshot that exists before the first read lands, and once per wake in the
+    // run loop's board arm. Neither of them is inside `view` — the draw path
+    // reads the value `App::adopt_board` left behind, never this handle
+    // (ADR-0007 rule 10).
+    let (board, mut board_handle) =
         board_poller::BoardPoller::spawn(board_poller::BoardConfig::from_env());
     let mut router = Router::new(initial, cfg, app_tx.clone());
     // The run loop keeps **no** sender of its own. This is not tidiness: the exit
@@ -318,15 +321,6 @@ async fn run(
     // pins the band to n rows, `0` turns it off entirely, and anything that is
     // not a number falls back to the height function with a warning from
     // `from_raw` rather than a panic at startup.
-    //
-    // The frame is not handed this value yet. `view` passes
-    // `viewport::KanbanBudget::Off`, because rows granted to a band nobody
-    // paints are a hole in the screen rather than a board, and the widget
-    // (looprs-5o4.4) and the beads-mode gate (looprs-5o4.5) have to exist
-    // before the grant buys anything. What *is* wired is the knob — parse,
-    // clamp, resolve, log — so the last step is one argument at one call site
-    // and no new policy, and a user who sets the variable today gets told what
-    // it resolved to instead of wondering whether it was read at all.
     let kanban_budget =
         viewport::KanbanBudget::from_raw(std::env::var("LOOPRS_KANBAN_ROWS").ok().as_deref());
     tracing::info!(
@@ -335,6 +329,26 @@ async fn run(
         max = viewport::MAX_KANBAN_ROWS,
         min = viewport::min_frame_rows_for_board(viewport::MAX_TOOL_ROWS, viewport::MAX_INPUT_ROWS),
     );
+    // …and handed to the App, which is where the frame reads it from
+    // (`App::kanban_budget`, gated on the displayed mode). Two knobs, two
+    // layers of "off": this one is how tall the band is when it is drawn, and
+    // `LOOPRS_KANBAN=0` is the board not existing at all. The second is not
+    // the App's business — it shows up here as "no snapshot was ever adopted",
+    // which the gate reads as `Off` without this function having to know which
+    // of the two turned it off.
+    app.set_kanban_budget(kanban_budget);
+    // Seed the band with whatever the poller has already got, which before its
+    // first read returns is `BoardSnapshot::loading()` — the `reading the
+    // board…` state. Seeding is not decoration: a band that started out as
+    // *nothing adopted* would paint a hole in the frame for the first poll
+    // interval, and a hole where a band will go is the same blank stripe that
+    // reserving rows for an unpainted band was (ADR-0007 §4: never a blank
+    // board). Skipped entirely when the board is off, so an off board paints
+    // nothing rather than a permanently-loading band.
+    if board_handle.is_enabled() {
+        app.adopt_board(board_handle.borrow().clone());
+    }
+
     // Tell the sessions the size they are being shown at before anyone runs a
     // command. A Bash shell spawned later still inherits this: `BashTask::resize`
     // records the size even with no shell up yet, and uses it for the pty it
@@ -350,6 +364,12 @@ async fn run(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Set once the bus reports every producer gone. See the `app_rx` arm.
     let mut bus_closed = false;
+    // Set when the board's `watch` closes — the poller stopped, which today
+    // means the last reader left, which today cannot happen while this loop
+    // holds one. Guarded anyway, for the same reason `bus_closed` is: a select
+    // arm whose future resolves immediately is a spin, and "the sender is gone"
+    // is exactly that. Taking the arm out of the select is the whole handling.
+    let mut board_lane_open = true;
     // The backstop for the resize repaint. Why a poll exists next to a resize
     // *event* is the whole doc on `viewport::WindowPoll` (looprs-pdl.15);
     // three lines here, and the reason it is a type and not an `if` is that it
@@ -430,8 +450,11 @@ async fn run(
                 // and the bytes are going out from `App::update` instead. Drawing
                 // over a program that believes it owns the terminal is the bug this
                 // whole path exists to fix, so it is blocked here rather than
-                // trusted to be absent.
-                if app.dirty && !app.passthrough() {
+                // trusted to be absent. The kanban band is under the same rule as
+                // every other band — a poll that lands while `vim` owns the screen
+                // updates the value and paints nothing (looprs-5o4.5 §4), and the
+                // frame the release asks for brings it back current.
+                if frame_may_draw(&app) {
                     // Settled lines are *made* final by the flush, so it happens
                     // here, in the branch that draws, and with the width this
                     // frame will draw at. Flushing outside a draw would wrap the
@@ -472,6 +495,30 @@ async fn run(
                     } else {
                         app.dirty = false;
                     }
+                }
+            }
+            // The board's lane (looprs-5o4.5). `watch::Receiver::changed()` is
+            // the wake, and the wake is the only thing this arm is for: no
+            // per-poll message crosses the bounded bus (`crate::bus` never drops
+            // or merges a non-`BashOutput` message, so one `Msg` per poll would
+            // be a queue of stale boards replayed in order — see
+            // `services::board_poller`), three publishes coalesced mid-flight
+            // wake this once, and `App::adopt_board` then decides whether what
+            // it found was worth a frame. A poll that changed nothing the band
+            // draws therefore costs a comparison and no bytes at all.
+            //
+            // The `if` on the arm takes it out of the select for good once the
+            // sender is gone, rather than leaving a permanently-ready future
+            // here spinning the loop.
+            board_news = board_handle.changed(), if board_lane_open => {
+                board_lane_open = board_news;
+                if board_news {
+                    // Cloned out of the `watch` here, in the loop that owns the
+                    // run, and not borrowed inside the draw: the value the frame
+                    // paints is one that crossed the boundary on the frame's
+                    // side of it. The borrow is dropped before this arm returns,
+                    // so no read guard is ever held across an `await`.
+                    app.adopt_board(board_handle.borrow().clone());
                 }
             }
             // A signal from outside the terminal. It means the same thing Ctrl-Q
@@ -606,6 +653,19 @@ async fn drain_sessions(app: &mut App, rx: &mut bus::Receiver) {
     }
 }
 
+/// The run loop's draw gate, in one place so the rule it encodes can be tested
+/// without a terminal (looprs-5o4.5 §4).
+///
+/// Two halves, and the second is the one with a bug history: `dirty` is "somebody
+/// asked for a frame", `passthrough` is "a full-screen child owns the canvas, so
+/// every frame is one frame too many". A board poll that lands while `vim` has
+/// the screen sets the first and must not get past the second — the value is
+/// adopted, nothing is drawn, and the frame the release asks for paints the
+/// current value anyway.
+fn frame_may_draw(app: &App) -> bool {
+    app.dirty && !app.passthrough()
+}
+
 /// Pure function of state (the tail preview re-parses only the open block).
 ///
 /// `preview` is the active view's live tail, rendered once by the caller and
@@ -616,6 +676,11 @@ async fn drain_sessions(app: &mut App, rx: &mut bus::Receiver) {
 /// for when the frame was laid out — or [`viewport::NO_INPUT_ROWS`] when the
 /// active session is not taking input — so the box is drawn into the rows it was
 /// promised and not into a re-derived guess.
+///
+/// Five bands, one call to [`viewport::frame_areas`], and no band draws outside
+/// the [`Rect`] it was handed — including the fifth, the kanban band, which is
+/// painted from a snapshot value and whose rows the frame may well have granted
+/// to nothing (looprs-5o4.5).
 fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
     let active = app.active_view();
     // The card count comes from the App so the band and the cards cannot ask for
@@ -626,12 +691,13 @@ fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
     let cards: Vec<&Entry> = active
         .map(|v| v.transcript.open_cards().take(card_rows as usize).collect())
         .unwrap_or_default();
-    // `KanbanBudget::Off` for the same reason the band has no widget yet: a
-    // grant with no paint is a blank stripe in the middle of the frame. The
-    // budget itself is resolved at startup (see `kanban_budget` in `run`), and
-    // this is the argument that takes it when looprs-5o4.4/.5 land.
-    let [text_area, card_area, _board_area, status_area, input] =
-        viewport::frame_areas(f.area(), card_rows, input_rows, viewport::KanbanBudget::Off);
+    let viewport::FrameAreas {
+        transcript: text_area,
+        cards: card_area,
+        kanban: board_area,
+        status: status_area,
+        input,
+    } = viewport::frame_areas(f.area(), card_rows, input_rows, app.kanban_budget());
 
     // The live tail shows only while the view is following the tail. Scrolled up
     // into history, the band belongs to the history: putting a live line under the
@@ -713,6 +779,24 @@ fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
             ..card_area
         };
         f.render_widget(LiveCardPreview::new(e, app.spinner), row);
+    }
+
+    // The kanban band (epic looprs-5o4): painted into the rows the frame
+    // budgeted for it, and into no others. `board_area` is empty in every mode
+    // except `Beeds` — `App::kanban_budget` gates on the *displayed* mode, the
+    // budget turns that into zero rows, and a zero-length band is a band that
+    // occupies nothing — so "there are rows here" is the gate. There is no
+    // second mode check in this function, because a second check is a second
+    // opinion about what the layout already decided, and the two disagreeing is
+    // the blank-stripe bug this whole shape exists to avoid.
+    //
+    // What gets painted is a value (`App::board`), not a poll: this line cannot
+    // reach `bd`, a `Command`, or a channel, which is ADR-0007 rule 10 being
+    // true of the code rather than of the intention.
+    if !board_area.is_empty()
+        && let Some(board) = app.board()
+    {
+        f.render_widget(Kanban::new(board), board_area);
     }
 
     // The status row (looprs-guh): the row `frame_areas` reserves and this draws
@@ -858,7 +942,7 @@ mod tests {
     #[test]
     fn the_status_row_is_painted_into_the_band_the_layout_reserved_for_it() {
         let app = app(TerminalType::Beeds, true);
-        let [_, _, _, status, _] = viewport::frame_areas(
+        let viewport::FrameAreas { status, .. } = viewport::frame_areas(
             Rect::new(0, 0, 60, 12),
             0,
             viewport::MIN_INPUT_ROWS,
@@ -883,7 +967,7 @@ mod tests {
             .set_text(format!("{} THE-END", "word ".repeat(20)));
         let want = app.input_rows(60);
         let h = 40; // the window: the frame *is* the window now
-        let [_, _, _, status, input] =
+        let viewport::FrameAreas { status, input, .. } =
             viewport::frame_areas(Rect::new(0, 0, 60, h), 0, want, viewport::KanbanBudget::Off);
         assert!(
             input.height > viewport::MIN_INPUT_ROWS,
@@ -914,7 +998,7 @@ mod tests {
             session: SessionId::new(TerminalType::Beeds, 1),
             status: SessionStatus::Running,
         });
-        let [_, _, _, status, input] = viewport::frame_areas(
+        let viewport::FrameAreas { status, input, .. } = viewport::frame_areas(
             Rect::new(0, 0, 60, 12),
             0,
             viewport::MIN_INPUT_ROWS,
@@ -954,7 +1038,7 @@ mod tests {
         );
 
         let h = 40; // the window: the frame *is* the window now
-        let [_, _, _, status, input] =
+        let viewport::FrameAreas { status, input, .. } =
             viewport::frame_areas(Rect::new(0, 0, 60, h), 0, band, viewport::KanbanBudget::Off);
         assert_eq!(input.height, 0, "the hidden box kept rows: {input:?}");
         assert_eq!(status.bottom(), h, "the status row does not end the frame");
@@ -991,7 +1075,7 @@ mod tests {
         let band = app.input_band(60);
         assert_eq!(band, app.input_rows(60), "the box did not come back whole");
         let h = 40; // the window: the frame *is* the window now
-        let [_, _, _, status, input] =
+        let viewport::FrameAreas { status, input, .. } =
             viewport::frame_areas(Rect::new(0, 0, 60, h), 0, band, viewport::KanbanBudget::Off);
         assert_eq!(input.height, band);
         assert_eq!(status.bottom(), input.top());
@@ -1011,7 +1095,7 @@ mod tests {
             text: "spawn failed: bash not found on PATH".into(),
         });
         for h in 5u16..=20 {
-            let [_, _, _, status, _] = viewport::frame_areas(
+            let viewport::FrameAreas { status, .. } = viewport::frame_areas(
                 Rect::new(0, 0, 60, h),
                 0,
                 viewport::MIN_INPUT_ROWS,
@@ -1057,7 +1141,7 @@ mod tests {
             "the frame is told there is a card to make room for"
         );
         let h = 40; // the window: the frame *is* the window now
-        let [_, cards, _, _, _] = viewport::frame_areas(
+        let viewport::FrameAreas { cards, .. } = viewport::frame_areas(
             Rect::new(0, 0, 60, h),
             rows,
             band,
@@ -1198,7 +1282,8 @@ mod tests {
             0,
             viewport::MIN_INPUT_ROWS,
             viewport::KanbanBudget::Off,
-        )[0];
+        )
+        .transcript;
         assert_eq!(
             band as u16, band_area.height,
             "the band the app counts and the band the frame lays out are the same"
@@ -1268,7 +1353,8 @@ mod tests {
             0,
             viewport::MIN_INPUT_ROWS,
             viewport::KanbanBudget::Off,
-        )[0]
+        )
+        .transcript
         .height as usize;
 
         // Rest the view with MARK-7 as its bottom-most visible row.
@@ -1373,7 +1459,12 @@ mod tests {
         settle(&mut app, SessionId::new(TerminalType::Pi, 1), 6);
         let h = HEIGHT;
         let input_rows = viewport::MIN_INPUT_ROWS;
-        let [text, _, _, status, input] = viewport::frame_areas(
+        let viewport::FrameAreas {
+            transcript: text,
+            status,
+            input,
+            ..
+        } = viewport::frame_areas(
             Rect::new(0, 0, WIDTH, h),
             app.live_card_rows(),
             app.input_band(WIDTH),
@@ -1429,5 +1520,680 @@ mod tests {
             rows(before.backend()),
             "and the frame moved nothing: a highlight is a style, not a reflow"
         );
+    }
+
+    // ─────────────────────── the kanban band, wired into the frame ───────────────────────
+    //
+    // looprs-5o4.5. Every board below is a **value** — built by hand, or read
+    // off a poller aimed at a fake `bd` — and every assertion is made against a
+    // `TestBackend` painted through the real `view`. That is not a style choice:
+    // the property under test is that the draw path cannot reach `bd`, so the
+    // tests must not be able to reach it either, and a snapshot is the only
+    // thing on the table that carries a board into a frame (ADR-0007 rule 10).
+
+    use crate::services::bd::{Bead, BeadIssueType, BeadStatus, BeadStatusFallback};
+    use crate::services::board_poller::{BoardConfig, BoardPoller};
+    use crate::state::board::{BoardRead, BoardSnapshot};
+    use crate::testing::{BOARD_VARIETY, BdFake, Fakes, PiFake};
+
+    /// A bead, by hand.
+    fn bead(id: &str, title: &str, status: BeadStatus) -> Bead {
+        Bead {
+            id: id.to_string(),
+            title: title.to_string(),
+            status: BeadStatusFallback::Known(status),
+            issue_type: BeadIssueType::Task,
+        }
+    }
+
+    /// A board with a row in every column, a marked bead, and one deferred
+    /// bead that is a footer count rather than a row.
+    fn wired_board() -> BoardSnapshot {
+        BoardSnapshot::from_beads(
+            &[
+                bead("looprs-aa", "Rewrap the transcript", BeadStatus::Open),
+                bead("looprs-ab", "Blocked on the Dolt lock", BeadStatus::Blocked),
+                bead("looprs-ac", "Wire the band", BeadStatus::InProgress),
+                bead("looprs-ad", "The old sketch", BeadStatus::Closed),
+                bead(
+                    "looprs-ae",
+                    "Postponed until next quarter",
+                    BeadStatus::Deferred,
+                ),
+            ],
+            Some(Duration::from_secs(3)),
+        )
+    }
+
+    /// The frame's bands for this app, asked with the same values `view` asks
+    /// with — so a row read off the screen and a rect read off the layout are
+    /// one answer and cannot drift.
+    fn areas_of(app: &App, w: u16, h: u16) -> viewport::FrameAreas {
+        viewport::frame_areas(
+            Rect::new(0, 0, w, h),
+            app.live_card_rows(),
+            app.input_band(w),
+            app.kanban_budget(),
+        )
+    }
+
+    /// The text of one band of a painted screen.
+    fn band_text(screen: &[String], area: Rect) -> String {
+        screen[area.y as usize..area.bottom() as usize].join("|")
+    }
+
+    /// A screen that is only ever repainted when the run loop's own gate allows
+    /// it.
+    ///
+    /// The point of the harness rather than a `paint` call is the negative half
+    /// of "an unchanged poll causes zero repaints": with a screen that outlives
+    /// the call, "nothing was drawn" is a fact about the buffer that is
+    /// unchanged, not a claim about what the test did or did not call.
+    struct Screen {
+        term: Terminal<TestBackend>,
+    }
+
+    impl Screen {
+        fn new(height: u16) -> Self {
+            Self {
+                term: Terminal::new(TestBackend::new(60, height)).unwrap(),
+            }
+        }
+
+        fn rows(&self) -> Vec<String> {
+            rows(self.term.backend())
+        }
+
+        /// One iteration's worth of drawing, through the run loop's gate.
+        /// Returns whether a frame went out.
+        fn paint(&mut self, app: &mut App) -> bool {
+            if !frame_may_draw(app) {
+                return false;
+            }
+            let input = app.input_band(60);
+            self.term
+                .draw(|f| view(app, f, &[], input))
+                .expect("the frame draws");
+            app.dirty = false;
+            true
+        }
+    }
+
+    /// A `Tab`, as the run loop delivers it.
+    fn tab() -> Msg {
+        Msg::Term(Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Tab,
+            KeyModifiers::NONE,
+        )))
+    }
+
+    /// **The band's place in the frame**: directly above the status row,
+    /// directly below the cards, and drawn — header, rows and footer — in
+    /// beads mode.
+    #[test]
+    fn the_band_sits_directly_above_the_status_row_and_below_the_cards() {
+        let mut app = app(TerminalType::Beeds, true);
+        app.set_kanban_budget(viewport::KanbanBudget::Auto);
+        app.adopt_board(wired_board());
+        let areas = areas_of(&app, WIDTH, HEIGHT);
+        assert!(
+            areas.kanban.height >= viewport::MIN_KANBAN_ROWS,
+            "beads mode got no band: {areas:?}"
+        );
+        // The adjacency the ticket specifies, from the layout side …
+        assert_eq!(areas.cards.bottom(), areas.kanban.top(), "{areas:?}");
+        assert_eq!(areas.kanban.bottom(), areas.status.top(), "{areas:?}");
+        // … and the same adjacency seen off the painted screen.
+        let screen = paint(&app, HEIGHT);
+        assert_eq!(
+            band_text(&screen, areas.kanban).matches("bd ok").count(),
+            1,
+            "the footer row is missing: {screen:?}"
+        );
+        let band = band_text(&screen, areas.kanban);
+        for want in [
+            "To-do 2",
+            "In progress 1",
+            "Complete 1",
+            "⊘ looprs-ab",
+            "looprs-ac",
+            "bd ok",
+            "⏸ 1 deferred",
+        ] {
+            assert!(
+                band.contains(want),
+                "the band never painted {want:?}: {band:?}"
+            );
+        }
+        // The row the band sits on top of is still the status row and nothing
+        // of the band leaked into it.
+        assert!(
+            screen[areas.status.y as usize].contains("Beeds"),
+            "the row under the band is not the status row: {screen:?}"
+        );
+        assert!(
+            !screen[areas.status.y as usize].contains("To-do"),
+            "the band leaked into the status row: {screen:?}"
+        );
+    }
+
+    /// **Gated by the displayed mode, and the gate is *zero rows*, not "hidden
+    /// but reserved"**: in Bash and in Pi the band is granted nothing, which
+    /// the frame proves the hard way — by painting a screen identical to the one
+    /// it paints for an app that has no board at all.
+    #[test]
+    fn the_band_is_zero_rows_outside_beads_mode_and_leaves_the_frame_untouched() {
+        for mode in [TerminalType::Bash, TerminalType::Pi] {
+            let mut with = app(mode, true);
+            with.set_kanban_budget(viewport::KanbanBudget::Auto);
+            with.adopt_board(wired_board());
+            assert_eq!(
+                with.kanban_budget(),
+                viewport::KanbanBudget::Off,
+                "{mode:?}: the gate let a board through"
+            );
+            let areas = areas_of(&with, WIDTH, HEIGHT);
+            assert_eq!(
+                areas.kanban.height, 0,
+                "{mode:?}: the band took rows: {areas:?}"
+            );
+            // Still tiled: the zero-height band is a band that occupies nothing,
+            // so the cards meet the status row exactly where it should have been.
+            assert_eq!(
+                areas.cards.bottom(),
+                areas.status.top(),
+                "{mode:?}: {areas:?}"
+            );
+            let painted = paint(&with, HEIGHT);
+            assert!(
+                !painted.concat().contains("To-do"),
+                "{mode:?}: band content on a non-beads screen: {painted:?}"
+            );
+            // …and the frame is what it was with no board adopted at all.
+            let none = app(mode, true);
+            assert_eq!(
+                painted,
+                paint(&none, HEIGHT),
+                "{mode:?}: a board that is not displayed still changed the frame"
+            );
+        }
+    }
+
+    /// **Both halves of the repaint rule** (looprs-5o4.3's "an idle app does
+    /// not repaint", arrived at from the poller side): a poll of a board that
+    /// changed nothing the band draws costs zero frames, and a poll that moved a
+    /// bead costs one.
+    ///
+    /// The identical board is deliberately *not* `==` to the first one: the
+    /// stamp moved, which is exactly the difference that would repaint a
+    /// static screen every five seconds forever if the App compared snapshots
+    /// instead of comparing what is drawn.
+    #[test]
+    fn an_unchanged_poll_draws_nothing_and_a_moved_board_draws_once() {
+        let t0 = Instant::now();
+        let mut app = app(TerminalType::Beeds, true);
+        app.set_kanban_budget(viewport::KanbanBudget::Auto);
+        app.adopt_board(wired_board().stamped_at(t0));
+        let mut screen = Screen::new(HEIGHT);
+        assert!(screen.paint(&mut app), "the first board must draw");
+        let painted = screen.rows();
+        assert!(painted.concat().contains("To-do 2"), "{painted:?}");
+
+        // The same board, read again five seconds later.
+        let re_poll = {
+            let mut s = wired_board();
+            s.fetched_at = Some(t0 + Duration::from_secs(5));
+            s.age = Some(Duration::from_secs(5));
+            s
+        };
+        assert_ne!(
+            re_poll,
+            wired_board().stamped_at(t0),
+            "setup: the two reads differ in their stamps, so a `==` here would repaint forever"
+        );
+        assert!(
+            re_poll.same_paint_as(&wired_board().stamped_at(t0)),
+            "setup: nothing that is drawn differs"
+        );
+        app.adopt_board(re_poll);
+        assert!(
+            !app.dirty,
+            "an unchanged poll marked the frame dirty — the band would repaint every interval forever"
+        );
+        assert!(
+            !screen.paint(&mut app),
+            "the gate drew a frame that nobody asked for"
+        );
+        assert_eq!(
+            screen.rows(),
+            painted,
+            "the screen moved without a frame being drawn"
+        );
+
+        // …and the board moving *does* cost exactly one frame.
+        let moved = BoardSnapshot::from_beads(
+            &[
+                bead("looprs-ac", "Wire the band", BeadStatus::InProgress),
+                bead("looprs-ad", "The old sketch", BeadStatus::Closed),
+                bead("looprs-af", "A new ticket", BeadStatus::Open),
+            ],
+            Some(Duration::from_secs(1)),
+        )
+        .stamped_at(t0 + Duration::from_secs(10));
+        app.adopt_board(moved);
+        assert!(app.dirty, "a board that moved did not ask for a frame");
+        assert!(screen.paint(&mut app), "…and the frame was not drawn");
+        assert!(
+            !app.dirty,
+            "the frame cleared the request: one repaint, not a standing one"
+        );
+        let now = screen.rows();
+        assert_ne!(now, painted, "the moved board drew the same screen");
+        assert!(now.concat().contains("looprs-af"), "{now:?}");
+        assert!(now.concat().contains("To-do 1"), "{now:?}");
+    }
+
+    /// The footer's `Ns ago` is a **distance**, and a distance is true the
+    /// instant it is written and wrong forever after. So the App re-derives it
+    /// from the snapshot's own stamp on the tick — and marks nothing dirty doing
+    /// it, because a growing age is not news, and news is what costs a frame.
+    #[test]
+    fn the_age_the_band_shows_ages_without_costing_a_repaint() {
+        let t0 = Instant::now();
+        let mut app = app(TerminalType::Beeds, true);
+        app.set_kanban_budget(viewport::KanbanBudget::Auto);
+        app.adopt_board(wired_board().stamped_at(t0));
+        app.dirty = false;
+        assert_eq!(
+            app.board().and_then(|b| b.age),
+            Some(Duration::from_secs(3))
+        );
+
+        app.on_tick(t0 + Duration::from_secs(11));
+        assert_eq!(
+            app.board().and_then(|b| b.age),
+            Some(Duration::from_secs(11)),
+            "the age did not follow the clock, so the footer would freeze at the publish time"
+        );
+        assert!(
+            !app.dirty,
+            "the tick set dirty: a live board would repaint every tick with nothing on it moving"
+        );
+        // What the frame then paints says eleven, not three.
+        assert!(
+            paint(&app, HEIGHT).concat().contains("bd ok · 11s ago"),
+            "the footer is still quoting the publish: {screen:?}",
+            screen = paint(&app, HEIGHT)
+        );
+        // A board that has never had a good read has no age to grow — and is
+        // still not blank (the never-loaded band is a state, not an absence).
+        app.adopt_board(BoardSnapshot::loading());
+        app.on_tick(t0 + Duration::from_secs(20));
+        assert_eq!(app.board().and_then(|b| b.age), None);
+    }
+
+    /// The state the first frame of every run is in: the poller is up, nothing
+    /// has answered. That is `reading the board…`, not a hole in the frame and
+    /// not an empty board (looprs-037, one layer up from the widget).
+    #[test]
+    fn the_band_comes_up_reading_and_never_blank() {
+        let mut app = app(TerminalType::Beeds, true);
+        app.set_kanban_budget(viewport::KanbanBudget::Auto);
+        app.adopt_board(BoardSnapshot::loading());
+        let areas = areas_of(&app, WIDTH, HEIGHT);
+        assert!(
+            areas.kanban.height >= viewport::MIN_KANBAN_ROWS,
+            "{areas:?}"
+        );
+        let screen = paint(&app, HEIGHT);
+        let band = band_text(&screen, areas.kanban);
+        assert!(band.contains("reading the board…"), "{band:?}");
+        assert!(
+            band.contains("To-do —"),
+            "not-yet-counted must not read as zero: {band:?}"
+        );
+        // And the band is *there*: the rows the layout granted are painted, so
+        // the first frame of the run has no hole where the board will go.
+        assert!(
+            !band.split('|').all(|row| row.trim().is_empty()),
+            "the band's rows are blank: {screen:?}"
+        );
+    }
+
+    /// **Both directions of the mode switch**, driven by the key that causes
+    /// it: Beeds → other must take the band off in one frame with nothing left
+    /// behind, and the way back must put it back where it was.
+    #[test]
+    fn tab_out_of_beads_takes_the_band_off_and_tab_back_puts_it_exactly_back() {
+        let mut app = app(TerminalType::Beeds, true);
+        app.set_kanban_budget(viewport::KanbanBudget::Auto);
+        app.adopt_board(wired_board());
+        let mut screen = Screen::new(HEIGHT);
+        assert!(screen.paint(&mut app));
+        let with_band = screen.rows();
+        assert!(with_band.concat().contains("To-do 2"), "{with_band:?}");
+
+        let mut saw_other_mode = false;
+        for _ in 0..3 {
+            app.update(tab());
+            assert!(screen.paint(&mut app), "the mode switch asked for a frame");
+            let now = screen.rows();
+            if app.active == TerminalType::Beeds {
+                continue;
+            }
+            saw_other_mode = true;
+            let joined = now.concat();
+            assert!(
+                !joined.contains("To-do") && !joined.contains("bd ok"),
+                "{:?}: band paint survived the switch out: {now:?}",
+                app.active
+            );
+            assert!(
+                !joined.contains("reading the board"),
+                "{:?}: the band is still there, only emptier: {now:?}",
+                app.active
+            );
+        }
+        assert!(saw_other_mode, "Tab never left beads mode");
+        assert_eq!(app.active, TerminalType::Beeds, "three Tabs cycle back");
+        assert!(
+            screen.rows().concat().contains("To-do 2"),
+            "the band did not come back: {:?}",
+            screen.rows()
+        );
+        assert_eq!(
+            screen.rows(),
+            with_band,
+            "the band came back into a screen that still carried traces of the modes between"
+        );
+    }
+
+    /// **Resize** (looprs-5o4.5 §5): the band is re-budgeted off the frame's
+    /// own height every frame, so a shrink takes it down and out — and the
+    /// status row stays directly above the box the whole way, with no band
+    /// overrunning the frame at any size.
+    #[test]
+    fn shrinking_the_window_takes_the_band_first_and_the_status_row_never_moves() {
+        let mut app = app(TerminalType::Beeds, true);
+        app.set_kanban_budget(viewport::KanbanBudget::Auto);
+        app.adopt_board(wired_board());
+        assert_eq!(
+            areas_of(&app, 60, 40).kanban.height,
+            viewport::MAX_KANBAN_ROWS,
+            "a tall window should buy the ceiling"
+        );
+        let mut prev = u16::MAX;
+        let mut gone_at = None;
+        for h in (4u16..=40u16).rev() {
+            app.set_window(60, h);
+            let a = areas_of(&app, 60, h);
+            assert!(
+                a.kanban.height <= prev,
+                "h={h}: the band grew as the window shrank ({prev} -> {})",
+                a.kanban.height
+            );
+            prev = a.kanban.height;
+            if a.kanban.height == 0 && gone_at.is_none() {
+                gone_at = Some(h);
+            }
+            // Nothing overruns the frame, however the ladder resolved.
+            for band in [a.transcript, a.cards, a.kanban, a.status, a.input] {
+                assert!(
+                    band.bottom() <= h,
+                    "h={h}: {band:?} runs past the bottom edge"
+                );
+            }
+            // The two rows a user reads never separate: the status row sits on
+            // the box's top edge whatever the band did above them.
+            assert_eq!(a.status.bottom(), a.input.top(), "h={h}: {a:?}");
+            // And the band can never land on the status row.
+            assert!(
+                a.kanban.bottom() <= a.status.top(),
+                "h={h}: the band overlaps the status row: {a:?}"
+            );
+        }
+        assert_eq!(
+            gone_at,
+            Some(7),
+            "the band should be gone by the height where the surplus cannot hold one"
+        );
+        // Painted at a size where it is gone: nothing band-shaped anywhere, and
+        // the status row exactly where the layout says it is.
+        app.set_window(60, 6);
+        let small = paint_with(&app, 6, app.input_band(60));
+        let a = areas_of(&app, 60, 6);
+        assert_eq!(a.kanban.height, 0, "{a:?}");
+        assert!(!small.concat().contains("To-do"), "{small:?}");
+        assert!(small[a.status.y as usize].contains("Beeds"), "{small:?}");
+    }
+
+    /// **The overlays keep their own band** (§4): the "N new" pill and the copy
+    /// toast are bottom-right overlays of the *transcript*, and the kanban band
+    /// sits below that. The layout says they cannot meet; the paint says it too.
+    #[test]
+    fn the_transcript_overlays_do_not_take_the_bands_rows() {
+        let mut app = app(TerminalType::Beeds, true);
+        app.set_kanban_budget(viewport::KanbanBudget::Auto);
+        app.adopt_board(wired_board());
+        settle(&mut app, SessionId::new(TerminalType::Beeds, 1), 30);
+        let band_rows_count = app.transcript_band_rows();
+        // Off the tail, so the pill is up.
+        app.scroll_active(-(band_rows_count as isize));
+        app.view_mut(SessionId::new(TerminalType::Beeds, 1))
+            .push_note(MessageKind::System, "late arrival".into());
+        app.flush_active(WIDTH);
+        assert!(app.new_rows() > 0, "setup: rows the user has not seen");
+
+        let areas = areas_of(&app, WIDTH, HEIGHT);
+        // The transcript ends where the band begins: an overlay scoped to the
+        // transcript has no row of the band to reach.
+        assert_eq!(areas.transcript.bottom(), areas.kanban.top(), "{areas:?}");
+        let screen = paint(&app, HEIGHT);
+        assert!(
+            screen.concat().contains("new"),
+            "setup: the pill is not on screen: {screen:?}"
+        );
+        let band = band_text(&screen, areas.kanban);
+        assert!(
+            !band.contains("new"),
+            "the pill spilled into the band: {band:?}"
+        );
+        assert!(
+            band.contains("To-do 2"),
+            "and the band still painted itself: {band:?}"
+        );
+    }
+
+    /// **No band while a full-screen child holds the screen** (§4). The poll is
+    /// still running, so the value still updates; the gate is what keeps the
+    /// paint off the child's canvas, and the release brings the current value
+    /// back in the frame it asks for.
+    #[test]
+    fn a_band_update_while_the_screen_is_held_paints_nothing_until_it_comes_back() {
+        let mut app = app(TerminalType::Beeds, true);
+        app.set_kanban_budget(viewport::KanbanBudget::Auto);
+        app.adopt_board(wired_board());
+        let mut screen = Screen::new(HEIGHT);
+        assert!(screen.paint(&mut app));
+        let held_by = SessionId::new(TerminalType::Beeds, 1);
+
+        app.update(Msg::ScreenHeld {
+            session: held_by,
+            active: true,
+        });
+        assert!(app.passthrough(), "the child owns the screen");
+        // A poll lands while `vim` is up: it may update the value, and it must
+        // not put a pixel on the terminal.
+        app.adopt_board(
+            BoardSnapshot::from_beads(
+                &[bead("looprs-ag", "Arrived while held", BeadStatus::Open)],
+                Some(Duration::from_secs(1)),
+            )
+            .stamped_at(Instant::now()),
+        );
+        assert!(app.dirty, "the poll did ask for a frame");
+        assert!(
+            !frame_may_draw(&app),
+            "the gate let a frame out while a child held the screen"
+        );
+        assert!(
+            !screen.paint(&mut app),
+            "a frame went out over the child's screen"
+        );
+
+        // The release repaints, and repaints *current*.
+        app.update(Msg::ScreenHeld {
+            session: held_by,
+            active: false,
+        });
+        assert!(frame_may_draw(&app), "the release asked for the repaint");
+        assert!(screen.paint(&mut app));
+        assert!(
+            screen.rows().concat().contains("looprs-ag"),
+            "the band came back stale instead of current: {:?}",
+            screen.rows()
+        );
+    }
+
+    /// **The frame never learns about `bd`** (ADR-0007 rule 10). Scanned off
+    /// the source rather than argued off the types, because what is forbidden is
+    /// a *reach*: a client call, a `Command`, an env read. Comments are
+    /// stripped first — these modules *name* the things they forbid, and a scan
+    /// that read the prose would fail on the rule that stops the code.
+    #[test]
+    fn the_app_and_the_frame_never_reach_for_bd_a_command_or_the_environment() {
+        fn code_of(src: &str) -> String {
+            src.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        /// One function's text: from the signature to the closing brace at
+        /// column zero, which is the only brace at that column inside `fn`s in
+        /// this crate (`rustfmt` guarantee, and the crate is `cargo fmt` clean).
+        fn fn_body(src: &str, signature: &str) -> String {
+            let at = src
+                .find(signature)
+                .unwrap_or_else(|| panic!("no {signature} in the source"));
+            let rest = &src[at..];
+            let end = rest.find("\n}\n").unwrap_or(rest.len());
+            rest[..end].to_string()
+        }
+
+        const FORBIDDEN: [&str; 10] = [
+            "services::bd",
+            "bd::",
+            "BdError",
+            "BdList",
+            "std::process",
+            "Command::new",
+            "env::var",
+            // …and neither the poller nor its read end: the App holds the
+            // *snapshot value* the run loop copied across the boundary, not a
+            // live handle into somebody else's task. A `watch` reachable from
+            // the draw path is `bd` reachable from the draw path, one method
+            // call away.
+            "board_poller",
+            "BoardHandle",
+            "watch::",
+        ];
+        let scopes: [(&str, String); 3] = [
+            ("App", code_of(include_str!("app.rs"))),
+            ("viewport", code_of(include_str!("viewport.rs"))),
+            (
+                "the draw path (main::view)",
+                fn_body(&code_of(include_str!("main.rs")), "fn view("),
+            ),
+        ];
+        for (name, code) in scopes {
+            for bad in FORBIDDEN {
+                assert!(
+                    !code.contains(bad),
+                    "{name} reaches for {bad:?} — the frame must read a snapshot value and a row \
+                     count, never a board client, a subprocess or the environment (ADR-0007 rule 10)"
+                );
+            }
+        }
+        // And the frame's entry point takes a *count*, not a board: the widget
+        // and the poller are not allowed to meet in the layout.
+        assert!(
+            !code_of(include_str!("viewport.rs")).contains("BoardSnapshot"),
+            "viewport takes a board as an argument; it is supposed to take a row count"
+        );
+    }
+
+    /// The whole lane, end to end: a **live poller** on a fake `bd`, the run
+    /// loop's adopt, and the band that comes out of the frame — including the
+    /// never-loaded state the first frame paints and the re-poll that costs
+    /// nothing.
+    #[tokio::test]
+    async fn a_live_poller_drives_the_band_and_repeats_of_the_same_board_cost_nothing() {
+        let fakes = Fakes::new("band-live", PiFake::Started, BdFake::Ok, BOARD_VARIETY);
+        let (_poller, mut handle) = BoardPoller::spawn(BoardConfig {
+            bin: fakes.bd_bin().to_string(),
+            interval: Duration::from_millis(50),
+            enabled: true,
+        });
+        let mut app = app(TerminalType::Beeds, true);
+        app.set_kanban_budget(viewport::KanbanBudget::Auto);
+        // The seed `run` installs before the first read lands.
+        app.adopt_board((*handle.borrow()).clone());
+        assert_eq!(
+            app.board().map(|b| b.read.clone()),
+            Some(BoardRead::Never),
+            "the seed is the not-asked-yet state"
+        );
+        let mut screen = Screen::new(HEIGHT);
+        assert!(screen.paint(&mut app));
+        let reading = screen.rows().concat();
+        assert!(reading.contains("reading the board…"), "{reading:?}");
+        assert!(
+            !reading.contains("To-do 0"),
+            "not-yet-read read as an empty board: {reading:?}"
+        );
+
+        // The first real read, adopted the way the run loop adopts it: a wake on
+        // the `watch`, then a borrow of whatever is newest at that moment.
+        let woke = tokio::time::timeout(Duration::from_secs(10), handle.changed())
+            .await
+            .expect("the fake `bd` never published");
+        assert!(woke, "the poller's sender went away before it answered");
+        let read = (*handle.borrow()).clone();
+        assert_eq!(
+            read.read,
+            BoardRead::Ok,
+            "the fake `bd` failed: {:?}",
+            read.read
+        );
+        app.adopt_board(read);
+        assert!(app.dirty, "a board that arrived must ask for a frame");
+        assert!(screen.paint(&mut app));
+        let board = screen.rows().concat();
+        assert!(board.contains("To-do 3"), "{board:?}");
+        assert!(board.contains("bd ok"), "{board:?}");
+        assert!(board.contains("⏸ 1 deferred"), "{board:?}");
+
+        // …and the next poll of the same board: a wake, a comparison, no frame.
+        let woke = tokio::time::timeout(Duration::from_secs(10), handle.changed()).await;
+        assert!(woke.is_ok(), "the poller stopped publishing");
+        let again = (*handle.borrow()).clone();
+        assert_eq!(
+            again.read,
+            BoardRead::Ok,
+            "the second read failed; the fake is supposed to be deterministic"
+        );
+        assert_ne!(
+            app.board().and_then(|b| b.fetched_at),
+            again.fetched_at,
+            "setup: the second publish should be a newer stamp over the same board"
+        );
+        assert!(
+            again.same_paint_as(app.board().expect("a board is adopted")),
+            "setup: the second read should draw the same board"
+        );
+        app.adopt_board(again);
+        assert!(!app.dirty, "a repeat of the same board asked for a repaint");
+        assert!(!screen.paint(&mut app), "…and a frame went out anyway");
     }
 }

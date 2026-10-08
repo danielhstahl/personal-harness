@@ -24,6 +24,7 @@ use crate::components::compaction::{CompactionState, token_delta};
 use crate::components::input::{InputAction, InputState, inner_width};
 use crate::session::view::SessionView;
 use crate::session::{ChatState, SessionId, SessionStatus, TerminalType};
+use crate::state::board::BoardSnapshot;
 use crate::state::scrollback::{DisplayRow, Scrollback};
 use crate::state::selection::{BandSnapshot, Selection};
 use crate::state::transcript::MessageKind;
@@ -267,6 +268,34 @@ pub struct App {
     /// When the prefix went armed, for the window's expiry.
     /// Only meaningful while [`Self::copy_chord`] is `Armed`.
     copy_chord_at: Instant,
+    /// The beads board the band paints, held as a **plain value**
+    /// (looprs-5o4.5, ADR-0007 §5/rule 10).
+    ///
+    /// Not a handle to the poller and not a receiver: the poller publishes into
+    /// a `watch`, `main` copies the newest value across in
+    /// [`App::adopt_board`], and from there to the widget it is one read of
+    /// this field. ADR-0007's "the poller, the `bd` service and the widget
+    /// must never meet in the draw path" is a property of this field's *type*:
+    /// the frame reads bytes somebody else read, on a schedule this type can
+    /// neither slow down nor accidentally start.
+    ///
+    /// `None` means *there is no board this run* (`LOOPRS_KANBAN=0`, or nothing
+    /// adopted yet). That is deliberately not the same claim as
+    /// [`BoardRead::Never`](crate::state::board::BoardRead::Never), which is
+    /// "a board is being polled and has not answered yet": the first paints no
+    /// band at all, the second paints `reading the board…`, and looprs-037 is
+    /// the reason those two sentences are not interchangeable.
+    board: Option<BoardSnapshot>,
+    /// The band's row budget, resolved once at startup from
+    /// `LOOPRS_KANBAN_ROWS` (looprs-5o4.3) and handed in by `main`.
+    ///
+    /// Stored rather than threaded through every draw call because the frame that
+    /// lays the bands out and every geometry question the App is asked have to
+    /// answer from one number, and because the knob is a fact about the run,
+    /// not about a frame. Default [`KanbanBudget::Off`]: an `App` built by a
+    /// test that says nothing about the board gets no band, exactly the frame
+    /// that existed before the band did.
+    kanban_budget: viewport::KanbanBudget,
     cmd_tx: mpsc::Sender<UiCommand>, // UI -> Router
 }
 
@@ -312,6 +341,8 @@ impl App {
             pending_dump: None,
             copy_chord: CopyChord::Off,
             copy_chord_at: now,
+            board: None,
+            kanban_budget: viewport::KanbanBudget::Off,
             cmd_tx,
         }
     }
@@ -756,13 +787,90 @@ impl App {
     /// a scroll key moves is the band the frame actually lays out — the same
     /// reason `input_rows` and `preview_active` are taken once and handed down.
     pub fn transcript_band_rows(&self) -> usize {
-        let [text, ..] = viewport::frame_areas(
+        let areas = viewport::frame_areas(
             Rect::new(0, 0, self.width, self.height),
             self.live_card_rows(),
             self.input_band(self.width),
-            viewport::KanbanBudget::Off,
+            self.kanban_budget(),
         );
-        text.height as usize
+        areas.transcript.height as usize
+    }
+
+    /// The board to paint, as a plain value — `None` when this run has no board
+    /// at all (looprs-5o4.5).
+    ///
+    /// A borrow of a value that was put here by [`App::adopt_board`]. Nothing on
+    /// this read path can block, allocate, call `bd`, or ask a channel for
+    /// anything, because by the time the frame runs the poll is long over: the
+    /// poller did it on its own clock, in its own task, and published a value
+    /// that was copied across the boundary the way every other injected fact in
+    /// this type is.
+    pub fn board(&self) -> Option<&BoardSnapshot> {
+        self.board.as_ref()
+    }
+
+    /// Take the newest board from the poller, and repaint **only if it says
+    /// something different**.
+    ///
+    /// Both halves of that are the requirement, and each one kills a different
+    /// bug (looprs-5o4.3: "an idle app does not repaint", arriving from the
+    /// other direction):
+    ///
+    /// * *adopt it* — the value stored here is what the frame draws, so a board
+    ///   nobody copied in here stops updating no matter how much the loop moves.
+    ///   The first half is what makes the band live at all.
+    /// * *mark dirty only on a drawn change* — the naive cure for the first bug
+    ///   is `dirty = true` on every poll, which repaints the whole frame every
+    ///   few seconds forever, in a window nobody touched, to change nothing.
+    ///   [`BoardSnapshot::same_paint_as`] is the drawn-fields comparison that
+    ///   keeps that from happening: the same board with a newer timestamp is
+    ///   not news, and no frame is drawn for it.
+    ///
+    /// The freshness the footer shows still moves, because it is not compared:
+    /// it is re-derived from the snapshot's own `fetched_at` on every tick
+    /// (see [`on_tick`](Self::on_tick)), so the age on screen is the age as of
+    /// the frame that shows it, whether or not the board itself moved.
+    pub fn adopt_board(&mut self, snap: BoardSnapshot) {
+        if self
+            .board
+            .as_ref()
+            .is_none_or(|current| !current.same_paint_as(&snap))
+        {
+            self.dirty = true;
+        }
+        self.board = Some(snap);
+    }
+
+    /// The budget the frame should lay the band out with, as displayed right now.
+    ///
+    /// **Gated by the displayed mode, not by "a board exists"** — the ticket's
+    /// first wiring requirement. `Beeds` on screen with a board to show is the
+    /// only state that gets a non-`Off` budget; in Bash and in Pi the band is
+    /// `Off`, which [`viewport::kanban_rows`] answers with `0` rows, which is
+    /// "not hidden but reserved" and precisely the *zero rows* the frame is
+    /// required to give it. `NO_INPUT_ROWS` is the precedent this copies: a
+    /// band that is not drawn is granted nothing, so nothing floats.
+    ///
+    /// `active` is the *displayed* mode and not "the beads session is alive",
+    /// which is the distinction that matters here: the loop keeps running while
+    /// the user reads Pi, and a band that appeared because a session existed
+    /// would be chrome about something the user is not looking at.
+    pub fn kanban_budget(&self) -> viewport::KanbanBudget {
+        if self.active == TerminalType::Beeds && self.board.is_some() {
+            self.kanban_budget
+        } else {
+            viewport::KanbanBudget::Off
+        }
+    }
+
+    /// Hand in the band's row budget (`LOOPRS_KANBAN_ROWS`, resolved once in
+    /// `main` by [`KanbanBudget::from_raw`](viewport::KanbanBudget::from_raw)).
+    ///
+    /// Injected rather than read here for the standing rule every knob in this
+    /// type follows: the App reads no environment, so every branch of the frame
+    /// is reachable from a test that hands it a value.
+    pub fn set_kanban_budget(&mut self, budget: viewport::KanbanBudget) {
+        self.kanban_budget = budget;
     }
 
     /// The real window changed shape (`Event::Resize`).
@@ -935,6 +1043,20 @@ impl App {
     /// without sleeping.
     pub fn on_tick(&mut self, now: Instant) {
         self.clock = now;
+        // The board's age is a distance, and a distance is only true at the
+        // instant it is written. Re-derived here — in the tick, off the App's
+        // own clock, next to the row's animation this is the same trick for —
+        // so that the footer's `bd ok · Ns ago` is the age as of the frame
+        // that shows it rather than the age as of the publish that made it.
+        //
+        // Restamped **without** marking anything dirty, and that half is not an
+        // optimisation: the age moves every tick, a repaint costs a frame every
+        // tick, and the band's whole argument is that it costs nothing to look
+        // at. An age nobody has repainted yet is not news; the frame that
+        // repaints for a real reason will show the current value anyway.
+        if let Some(board) = self.board.as_mut() {
+            board.restamp_age(now);
+        }
         // The toast's lifetime and the copy's deadline run off the tick, not off
         // the animation gate below: a copy made in an otherwise idle app still
         // has to get its confirmation on screen, and still has to come off.

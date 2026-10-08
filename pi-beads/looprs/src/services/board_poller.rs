@@ -311,7 +311,6 @@ pub struct BoardHandle {
     enabled: bool,
 }
 
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that draws from this handle
 impl BoardHandle {
     /// The newest snapshot, **borrowed**.
     ///
@@ -330,6 +329,10 @@ impl BoardHandle {
     /// and read [`BoardSnapshot::age_of_last_good`], or keep a snapshot of your
     /// own and [`BoardSnapshot::restamp_age`] it, which is one field write.
     /// This exists for whoever wants a value and does not care about the copy.
+    #[allow(dead_code)] // deliberately not the frame's door: looprs-5o4.5 adopted the
+    // *value* into `App` instead of cloning a board per paint, and keeps it
+    // current by restamping one field per tick (`App::on_tick`). This is the
+    // convenience read for a caller that wants a snapshot and not the copy.
     pub fn snapshot_at(&self, now: Instant) -> BoardSnapshot {
         let mut snap = self.rx.borrow().clone();
         snap.restamp_age(now);

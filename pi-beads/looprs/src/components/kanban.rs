@@ -93,7 +93,6 @@ use crate::viewport::{KANBAN_FOOTER_ROWS, KANBAN_HEADER_ROWS};
 ///
 /// Two columns, not one: a single space is closer than the space inside a row
 /// (`⊘ looprs-4`), so adjacent columns read as continuations of each other.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 const COLUMN_GAP_COLS: u16 = 2;
 
 /// The least a column header must leave for its name before the name is dropped
@@ -103,7 +102,6 @@ const COLUMN_GAP_COLS: u16 = 2;
 /// label that stopped labelling is worth less than the number next to it — which
 /// is the one number in the header a reader cannot reconstruct from anything
 /// else on screen.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 const MIN_HEADER_NAME_COLS: usize = 4;
 
 /// The band, as painted from a snapshot.
@@ -112,12 +110,10 @@ const MIN_HEADER_NAME_COLS: usize = 4;
 /// read, re-rendered as often as the frame runs, and cloning a few hundred beads
 /// every frame to satisfy a widget signature is a cost with no name.
 #[derive(Debug)]
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 pub struct Kanban<'a> {
     snapshot: &'a BoardSnapshot,
 }
 
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 impl<'a> Kanban<'a> {
     pub fn new(snapshot: &'a BoardSnapshot) -> Self {
         Self { snapshot }
@@ -135,7 +131,6 @@ impl Widget for Kanban<'_> {
 /// Split by split, top down. Everything here is total: an area of any size, down
 /// to `0 × 0`, returns having painted nothing and without panicking, because a
 /// small window must not be able to take the frame down with it.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 pub fn paint(snapshot: &BoardSnapshot, area: Rect, buf: &mut Buffer) {
     if area.is_empty() {
         return;
@@ -180,14 +175,12 @@ pub fn paint(snapshot: &BoardSnapshot, area: Rect, buf: &mut Buffer) {
 /// whether any of this is true), so it is taken first and the header is what has
 /// room left over. Given one row the band paints a footer and no header, which is
 /// the right way to be short — short in the chrome, not short in the state.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 struct Band {
     header: Option<Rect>,
     body: Option<Rect>,
     footer: Option<Rect>,
 }
 
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 fn band_areas(area: Rect) -> Band {
     let footer = if area.height >= KANBAN_FOOTER_ROWS {
         Some(Rect {
@@ -243,7 +236,6 @@ fn band_areas(area: Rect) -> Band {
 /// the remainder out with its own rounding and spends every column it was given.
 /// Used for the header row and the body rows alike, so a column's name is always
 /// over its rows.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 fn column_areas(area: Rect) -> [Rect; 3] {
     let chunks: [Rect; 5] = Layout::horizontal([
         Constraint::Fill(1),                 // To-do
@@ -266,7 +258,6 @@ fn column_areas(area: Rect) -> [Rect; 3] {
 /// [`MIN_HEADER_NAME_COLS`] to say itself with; below that the name goes and the
 /// count stands alone, and below the width of the count itself the cell is left
 /// empty rather than showing a truncated number.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 fn header_line(column: Column, count: &str, width: usize) -> Line<'static> {
     let need = count.width() + 1;
     let text = if width >= need + MIN_HEADER_NAME_COLS {
@@ -288,7 +279,6 @@ fn header_line(column: Column, count: &str, width: usize) -> Line<'static> {
 /// **The marker row is one of the `rows`, not an extra one.** With `rows = 4`
 /// and ten beads the column draws three beads and `+7 more`. A column that drew
 /// four *and* said `+7 more` would be claiming eleven.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 fn column_lines(
     snapshot: &BoardSnapshot,
     column: Column,
@@ -334,7 +324,6 @@ fn column_lines(
 /// bead still counted, now lying about what it is. The id buys next because it is
 /// the handle the user acts on. The title — prose, and re-readable with one
 /// `bd show` — is what gives way.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 fn bead_line(bead: &BoardBead, width: usize, stale: bool) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     if width == 0 {
@@ -397,7 +386,6 @@ fn bead_line(bead: &BoardBead, width: usize, stale: bool) -> Line<'static> {
 /// if it cannot hold even that: by the point the marker is being cut the column is
 /// three cells wide, and an ellipsis saying "…and more than this" is still the
 /// truest thing available.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 fn overflow_line(hidden: usize, width: usize) -> Line<'static> {
     let full = format!("+{hidden} more");
     let text = if full.width() > width {
@@ -416,7 +404,6 @@ fn overflow_line(hidden: usize, width: usize) -> Line<'static> {
 /// **the head gives and the tails stand**: "how out of date is this" is the
 /// question the footer exists to answer, and an error that reads as current news
 /// is worse than an error whose message was cut short.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 fn footer_line(snapshot: &BoardSnapshot, width: usize) -> Line<'static> {
     let (head, tails, style) = footer_parts(snapshot);
     let head_avail = width.saturating_sub(tails.width());
@@ -429,7 +416,6 @@ fn footer_line(snapshot: &BoardSnapshot, width: usize) -> Line<'static> {
 /// The footer's sentence, its freshness tails, and its colour — one row of the
 /// ADR §4 table, picked by the snapshot's own state rather than by re-reading an
 /// error string.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 fn footer_parts(snapshot: &BoardSnapshot) -> (String, String, Style) {
     let stale_tail = stale_suffix(snapshot);
     match &snapshot.read {
@@ -493,7 +479,6 @@ fn footer_parts(snapshot: &BoardSnapshot) -> (String, String, Style) {
 ///
 /// No age means there is nothing behind the band to date, and `stale —` would be
 /// an adjective about nothing.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 fn stale_suffix(snapshot: &BoardSnapshot) -> String {
     snapshot
         .age
@@ -505,7 +490,6 @@ fn stale_suffix(snapshot: &BoardSnapshot) -> String {
 ///
 /// A function rather than an `if` at each call site so that "everything stale is
 /// dimmed the same way" is one decision rather than four that can disagree.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame wiring that paints this band
 fn shade(style: Style, stale: bool) -> Style {
     if stale { board_staled(style) } else { style }
 }

@@ -109,7 +109,6 @@ pub fn trim_marker_style() -> Style {
 /// Bold and uncoloured. It is the one row in the band that is *labels* rather
 /// than *content*, and bold is enough to separate label from content without a
 /// colour that would then have to be reserved for something more important.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the kanban band
 pub fn board_header() -> Style {
     Style::new().add_modifier(Modifier::BOLD)
 }
@@ -119,7 +118,6 @@ pub fn board_header() -> Style {
 /// The row's own information is the id and the title; the *style* has nothing to
 /// add, and any colour here would be competing with the marker two cells to its
 /// left.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the kanban band
 pub fn board_row() -> Style {
     Style::default()
 }
@@ -132,7 +130,6 @@ pub fn board_row() -> Style {
 /// bead, it is our own classifier that came up short, and making `?` shout would
 /// read as "this ticket is broken" rather than "this build has not met this
 /// status".
-#[allow(dead_code)] // consumer: looprs-5o4.5, the kanban band
 pub fn board_marker(marker: Marker) -> Style {
     match marker {
         Marker::Blocked => Style::new().fg(Color::Yellow),
@@ -148,7 +145,6 @@ pub fn board_marker(marker: Marker) -> Style {
 /// Italic rather than dim alone because a dim-only style is unreliable across
 /// palettes (see [`trim_marker_style`] for the same call, made for the same
 /// reason).
-#[allow(dead_code)] // consumer: looprs-5o4.5, the kanban band
 pub fn board_overflow() -> Style {
     Style::new().dark_gray().add_modifier(Modifier::ITALIC)
 }
@@ -158,7 +154,6 @@ pub fn board_overflow() -> Style {
 /// Dim but upright: the column answered, and what it said was "nothing". A
 /// column that draws nothing at all is a column that failed to render, which is
 /// the reading this character exists to prevent.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the kanban band
 pub fn board_empty() -> Style {
     Style::new().dark_gray()
 }
@@ -167,7 +162,6 @@ pub fn board_empty() -> Style {
 ///
 /// Dark gray, because "bd ok · 3s ago" is the boring state and the boring state
 /// should not be the one that catches the eye.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the kanban band
 pub fn board_footer_ok() -> Style {
     Style::new().dark_gray()
 }
@@ -177,7 +171,6 @@ pub fn board_footer_ok() -> Style {
 /// Not bold — the status row already spends bold red on failures, and two red
 /// bold rows stacked one above the other is one red shout rather than two facts.
 /// The word order and the app's red carry it on their own.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the kanban band
 pub fn board_footer_error() -> Style {
     Style::new().fg(RED)
 }
@@ -191,7 +184,6 @@ pub fn board_footer_error() -> Style {
 /// Dark gray rather than the `DIM` modifier, for the palette reason given on
 /// [`trim_marker_style`] — a modifier alone disappears on terminals that render
 /// it as a no-op, and "stale" is the one state that must not be invisible.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the kanban band
 pub fn board_staled(base: Style) -> Style {
     base.patch(Style::new().fg(Color::DarkGray))
 }

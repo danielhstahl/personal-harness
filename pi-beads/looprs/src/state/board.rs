@@ -43,7 +43,6 @@ pub enum Column {
     Complete,
 }
 
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
 impl Column {
     /// Every column, in draw order. The widget walks this; nothing indexes by a
     /// literal `0`/`1`/`2`, which is the mistake the original four-line sketch
@@ -82,7 +81,6 @@ pub enum Marker {
     Unknown,
 }
 
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
 impl Marker {
     pub fn glyph(self) -> &'static str {
         match self {
@@ -196,7 +194,6 @@ pub enum BoardRead {
     Timeout,
 }
 
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
 impl BoardRead {
     pub fn is_ok(&self) -> bool {
         matches!(self, Self::Ok)
@@ -295,7 +292,6 @@ pub struct BoardSnapshot {
     pub fetched_at: Option<Instant>,
 }
 
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
 impl BoardSnapshot {
     /// The band before the first read lands: nothing counted, and the footer's
     /// `reading the board…` says so.
@@ -398,9 +394,35 @@ impl BoardSnapshot {
     /// true at this painting — one field write, no clone of the bead vectors,
     /// which is the whole reason [`Self::age`] is not simply recomputed inside
     /// the widget.
-    #[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that stamps its footer each paint
     pub fn restamp_age(&mut self, now: Instant) {
         self.age = self.age_of_last_good(now);
+    }
+
+    /// Would this snapshot paint **different pixels** from `other`?
+    ///
+    /// The *drawn* fields and nothing else: the read's state, the rows of every
+    /// column, and the deferred count. `age` and `fetched_at` are deliberately
+    /// left out, and that omission is the entire reason this function exists
+    /// instead of `==`.
+    ///
+    /// A poll of a board that has not moved returns the same beads with a new
+    /// timestamp. Under `PartialEq` that is a change, the frame repaints on
+    /// every tick of the poller, forever, in a window nobody touched — which is
+    /// the property the band is sold on having the opposite of. Under this
+    /// function it is not a change and no frame is drawn at all.
+    ///
+    /// What the footer's `bd ok · Ns ago` then shows is not a frozen age, because
+    /// the age is not what gets compared: it is re-derived from `fetched_at` at
+    /// paint time (`App::on_tick` calling [`Self::restamp_age`]), so whatever
+    /// frame is on screen states the age as of itself. Freshness is a value the
+    /// frame re-reads; it is not news, and news is what costs a repaint.
+    ///
+    /// Written as the list it is rather than as `self == other` minus two fields,
+    /// so that adding a field to [`BoardSnapshot`] forces the question this
+    /// function exists to answer: *is it drawn?* If yes it belongs in this list;
+    /// if it is a clock, it does not.
+    pub fn same_paint_as(&self, other: &Self) -> bool {
+        self.read == other.read && self.columns == other.columns && self.deferred == other.deferred
     }
 
     /// The rows of one column, from the last good read.
@@ -414,6 +436,10 @@ impl BoardSnapshot {
 
     /// Every row the last good read carried, across the three columns.
     /// `deferred` is not in this number: it is not a row.
+    #[allow(dead_code)] // diagnostic/test seam: the band paints each column's count off
+    // `header_count`, and never asks for the whole board's row count — but I1
+    // ("every bead in the read is counted exactly once") is only checkable
+    // against a total, and the poller's log line wants one too.
     pub fn total(&self) -> usize {
         self.columns.iter().map(|c| c.beads.len()).sum()
     }
@@ -434,7 +460,6 @@ impl BoardSnapshot {
 }
 
 /// What a column header says for its count when the read cannot say.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
 const UNKNOWN_COUNT: &str = "—";
 
 /// All three columns, each empty, in draw order. The builder's starting point so
