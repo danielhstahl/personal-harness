@@ -39,9 +39,34 @@ code: whether Esc ever quits, and what happens when the thing being cancelled re
 | done | `cancelled` + "the loop is parked" | `cancelled` | `interrupted (exit 130)` |
 | **refuses to unwind** (after `cancel::GRACE` = 3 s) | **kill the worker**, park, name the bead that stays claimed | **kill the child**, report `ExitReason::Cancelled`; next message cold-starts a replacement | **say so and hand the choice back** — never kill the shell |
 | next Esc while cancelling | dropped while the attempt is live; retried once the stall has been reported | same | same |
+| **typed but not yet at the child** (queued behind a shell that has not printed its prompt) | n/a — a pass starts from a claim, not from a queue | `clear_queue` hands the queued text back to the input box | **dequeue it and say so**: ``cancelled `sleep 30` before it started`` |
 
 The four answers are the contract, and `src/session/cancel.rs` holds its vocabulary and its one
 number so that three backends cannot drift into three dialects.
+
+### Why an Esc that arrives early still cancels
+
+There is a window in Bash between a command being submitted and the shell being able to take it:
+`submit` never writes to a shell that has not printed its first prompt, so the command sits in
+the session's own queue. `status()` reports that window as `Running`, and it is *right* to —
+something is pending and the user should not start another thing. The keystroke is what has to
+catch up with the status rather than the other way round.
+
+The interrupt keyed on "nothing outstanding" and returned silently there, which produced the one
+combination a cancel key must never have: **the keystroke was lost *and* the command started
+anyway** a moment later, uncancelled, after the user had pressed the key that said it should not.
+Silence was the bug; the state was fine.
+
+So the branch takes the command out of the queue — the only place it still exists, since nothing
+has been given to the child — and says `cancelled <thing> before it started`
+(`cancel::dropped_before_start`). Two details of that are decisions, not accidents:
+
+* **The whole queue goes, not the newest entry.** "Stop" means the things I have not seen start
+  shall not start. Choosing among them is guessing at a key whose whole job is "not that".
+* **It is said out loud**, unlike the idle no-op above it. An idle Esc stays quiet because
+  nothing happened *and nothing was going to*. Here something *was* taken away, and a user who
+  cannot see that has to infer it from a prompt that stayed put — which is exactly the reading
+  this ADR exists to make unnecessary.
 
 ### Why Esc never quits
 

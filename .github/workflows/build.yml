@@ -2,6 +2,47 @@ on:
   release:
     types: [published]
 jobs:
+
+  build_rust_binary:
+    name: release ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # release changes require contents write
+    defaults:
+      run:
+        working-directory: ./pi-beads/looprs
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - armv7-unknown-linux-gnueabihf
+          - aarch64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          curl -L https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz -o cross-x86_64-unknown-linux-gnu.tar.gz
+          tar -xvzf cross-x86_64-unknown-linux-gnu.tar.gz
+          rustup update stable
+
+      - name: Compile
+        run: |
+          ./cross build --release --target ${{ matrix.target }}
+
+      - name: Release
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czvf ../../../looprs-${{ matrix.target }}.tar.gz looprs
+
+      - name: upload artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} looprs-${{ matrix.target }}.tar.gz
+
+
   build_pi_beads:
     runs-on: ubuntu-latest
     permissions:

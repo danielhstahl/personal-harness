@@ -10,4 +10,4 @@ looprs.log
 
 # Python bytecode from the spike drivers (they import each other)
 __pycache__/
-*.lock
+.beads.gate.lock

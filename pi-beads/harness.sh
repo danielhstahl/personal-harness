@@ -11,11 +11,11 @@ docker volume create $VOLUME  >/dev/null
 # make issue names shorter and reflect pwd
 BASENAME=$(basename "$PWD")
 # make sure .beads exists before anything else touches the volume
-docker run --rm \
-  -v $VOLUME:/home/appuser/.beads \
-  --entrypoint bd \
-  ghcr.io/danielhstahl/pi-beads:$TAG \
-  init --quiet --stealth --prefix "${BASENAME:0:2}" || echo "already initialized"
+#docker run --rm \
+#  -v $VOLUME:/home/appuser/.beads \
+#  --entrypoint bd \
+#  ghcr.io/danielhstahl/pi-beads:$TAG \
+#  init --quiet --stealth --prefix "${BASENAME:0:2}" || echo "already initialized"
 
 
 GIT_USER_NAME="$(git config user.name || true)"
@@ -23,6 +23,12 @@ GIT_USER_NAME="${GIT_USER_NAME:-$USER}"
 
 GIT_USER_EMAIL="$(git config user.email || true)"
 GIT_USER_EMAIL="${GIT_USER_EMAIL:-$USER@example.com}"
+
+#-e LOOP_TOOL_TIMEOUT_MS=60000 \
+#-e LOOP_KANBAN="board" \
+#-e LOOP_MONITOR=0 \
+#-e LOOP_AUDIT=0 \
+#
 # run the actual pi harness
 # put models.json in $HOME/.pi/agent
 # Tools timeout after 10 minutes
@@ -35,8 +41,5 @@ docker run --rm -it \
   -e GIT_USER_EMAIL="$GIT_USER_EMAIL" \
   -e LOOP_NTFY_URL="$NTFY_URL" \
   -e LOOP_NTFY_TOPIC="harness" \
-  -e LOOP_TOOL_TIMEOUT_MS=60000 \
-  -e LOOP_KANBAN="board" \
-  -e LOOP_MONITOR=0 \
-  -e LOOP_AUDIT=0 \
+
   ghcr.io/danielhstahl/pi-beads:$TAG

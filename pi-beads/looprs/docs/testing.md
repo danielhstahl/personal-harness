@@ -211,12 +211,50 @@ The ntfy wire format itself is checked against a loopback listener, under
 - `session::cancel::tests::arm_delivers_the_command_after_the_grace`
 - `session::bash::tests::esc_interrupts_a_running_command_without_killing_the_shell`
 - `session::bash::tests::esc_says_cancelling_before_the_command_reports_itself_done`
+- `session::bash::tests::an_esc_aimed_at_a_queued_command_takes_it_out_of_the_queue` — the
+  cold-start window, held open on purpose with `/bin/cat` as the "shell" (it never prints the
+  readiness marker, so the command cannot leave the queue underneath the test)
+- `session::cancel::tests::the_queued_cancel_names_the_command_and_says_it_never_ran`
 - `session::pi_chat::tests::esc_clears_the_queue_before_aborting_and_gives_the_words_back`
 - `session::pi_chat::tests::a_pi_that_ignores_the_abort_is_killed_said_so_and_the_mode_recovers`
 - `session::beads::tests::a_worker_that_ignores_the_abort_is_killed_and_leaves_the_bead_named`
 - `session::router::tests::cancel_reaches_the_active_session_only`
 - pure: `session::beads::tests::esc_is_absorbed_while_a_cancel_is_unwinding_and_only_while`
 - pure: `session::beads::tests::a_stall_timer_only_answers_for_the_attempt_that_armed_it`
+
+#### A cold shell makes `Running` mean "pending", and that is not "started"
+
+Every Bash test that wants *the command is in flight, now interrupt it* has to warm the shell
+first (`session::bash::tests::warm_shell`), and this is the rule that killed a whole class of
+CI flakes:
+
+`submit` cannot write to a shell that has not printed its prompt, so a command submitted cold
+sits in the session queue — and `SessionStatus::Running` covers both "queued" and "in flight".
+A poll of the form *"wait until `status() == Running`, then act"* therefore cannot tell the two
+apart, and on a loaded runner the start-up window is wide enough to land in most of the time.
+What the test then interrupts is a queue entry: the `0x03` goes to an idle prompt, the raw keys
+are typed before the command line exists, and the assertion fails against a state the test never
+set up.
+
+The two halves of the fix, both needed:
+
+* **the product** — `interrupt` now handles the queued case instead of returning on "nothing
+  outstanding" (ADR-0003: *why an Esc that arrives early still cancels*);
+* **the tests** — `warm_shell` runs one cheap command to completion first, so the shell is
+  ready and the next `send_text` goes straight to the child. `wait_running`'s doc now says out
+  loud that it cannot honour its own name on a cold shell.
+
+`wait_running` on a cold shell was the shared root of
+`esc_interrupts_…`, `esc_says_cancelling_…`, `a_command_that_traps_the_interrupt_…`,
+`a_command_that_never_reported_…` and `raw_keys_reach_the_child_verbatim_…` failing on
+Actions. A separate flake of the same shape lived in the test rather than the code: the
+alt-screen test identified "the program painted" as *an event containing `painted` and an escape
+byte*, which the shell's own prompt (`\033[?1034h`) satisfies whenever the pty happens to
+coalesce the prompt with the echoed command. It now matches the escape **where the program put
+one** (`\033[?25lpainted`) and rejects the command's literal `\033[` text.
+
+Verified under load rather than hoped for: the full suite green with 8–10 `yes > /dev/null`
+hogging every core (32 s against 24 s idle, so the load was real), several runs in a row.
 
 ### `bd` missing / failing surfaces (looprs-037)
 

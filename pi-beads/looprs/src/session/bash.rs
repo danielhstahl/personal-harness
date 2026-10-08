@@ -517,10 +517,20 @@ impl BashTask {
 
     /// `Esc` / Ctrl-C: interrupt the command in front of the shell.
     ///
-    /// Three cases, and only the last one sends a byte:
+    /// Four cases, and only the last two send a byte:
     ///
-    /// * **nothing outstanding** — an idle prompt. `0x03` would print a `^C` for
-    ///   no reason, so an idle Esc is a silent no-op, not an error (looprs-5g7).
+    /// * **nothing outstanding, nothing queued** — an idle prompt. `0x03` would
+    ///   print a `^C` for no reason, so an idle Esc is a silent no-op, not an
+    ///   error (looprs-5g7).
+    /// * **queued, not started** — the command is still in this session's own
+    ///   queue, because [`Self::submit`] never writes to a shell that has not
+    ///   printed its prompt. Nothing has reached the child, so there is nothing to
+    ///   signal and the cancel *is* the dequeue. It is said out loud
+    ///   ([`cancel::dropped_before_start`]) because the alternative was the worst
+    ///   answer a cancel key can give: the keystroke lost **and** the command left
+    ///   queued to start a moment later. `status()` calls that window `Running`,
+    ///   so from the user's side there is a command to cancel — the branch that
+    ///   refuses to see it is the bug, not the status.
     /// * **already cancelling and the attempt is still live** — the byte is already
     ///   in the line discipline. Stacking a second one on it buys nothing and
     ///   makes "which interrupt is the pending one?" unanswerable, so the repeat
@@ -531,6 +541,19 @@ impl BashTask {
     ///   deadline.
     fn interrupt(&mut self) {
         if self.outstanding.is_empty() {
+            let queued: Vec<String> = std::mem::take(&mut self.queue).into();
+            if queued.is_empty() {
+                return;
+            }
+            // The whole queue rather than the newest entry: "stop" means the things
+            // I have not seen start shall not start. Picking among them would be
+            // guessing at the meaning of a key whose whole job is "not that".
+            let what = if queued.len() == 1 {
+                format!("`{}`", clip(&queued[0], 60))
+            } else {
+                format!("{} queued commands", queued.len())
+            };
+            self.note(cancel::dropped_before_start(&what, queued.len() > 1));
             return;
         }
         if self.aborting && !self.stall_reported {
@@ -1516,6 +1539,7 @@ mod tests {
     #[tokio::test]
     async fn esc_interrupts_a_running_command_without_killing_the_shell() {
         let (mut s, mut rx) = bash(7);
+        warm_shell(&mut s, &mut rx).await;
         s.send_text("sleep 30".into()).unwrap();
         // Wait until the command is actually in flight.
         for _ in 0..200 {
@@ -1605,6 +1629,79 @@ mod tests {
         assert_eq!(s.status(), SessionStatus::Idle, "and changed nothing");
     }
 
+    /// **The cold-start window: `Esc` while the command has not reached the shell.**
+    ///
+    /// `submit` never writes to a shell that has not printed its prompt, so a
+    /// command typed during start-up sits in the session's own `queue` — and
+    /// `status()` reports that as `Running`, because something *is* pending. The
+    /// interrupt used to bail out on "nothing outstanding" in exactly that window,
+    /// which lost the keystroke **and** left the command queued to start as soon
+    /// as the prompt arrived. A cancel that cancels nothing, silently, while the
+    /// thing it was aimed at runs a moment later.
+    ///
+    /// `/bin/cat` is the fixture that holds that state open instead of racing for
+    /// it: it never prints the readiness marker, so the command never leaves the
+    /// queue and the window cannot close underneath the test. That is the same
+    /// window the interrupt tests used to fall into by accident whenever CI was
+    /// slow enough to widen it — here it is the subject rather than the accident.
+    #[tokio::test]
+    async fn an_esc_aimed_at_a_queued_command_takes_it_out_of_the_queue() {
+        let cfg = SessionConfig {
+            // Not a shell, and on purpose: nothing `cat` prints is the readiness
+            // marker, so `ready` stays false and every submit stays queued.
+            shell_bin: "/bin/cat".into(),
+            ..Default::default()
+        };
+        let (mut s, mut rx) =
+            BashSession::build(SessionId::new(TerminalType::Bash, 26), &cfg).expect("build");
+        s.resize(24, 80).ok();
+
+        s.send_text("sleep 30".into()).unwrap();
+        // Through the seam rather than by polling: `status` is a mirror the session
+        // task writes — at the seam and on the byte lane — and with `cat` as the
+        // child no bytes ever arrive to push it. The seam is the one thing that
+        // both waits for the `Submit` to have been handled and publishes what the
+        // state was when it was.
+        assert!(s.quiesce().await, "the submit was handled");
+        assert_eq!(
+            s.status(),
+            SessionStatus::Running,
+            "a queued command reads as work pending: the status is *right* here, and it is the \
+             keystroke that has to catch up with it"
+        );
+        drain(&mut rx);
+
+        s.abort().unwrap();
+        assert!(s.quiesce().await, "the Esc was handled");
+
+        let msgs = drain(&mut rx);
+        assert!(
+            msgs.iter().any(|m| m.contains("cancelled")
+                && m.contains("sleep 30")
+                && m.contains("before it started")),
+            "the queued cancel said nothing: {msgs:?}"
+        );
+        assert_eq!(
+            s.status(),
+            SessionStatus::Idle,
+            "the queue is empty and nothing was ever in flight, so nothing is left busy"
+        );
+        assert!(
+            msgs.iter().all(|m| !m.contains("cancelling")),
+            "a queued cancel must not claim a byte was sent at something: {msgs:?}"
+        );
+
+        // And it stays cancelled: no late line reporting the command as having run,
+        // which is exactly what the swallowed version produced.
+        let late =
+            crate::testing::collect_within(&mut rx, Duration::from_millis(500), describe).await;
+        assert!(
+            late.iter()
+                .all(|l| !l.contains("exit ") && !l.contains("cancelling")),
+            "the dropped command came back to life: {late:?}"
+        );
+    }
+
     /// **Acceptance: the word comes before the child does.** A `sleep 30` stops
     /// fast but not instantly, and the user must not spend the gap wondering
     /// whether Esc reached anything. So the contract is an *ordering*: the
@@ -1613,6 +1710,7 @@ mod tests {
     #[tokio::test]
     async fn esc_says_cancelling_before_the_command_reports_itself_done() {
         let (mut s, mut rx) = bash(22);
+        warm_shell(&mut s, &mut rx).await;
         s.send_text("sleep 30".into()).unwrap();
         wait_running(&s).await;
         drain(&mut rx);
@@ -1652,6 +1750,7 @@ mod tests {
     #[tokio::test]
     async fn a_command_that_traps_the_interrupt_is_reported_not_silently_wedged() {
         let (mut s, mut rx) = bash(23);
+        warm_shell(&mut s, &mut rx).await;
         s.send_text("trap '' INT; sleep 30".into()).unwrap();
         wait_running(&s).await;
 
@@ -1698,8 +1797,32 @@ mod tests {
         );
     }
 
+    /// Bring the shell up to its first prompt *before* the test's real command.
+    ///
+    /// **This is what makes "the command is running" mean running.** A cold
+    /// `submit` cannot be written at all — the shell has not printed its prompt —
+    /// so the command sits in the session's queue, `status()` reports `Running`
+    /// because something is pending, and an `Esc` aimed at "the running command"
+    /// is in fact aimed at a queue entry that has not started. `wait_running`
+    /// cannot tell those two apart from the outside: both are `Running`, and that
+    /// conflation is what made these tests CI-flaky, with the window widening with
+    /// load. Running one cheap command to completion first leaves the shell ready,
+    /// so the next `send_text` goes straight to the child and the interrupt has
+    /// something to interrupt.
+    async fn warm_shell(s: &mut BashSession, rx: &mut mpsc::UnboundedReceiver<SessionEvent>) {
+        s.send_text("echo looprs-warm".into()).unwrap();
+        let (out, code) = run_command(rx).await;
+        assert_eq!(code, Some(0), "the shell did not come up warm: {out:?}");
+        assert_eq!(s.status(), SessionStatus::Idle, "warm means idle");
+        drain(rx);
+    }
+
     /// Poll until the session says the command is in flight, so an interrupt is
     /// never aimed at a shell that has not started the command yet.
+    ///
+    /// Read the doc on [`warm_shell`]: this helper *cannot* honour that intention
+    /// on a cold shell, because a queued command and a running one are the same
+    /// `SessionStatus`. Call `warm_shell` first.
     async fn wait_running(s: &BashSession) {
         for _ in 0..400 {
             if s.status() == SessionStatus::Running {
@@ -1829,6 +1952,7 @@ mod tests {
     #[tokio::test]
     async fn a_command_that_never_reported_is_named_when_the_shell_dies() {
         let (mut s, mut rx) = bash(16);
+        warm_shell(&mut s, &mut rx).await;
         s.send_text("(sleep 1; kill -KILL $$) >/dev/null 2>&1 & sleep 30".into())
             .unwrap();
         for _ in 0..200 {
@@ -1948,12 +2072,23 @@ mod tests {
             .iter()
             .position(|e| e == "screen true")
             .unwrap_or_else(|| panic!("the takeover was never reported: {events:?}"));
-        // The *program's* paint, not the echo of the command that printed it: the
-        // echo contains the literal characters `\033[?1049h…` and the word
-        // "painted", so only an actual escape byte tells them apart.
+        // The *program's* paint, and not the two other events that say "painted".
+        // The command echo carries the literal characters `\033[?1049h…` with no
+        // escape byte at all, which is the easy case. The one that used to win the
+        // race is the shell's own prompt: it arrives with a real escape of its own
+        // (`\033[?1034h`), and when the pty coalesces the prompt with the echoed
+        // command — which it does or does not depending on nothing but scheduling —
+        // that single event satisfies "contains `painted` **and** contains an
+        // escape byte" without being the program's bytes in the slightest, and the
+        // ordering assertion then fails on a machine that happened to batch the
+        // reads. So the test is for an escape **where the program put one**, and
+        // for none of the command's literal `\033` text: the paint is
+        // `\033[?25lpainted`, the echo and the prompt are not.
         let painted = events
             .iter()
-            .position(|e| e.starts_with("out ") && e.contains("painted") && e.contains('\u{1b}'))
+            .position(|e| {
+                e.starts_with("out ") && e.contains("\u{1b}[?25lpainted") && !e.contains("\\033[")
+            })
             .unwrap_or_else(|| panic!("the paint never arrived: {events:?}"));
         let released = events
             .iter()
@@ -2197,6 +2332,7 @@ mod tests {
     #[tokio::test]
     async fn raw_keys_reach_the_child_verbatim_and_the_shell_still_survives() {
         let (mut s, mut rx) = bash(24);
+        warm_shell(&mut s, &mut rx).await;
         s.send_text("printf 'first-line\\n'; sleep 1.5".into())
             .unwrap();
         // Wait until the command is genuinely in flight, then type a keystroke
