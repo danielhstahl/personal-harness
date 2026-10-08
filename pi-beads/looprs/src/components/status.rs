@@ -60,7 +60,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::session::view::Tokens;
 use crate::session::{ActiveBead, BeadStep, SessionStatus, TerminalType};
-use crate::theme::styles::mode_color;
+use crate::theme::styles::{BLUE, RED, mode_color};
 use crate::utils::render::FRAMES;
 
 /// The gap between two segments.
@@ -306,7 +306,7 @@ fn segments(s: &Status<'_>) -> Vec<Seg> {
     segs.push(Seg::new(
         a.verb(),
         if busy {
-            Style::new().fg(Color::Blue)
+            Style::new().fg(BLUE)
         } else if a.status.is_alive() {
             Style::default()
         } else {
@@ -335,7 +335,7 @@ fn segments(s: &Status<'_>) -> Vec<Seg> {
         segs.push(Seg {
             prefix: "✗ ",
             text: err.to_string(),
-            style: Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            style: Style::new().fg(RED).add_modifier(Modifier::BOLD),
             keep: keep::ERROR,
             cut: Cut::Short,
         });

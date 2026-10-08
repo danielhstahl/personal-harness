@@ -27,9 +27,10 @@
 //! failure tone adds a red foreground on top of the swap, which is legible
 //! against both halves of it.
 
+use crate::theme::styles::RED;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
@@ -56,7 +57,7 @@ impl<'a> ToastOverlay<'a> {
         let s = Style::new().add_modifier(Modifier::REVERSED);
         match self.tone {
             Tone::Good => s,
-            Tone::Bad => s.fg(Color::Red).add_modifier(Modifier::BOLD),
+            Tone::Bad => s.fg(RED).add_modifier(Modifier::BOLD),
         }
     }
 }

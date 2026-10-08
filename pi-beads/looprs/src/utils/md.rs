@@ -3,6 +3,7 @@
 
 use std::sync::OnceLock;
 
+use crate::theme::styles::BLUE;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -196,7 +197,7 @@ impl R {
                 let c = match level as usize {
                     1 => Color::Magenta,
                     2 => Color::Cyan,
-                    _ => Color::Blue,
+                    _ => BLUE,
                 };
                 self.style.push(bold.fg(c));
             }
@@ -239,11 +240,8 @@ impl R {
                 .push(Style::default().add_modifier(Modifier::CROSSED_OUT)),
             Tag::Link { dest_url, .. } => {
                 self.links.push(dest_url.to_string());
-                self.style.push(
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::UNDERLINED),
-                );
+                self.style
+                    .push(Style::default().fg(BLUE).add_modifier(Modifier::UNDERLINED));
             }
             _ => {}
         }
@@ -372,5 +370,55 @@ fn trim_trailing(v: &mut [Span<'static>]) {
     if let Some(l) = v.last_mut() {
         let t = l.content.trim_end().to_string();
         l.content = t.into();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Markdown's two blues are the palette's, not `Color::Blue`.
+    ///
+    /// A heading and a link are the two places a user most needs to pick the
+    /// colour out at speed, and both were the worst case for the ANSI basic:
+    /// rendered at roughly the background's luminance, an underlined link is a
+    /// smear with a line through it. The link assertion checks the underline
+    /// too, so the style — not just the colour — is pinned.
+    #[test]
+    fn a_small_heading_and_a_link_are_the_palettes_blue() {
+        let lines = render_markdown(
+            "### Heading three\n\nsee [a link](https://example.com)\n",
+            40,
+        );
+
+        let heading = lines
+            .iter()
+            .find(|l| l.to_string().contains("Heading three"))
+            .expect("the heading rendered");
+        assert_eq!(
+            heading
+                .spans
+                .iter()
+                .find(|s| s.content.contains("Heading"))
+                .expect("the heading span")
+                .style
+                .fg,
+            Some(BLUE)
+        );
+
+        let link = lines
+            .iter()
+            .find(|l| l.to_string().contains("a link"))
+            .expect("the link rendered");
+        let span = link
+            .spans
+            .iter()
+            .find(|s| s.content.contains("link"))
+            .expect("the link span");
+        assert_eq!(span.style.fg, Some(BLUE));
+        assert!(
+            span.style.add_modifier.contains(Modifier::UNDERLINED),
+            "the link lost its underline along with its old colour"
+        );
     }
 }

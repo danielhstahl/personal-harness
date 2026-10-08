@@ -16,6 +16,7 @@ use ratatui::text::Line;
 
 use crate::components::status::fmt_tokens;
 use crate::state::transcript::{Entry, MessageKind};
+use crate::theme::styles::{BLUE, RED};
 use crate::utils::render::FRAMES;
 
 /// Where this session's compaction has got to.
@@ -42,10 +43,10 @@ pub enum CompactionState {
 impl CompactionState {
     fn color(self) -> Color {
         match self {
-            Self::Running => Color::Blue,
+            Self::Running => BLUE,
             Self::Done => Color::Green,
             Self::Aborted => Color::DarkGray,
-            Self::Failed => Color::Red,
+            Self::Failed => RED,
         }
     }
 
@@ -153,7 +154,7 @@ mod tests {
             "a cancel is grey: {:?}",
             aborted.style
         );
-        assert_eq!(failed.style.fg, Some(Color::Red));
+        assert_eq!(failed.style.fg, Some(RED));
     }
 
     /// A card that never saw its start event still reads as a complete sentence —

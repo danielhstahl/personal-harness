@@ -18,6 +18,8 @@
 //! * [`select_to_copy`](select_to_copy) — the copy a release makes: the count,
 //!   the toast, the deadline, the clear list;
 //! * [`wheel`](wheel) — the wheel and the trackpad: bands, cadence, throttling;
+//! * [`user_band`](user_band) — the user's own rows: the background that says
+//!   "mine", and the copy that must carry none of it;
 //! * [`chord_table`](chord_table) — the `Ctrl-S` family, driven keystroke by
 //!   keystroke against the table in `session::view`.
 //!
@@ -42,6 +44,7 @@ mod scrollback_band;
 mod select_to_copy;
 mod status_row;
 mod token_window;
+mod user_band;
 mod wheel;
 
 const W: u16 = 80;

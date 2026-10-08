@@ -29,7 +29,7 @@ use crate::{
     components::card::card_line,
     state::scrollback::RowEnd,
     state::transcript::{Entry, MessageKind, Transcript},
-    theme::styles::{content_width, restyle, style_for},
+    theme::styles::{RED, content_width, restyle, style_for},
     utils::{
         md::{self, Wrapped},
         shelltext::spanned,
@@ -66,15 +66,23 @@ impl std::fmt::Display for RenderedRow {
 
 fn render_simple(e: &Entry, w: u16) -> Vec<Wrapped> {
     let mut rows = match &e.kind {
+        // The user's own words, unmarked. The chevron this dropped used to be
+        // the only thing telling the message apart from the assistant's, and it
+        // did it with one character at the head of a block that can be many
+        // rows long. The distinction moved to the background
+        // (`theme::styles::USER_BG`), which covers every row of the message
+        // rather than just the first, and which `restyle` paints from
+        // `style_for` — so there is nothing to style here, and no prefix to
+        // keep in step with it.
         MessageKind::User => md::wrap(
             vec![Span::raw(e.text.clone())],
             w as usize,
-            "❯ ".into(),
-            "  ".into(),
+            String::new(),
+            String::new(),
         ),
         MessageKind::Error => vec![Wrapped::hard(Line::styled(
             format!("error: {}", e.text),
-            Style::new().red(),
+            Style::new().fg(RED),
         ))],
         MessageKind::System => vec![Wrapped::hard(Line::styled(
             format!("• {}", e.text),
