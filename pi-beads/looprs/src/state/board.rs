@@ -31,13 +31,12 @@
 //! branch of the board is paintable in a test with no subprocess, no terminal and
 //! no `sleep` — the same rule [`crate::components::status`] states for its row.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::services::bd::{BdError, Bead, BeadStatus};
 
 /// The three columns of the board, in the order they are painted (ADR-0007 §1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
 pub enum Column {
     ToDo,
     InProgress,
@@ -69,7 +68,6 @@ impl Column {
 /// blocked bead looking exactly like pickable work, which is dropping the bead
 /// visually while still counting it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
 pub enum Marker {
     /// `⊘` — the bead is `blocked`: not work the loop may take, but the most
     /// actionable thing on the board for the person reading it.
@@ -117,7 +115,6 @@ impl Marker {
 /// *do not merge `deferred` into To-do* — is the reason `Deferred` is the arm
 /// that answers `None`: a human took it out of the running, and a row puts it
 /// back in visually.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
 pub fn column_of(status: BeadStatus) -> Option<Column> {
     match status {
         // The plain case, and the two that mean "available work" in `bd`'s own
@@ -140,14 +137,12 @@ pub fn column_of(status: BeadStatus) -> Option<Column> {
 /// priority, no labels, no pin, no blockers, no due date — each of those is a
 /// column-of-the-mind that costs a read field and a layout slot nobody asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
 pub struct BoardBead {
     pub id: String,
     pub title: String,
     pub marker: Option<Marker>,
 }
 
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
 impl BoardBead {
     /// Take the row shape from a bead the read returned.
     pub fn from_bead(bead: &Bead) -> Self {
@@ -161,7 +156,6 @@ impl BoardBead {
 
 /// One column's worth of rows, name included.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
 pub struct ColumnBeads {
     pub column: Column,
     /// The column's beads in the order the read returned them (`bd list`'s own
@@ -181,7 +175,6 @@ pub struct ColumnBeads {
 /// collapse into one another — a thing you decide by `string matching` is a thing
 /// that starts matching the wrong string the first time a message changes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
 pub enum BoardRead {
     /// Nothing has been read yet. Renders the header with `—` counts and the
     /// footer `reading the board…`, never a blank band.
@@ -244,7 +237,6 @@ impl From<&BdError> for BoardRead {
 /// footer's `bd failed (exit N): …` is specified as. `None` when there is
 /// nothing to say, so the footer says `bd failed (exit 3)` rather than
 /// `bd failed (exit 3):` with nothing after the colon.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
 fn first_line(s: &str) -> Option<String> {
     s.lines()
         .map(str::trim)
@@ -258,7 +250,6 @@ fn first_line(s: &str) -> Option<String> {
 /// Clone it, stash it in a `watch`, hand a reference to the widget — nothing in
 /// here can block, read a clock, or ask `bd` anything while painting.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
 pub struct BoardSnapshot {
     /// How the last read ended.
     pub read: BoardRead,
@@ -279,7 +270,29 @@ pub struct BoardSnapshot {
     /// frame at paint time — and passed in. `None` means there has never been a
     /// good read, which is a different claim from `Some(0s)`: the first says "we
     /// do not know yet", the second says "we just looked".
+    ///
+    /// Which is exactly the trouble with it: a `Duration` is a *distance*, so it
+    /// is true the moment it is written and wrong forever after. For anything
+    /// that outlives the instant it was made, read [`BoardSnapshot::fetched_at`]
+    /// and subtract.
     pub age: Option<Duration>,
+    /// The instant the last **good** read finished, when whoever built this had a
+    /// clock to give (ADR-0007 F3).
+    ///
+    /// This is the reading; [`Self::age`] is what somebody decided to call its
+    /// distance. The poller publishes once and the frame paints sixty times a
+    /// second off that one value, so "how old is this?" has to be answerable at
+    /// paint time from the snapshot alone — otherwise the footer says `bd ok · 0s
+    /// ago` about a five-second-old read, which is the freshness marker telling
+    /// the opposite of the truth. [`BoardSnapshot::age_of_last_good`] does the
+    /// subtraction; [`BoardSnapshot::restamp_age`] writes the answer back into
+    /// [`Self::age`] for a reader that only speaks `age`.
+    ///
+    /// `None` when nothing was ever stamped — the never-loaded band, or a
+    /// hand-built value with no clock. Such a snapshot keeps the `age` it was
+    /// handed and ages no further: there is nothing to date it from, and
+    /// inventing a start instant would be guessing.
+    pub fetched_at: Option<Instant>,
 }
 
 #[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
@@ -298,6 +311,7 @@ impl BoardSnapshot {
             columns: empty_columns(),
             deferred: 0,
             age: None,
+            fetched_at: None,
         }
     }
 
@@ -312,6 +326,7 @@ impl BoardSnapshot {
             columns: empty_columns(),
             deferred: 0,
             age,
+            fetched_at: None,
         };
         for bead in beads {
             let status = bead.status();
@@ -346,7 +361,46 @@ impl BoardSnapshot {
             columns: self.columns.clone(),
             deferred: self.deferred,
             age,
+            // The stamp rides along with the rows it dates. An error does not
+            // move when the board was last seen — it *starts* the count of how
+            // long it has been since it was, which is the number the stale
+            // marker is made of.
+            fetched_at: self.fetched_at,
         }
+    }
+
+    /// Stamp the instant this snapshot's read completed.
+    #[must_use]
+    pub fn stamped_at(mut self, at: Instant) -> Self {
+        self.fetched_at = Some(at);
+        self
+    }
+
+    /// How old the last **good** read is as of `now`, or `None` if there has
+    /// never been one — the never-loaded band and the five-second-old board are
+    /// still, and must stay, different answers.
+    ///
+    /// Takes `now` rather than reading a clock so the whole board stays paintable
+    /// without a subprocess, a terminal or a `sleep`, exactly as the module doc
+    /// promises. The one place a real clock belongs is the poller that produced
+    /// the stamp.
+    pub fn age_of_last_good(&self, now: Instant) -> Option<Duration> {
+        // `saturating`: a monotonic clock cannot go backwards, but a snapshot
+        // carried across a clock source it does not know about should read as
+        // `0s` rather than panic in a paint path.
+        self.fetched_at.map(|at| now.saturating_duration_since(at))
+    }
+
+    /// Rewrite [`Self::age`] from [`Self::fetched_at`] as of `now`, leaving
+    /// every other field alone.
+    ///
+    /// For the reader that holds a snapshot of its own and wants its `age` to be
+    /// true at this painting — one field write, no clone of the bead vectors,
+    /// which is the whole reason [`Self::age`] is not simply recomputed inside
+    /// the widget.
+    #[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that stamps its footer each paint
+    pub fn restamp_age(&mut self, now: Instant) {
+        self.age = self.age_of_last_good(now);
     }
 
     /// The rows of one column, from the last good read.
@@ -385,7 +439,6 @@ const UNKNOWN_COUNT: &str = "—";
 
 /// All three columns, each empty, in draw order. The builder's starting point so
 /// that "all three columns are always present" is a property of one function.
-#[allow(dead_code)] // consumer: looprs-5o4.5, the frame band that reads this data
 fn empty_columns() -> Vec<ColumnBeads> {
     Column::ALL
         .iter()

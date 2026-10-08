@@ -431,7 +431,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             pi_bin: std::env::var("LOOPRS_PI_BIN").unwrap_or_else(|_| "pi".to_string()),
-            bd_bin: std::env::var("LOOPRS_BD_BIN").unwrap_or_else(|_| "bd".to_string()),
+            bd_bin: crate::services::bd::bd_bin_from_env(),
             shell_bin: default_shell_bin(),
             notifier: Arc::new(crate::services::notification::Noop),
             clipboard: Arc::new(crate::services::clipboard::Noop),

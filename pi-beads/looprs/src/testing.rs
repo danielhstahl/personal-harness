@@ -20,6 +20,25 @@ pub const ONE_BEADED_BOARD: &str = r#"{
   "schema_version": 1
 }"#;
 
+/// A board with one bead in every place the kanban mapping knows about, at once:
+/// `open` / `blocked` / a status this build has never seen in To-do, one in
+/// progress, two complete, and one deferred that is a footer count rather than a
+/// row. Seven in, six rows plus one deferred — ADR-0007's invariant I1 in a
+/// fixture, so "nothing dropped and nothing counted twice" is checkable against
+/// a board that exercises every arm instead of one that happens to be tidy.
+pub const BOARD_VARIETY: &str = r#"{
+  "data": [
+    {"id": "looprs-open-1", "title": "plain open work", "status": "open", "issue_type": "task"},
+    {"id": "looprs-blocked-1", "title": "waiting on a human", "status": "blocked", "issue_type": "bug"},
+    {"id": "looprs-weird-1", "title": "a status from a newer bd", "status": "frobnicated", "issue_type": "task"},
+    {"id": "looprs-prog-1", "title": "a worker has this", "status": "in_progress", "issue_type": "task"},
+    {"id": "looprs-done-1", "title": "closed by a worker", "status": "closed", "issue_type": "task"},
+    {"id": "looprs-done-2", "title": "closed a long time ago", "status": "done", "issue_type": "feature"},
+    {"id": "looprs-deferred-1", "title": "taken out of the running", "status": "deferred", "issue_type": "task"}
+  ],
+  "schema_version": 1
+}"#;
+
 /// How the fake `pi` behaves when it is started / prompted.
 #[derive(Clone, Copy, Debug)]
 pub enum PiFake {
@@ -56,7 +75,24 @@ pub enum BdFake {
     /// Like [`BdFake::Ok`], plus `bd show <id> --json` answers from `show.json`
     /// (set with [`Fakes::set_show`]) — the read the claim guard is built on.
     ShowStatus,
+    /// Answers like [`BdFake::Ok`], but **slowly**: holds the read open for
+    /// [`SLOW_FAKE_READ`] before it answers.
+    ///
+    /// The personality that makes *timing* properties testable rather than
+    /// assumed. A `bd` that answers instantly makes "two reads never overlap",
+    /// "a tick missed while the last read was in flight is skipped, not queued"
+    /// and "dropping the poller mid-read kills the child" all unobservable —
+    /// there is no window in which they could be false. The board poller
+    /// (looprs-5o4.2) is entirely about that window.
+    Slow,
 }
+
+/// How long [`BdFake::Slow`] holds a read open.
+///
+/// Long enough to span several of the shortest intervals the poller tests use
+/// (60 ms), short enough that the suite does not notice: the whole slow-fake
+/// group costs about a second of wall clock.
+pub const SLOW_FAKE_READ: std::time::Duration = std::time::Duration::from_millis(350);
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
@@ -604,6 +640,78 @@ impl Fakes {
         self.bd_log().iter().filter(|l| *l == cmd).count()
     }
 
+    // The pid markers `tests/fixtures/fake_bd.sh` writes on the way in and out
+    // of every invocation. `bd_log()` answers "what was this `bd` asked to do";
+    // these answer the question a log of invocations cannot: **was one alive
+    // just now** — which is the only form in which "two reads never overlap"
+    // and "no child outlived its poller" are checkable facts (looprs-5o4.2).
+
+    /// Every fake-`bd` pid that started, in start order.
+    pub fn bd_pids(&self) -> Vec<u32> {
+        self.read(&self.bd_log)
+            .lines()
+            .filter_map(|l| l.strip_prefix("start "))
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    }
+
+    /// The most recent fake-`bd` pid — the read that is probably still in
+    /// flight, if `bd_starts() > bd_stops()`.
+    pub fn last_bd_pid(&self) -> Option<u32> {
+        self.bd_pids().last().copied()
+    }
+
+    fn bd_marker_lines(&self) -> Vec<String> {
+        self.read(&self.bd_log)
+            .lines()
+            .filter(|l| l.starts_with("start ") || l.starts_with("stop "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Every invocation that started, in start order.
+    pub fn bd_starts(&self) -> usize {
+        self.bd_marker_lines()
+            .iter()
+            .filter(|l| l.starts_with("start "))
+            .count()
+    }
+
+    /// Every invocation that came back.
+    pub fn bd_stops(&self) -> usize {
+        self.bd_marker_lines()
+            .iter()
+            .filter(|l| l.starts_with("stop "))
+            .count()
+    }
+
+    /// The high-water mark of concurrent fake-`bd` processes the log records.
+    ///
+    /// Computed by walking the start/stop lines in the order they were written:
+    /// `1` means the reads were strictly serial, which is what "no two reads in
+    /// flight" is supposed to mean; `2` or more is the bug, caught red-handed.
+    /// A `stop` with no matching `start` is clamped at zero rather than allowed
+    /// to hide a later overlap under a negative count.
+    pub fn bd_max_concurrency(&self) -> usize {
+        let mut live = 0usize;
+        let mut peak = 0usize;
+        for marker in self.bd_marker_lines() {
+            if marker.starts_with("start ") {
+                live += 1;
+                peak = peak.max(live);
+            } else if marker.starts_with("stop ") {
+                live = live.saturating_sub(1);
+            }
+        }
+        peak
+    }
+
+    /// The raw start/stop lines, for a failure message that has to show what
+    /// actually happened rather than a count of it.
+    pub fn bd_trace(&self) -> Vec<String> {
+        self.bd_marker_lines()
+    }
+
     /// Make the chat fake **ignore `abort`**.
     ///
     /// The lever for the half of looprs-5g7 that only shows up when the child
@@ -629,8 +737,11 @@ impl Drop for Fakes {
     fn drop(&mut self) {
         // Kill every child we recorded before deleting the scratch dir. A fake that
         // outlives its test is a fake that turns up in somebody else's process
-        // count assertion, and the chat fake holds runs open on purpose.
-        for pid in self.pi_pids() {
+        // count assertion, and the chat fake holds runs open on purpose. The `bd`
+        // fakes are on the list for the same reason now that one of them can sleep
+        // for a third of a second (BdFake::Slow): a slow fake that outlives its
+        // test is a slow fake turning up in the next one's timing.
+        for pid in self.pi_pids().into_iter().chain(self.bd_pids()) {
             let _ = Command::new("kill")
                 .args(["-9", &pid.to_string()])
                 .stdout(std::process::Stdio::null())
@@ -728,6 +839,15 @@ fn bd_script(
         BdFake::ShowStatus => (
             format!("cat {}", board.display()),
             format!("cat {}", show.display()),
+            "exit 0".into(),
+        ),
+        BdFake::Slow => (
+            format!(
+                "sleep {}; cat {}",
+                SLOW_FAKE_READ.as_secs_f64(),
+                board.display()
+            ),
+            "printf '[]\\n'".into(),
             "exit 0".into(),
         ),
     };

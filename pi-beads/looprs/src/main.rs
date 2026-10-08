@@ -39,6 +39,7 @@ use components::toast::ToastOverlay;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
+use crate::services::board_poller;
 use crate::services::clipboard;
 use crate::services::notification;
 use crate::session::router::{Router, SHUTDOWN_GRACE};
@@ -214,6 +215,26 @@ async fn run(
         output_budget: app_tx.budget(),
         ..SessionConfig::default()
     };
+    // The kanban board's own task (looprs-5o4.2), on the same rule as the two
+    // sinks above and for the same reasons: it talks to the outside world, it
+    // can fail in ways the UI has to report rather than handle, and `main` being
+    // the only place one is ever built is what keeps the test suite off a real
+    // board by construction rather than by luck.
+    //
+    // Built before the Router so it outlives every session, exactly like the
+    // notifier: a beads session is respawned per generation and parked on Tab,
+    // and the board is meant to keep answering through both of those. It reads
+    // `bd` — the board — and not the session's mirror of it, which is ADR-0007
+    // §5's whole argument for why the band is not a session feature.
+    //
+    // Both ends are held here for the length of the run: the handle because a
+    // poller with no readers stops itself, the poller because dropping it is the
+    // shutdown (see the exit path below). What is *not* wired yet is the band —
+    // handing the handle to the frame is looprs-5o4.5. What *is* wired is the
+    // knob: `LOOPRS_KANBAN`, `LOOPRS_KANBAN_POLL_MS` and `LOOPRS_BD_BIN` are
+    // read once, here, and `spawn` logs what they resolved to.
+    let (board, board_handle) =
+        board_poller::BoardPoller::spawn(board_poller::BoardConfig::from_env());
     let mut router = Router::new(initial, cfg, app_tx.clone());
     // The run loop keeps **no** sender of its own. This is not tidiness: the exit
     // drain ends when `app_rx` closes, and `app_rx` closes when the last sender
@@ -494,6 +515,16 @@ async fn run(
     // and it makes the rule independent of whoever adds the next line here.
     drop(keys);
     drop(tick);
+    // The board goes before the drain for the same reason the key stream does:
+    // it is the one thing still able to start a subprocess on the way out.
+    // Dropping the poller aborts its task, which drops the pending read inside
+    // `services::bd`, whose `kill_on_drop(true)` takes any `bd` that was
+    // mid-flight with it — so a quit does not leave a `bd` running behind a
+    // terminal that has already been handed back, and does not wait on a read
+    // that could be a `BD_TIMEOUT` away. The handle goes first so nothing can
+    // read a snapshot that will never be updated again.
+    drop(board_handle);
+    drop(board);
 
     // (2) A command, not a `drop(app)`. Closing the channel does shut the
     // sessions down, but it also closes the only reader of what they say next.
@@ -721,6 +752,54 @@ mod tests {
     /// store needs in order to know how tall a page of scrollback is.
     const WIDTH: u16 = 60;
     const HEIGHT: u16 = 24;
+
+    /// **The board poller is built once, here, and before the Router**
+    /// (looprs-5o4.2).
+    ///
+    /// "Built only in `main`" is the ticket's first acceptance line, and the
+    /// reason is the notifier's right next door: a beads session is respawned per
+    /// generation and parked on Tab, so whatever the board leans on has to have
+    /// existed before the first session did. Asserted against this file's source
+    /// because the runtime form of "there is exactly one" is a counter nobody
+    /// would read, and the compile-time form of "and nowhere else" is a type error
+    /// that says nothing about *where*.
+    ///
+    /// Assembled from parts so this test's own text cannot match what it greps
+    /// for — the pattern `router.rs`'s removed-`BeadsNext` check sets.
+    #[test]
+    fn the_board_poller_is_built_once_and_before_the_router() {
+        let spawn = concat!("board_poller::Board", "Poller::spawn");
+        let knob = concat!("Board", "Config::from_env");
+        let router = concat!("Router::", "new");
+        let src = include_str!("main.rs");
+        let lines: Vec<&str> = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+
+        let builds: Vec<&&str> = lines.iter().filter(|l| l.contains(spawn)).collect();
+        assert_eq!(
+            builds.len(),
+            1,
+            "the board poller is built exactly once, in the run loop: {builds:?}"
+        );
+        let knobs: Vec<&&str> = lines.iter().filter(|l| l.contains(knob)).collect();
+        assert_eq!(
+            knobs.len(),
+            1,
+            "the board's knobs are read once, at startup, and never re-read: {knobs:?}"
+        );
+
+        // Ordered, not merely both present: the poller has to predate every
+        // session the Router is about to bring up, or it does not outlive them.
+        let built_at = src.find(spawn).expect("the poller build");
+        let router_at = src.find(router).expect("the Router build");
+        assert!(
+            built_at < router_at,
+            "the board poller is built after the Router, so it does not outlive the \
+             sessions it exists to outlive"
+        );
+    }
 
     /// Read the backend's screen back as trimmed rows of text.
     fn rows(b: &TestBackend) -> Vec<String> {

@@ -22,13 +22,29 @@
 # which is what lets a test rewrite the board *between* two reads of one pass.
 set -u
 echo "bd $*" >>"{{LOG}}"
+# Every invocation records its own pid on the way in and on the way out, so a
+# test can tell "a `bd` was alive at this moment" from "a `bd` has ever run" —
+# the difference the board poller's *no two reads in flight* and *no orphan left
+# behind* assertions are made of (looprs-5o4.2). The trap covers every exit
+# path, including the fail marker and the unsupported verb below.
+echo "start $$" >>"{{LOG}}"
+trap 'echo "stop $$" >>"{{LOG}}"' EXIT
 # Mid-run failure lever: see `Fakes::fail_bd`. Checked per invocation, so a test
 # can flip the board's health between two reads of the same pass.
 if [ -e "{{FAIL_MARK}}" ]; then
   echo "fake bd: failing on request (fail marker set)" >&2
   exit 3
 fi
-verb="${1:-}"
+# The verb is the first argument that is not a *global* flag: the board read is
+# `bd --readonly list --all --limit 0 --json`, and `--readonly` sits in front of
+# the subcommand the same way it does for the real `bd` (ADR-0007 S3).
+verb=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    *) verb="$arg"; break ;;
+  esac
+done
 # A refused claim is its own failure mode, distinct from "bd is down": reads still
 # work, only `--claim` says no. Exit 4 so the two are not confusable.
 case "$verb" in

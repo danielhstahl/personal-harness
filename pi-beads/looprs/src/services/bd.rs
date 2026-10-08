@@ -346,6 +346,44 @@ async fn beads(bin: &str, args: &[&str]) -> Result<Vec<Bead>, BdError> {
     }
 }
 
+/// The `bd` binary this run should use: `$LOOPRS_BD_BIN`, else `bd`.
+///
+/// One home for the default so the beads loop and the board poller cannot drift
+/// onto two different binaries — ADR-0007 §5 wants the board reading *the same*
+/// `bd` the loop reads, or "the board" means two things in one run.
+pub fn bd_bin_from_env() -> String {
+    std::env::var("LOOPRS_BD_BIN").unwrap_or_else(|_| "bd".to_string())
+}
+
+/// `bd --readonly list --all --limit 0 --json` — the whole board in **one**
+/// consistent read (ADR-0007 §3). This is the board poller's read.
+///
+/// Four flags, each load-bearing, so they are written out rather than assembled:
+///
+/// * **`--readonly`** is a *global* `bd` flag and therefore has to come before
+///   the subcommand. It is free, and it makes "the board cannot change the
+///   board" a property of the command line instead of of good intentions: a
+///   write under it is refused (`rc=1`, "operation 'update' is not allowed in
+///   read-only mode") and the bead is unchanged.
+/// * **`--all`** — without it `bd list` hides closed beads, so the Complete
+///   column would read empty forever.
+/// * **`--limit 0`** — mandatory per looprs-037. `bd list` defaults to 50
+///   rows, and a truncated page makes every count in the snapshot a lie about
+///   a bigger board.
+/// * **one read, not three.** Three per-status queries measured 2.9× the cost
+///   of this one *and* can disagree with each other inside a frame: a bead that
+///   closes between query 1 and query 2 shows up in two columns at once.
+///
+/// `--skip-labels` is deliberately absent — measured to save nothing and to
+/// change the payload into a shape [`BdList`] reports as `Malformed`.
+pub async fn board_read_with(bin: &str) -> Result<Vec<Bead>, BdError> {
+    beads(
+        bin,
+        &["--readonly", "list", "--all", "--limit", "0", "--json"],
+    )
+    .await
+}
+
 /// `bd ready --json` — the beads the loop may pick up, in bd's own priority order.
 ///
 /// `Ok(vec![])` means the board is genuinely empty. It does *not* mean "bd could
@@ -491,6 +529,55 @@ mod tests {
         );
         let err = ready_with(fakes.bd_bin()).await.unwrap_err();
         assert!(matches!(err, BdError::Malformed { .. }), "{err:?}");
+    }
+
+    /// The board read is the ADR's literal command line, flag for flag — and
+    /// `--readonly` in the position that makes it a *global* flag rather than a
+    /// `list` option it would be rejected as.
+    #[tokio::test]
+    async fn the_board_read_is_the_boards_one_read_and_no_other_verb_ever() {
+        let fakes = Fakes::new(
+            "bd-board-read",
+            crate::testing::PiFake::Started,
+            BdFake::Ok,
+            ONE_BEADED_BOARD,
+        );
+        let beads = board_read_with(fakes.bd_bin()).await.unwrap();
+        assert_eq!(beads.len(), 1);
+        let lines = fakes.bd_log();
+        assert_eq!(
+            lines.as_slice(),
+            &["--readonly list --all --limit 0 --json".to_string()],
+            "ADR-0007 §3 fixes this command line exactly"
+        );
+    }
+
+    /// The board read fails like every other read: a broken `bd` is an error,
+    /// never an empty board — including when the binary is missing entirely.
+    #[tokio::test]
+    async fn a_board_that_cannot_be_read_is_never_reported_as_an_empty_board() {
+        let fakes = Fakes::new(
+            "bd-board-fails",
+            crate::testing::PiFake::Started,
+            BdFake::Fails,
+            EMPTY_BOARD,
+        );
+        assert!(matches!(
+            board_read_with(fakes.bd_bin()).await,
+            Err(BdError::Failed { .. })
+        ));
+        assert!(matches!(
+            board_read_with("/nonexistent/looprs/bd-not-installed").await,
+            Err(BdError::Unavailable { .. })
+        ));
+        // …and a board that answers with an actual zero beads *is* an empty one.
+        let empty = Fakes::new(
+            "bd-board-empty",
+            crate::testing::PiFake::Started,
+            BdFake::Ok,
+            EMPTY_BOARD,
+        );
+        assert!(board_read_with(empty.bd_bin()).await.unwrap().is_empty());
     }
 
     /// Both shapes `bd` actually speaks parse: the envelope and the bare array.
