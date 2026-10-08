@@ -304,7 +304,7 @@ not reconstructing a screen we do not own.
 | SGR table | `LineResolver::apply_sgr` / `extended_color` / `params` | closed set, table-tested |
 | Cluster rules | `is_joiner`, `cluster_cells`, `put_char`, `place_cluster`, `extend_cluster` | the cell/character half of the mapping |
 | The store | `state::transcript::{Entry.styles, Transcript::push_shell_lines}` | text and styles appended together, ranges re-based onto the entry |
-| Render | `components::scrollback::Flusher::drain_raw`, `spanned` | clips runs to the line, fills gaps with raw |
+| Render | `components::line_render::Flusher::drain_raw`, `spanned` | clips runs to the line, fills gaps with raw (`line_render` is what this module was called `scrollback` until looprs-di9 gave the word to the store alone) |
 | Live tail | `session::view::SessionView::preview` | the resolver's open line, styled |
 | Stream state | `session::view::SessionView::shell` | one resolver per Bash view; `flush_shell_pending` on every path that ends the stream |
 | Wrap width | `App::width` → `push_bash(chunk, width)`, same value as `forward_resize` | **must** stay equal to the pty width, or `\r` means the wrong row |

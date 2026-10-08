@@ -114,7 +114,7 @@ impl Widget for SelectionHighlight<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::scrollback::RenderedRow;
+    use crate::components::line_render::RenderedRow;
     use crate::components::text_stream::{TranscriptBand, band_layout};
     use crate::state::scrollback::{RowEnd, rows_from_rendered};
     use ratatui::backend::TestBackend;

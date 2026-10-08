@@ -93,6 +93,13 @@ const ROW_ANIM: Duration = Duration::from_millis(125);
 /// Event routing never consults it — the envelope names the owner.
 pub struct App {
     pub input: InputState,
+    /// One view per mode, kept warm and invisible (ADR-0002 Q2).
+    ///
+    /// This map *is* the "how many bounded stores does this process hold?"
+    /// question: its ceiling is one entry per [`TerminalType`]
+    /// ([`MAX_VIEWS`](crate::session::view::MAX_VIEWS)), and the bytes behind
+    /// those entries are stated once on
+    /// [`RETAINED_BYTES_WORST_CASE`](crate::session::view::RETAINED_BYTES_WORST_CASE).
     pub views: HashMap<TerminalType, SessionView>,
     pub active: TerminalType,
     pub spinner: usize,

@@ -1,4 +1,30 @@
-// scrollback.rs
+//! The transcript renderer: finalized entries in, display rows out.
+//!
+//! This module used to be called `scrollback`. It is not any more, because that
+//! word was doing double duty across two unrelated types and every "scrollback"
+//! in a review of this area had to be resolved by which file the line was in
+//! (looprs-di9). The split, so the next reader does not have to rediscover it:
+//!
+//! * [`crate::state::scrollback::Scrollback`] — the **store**. The bounded
+//!   rows, the offset, the pin, the `N new` count, the trim marker, and the
+//!   thing a selection or a re-wrap addresses by content.
+//! * this module's [`Flusher`] — the **renderer**. A cursor into one
+//!   [`Transcript`] that turns each newly finalized line into the
+//!   [`RenderedRow`]s the store is made of.
+//!
+//! Only one of them could keep the word, and the store won it: the user scrolls
+//! the store. The renderer keeps a name about what it *does* — it flushes
+//! settled text out of the transcript and into rows, one frame at a time — so
+//! the module is `line_render` and the type is still `Flusher`.
+//!
+//! The pairing rule is ADR-0002 Q5's and is not changed here: a `Flusher` is a
+//! cursor into **one specific** [`Transcript`], so the two are created together
+//! and only ever used together, under
+//! [`SessionView`](crate::session::view::SessionView). This module holds the
+//! rendering half only, and knows nothing of the store beyond the shape of the
+//! row it hands over.
+//!
+//! [`Transcript`]: crate::state::transcript::Transcript
 use crate::{
     components::card::card_line,
     state::scrollback::RowEnd,

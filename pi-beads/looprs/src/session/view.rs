@@ -26,10 +26,10 @@ use std::time::{Duration, Instant};
 use ratatui::text::Line;
 
 use super::{SessionId, TerminalType};
-use crate::components::scrollback::Flusher;
+use crate::components::line_render::Flusher;
 use crate::session::ActiveBead;
 use crate::session::{BeadStep, SessionStatus};
-use crate::state::scrollback::{ROW_STRUCT_BYTES, Scrollback};
+use crate::state::scrollback::{DEFAULT_RETAINED_BYTES, ROW_STRUCT_BYTES, Scrollback};
 use crate::state::transcript::{MessageKind, Transcript};
 use crate::theme::styles::{content_width, restyle, style_for};
 use crate::utils::shelltext::LineResolver;
@@ -50,7 +50,59 @@ use crate::utils::shelltext::LineResolver;
 /// the same number, and cannot be, as the cap on what a seen session *renders*
 /// ([`DEFAULT_RETAINED_BYTES`](crate::state::scrollback::DEFAULT_RETAINED_BYTES)):
 /// rendered rows carry styling and a cell map and cost several times their text.
+///
+/// Also per-view, so the two caps together are [`RETAINED_BYTES_WORST_CASE`]'s
+/// per-view term, multiplied by the number of modes the app runs.
 pub const DEFAULT_VIEW_BUFFER: usize = 256 * 1024;
+
+/// How many [`SessionView`]s the app can hold at once — one per mode.
+///
+/// [`App`](crate::app::App) keys its views by [`TerminalType`], so this is not
+/// a knob of its own but a fact about the mode table, and it is *derived* from
+/// [`TerminalType::ALL`] for the reason the paragraph on
+/// [`RETAINED_BYTES_WORST_CASE`] gives: a number that has to be re-derived by
+/// hand is a number that gets left behind.
+pub const MAX_VIEWS: usize = TerminalType::ALL.len();
+
+/// The ceiling on what the app **retains**, in one number and one honest sentence.
+///
+/// Every mode keeps one [`SessionView`], and every view holds two separately
+/// capped things:
+///
+/// * the **rendered store** — [`DEFAULT_RETAINED_BYTES`], 32 MiB of
+///   [`Scrollback`], which is where the band draws from;
+/// * the **transcript text** it renders from — [`DEFAULT_VIEW_BUFFER`], 256 KiB
+///   of [`Transcript`].
+///
+/// All three modes alive with both caps full is therefore **3 × 32 MiB of
+/// rendered rows (~96 MiB) + 3 × 256 KiB of transcript text (~0.75 MiB) ≈ 97
+/// MiB retained**, which is the figure to quote when someone asks how much
+/// looprs holds. It was previously not stated anywhere as a single thing: each
+/// cap documented itself per view, and adding up "how many views are there" was
+/// left to the reader — which is exactly how a ~96 MiB ceiling stays invisible
+/// while two 32 MiB-sized-looking numbers sit in two different modules.
+///
+/// Why a `const` rather than the sentence alone: the sentence depends on three
+/// numbers that live in three places (the mode count, the store cap, the buffer
+/// cap), and hand-written prose about them goes stale silently. This one moves
+/// with its inputs, and the test that pins its human-readable form —
+/// [`tests::the_retained_ceiling_is_the_sum_it_says_it_is`] — fails loudly when
+/// a fourth mode or a retuned cap changes it, so the sentence has to be *said
+/// again* on purpose rather than inherited by accident.
+///
+/// What it does **not** cover, all of it deliberate:
+///
+/// * **syntect's syntax set** — megabytes paid once on the first highlight,
+///   shared process-wide, and not history;
+/// * **transients** — the peak a rebuild passes *through* is larger than what
+///   it retains, and is measured separately (`spikes/results/resize-transient.log`);
+/// * **allocator slack** — freed is not the same as returned to the OS.
+///
+/// So: this is the retained-history ceiling, not a peak-RSS figure.
+///
+/// [`Transcript`]: crate::state::transcript::Transcript
+pub const RETAINED_BYTES_WORST_CASE: usize =
+    MAX_VIEWS * (DEFAULT_RETAINED_BYTES + DEFAULT_VIEW_BUFFER);
 
 /// Floor on what [`SessionView::trim_open_entry`] leaves inside the entry it cuts.
 ///
@@ -197,9 +249,10 @@ pub struct SessionView {
     /// that made "a line reaches the scrollback exactly once" true, and a resize
     /// cannot leave the store wrapped for two different widths.
     ///
-    /// Bounded by [`crate::state::scrollback::DEFAULT_MAX_ROWS`] rendered rows;
-    /// the text it was rendered from is separately bounded by
-    /// [`DEFAULT_VIEW_BUFFER`].
+    /// Bounded by [`DEFAULT_RETAINED_BYTES`] rendered bytes; the text it was
+    /// rendered from is separately bounded by [`DEFAULT_VIEW_BUFFER`]. Both
+    /// per-view halves, and the ceiling the three of them add up to, are on
+    /// [`RETAINED_BYTES_WORST_CASE`].
     scrollback: Scrollback,
     /// Liveness mirror of the owning session, for the status row (looprs-guh).
     pub status: SessionStatus,
@@ -353,7 +406,12 @@ impl SessionView {
             session,
             transcript: Transcript::new(),
             flusher: Flusher::new(),
-            scrollback: Scrollback::new(0),
+            // The store's cap is passed in here rather than left to
+            // `Scrollback::new`'s own default, so that both of this view's
+            // caps — rendered rows and transcript text — are set on adjacent
+            // lines and the arithmetic on `RETAINED_BYTES_WORST_CASE` can be
+            // read off the code it describes.
+            scrollback: Scrollback::with_cap(0, DEFAULT_RETAINED_BYTES),
             status: SessionStatus::NotStarted,
             run_started: None,
             last_error: None,
@@ -2190,6 +2248,68 @@ mod tests {
 
     fn with_journal(v: &mut SessionView, j: Arc<RecordingJournal>) {
         v.set_journal(j);
+    }
+
+    // ───────────── the retained ceiling is stated where it is set (looprs-di9) ─────────────
+
+    /// The "≈ 97 MiB retained" in [`RETAINED_BYTES_WORST_CASE`]'s doc is a
+    /// claim about three numbers that live in three places: the mode count, the
+    /// rendered-store cap and the transcript-buffer cap. Prose about numbers in
+    /// other modules goes stale silently, so this is the tripwire: change any
+    /// one of them and this fails, and the failure message is the sentence that
+    /// has to be re-written on purpose.
+    #[test]
+    fn the_retained_ceiling_is_the_sum_it_says_it_is() {
+        const KIB: usize = 1024;
+        const MIB: usize = 1024 * KIB;
+
+        // One view per mode, and the mode table is the only thing that decides
+        // it. A fourth `TerminalType` is a fourth store, and this is where that
+        // gets noticed — not in a comment that still says "three".
+        assert_eq!(
+            MAX_VIEWS,
+            3,
+            "one view per mode: {:?}",
+            TerminalType::ALL.map(|m| m.label())
+        );
+        // The two per-view halves, as the doc describes them.
+        assert_eq!(DEFAULT_RETAINED_BYTES, 32 * MIB, "the store cap moved");
+        assert_eq!(DEFAULT_VIEW_BUFFER, 256 * KIB, "the buffer cap moved");
+        // And the total is what the sentence claims it is.
+        assert_eq!(
+            RETAINED_BYTES_WORST_CASE,
+            MAX_VIEWS * DEFAULT_RETAINED_BYTES + MAX_VIEWS * DEFAULT_VIEW_BUFFER,
+            "the ceiling is not the sum of its halves"
+        );
+        assert!(
+            (96 * MIB..98 * MIB).contains(&RETAINED_BYTES_WORST_CASE),
+            "the doc quotes ~97 MiB; the numbers now add up to {} MiB — re-write \
+             the sentence (and re-check that number is still acceptable)",
+            RETAINED_BYTES_WORST_CASE as f64 / MIB as f64,
+        );
+    }
+
+    /// The ceiling only describes the app if the views the app *builds* are
+    /// built to it. A `SessionView::new` that quietly picked a different store
+    /// cap would leave [`RETAINED_BYTES_WORST_CASE`] documenting the defaults
+    /// instead of the running thing.
+    #[test]
+    fn a_fresh_view_is_built_to_both_halves_of_the_ceiling() {
+        for mode in TerminalType::ALL {
+            let v = view(mode);
+            assert_eq!(
+                v.scrollback().cap_bytes(),
+                DEFAULT_RETAINED_BYTES,
+                "{}'s store is not capped at the stated figure",
+                mode.label()
+            );
+            assert_eq!(
+                v.limit,
+                DEFAULT_VIEW_BUFFER,
+                "{}'s transcript buffer is not capped at the stated figure",
+                mode.label()
+            );
+        }
     }
 
     // ─────────────── the journal is the escape hatch (looprs-pdl.7) ───────────────

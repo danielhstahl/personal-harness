@@ -780,7 +780,7 @@ impl BandSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::scrollback::RenderedRow;
+    use crate::components::line_render::RenderedRow;
     use crate::state::scrollback::{RowEnd, rows_from_rendered};
     use ratatui::text::Line;
 

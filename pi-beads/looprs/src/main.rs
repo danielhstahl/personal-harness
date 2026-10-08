@@ -166,6 +166,28 @@ async fn run(
     // producer past the ceiling waits — which is what has to reach the source.
     let (app_tx, mut app_rx) = bus::channel(bus::DEFAULT_CAP_BYTES);
 
+    // What this process intends to hold, said out loud once, next to the last
+    // of the bounded layers being built. A memory question on a long-running
+    // UI otherwise starts with "how big is it *supposed* to be?" and the
+    // answer used to be spread over three doc comments in three modules; this
+    // line puts the sum in the log the question gets asked next to.
+    //
+    // `retained_ceiling_bytes` bounds *retained history* — every mode's
+    // rendered store plus its transcript buffer — and deliberately excludes the
+    // one-time syntect syntax set and any rebuild transient
+    // (`crate::session::view::RETAINED_BYTES_WORST_CASE` carries the
+    // arithmetic and the exclusions). `bus_bytes` is a different shape of
+    // bound: the in-flight byte lane (`crate::bus`), paced by the consumer
+    // rather than stored for it.
+    tracing::info!(
+        views = crate::session::view::MAX_VIEWS,
+        store_bytes_per_view = crate::state::scrollback::DEFAULT_RETAINED_BYTES,
+        transcript_bytes_per_view = crate::session::view::DEFAULT_VIEW_BUFFER,
+        retained_ceiling_bytes = crate::session::view::RETAINED_BYTES_WORST_CASE,
+        bus_bytes = bus::DEFAULT_CAP_BYTES,
+        "bounded layers: per-mode store + transcript buffer, plus the byte lane"
+    );
+
     // The Router owns every backend from here: one session per terminal state, and
     // only this task's copy of `cmd_tx` can ask it for anything.
     //

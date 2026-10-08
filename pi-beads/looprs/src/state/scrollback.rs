@@ -7,10 +7,29 @@
 //! thing that is scrolled needs a store under it: the rendered rows, an offset,
 //! and a follow-the-tail rule.
 //!
+//! # The name
+//!
+//! This is the only thing in the crate called *scrollback*, and that is since
+//! looprs-di9. It used to share the word — and the file name — with the
+//! renderer that produces its rows
+//! ([`crate::components::line_render::Flusher`]), which left every
+//! "scrollback" in a review comment ambiguous between **the state** and
+//! **the thing that draws it**, and left "do I mean the store or the
+//! flusher?" as a question the reader had to resolve by which module the line
+//! was in.
+//!
+//! The store keeps the word because the store *is* what the user scrolls: the
+//! band draws out of it, the offset and the pin are its fields, the selection
+//! and its anchors address it by content, and the trim marker is its row. The
+//! renderer is named for what it does — it flushes finalized text out of a
+//! [`Transcript`](crate::state::transcript::Transcript) into rows — and lives
+//! under [`crate::components::line_render`] so that reading `scrollback`
+//! anywhere in this tree resolves to exactly one type.
+//!
 //! # The shape
 //!
 //! [`Scrollback`] is a `Vec<DisplayRow>` plus scroll state. The rows come from
-//! the existing [`Flusher`](crate::components::scrollback::Flusher) — the
+//! the existing [`Flusher`](crate::components::line_render::Flusher) — the
 //! markdown/fence/raw rendering stays exactly where it is — and this module adds
 //! the three things the renderer knows but had nowhere to put:
 //!
@@ -92,7 +111,7 @@ use std::fmt;
 
 use ratatui::text::Line;
 
-use crate::components::scrollback::RenderedRow;
+use crate::components::line_render::RenderedRow;
 use crate::utils::shelltext;
 
 /// How the text after this row continues.
@@ -130,6 +149,13 @@ pub enum RowEnd {
 /// history that scrolling back reaches the answer you were reading, and a
 /// ceiling that can be stated in one number and holds on the worst transcript
 /// rather than the average one.
+///
+/// This is the **per-view** cap: one store, one 32 MiB. The app runs one
+/// [`SessionView`](crate::session::view::SessionView) per mode, so the number
+/// a reader actually wants — every mode alive, both halves of every view full
+/// — is stated once, with the sentence around it, on
+/// [`RETAINED_BYTES_WORST_CASE`](crate::session::view::RETAINED_BYTES_WORST_CASE):
+/// 3 × 32 MiB of this plus 3 × 256 KiB of transcript text, ≈ 97 MiB.
 ///
 /// `0` means unbounded, by the convention [`Scrollback::set_cap`] keeps.
 pub const DEFAULT_RETAINED_BYTES: usize = 32 * 1024 * 1024;
