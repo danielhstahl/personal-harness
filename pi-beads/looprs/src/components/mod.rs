@@ -1,6 +1,7 @@
 pub mod card;
 pub mod compaction;
 pub mod input;
+pub mod kanban;
 pub mod line_render;
 pub mod selection;
 pub mod status;

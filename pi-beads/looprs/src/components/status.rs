@@ -61,7 +61,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::session::view::Tokens;
 use crate::session::{ActiveBead, BeadStep, SessionStatus, TerminalType};
 use crate::theme::styles::{BLUE, RED, mode_color};
-use crate::utils::render::FRAMES;
+use crate::utils::render::{FRAMES, truncate_columns};
 
 /// The gap between two segments.
 const SEP: &str = " · ";
@@ -474,7 +474,7 @@ fn fit(mut segs: Vec<Seg>, width: usize) -> Vec<Seg> {
             .saturating_sub(others)
             .saturating_sub(join)
             .saturating_sub(segs[i].prefix.width());
-        let cut = shorten(&segs[i].text, avail);
+        let cut = truncate_columns(&segs[i].text, avail);
         segs[i].text = cut;
     }
     segs
@@ -571,38 +571,11 @@ fn clip(spans: Vec<Span<'static>>, avail: usize) -> Vec<Span<'static>> {
     out
 }
 
-/// Shorten `text` to `avail` display columns, marking the cut with `…`.
-///
-/// Cut by display width, not by `chars().count()` or by bytes: a box-drawing
-/// character, an emoji or a combining mark all break the latter two, and a cut
-/// that lands where the reader cannot see it is a cut that silently loses text.
-fn shorten(text: &str, avail: usize) -> String {
-    if text.width() <= avail {
-        return text.to_string();
-    }
-    if avail == 0 {
-        return String::new();
-    }
-    // `…` is part of the budget. Below two columns there is nothing worth keeping
-    // but the first column, so say that much rather than nothing.
-    let body = take(text, avail.saturating_sub(1));
-    format!("{body}…")
-}
-
-/// The first `avail` display columns of `text`.
-fn take(text: &str, avail: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in text.chars() {
-        let w = ch.width().unwrap_or(0);
-        if used + w > avail {
-            break;
-        }
-        used += w;
-        out.push(ch);
-    }
-    out
-}
+// `shorten` and `take` lived here until looprs-5o4.4 needed the same cut for the
+// kanban band. They are now [`truncate_columns`] / [`take_columns`] in
+// `crate::utils::render`, shared rather than duplicated: two truncations that
+// drift apart is two answers to one question, and the second one is the one
+// nobody tested against the first.
 
 /// A run's age, in the fewest columns that still read: `9s`, `59s`, `1m03s`,
 /// `1h04m`. Past a day it stops being a run age and says so.
