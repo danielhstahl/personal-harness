@@ -19,18 +19,26 @@
 //! ("do not put `bd` in the draw path") is a property of this signature, not of
 //! good intentions.
 //!
-//! # The band's three rows
+//! # The band's rows
 //!
 //! ```text
-//! To-do 12       In progress 3    Complete 214     ← one header row, shared
-//! ⊘ looprs-4 Fix the rewrap       …                ← one bead per row
-//! +9 more                                          ← the overflow marker
-//! bd ok · 3s ago · ⏸ 2 deferred                  ← one footer row, never omitted
+//! To-do 12         │ In progress 3     │ Complete 214   ← one header row, shared
+//! ─────────────────┼───────────────────┼───────────────── ← the rule: granted, or not
+//! ⊘ looprs-4 Fix … │ …                 │                ← one bead per row
+//! +9 more          │                   │                ← the overflow marker
+//! bd ok · 3s ago · ⏸ 2 deferred                        ← one footer row, never omitted
 //! ```
 //!
 //! The header is **one row shared by three columns**, not three headers
-//! ([`KANBAN_HEADER_ROWS`]), which is why each column gets
-//! `height − header − footer` rows and not less.
+//! ([`KANBAN_HEADER_ROWS`]), and the vertical rules are drawn in the *gutters*
+//! rather than at a column's edge — which is why a column gets
+//! `height − header − rule − footer` rows and not less.
+//!
+//! The rule row is the only one of the four that is **conditional**, and it is
+//! conditional in one direction only: it is granted when the body would still
+//! keep [`MIN_KANBAN_BODY_ROWS_WITH_RULE`] rows after paying for it, and is not
+//! drawn at all otherwise. [`band_areas`] is the one place that decision is
+//! made, so a band can never end up with a rule and nothing under it.
 //!
 //! # What each rule below is protecting
 //!
@@ -71,6 +79,10 @@
 //! this file. The band is chrome sitting above the transcript, so it is
 //! deliberately quieter than the thing the user is reading: no background, no
 //! bold on the rows, and colour spent only on the two markers and a failed read.
+//! The framing — the dividers and the rule — is `board_divider`, the same dark
+//! gray as the footer, and it is **never** run through [`shade`]: the framing's
+//! colour never changes, so `dim` goes on meaning one thing only, *these rows are
+//! from the last good read*, rather than "some of this band is old".
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -83,17 +95,42 @@ use crate::components::status::fmt_elapsed;
 use crate::services::bd::BD_TIMEOUT;
 use crate::state::board::{BoardBead, BoardRead, BoardSnapshot, Column};
 use crate::theme::styles::{
-    board_empty, board_footer_error, board_footer_ok, board_header, board_marker, board_overflow,
-    board_row, board_staled,
+    board_divider, board_empty, board_footer_error, board_footer_ok, board_header, board_marker,
+    board_overflow, board_row, board_staled,
 };
 use crate::utils::render::truncate_columns;
 use crate::viewport::{KANBAN_FOOTER_ROWS, KANBAN_HEADER_ROWS};
 
-/// The gutter between two columns.
+/// The gutter between two columns, **including the divider drawn in it**.
 ///
-/// Two columns, not one: a single space is closer than the space inside a row
-/// (`⊘ looprs-4`), so adjacent columns read as continuations of each other.
-const COLUMN_GAP_COLS: u16 = 2;
+/// Three columns, and the middle one is the `│`. It was two before the framing
+/// existed, which left nowhere to put a divider without spending one of the two
+/// cells on it: at two columns the line would have had to sit against a column's
+/// last cell (touching the text it separates) or replace the gap entirely (no air
+/// either side). Three gives the divider a cell of its own and a space of its own
+/// on each side, and the columns keep every column they were given — the divider
+/// is laid inside the gutter and never takes width from a row.
+const COLUMN_GAP_COLS: u16 = 3;
+
+/// The horizontal rule between the header and the body.
+///
+/// It exists because the header and the bead rows are the only two things on the
+/// band that mean different categories of thing — *labels* above, *content* below
+/// — and bold on the header alone did not say so: at a glance the header read as
+/// a fourth bead row that happened to have no id in it.
+const KANBAN_RULE_ROWS: u16 = 1;
+
+/// What the body must be worth before the band will spend a row on the rule.
+///
+/// **This is the affordability rule, and it is the whole degradation order in one
+/// number.** The rule is chrome, and every row of chrome on this band is bought
+/// out of the body's surplus, so the rule is given up *before* a single bead row
+/// is cut: a 3- or 4-row band has no rule at all and keeps every bead row it can
+/// afford, and a 5-row band trades one of its four for the line. That makes the
+/// framing the cheapest thing on the band to lose, which is the right ranking —
+/// the rule makes the columns legible, and a bead row is the thing the user came
+/// to read.
+const MIN_KANBAN_BODY_ROWS_WITH_RULE: u16 = 2;
 
 /// The least a column header must leave for its name before the name is dropped
 /// in favour of the count.
@@ -166,6 +203,83 @@ pub fn paint(snapshot: &BoardSnapshot, area: Rect, buf: &mut Buffer) {
         let line = footer_line(snapshot, footer.width as usize);
         Paragraph::new(line).render(footer, buf);
     }
+
+    // The framing goes on last. It is drawn into rects the content never touches,
+    // so the order cannot matter in principle — and is put here anyway so that it
+    // cannot matter in practice either: a divider rendered after the content
+    // cannot be wiped by a paragraph that overran its cell, which is the one way
+    // a framing bug could hide by being invisible rather than by being wrong.
+    //
+    // Both passes are outside `shade` on purpose. The framing is not stale-able:
+    // a divider did not come from a read, so dimming it would split `dim` into
+    // "old data" and "old decoration", and the first of those is the one the user
+    // needs to be able to see.
+    for chrome in [band.header, band.body].into_iter().flatten() {
+        paint_dividers(chrome, buf);
+    }
+    if let Some(rule) = band.rule {
+        let line = Line::styled(rule_line(rule.width as usize), board_divider());
+        Paragraph::new(line).render(rule, buf);
+    }
+}
+
+/// Draw the `│` down the middle of every gutter of `area`.
+///
+/// A `Paragraph` per gutter rather than poking cells in the buffer: same reason the
+/// rest of this file renders — the widget is checked for width, clipping and style
+/// by ratatui, and a `buf[(x, y)].set_symbol(…)` is checked by nobody until a
+/// narrow terminal finds out the hard way.
+fn paint_dividers(area: Rect, buf: &mut Buffer) {
+    for gutter in gutter_areas(area) {
+        let Some(col) = divider_col(gutter.width) else {
+            continue;
+        };
+        let mut line = String::new();
+        for i in 0..gutter.width as usize {
+            line.push(if i == col { '│' } else { ' ' });
+        }
+        // One line per row of the gutter: the vertical rule runs the whole height
+        // of whatever band it was given, header rows and body rows alike, so the
+        // columns read as *columns* and not as three separate lists.
+        let style = board_divider();
+        let lines = vec![Line::styled(line.clone(), style); gutter.height as usize];
+        Paragraph::new(lines).render(gutter, buf);
+    }
+}
+
+/// The rule under the header, built from the *same* [`column_split`] as the
+/// dividers it crosses.
+///
+/// Not a repeated `─`: the junctions have to land on the divider columns, and a
+/// string built without reference to the layout puts them wherever its own
+/// rounding felt like. Every chunk of the split is answered with its own width in
+/// its own glyph, so the result is exactly `width` columns wide at any width,
+/// including the ones where the gutters have been rounded away.
+fn rule_line(width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let chunks = column_split(Rect::new(0, 0, width as u16, KANBAN_RULE_ROWS));
+    let mut line = String::with_capacity(width);
+    for (i, chunk) in chunks.iter().enumerate() {
+        let w = chunk.width as usize;
+        // A column chunk is all rule; a gutter chunk is rule up to the divider
+        // column, the junction on it, and rule for what is left of the gutter.
+        let junction = if i % 2 == 1 {
+            divider_col(chunk.width)
+        } else {
+            None
+        };
+        match junction {
+            Some(col) => {
+                line.push_str(&"─".repeat(col));
+                line.push('┼');
+                line.push_str(&"─".repeat(w.saturating_sub(col + 1)));
+            }
+            None => line.push_str(&"─".repeat(w)),
+        }
+    }
+    line
 }
 
 /// The band's three rows: header, body, footer.
@@ -177,6 +291,10 @@ pub fn paint(snapshot: &BoardSnapshot, area: Rect, buf: &mut Buffer) {
 /// the right way to be short — short in the chrome, not short in the state.
 struct Band {
     header: Option<Rect>,
+    /// The rule under the header — `None` when the body could not pay for it
+    /// ([`MIN_KANBAN_BODY_ROWS_WITH_RULE`]), which is the only way this band has
+    /// of being short in the chrome rather than in the content.
+    rule: Option<Rect>,
     body: Option<Rect>,
     footer: Option<Rect>,
 }
@@ -204,15 +322,37 @@ fn band_areas(area: Rect) -> Band {
     } else {
         None
     };
-    let body_rows = above_footer.saturating_sub(if header.is_some() {
+    // Everything below the header is laid out from a single cursor, because the
+    // rule sits between two rows that both already had fixed offsets and a second
+    // `area.y + …` in the middle of them is exactly where a row starts being
+    // painted on top of its own neighbour.
+    let used_by_header = if header.is_some() {
         KANBAN_HEADER_ROWS
     } else {
         0
-    });
+    };
+    let room = above_footer.saturating_sub(used_by_header);
+    let mut y = area.y.saturating_add(used_by_header);
+
+    // Granted only if the body still keeps its own minimum afterwards — read the
+    // constant, not this line, for why it is phrased that way.
+    let rule = if room >= KANBAN_RULE_ROWS + MIN_KANBAN_BODY_ROWS_WITH_RULE {
+        Some(Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: KANBAN_RULE_ROWS,
+        })
+    } else {
+        None
+    };
+    let used_by_rule = if rule.is_some() { KANBAN_RULE_ROWS } else { 0 };
+    y = y.saturating_add(used_by_rule);
+    let body_rows = room.saturating_sub(used_by_rule);
     let body = if body_rows > 0 {
         Some(Rect {
             x: area.x,
-            y: area.y.saturating_add(KANBAN_HEADER_ROWS),
+            y,
             width: area.width,
             height: body_rows,
         })
@@ -221,6 +361,7 @@ fn band_areas(area: Rect) -> Band {
     };
     Band {
         header,
+        rule,
         body,
         footer,
     }
@@ -236,19 +377,46 @@ fn band_areas(area: Rect) -> Band {
 /// the remainder out with its own rounding and spends every column it was given.
 /// Used for the header row and the body rows alike, so a column's name is always
 /// over its rows.
-fn column_areas(area: Rect) -> [Rect; 3] {
-    let chunks: [Rect; 5] = Layout::horizontal([
+fn column_split(area: Rect) -> [Rect; 5] {
+    Layout::horizontal([
         Constraint::Fill(1),                 // To-do
         Constraint::Length(COLUMN_GAP_COLS), // gutter
         Constraint::Fill(1),                 // In progress
         Constraint::Length(COLUMN_GAP_COLS), // gutter
         Constraint::Fill(1),                 // Complete
     ])
-    .areas(area);
-    // The even chunks are columns, the odd ones are gutters — a `step` rather
-    // than three literals, so the pairing is the thing being read rather than a
-    // magic index.
+    .areas(area)
+}
+
+/// The three column rects inside `area` — the even chunks of [`column_split`].
+fn column_areas(area: Rect) -> [Rect; 3] {
+    let chunks = column_split(area);
     std::array::from_fn(|i| chunks[i * 2])
+}
+
+/// The two gutter rects inside `area` — the odd chunks of [`column_split`], and
+/// the only place a divider may be drawn.
+///
+/// Taken from the same split rather than computed as `column.right() + 1`: the
+/// gutter's position is the *only* fact a divider needs, and the two ways of
+/// naming it disagree as soon as a layout rounds, which is how a column ends up
+/// with its rule one cell to the left of where the other two are.
+fn gutter_areas(area: Rect) -> [Rect; 2] {
+    let chunks = column_split(area);
+    [chunks[1], chunks[3]]
+}
+
+/// The column *inside a gutter* that the vertical line occupies.
+///
+/// One function answers for the `│` and for the `┼` on the rule, because those
+/// two have to be in the same cell at every width or the framing shows a crossing
+/// that leads nowhere. `None` is a gutter too narrow to hold a line at all (a
+/// band this narrow has no third column either) and the caller draws nothing.
+fn divider_col(gutter_width: u16) -> Option<usize> {
+    if gutter_width == 0 {
+        return None;
+    }
+    Some((gutter_width as usize - 1) / 2)
 }
 
 /// One column header: the name, then its true total.
@@ -558,11 +726,41 @@ mod tests {
                 .collect()
         }
 
-        /// Every cell of `area` still blank — nothing was painted over there.
-        fn untouched(&self, area: Rect) -> bool {
-            (0..area.height).all(|dy| {
-                (0..area.width).all(|dx| self.buf[(area.x + dx, area.y + dy)].symbol() == " ")
-            })
+        /// The framing's own vocabulary: what a gutter is allowed to contain.
+        ///
+        /// `""` is in there because a wide glyph leaves its continuation cell
+        /// blank — folded by `region_text`, not here, but a cell the backend
+        /// never wrote to reads as `""` when asked directly.
+        const FRAMING: [&'static str; 5] = [" ", "", "│", "─", "┼"];
+
+        /// Every symbol in `area` that is neither blank nor one of the framing's
+        /// own glyphs. Empty means the area holds framing and nothing else.
+        ///
+        /// This replaces the `untouched` helper that used to guard the gutters —
+        /// "is this area blank" stopped being the right question the moment the
+        /// band started drawing in them, and a boolean was the worse answer to the
+        /// new one anyway: this names the cell that got in.
+        fn intrusions(&self, area: Rect) -> Vec<String> {
+            let mut out = Vec::new();
+            for dy in 0..area.height {
+                for dx in 0..area.width {
+                    let sym = self.buf[(area.x + dx, area.y + dy)].symbol();
+                    if !Self::FRAMING.contains(&sym) {
+                        out.push(format!("({dx},{dy})={sym:?}"));
+                    }
+                }
+            }
+            out
+        }
+
+        /// The `x` positions in `area` whose **top row** carries `glyph` — the way
+        /// to ask "where is the divider" of the painted buffer rather than of the
+        /// code that drew it.
+        fn glyph_xs(&self, area: Rect, glyph: &str) -> Vec<u16> {
+            (0..area.width)
+                .filter(|&dx| self.buf[(area.x + dx, area.y)].symbol() == glyph)
+                .map(|dx| area.x + dx)
+                .collect()
         }
 
         fn to_do(&self) -> &[String] {
@@ -654,10 +852,30 @@ mod tests {
         }
     }
 
-    /// Paint a board whose To-do column holds `total` plain beads and whose other
-    /// two columns are empty, at a band height that buys `body` rows per column.
-    fn todo_only(total: usize, body: usize) -> Painted {
-        let beads: Vec<Bead> = (0..total)
+    /// The band height that renders a body of exactly `want` rows at width `w`
+    /// (the smallest such height, since the affordability rule makes `want`
+    /// reachable with or without the rule row).
+    ///
+    /// **Derived from [`band_areas`] rather than computed as `want + 2`.** That
+    /// arithmetic was true when the band was header + body + footer; with a rule
+    /// row that the band may spend, `want + 2` silently paints a *shorter* body
+    /// than the helper's own name promises, and every overflow assertion built on
+    /// it quietly becomes a test of `want − 1` — failing loudly at best and, if
+    /// the expected numbers were copied from the same wrong formula, passing while
+    /// proving nothing. Asking the layout what it would render is the only version
+    /// that stays true when the framing changes again.
+    fn height_for_body(w: u16, want: usize) -> u16 {
+        (1u16..=64)
+            .find(|&h| {
+                band_areas(Rect::new(0, 0, w, h))
+                    .body
+                    .is_some_and(|b| b.height as usize == want)
+            })
+            .unwrap_or_else(|| panic!("no band height renders a body of {want} rows at {w} cols"))
+    }
+
+    fn todo_beads(total: usize) -> Vec<Bead> {
+        (0..total)
             .map(|i| {
                 bead(
                     &format!("looprs-{:02}", i),
@@ -665,8 +883,13 @@ mod tests {
                     BeadStatus::Open,
                 )
             })
-            .collect();
-        paint_snap(&board(&beads), 90, (body + 2) as u16)
+            .collect()
+    }
+
+    /// Paint a board whose To-do column holds `total` plain beads and whose other
+    /// two columns are empty, at a band height that buys `body` rows per column.
+    fn todo_only(total: usize, body: usize) -> Painted {
+        paint_snap(&board(&todo_beads(total)), 90, height_for_body(90, body))
     }
 
     // ─────────────────────────── the full board ───────────────────────────
@@ -717,7 +940,9 @@ mod tests {
         let beads: Vec<Bead> = (0..4)
             .map(|i| bead(&format!("looprs-{i}"), "t", BeadStatus::Open))
             .collect();
-        let p = paint_snap(&board(&beads), 90, 6); // 4 body rows
+        // Height derived, so "four body rows" is the layout's answer and not a
+        // guess about how many rows the framing will eat.
+        let p = paint_snap(&board(&beads), 90, height_for_body(90, 4));
         let drawn = drawn(p.to_do());
         assert_eq!(drawn.len(), 4, "one per row, four rows: {drawn:?}");
         for row in drawn {
@@ -830,7 +1055,7 @@ mod tests {
             beads.push(bead(&format!("done-{i}"), "t", BeadStatus::Closed));
         }
         // body = 3 rows per column → shown 2, N = total - 2 in every column.
-        let p = paint_snap(&board(&beads), 90, 5);
+        let p = paint_snap(&board(&beads), 90, height_for_body(90, 3));
         for (col, total) in [
             (p.to_do(), 6usize),
             (p.in_progress(), 5usize),
@@ -1117,12 +1342,16 @@ mod tests {
                 row.width(),
                 col.width,
             );
-            // The two-column gap to the right of the column is still blank at
-            // every width: a row that ran past its column lands there first.
+            // The gutters hold the framing and nothing else at every width: a row
+            // that ran past its own column lands in the gutter first, so "the
+            // gutter contains only what the framing put there" is still the
+            // overflow check it always was — it just stopped being "the gutter is
+            // blank" the day the band started drawing its own rules in it.
             for gutter in p.gutters() {
                 assert!(
-                    p.untouched(gutter),
-                    "width {w}: a row spilled into {gutter:?}"
+                    p.intrusions(gutter).is_empty(),
+                    "width {w}: a row spilled into {gutter:?}: {:?}",
+                    p.intrusions(gutter)
                 );
             }
         }
@@ -1174,8 +1403,10 @@ mod tests {
             "a title far too long for this column",
             BeadStatus::Open,
         )]);
-        // 40 columns → three 12-column cells: exactly the id, and nothing else.
-        let p = paint_snap(&snap, 40, 5);
+        // 42 columns → three 12-column cells plus two 3-column gutters: exactly
+        // the id, and nothing else. (40 was the old number for the same shape,
+        // before the gutter grew the cell the divider lives in.)
+        let p = paint_snap(&snap, 42, 5);
         let rows = drawn(p.to_do());
         assert_eq!(rows, vec!["looprs-5o4-4"], "{rows:?}");
         assert_eq!(
@@ -1392,6 +1623,223 @@ mod tests {
         );
     }
 
+    // ─────────────────── the framing: dividers and the rule ───────────────────
+
+    /// The affordability rule read straight off the layout: the rule row exists
+    /// from 5 rows up and never below it.
+    ///
+    /// Asserted against the *heights* rather than against the constant, because
+    /// the constant is the decision and these are its consequences: a 3-row band
+    /// keeps its one bead row and goes without the line, and the line arrives the
+    /// moment there are two bead rows to spare. If someone moves the threshold
+    /// this test moves with it; if someone makes the rule unconditional, or lets
+    /// it be granted when the body cannot pay, it does not.
+    #[test]
+    fn the_rule_row_is_granted_only_when_the_body_can_pay_for_it() {
+        for h in 1u16..=12 {
+            let band = band_areas(Rect::new(0, 0, 90, h));
+            assert_eq!(
+                band.rule.is_some(),
+                h >= KANBAN_RULE_ROWS
+                    + MIN_KANBAN_BODY_ROWS_WITH_RULE
+                    + KANBAN_HEADER_ROWS
+                    + KANBAN_FOOTER_ROWS,
+                "h {h}: the rule was {}",
+                if band.rule.is_some() {
+                    "granted"
+                } else {
+                    "refused"
+                }
+            );
+            // The floor is a condition *of granting the rule*, not of having a
+            // body: a 3-row band has one body row and no rule, and that is the
+            // refusal working, not the floor being breached.
+            if band.rule.is_some() {
+                let body = band.body.expect("a granted rule leaves a body behind");
+                assert!(
+                    body.height >= MIN_KANBAN_BODY_ROWS_WITH_RULE,
+                    "h {h}: the rule was granted and left the body {} rows",
+                    body.height
+                );
+            }
+        }
+    }
+
+    /// The four rows tile the band: nothing spent twice, nothing left unspent, and
+    /// no gap between one row and the next.
+    ///
+    /// The contiguity check is the point. `band_areas` now lays the rows out from
+    /// a running cursor, which is exactly the shape of code that puts the body one
+    /// row too low and paints it over the footer — a bug that shows up as
+    /// half a footer on screen and as nothing at all in any single row's
+    /// contents.
+    #[test]
+    fn the_four_rows_tile_the_band_with_no_overlap_and_no_gap() {
+        for h in 0u16..=12 {
+            let band = band_areas(Rect::new(0, 0, 90, h));
+            let chain: Vec<Rect> = [band.header, band.rule, band.body, band.footer]
+                .into_iter()
+                .flatten()
+                .collect();
+            let spent: u16 = chain.iter().map(|r| r.height).sum();
+            assert!(spent <= h, "h {h}: spent {spent} rows out of {h}");
+            for pair in chain.windows(2) {
+                assert_eq!(
+                    pair[0].bottom(),
+                    pair[1].y,
+                    "h {h}: rows are not contiguous: {chain:?}"
+                );
+            }
+            if band.header.is_some() && band.footer.is_some() {
+                assert_eq!(spent, h, "h {h}: a row of the band went unspent: {chain:?}");
+            }
+        }
+    }
+
+    /// The `┼` on the rule sits on the `│` it crosses, measured off the painted
+    /// buffer rather than off the code that drew it.
+    ///
+    /// The two are produced by different functions (`paint_dividers` and
+    /// `rule_line`) out of the same split, which is the design; a drift between
+    /// them is invisible in review and obvious on screen, so it is checked here at
+    /// widths where the gutters round differently.
+    #[test]
+    fn the_rule_junctions_sit_on_the_dividers_they_cross() {
+        let snap = board(&[bead("looprs-a", "a title", BeadStatus::Open)]);
+        for w in [90u16, 78, 61, 45, 33] {
+            let p = paint_snap(&snap, w, 6);
+            let header = p.band.header.expect("a header at 6 rows");
+            let body = p.band.body.expect("a body at 6 rows");
+            let rule = p.band.rule.expect("the rule is granted at 6 rows");
+            for area in [header, body] {
+                let expected: Vec<u16> = gutter_areas(area)
+                    .iter()
+                    .filter_map(|g| divider_col(g.width).map(|c| g.x + c as u16))
+                    .collect();
+                assert_eq!(
+                    p.glyph_xs(area, "│"),
+                    expected,
+                    "{w}×6 rows: the dividers are not where the layout put them"
+                );
+            }
+            let expected_junctions: Vec<u16> = gutter_areas(rule)
+                .iter()
+                .filter_map(|g| divider_col(g.width).map(|c| g.x + c as u16))
+                .collect();
+            assert_eq!(
+                p.glyph_xs(rule, "┼"),
+                expected_junctions,
+                "{w}×6 rows: the rule's junctions drifted off the dividers"
+            );
+        }
+    }
+
+    /// The rule is neither short nor long for the width it was asked for, at every
+    /// width — a `─` is one column, so the line the widget renders and the line
+    /// that fits the area have to be the same number of columns, and at the
+    /// widths where the layout squeezes the gutters that is not obvious.
+    #[test]
+    fn the_rule_is_exactly_the_width_it_was_asked_for() {
+        for w in 0usize..=120 {
+            let line = rule_line(w);
+            assert_eq!(line.width(), w, "width {w}: {line:?}");
+        }
+    }
+
+    /// The framing does not go stale, so it is not dimmed.
+    ///
+    /// Tested with the row dimming asserted *first*: without the control, this
+    /// test would pass just as happily if the stale pass had stopped working
+    /// altogether, which is the opposite of what it is for.
+    #[test]
+    fn the_framing_is_never_dimmed_by_a_stale_read() {
+        let beads = [bead("looprs-a", "A title", BeadStatus::Open)];
+        let fresh = buffer(&board(&beads), 90, 6);
+        let stale = buffer(
+            &board(&beads).with_error(
+                &err_failed(3, "repository lock held\n"),
+                Some(Duration::from_secs(61)),
+            ),
+            90,
+            6,
+        );
+        let band = band_areas(Rect::new(0, 0, 90, 6));
+        let body = band.body.expect("a body at 6 rows");
+        let rule = band.rule.expect("the rule at 6 rows");
+
+        // The control: the row itself is dim.
+        let row = column_areas(body)[0];
+        assert_ne!(
+            fresh[(row.x, row.y)].style().fg,
+            Some(Color::DarkGray),
+            "a fresh row should not be dimmed"
+        );
+        assert_eq!(
+            stale[(row.x, row.y)].style().fg,
+            Some(Color::DarkGray),
+            "the stale pass did not reach the row"
+        );
+
+        // ...and the framing is identical either way, down the gutters and across
+        // the rule.
+        for area in [band.header.expect("a header"), body, rule] {
+            for g in gutter_areas(area) {
+                let Some(col) = divider_col(g.width) else {
+                    continue;
+                };
+                let x = g.x + col as u16;
+                assert_eq!(
+                    fresh[(x, g.y)].style().fg,
+                    stale[(x, g.y)].style().fg,
+                    "the framing changed colour because of a read: ({x}, {})",
+                    g.y
+                );
+                assert_eq!(
+                    stale[(x, g.y)].style().fg,
+                    Some(Color::DarkGray),
+                    "the framing is the footer's gray, not a fourth colour"
+                );
+            }
+        }
+    }
+
+    /// A gutter the layout has squeezed to nothing is left alone rather than given
+    /// a line that lands outside the area, and nothing but framing is ever painted
+    /// into a gutter at any width down there.
+    #[test]
+    fn a_gutter_too_narrow_to_hold_a_line_draws_nothing() {
+        assert_eq!(
+            divider_col(0),
+            None,
+            "a zero-width gutter has no divider column"
+        );
+        assert_eq!(
+            divider_col(1),
+            Some(0),
+            "a one-column gutter puts the line at 0"
+        );
+        let snap = board(&[bead(
+            "looprs-a",
+            "a title wide enough to want truncating",
+            BeadStatus::Open,
+        )]);
+        for w in 1u16..=24 {
+            let p = paint_snap(&snap, w, 6);
+            for area in [p.band.header, p.band.rule, p.band.body]
+                .into_iter()
+                .flatten()
+            {
+                for g in gutter_areas(area) {
+                    assert!(
+                        p.intrusions(g).is_empty(),
+                        "{w} cols, gutter {g:?}: {:?}",
+                        p.intrusions(g)
+                    );
+                }
+            }
+        }
+    }
+
     // ─────────────────────────── a look, not an assertion ───────────────────────────
 
     #[test]
@@ -1420,8 +1868,19 @@ mod tests {
             ),
         ] {
             println!("\n{name}");
-            for w in [90u16, 60, 40] {
-                let p = paint_snap(&snap, w, 8);
+            // Swept over height as well as width, because the rule row turns on
+            // partway up the ladder and a visual test that only ever looks at one
+            // height never sees both halves of the affordability rule.
+            for (w, h) in [(90u16, 8u16), (90, 6), (90, 5), (90, 4), (40, 8), (40, 4)] {
+                let p = paint_snap(&snap, w, h);
+                println!(
+                    "  {w}×{h} — rule {}",
+                    if p.band.rule.is_some() {
+                        "drawn"
+                    } else {
+                        "refused"
+                    }
+                );
                 for row in &p.rows {
                     println!("  {w:>3} │{row}│");
                 }

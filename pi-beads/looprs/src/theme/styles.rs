@@ -103,6 +103,14 @@ pub fn trim_marker_style() -> Style {
 // no background anywhere, and colour spent on exactly three things (the two
 // markers and an error footer). A board that competes with the answer the user is
 // reading is a board that gets turned off.
+//
+// **Lines are now allowed; colour is still not spent here.** The band draws its
+// own framing ([`board_divider`]) because three columns of ids separated by
+// nothing but spaces read as one long column with line breaks in it — the
+// whitespace between the columns was doing no work and pretending to. Framing is
+// cut from the same register as the footer text and gets no colour of its own:
+// *where one column ends* is not a fact about any bead, so it must not outshout
+// the rows it encloses. Everything the note above refuses still stands.
 
 /// The column header: name and true total.
 ///
@@ -155,6 +163,22 @@ pub fn board_overflow() -> Style {
 /// column that draws nothing at all is a column that failed to render, which is
 /// the reading this character exists to prevent.
 pub fn board_empty() -> Style {
+    Style::new().dark_gray()
+}
+
+/// The band's framing: the column dividers, and the rule under the header.
+///
+/// Dark gray — the same register as the footer's `bd ok · 3s ago`, the same as
+/// [`board_empty`], and the same colour [`board_staled`] dims a row *to*. That
+/// identity is deliberate rather than convenient: a divider must never be
+/// brighter than the dimmest bead on the band, or the frame would read before the
+/// content it exists to frame.
+///
+/// It is also why the framing never goes through the stale pass. Its colour never
+/// changes, so `dim` keeps meaning exactly one thing — *these rows are from the
+/// last good read* — instead of "some of this band is old", which is a fact
+/// nobody can act on and nothing to do about.
+pub fn board_divider() -> Style {
     Style::new().dark_gray()
 }
 

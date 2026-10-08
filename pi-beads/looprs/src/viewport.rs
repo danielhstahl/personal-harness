@@ -177,6 +177,14 @@ pub const KANBAN_HEADER_ROWS: u16 = 1;
 pub const KANBAN_FOOTER_ROWS: u16 = 1;
 /// The least body a band can have and still be a board: one row of beads
 /// between the header and the footer.
+///
+/// This is the **budget's** floor and the only one the frame knows about. The
+/// component keeps a second, stricter floor of its own
+/// ([`crate::components::kanban::MIN_KANBAN_BODY_ROWS_WITH_RULE`]) for whether it
+/// can afford to spend a row on the rule under the header, and refuses the rule
+/// rather than cut a bead row. Deliberately not a `KANBAN_*` constant here: the
+/// rule is a rendering choice, and a budget constant with its own name would read
+/// as something the frame hands out, which it does not.
 pub const MIN_KANBAN_BODY_ROWS: u16 = 1;
 /// The smallest thing that is still a board, and therefore the band's floor:
 /// header + one bead row + footer.
@@ -197,9 +205,10 @@ pub const MIN_KANBAN_ROWS: u16 = KANBAN_HEADER_ROWS + KANBAN_FOOTER_ROWS + MIN_K
 /// and every row of window after that goes to the transcript, where it was
 /// always going to go.
 ///
-/// Eight rows is six per column (`8 - header - footer`), which on this board
-/// is the whole live work — everything after that is `+N more` over a tail
-/// that `bd list` answers in one keystroke, while the transcript cannot be.
+/// Eight rows is five per column (`8 − header − footer − the band's rule row`),
+/// which on this board is the whole live work — everything after that is
+/// `+N more` over a tail that `bd list` answers in one keystroke, while the
+/// transcript cannot be.
 pub const MAX_KANBAN_ROWS: u16 = 8;
 
 /// What the operator asked the band for, before the frame works out what it can

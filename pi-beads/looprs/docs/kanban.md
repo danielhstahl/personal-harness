@@ -64,8 +64,14 @@ reads in priority order. The board does **not** re-derive `bd`'s claimability ru
 
 ## Height, and what `+N more` means
 
-The band is `header (1) + body + footer (1)`. Body rows are shared by the three columns, so a
-6-row band is 4 bead rows *per column*.
+The band is `header (1) + rule (0 or 1) + body + footer (1)`. Body rows are shared by the
+three columns, so an 8-row band is 5 bead rows *per column* (`8 − header − rule − footer`).
+
+The **rule** — the horizontal line under the header, crossed by the two column dividers — is
+the only row of the four that is conditional, and it is conditional in one direction only: it
+is granted when the body would still keep 2 bead rows after paying for it, so a 3- or 4-row
+band draws no rule at all. The framing is therefore the *first* thing on the band to be given
+back and the *last* thing to cost you a bead. [The framing](#the-framing) has the rules.
 
 How tall it gets is a function of the window, and the band is the **last** thing on the frame's
 ladder: it is paid for out of the transcript band's *surplus* — the rows above the
@@ -94,7 +100,33 @@ The band degrades in a fixed order, so that what survives is the thing you can a
 * a row drops the **title** before it drops the **id** — the id is the handle you type into
   `bd show`, and the title is one keystroke away from there;
 * a **marker is never cut**. It is laid out before the title is truncated, precisely so a
-  `blocked` bead can never end up looking exactly like pickable work in a narrow column.
+  `blocked` bead can never end up looking exactly like pickable work in a narrow column;
+* the **dividers are drawn inside the gutters and never take a column's width** — a gutter the
+  layout has squeezed to nothing gets no line, and the columns keep every column they were
+  given. The rule's `┼` junctions are computed from the *same* layout split as the `│` above
+  and below them, so a junction cannot end up one cell away from the line it is supposed to
+  cross.
+
+### The framing
+
+Two kinds of line, one style (`board_divider`, the same dark gray as the footer text):
+
+* **dividers** (`│`) down the middle of each gutter, spanning the header rows and the body rows
+   — not the footer, which is one sentence across the whole width and has nothing to divide;
+* the **rule** (`───┼───┼───`) between the header and the body, because the header and the
+   bead rows are the only two things on the band that mean different categories of thing, and
+   bold on the header alone did not say so: the header read as a fourth bead row that happened
+   to have no id in it.
+
+Two rules hold it together, and both are tested rather than asserted in prose:
+
+* **It is bought out of the body's surplus, and refused before it cuts a bead.** The framing is
+  the cheapest thing on the band to lose: a band that cannot keep 2 body rows after paying for
+  the rule draws none of it (`MIN_KANBAN_BODY_ROWS_WITH_RULE`), which is why 3- and 4-row bands
+  have no rule and 5-row-and-up bands do.
+* **The framing is never dimmed.** Its colour never changes with the read, so `dim` on this band
+  keeps meaning exactly one thing — *these rows are from the last good read* — instead of
+  "some of this band is old", which is not a fact anybody can act on.
 
 ## The knobs
 

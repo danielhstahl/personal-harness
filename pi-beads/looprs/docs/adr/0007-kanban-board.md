@@ -145,6 +145,11 @@ The band always draws **three rows' worth of structure**: a header row, the bead
 rows, and a footer row. The footer is never omitted while the band is drawn,
 because "when was this read?" is always informative.
 
+There is a fourth row — the framing rule under the header ([§6](#6-the-bands-framing)) —
+and it is deliberately absent from this table. It carries no state: no count, no
+marker, no freshness. A row that says nothing about the read cannot be in a table
+about what the read says, and putting it here would imply it can be wrong.
+
 | State | Header row | Column bodies | Footer row |
 |---|---|---|---|
 | **first poll in flight** (`never_loaded`) | three names, counts `—` | *(none)* | `reading the board…` |
@@ -210,6 +215,34 @@ of the app":
 That is why the snapshot lives behind a `watch` (latest-wins) owned outside the
 session and not inside it: looprs-5o4.2's contract, and why the frame reads a
 plain value and never learns that `bd` exists.
+
+### 6. The band's framing
+
+Three columns of ids separated by nothing but spaces read as **one long column
+with line breaks in it**. The whitespace between the columns was doing no work and
+pretending to, so the band draws its own framing: `│` down each gutter and a
+`───┼───┼───` rule between the header and the bodies. Two rules decide it, and
+both are properties of the layout rather than of taste.
+
+**The framing is bought out of the body's surplus and is refused rather than cut a
+bead row.** The rule row is granted only if the body still keeps 2 rows after
+paying for it, which puts the threshold at a 5-row band: below that there is no
+rule and every affordable row goes to a bead. The ranking is the reason, not the
+number — *the framing is the cheapest thing on this band to lose*, so it must go
+before any bead row does. A band that drew the rule by cutting the second-to-last
+bead would be spending the user's content on the widget's legibility, and would
+have it backwards in a way that is invisible in the diff and obvious on the screen.
+
+**The framing is never dimmed.** Its style is fixed and does not pass through the
+stale pass. This is not decoration-consistency for its own sake: on this band
+`dim` is a *word*, and the word is "these rows are from the last good read".
+Paint the framing with the same word and it stops meaning that anywhere — the user
+is left with "some of this band is old", which is neither the freshness state nor
+anything they can do about. One style, always, so the word keeps its meaning.
+
+The two are the same decision seen from different ends: the framing costs the user
+something (a row, and attention), so where it is granted and how it is coloured are
+both decisions about what the band is allowed to take.
 
 ---
 
@@ -306,3 +339,16 @@ inside the frame.
 10. **Do not put `bd` in the draw path.** The frame reads a snapshot value and a
     row count; the poller, the `bd` service and the widget never meet at paint
     time.
+11. **Do not dim the framing.** Dividers and rule keep one style whatever the read
+    did. `dim` on this band means *"these rows are from the last good read"*;
+    spending it on chrome too turns one legible fact into "some of this band is
+    old", which is not a fact with a verb attached to it.
+12. **Do not grant the rule row when the body cannot pay for it.** The framing is
+    the first thing on the band to be given back, not the last. A band that drew a
+    rule and one bead row where it could have drawn two bead rows has bought its own
+    legibility with the user's content.
+13. **Do not derive the framing's geometry independently of the columns.** The
+    `┼` junctions come from the same layout split as the `│` they cross. Two
+    functions each working out where the gutter is is how a junction ends up one
+    cell off the line, which reads as a rendering bug nobody can reproduce from
+    the code.
