@@ -2,14 +2,15 @@
 
 use super::*;
 
-/// The frame's four bands at this height, with the transcript's own band
+/// The frame's five bands at this height, with the transcript's own band
 /// first — the same call the draw makes, so a row classified against these
 /// rectangles is classified against the pixels.
-fn bands(app: &App, h: u16) -> [Rect; 4] {
+fn bands(app: &App, h: u16) -> [Rect; 5] {
     viewport::frame_areas(
         Rect::new(0, 0, W, h),
         app.live_card_rows(),
         app.input_band(W),
+        viewport::KanbanBudget::Off,
     )
 }
 
@@ -75,7 +76,7 @@ fn a_wheel_over_the_input_box_or_the_status_row_does_not_scroll_the_transcript()
     settle_deep(&mut app);
     let h = 24u16;
     paint(&app, h, &[]);
-    let [text, _cards, status, input] = bands(&app, h);
+    let [text, _cards, _board, status, input] = bands(&app, h);
     assert!(
         input.height > 0 && status.height > 0,
         "setup: chrome rows exist"
@@ -126,7 +127,7 @@ fn the_live_card_band_is_not_transcript_and_does_not_scroll() {
     });
     let h = 26u16;
     paint(&app, h, &[]);
-    let [_text, cards, _status, _input] = bands(&app, h);
+    let [_text, cards, _board, _status, _input] = bands(&app, h);
     assert!(cards.height > 0, "setup: a card row was laid out");
 
     let before = app.scrollback().offset();
@@ -443,7 +444,7 @@ fn the_wheel_follows_the_band_when_the_input_box_is_gone() {
 
     let h = 24u16;
     paint_real(&app, h);
-    let [text, _cards, status, _input] = bands(&app, h);
+    let [text, _cards, _board, status, _input] = bands(&app, h);
     assert_eq!(status.bottom(), h, "the status row is the last row now");
     assert_eq!(
         text.bottom(),

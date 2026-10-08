@@ -288,6 +288,32 @@ async fn run(
     // drops with a marker, and the marker names the file that kept everything.
     let journal = crate::services::journal::journal_from_env();
     app.set_journal(journal);
+    // The kanban band's row budget (looprs-5o4.3), on the same rule as every
+    // other knob in this function: read **once**, here, and resolved by a pure
+    // function of the string. The policy that spends the rows
+    // (`viewport::kanban_rows`) takes the resolved budget as an argument and
+    // reads no environment of its own, which is what makes every branch of it
+    // reachable from a test without a process env. `LOOPRS_KANBAN_ROWS=<n>`
+    // pins the band to n rows, `0` turns it off entirely, and anything that is
+    // not a number falls back to the height function with a warning from
+    // `from_raw` rather than a panic at startup.
+    //
+    // The frame is not handed this value yet. `view` passes
+    // `viewport::KanbanBudget::Off`, because rows granted to a band nobody
+    // paints are a hole in the screen rather than a board, and the widget
+    // (looprs-5o4.4) and the beads-mode gate (looprs-5o4.5) have to exist
+    // before the grant buys anything. What *is* wired is the knob — parse,
+    // clamp, resolve, log — so the last step is one argument at one call site
+    // and no new policy, and a user who sets the variable today gets told what
+    // it resolved to instead of wondering whether it was read at all.
+    let kanban_budget =
+        viewport::KanbanBudget::from_raw(std::env::var("LOOPRS_KANBAN_ROWS").ok().as_deref());
+    tracing::info!(
+        "kanban row budget: {kanban_budget:?} (ceiling {max} rows; no band at all below \
+         {min} rows of window with a full card wall and the tallest box)",
+        max = viewport::MAX_KANBAN_ROWS,
+        min = viewport::min_frame_rows_for_board(viewport::MAX_TOOL_ROWS, viewport::MAX_INPUT_ROWS),
+    );
     // Tell the sessions the size they are being shown at before anyone runs a
     // command. A Bash shell spawned later still inherits this: `BashTask::resize`
     // records the size even with no shell up yet, and uses it for the pty it
@@ -569,8 +595,12 @@ fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
     let cards: Vec<&Entry> = active
         .map(|v| v.transcript.open_cards().take(card_rows as usize).collect())
         .unwrap_or_default();
-    let [text_area, card_area, status_area, input] =
-        viewport::frame_areas(f.area(), card_rows, input_rows);
+    // `KanbanBudget::Off` for the same reason the band has no widget yet: a
+    // grant with no paint is a blank stripe in the middle of the frame. The
+    // budget itself is resolved at startup (see `kanban_budget` in `run`), and
+    // this is the argument that takes it when looprs-5o4.4/.5 land.
+    let [text_area, card_area, _board_area, status_area, input] =
+        viewport::frame_areas(f.area(), card_rows, input_rows, viewport::KanbanBudget::Off);
 
     // The live tail shows only while the view is following the tail. Scrolled up
     // into history, the band belongs to the history: putting a live line under the
@@ -749,8 +779,12 @@ mod tests {
     #[test]
     fn the_status_row_is_painted_into_the_band_the_layout_reserved_for_it() {
         let app = app(TerminalType::Beeds, true);
-        let [_, _, status, _] =
-            viewport::frame_areas(Rect::new(0, 0, 60, 12), 0, viewport::MIN_INPUT_ROWS);
+        let [_, _, _, status, _] = viewport::frame_areas(
+            Rect::new(0, 0, 60, 12),
+            0,
+            viewport::MIN_INPUT_ROWS,
+            viewport::KanbanBudget::Off,
+        );
         let screen = paint(&app, 12);
         let row = &screen[status.y as usize];
         assert_eq!(status.height, 1);
@@ -770,7 +804,8 @@ mod tests {
             .set_text(format!("{} THE-END", "word ".repeat(20)));
         let want = app.input_rows(60);
         let h = 40; // the window: the frame *is* the window now
-        let [_, _, status, input] = viewport::frame_areas(Rect::new(0, 0, 60, h), 0, want);
+        let [_, _, _, status, input] =
+            viewport::frame_areas(Rect::new(0, 0, 60, h), 0, want, viewport::KanbanBudget::Off);
         assert!(
             input.height > viewport::MIN_INPUT_ROWS,
             "the box did not grow: {input:?}"
@@ -800,8 +835,12 @@ mod tests {
             session: SessionId::new(TerminalType::Beeds, 1),
             status: SessionStatus::Running,
         });
-        let [_, _, status, input] =
-            viewport::frame_areas(Rect::new(0, 0, 60, 12), 0, viewport::MIN_INPUT_ROWS);
+        let [_, _, _, status, input] = viewport::frame_areas(
+            Rect::new(0, 0, 60, 12),
+            0,
+            viewport::MIN_INPUT_ROWS,
+            viewport::KanbanBudget::Off,
+        );
         let screen = paint(&app, 12);
         assert!(screen[status.y as usize].contains("working"), "{screen:?}");
         // …and the box really is gone, so the row is not being confused with it.
@@ -836,7 +875,8 @@ mod tests {
         );
 
         let h = 40; // the window: the frame *is* the window now
-        let [_, _, status, input] = viewport::frame_areas(Rect::new(0, 0, 60, h), 0, band);
+        let [_, _, _, status, input] =
+            viewport::frame_areas(Rect::new(0, 0, 60, h), 0, band, viewport::KanbanBudget::Off);
         assert_eq!(input.height, 0, "the hidden box kept rows: {input:?}");
         assert_eq!(status.bottom(), h, "the status row does not end the frame");
 
@@ -872,7 +912,8 @@ mod tests {
         let band = app.input_band(60);
         assert_eq!(band, app.input_rows(60), "the box did not come back whole");
         let h = 40; // the window: the frame *is* the window now
-        let [_, _, status, input] = viewport::frame_areas(Rect::new(0, 0, 60, h), 0, band);
+        let [_, _, _, status, input] =
+            viewport::frame_areas(Rect::new(0, 0, 60, h), 0, band, viewport::KanbanBudget::Off);
         assert_eq!(input.height, band);
         assert_eq!(status.bottom(), input.top());
         assert!(
@@ -891,8 +932,12 @@ mod tests {
             text: "spawn failed: bash not found on PATH".into(),
         });
         for h in 5u16..=20 {
-            let [_, _, status, _] =
-                viewport::frame_areas(Rect::new(0, 0, 60, h), 0, viewport::MIN_INPUT_ROWS);
+            let [_, _, _, status, _] = viewport::frame_areas(
+                Rect::new(0, 0, 60, h),
+                0,
+                viewport::MIN_INPUT_ROWS,
+                viewport::KanbanBudget::Off,
+            );
             let screen = paint(&app, h);
             let band = &screen[status.y as usize];
             assert!(band.contains("Bash"), "h={h}: {screen:?}");
@@ -933,7 +978,12 @@ mod tests {
             "the frame is told there is a card to make room for"
         );
         let h = 40; // the window: the frame *is* the window now
-        let [_, cards, _, _] = viewport::frame_areas(Rect::new(0, 0, 60, h), rows, band);
+        let [_, cards, _, _, _] = viewport::frame_areas(
+            Rect::new(0, 0, 60, h),
+            rows,
+            band,
+            viewport::KanbanBudget::Off,
+        );
 
         let screen = paint_with(&app, h, band);
         let drawn = &screen[cards.y as usize..cards.bottom() as usize];
@@ -1064,8 +1114,12 @@ mod tests {
         let id = SessionId::new(TerminalType::Pi, 1);
         settle(&mut app, id, 30);
         let band = app.transcript_band_rows();
-        let band_area =
-            viewport::frame_areas(Rect::new(0, 0, 60, 30), 0, viewport::MIN_INPUT_ROWS)[0];
+        let band_area = viewport::frame_areas(
+            Rect::new(0, 0, 60, 30),
+            0,
+            viewport::MIN_INPUT_ROWS,
+            viewport::KanbanBudget::Off,
+        )[0];
         assert_eq!(
             band as u16, band_area.height,
             "the band the app counts and the band the frame lays out are the same"
@@ -1130,8 +1184,13 @@ mod tests {
         }
         app.flush_active(80);
         let wide = app.scrollback().len();
-        let band = viewport::frame_areas(Rect::new(0, 0, 60, 30), 0, viewport::MIN_INPUT_ROWS)[0]
-            .height as usize;
+        let band = viewport::frame_areas(
+            Rect::new(0, 0, 60, 30),
+            0,
+            viewport::MIN_INPUT_ROWS,
+            viewport::KanbanBudget::Off,
+        )[0]
+        .height as usize;
 
         // Rest the view with MARK-7 as its bottom-most visible row.
         let marker = app
@@ -1235,10 +1294,11 @@ mod tests {
         settle(&mut app, SessionId::new(TerminalType::Pi, 1), 6);
         let h = HEIGHT;
         let input_rows = viewport::MIN_INPUT_ROWS;
-        let [text, _, status, input] = viewport::frame_areas(
+        let [text, _, _, status, input] = viewport::frame_areas(
             Rect::new(0, 0, WIDTH, h),
             app.live_card_rows(),
             app.input_band(WIDTH),
+            viewport::KanbanBudget::Off,
         );
 
         let before = paint_cells(&app, h, input_rows);

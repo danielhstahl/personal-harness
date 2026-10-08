@@ -106,6 +106,7 @@ fn geom(app: &App, height: u16) -> (u16, u16, Vec<String>) {
         Rect::new(0, 0, W, height),
         app.live_card_rows(),
         app.input_band(W),
+        viewport::KanbanBudget::Off,
     );
     let win = app.transcript_window(text.height as usize);
     let lay = crate::components::text_stream::band_layout(text, win.len(), 0);

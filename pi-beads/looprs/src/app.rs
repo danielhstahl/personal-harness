@@ -760,6 +760,7 @@ impl App {
             Rect::new(0, 0, self.width, self.height),
             self.live_card_rows(),
             self.input_band(self.width),
+            viewport::KanbanBudget::Off,
         );
         text.height as usize
     }

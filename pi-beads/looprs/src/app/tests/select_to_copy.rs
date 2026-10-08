@@ -507,6 +507,7 @@ fn the_live_tail_cannot_be_selected() {
         Rect::new(0, 0, W, h),
         app.live_card_rows(),
         app.input_band(W),
+        viewport::KanbanBudget::Off,
     );
     // The live line is the band's last row.
     let live_y = text.bottom() - 1;
@@ -538,10 +539,11 @@ fn chrome_cannot_be_selected_and_leaves_the_selection_alone() {
     settle_answers(&mut app, 3);
     let h = 20u16;
     paint(&app, h, &[]);
-    let [_text, _, status, input] = viewport::frame_areas(
+    let [_text, _, _, status, input] = viewport::frame_areas(
         Rect::new(0, 0, W, h),
         app.live_card_rows(),
         app.input_band(W),
+        viewport::KanbanBudget::Off,
     );
 
     // A press on the status row, then on the input box: nothing starts.

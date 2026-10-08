@@ -1,4 +1,5 @@
-//! The full-screen frame: the four bands, and how they tile the window (looprs-pdl.4).
+//! The full-screen frame: the five bands, and how they tile the window
+//! (looprs-pdl.4; the fifth band's row budget is looprs-5o4.3).
 //!
 //! # What this module used to be
 //!
@@ -38,7 +39,7 @@
 //!
 //! # The frame
 //!
-//! [`frame_areas`] tiles the whole window into four bands, top to bottom:
+//! [`frame_areas`] tiles the whole window into five bands, top to bottom:
 //!
 //! 1. **the transcript** — everything this session has finished saying, plus the
 //!    live tail of what it is saying now, pinned to the *bottom* of the band so
@@ -48,9 +49,17 @@
 //!    (bounded, journaled) get to build on.
 //! 2. **the tool rows** — the live cards: open tool calls and any open
 //!    compaction, capped at [`MAX_TOOL_ROWS`].
-//! 3. **the status row** — one row, [`STATUS_ROWS`], see
+//! 3. **the kanban band** — the beads board (epic looprs-5o4): three columns
+//!    sharing one header row, plus a footer row that is never omitted while the
+//!    band is drawn (ADR-0007 §4). How tall it gets is
+//!    [`kanban_rows`], and it is **zero rows** in every frame that is not
+//!    drawing it — see [`KanbanBudget::Off`], which is what every frame passes
+//!    today, before the widget (looprs-5o4.4) and the beads-mode gate
+//!    (looprs-5o4.5) exist. Reserving rows for a band nobody paints is a hole
+//!    in the frame, not a band.
+//! 4. **the status row** — one row, [`STATUS_ROWS`], see
 //!    [`crate::components::status`].
-//! 4. **the input box** — [`NO_INPUT_ROWS`] when the active session is not
+//! 5. **the input box** — [`NO_INPUT_ROWS`] when the active session is not
 //!    taking the keyboard, otherwise as tall as the typed text needs, up to
 //!    [`MAX_INPUT_ROWS`].
 //!
@@ -60,6 +69,17 @@
 //! than a row of the question you are. The transcript band is the frame's
 //! `Constraint::Min` and absorbs whatever the ladder did not spend, with a
 //! floor of [`MIN_TEXT_ROWS`] so a wall of tools cannot delete the transcript.
+//!
+//! **The board is last on that ladder** (looprs-5o4.3). It is paid out of the
+//! transcript's *surplus* — the rows above [`MIN_TEXT_ROWS`] that no one else
+//! claimed — and out of nothing else, so it can never take a row off the box,
+//! the cards, or the transcript's floor. That is why [`kanban_rows`] runs
+//! *after* [`bands`] and only ever sees the leftover: "shrink the input box so
+//! the board can show three more closed tickets" is not a thing this frame can
+//! be asked to do, let alone do. Its own floor is the reason it returns 0
+//! rather than a stub at the bottom of a short window, and its own ceiling is
+//! the reason a 200-row terminal does not turn into a board with a strip of
+//! transcript under it.
 //!
 //! The frame is a pure function of the area it is given. There is no
 //! "rows of scrollback to keep visible" and no absolute cap on the pane, because
@@ -72,7 +92,10 @@
 //! Three places, and none of them is terminal-shaped:
 //!
 //! 1. add its row count to [`bands`] and say what it outranks when the window is
-//!    too short (the ladder is the box > the cards > the transcript);
+//!    too short (the ladder is now the box > the cards > the transcript's
+//!    floor > the board; a band that ranks below the transcript's floor is
+//!    paid the way [`kanban_rows`] pays it, from the surplus, and is not in
+//!    [`bands`] at all);
 //! 2. add one `Constraint::Length` to the [`Layout`] in [`frame_areas`], in the
 //!    order the band sits in, and leave the transcript band's `Constraint::Min`
 //!    absorbing the rest;
@@ -132,6 +155,191 @@ pub const MAX_TOOL_ROWS: u16 = 4;
 /// should have lost.
 pub const MIN_TEXT_ROWS: u16 = 1;
 
+/// The kanban band's header row: the three column names and their true totals,
+/// **shared** across the columns (ADR-0007 §4), so three side-by-side columns
+/// cost one row of header between them, not three.
+///
+/// It is a row of the *band*, which means the budget pays for it whether or not
+/// a single bead is drawn under it.
+pub const KANBAN_HEADER_ROWS: u16 = 1;
+/// The kanban band's footer row: "when was this read", plus the `deferred`
+/// count that has no row of its own. **Never omitted while the band is drawn**
+/// (ADR-0007 §4/S1), which is what makes it a cost rather than a leftover.
+pub const KANBAN_FOOTER_ROWS: u16 = 1;
+/// The least body a band can have and still be a board: one row of beads
+/// between the header and the footer.
+pub const MIN_KANBAN_BODY_ROWS: u16 = 1;
+/// The smallest thing that is still a board, and therefore the band's floor:
+/// header + one bead row + footer.
+///
+/// A band that can only afford the header and the footer is **not** a board —
+/// it is two lines of chrome with nothing between them — so the budget returns
+/// `0` rather than rounding down into that. The ADR's "never a blank board"
+/// rule is carried by the footer's text (`reading the board…`), not by drawing
+/// a degenerate one.
+pub const MIN_KANBAN_ROWS: u16 = KANBAN_HEADER_ROWS + KANBAN_FOOTER_ROWS + MIN_KANBAN_BODY_ROWS;
+/// The most the band ever gets, however tall the window is.
+///
+/// Load-bearing in both directions. Without a ceiling the band is the transcript
+/// at a different font: a tall window gives the board every row above the
+/// transcript's floor, and a band with nothing better to do than grow spends
+/// rows the one band that cannot be re-read elsewhere never gets back. With
+/// this one, five rows past [`min_frame_rows_for_board`] the ceiling is reached
+/// and every row of window after that goes to the transcript, where it was
+/// always going to go.
+///
+/// Eight rows is six per column (`8 - header - footer`), which on this board
+/// is the whole live work — everything after that is `+N more` over a tail
+/// that `bd list` answers in one keystroke, while the transcript cannot be.
+pub const MAX_KANBAN_ROWS: u16 = 8;
+
+/// What the operator asked the band for, before the frame works out what it can
+/// afford.
+///
+/// The whole of the "or just let me pin it" route (§C of the ticket). The point
+/// of it being an argument and not an [`std::env::var`] inside
+/// [`kanban_rows`] is that the policy has no environment: every branch of it is
+/// reachable from a test without touching the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KanbanBudget {
+    /// No board, at any window height. This is what a frame that is **not**
+    /// drawing the band passes.
+    ///
+    /// It is not the same thing as `Pinned(0)`, though both grant nothing:
+    /// `Off` is a fact about the frame (not beads mode, or nothing painted yet)
+    /// that no environment variable can argue with, while a pin is a user
+    /// request that the frame may still turn out not to be able to afford.
+    Off,
+    /// The height function decides, per frame. The default when the environment
+    /// says nothing.
+    Auto,
+    /// `LOOPRS_KANBAN_ROWS=<n>`, already clamped into
+    /// `[0, MAX_KANBAN_ROWS]` by [`KanbanBudget::from_raw`]. The frame treats
+    /// it as a **ceiling on the request**, never as a guarantee: it still has
+    /// to fit, and it still dies at the floor rather than drawing a stub.
+    Pinned(u16),
+}
+
+impl KanbanBudget {
+    /// Resolve the raw `LOOPRS_KANBAN_ROWS` value into a budget.
+    ///
+    /// `main` reads the environment once at startup and passes the value here
+    /// (`from_raw(std::env::var("LOOPRS_KANBAN_ROWS").ok().as_deref())`), so
+    /// the knob is read once, logged once, and never re-parsed per frame — and
+    /// so that every rule below is a function of its argument rather than of
+    /// the machine's env.
+    ///
+    /// * unset / empty / whitespace — [`KanbanBudget::Auto`], no comment.
+    /// * `0` — the band is off entirely, which is the answer for a user who
+    ///   does not want it at all and does not want the height function's
+    ///   opinion either.
+    /// * a number above `MAX_KANBAN_ROWS` — clamped to the ceiling, with a
+    ///   warning, because a silently-ignored number is a number the user will
+    ///   keep setting.
+    /// * `1` or `2` — off, with a warning: below [`MIN_KANBAN_ROWS`] there is
+    ///   no band to be had (header + footer leaves no row for a bead), so the
+    ///   honest resolution is `0`, and the log says why rather than letting the
+    ///   user debug a silent `1`.
+    /// * unparseable — [`KanbanBudget::Auto`] with a warning. Never a panic,
+    ///   and never "off": a typo should not take the feature away, it should
+    ///   leave the default in place and say so loudly.
+    pub fn from_raw(raw: Option<&str>) -> Self {
+        let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+            return Self::Auto;
+        };
+        let Ok(rows) = raw.parse::<u16>() else {
+            tracing::warn!(
+                "LOOPRS_KANBAN_ROWS={raw:?} is not a number of rows; using the height function \
+                 (0 = off, 1..={max} = a fixed height)",
+                max = MAX_KANBAN_ROWS
+            );
+            return Self::Auto;
+        };
+        if rows > MAX_KANBAN_ROWS {
+            tracing::warn!(
+                "LOOPRS_KANBAN_ROWS={rows} is above the ceiling; clamped to {MAX_KANBAN_ROWS}"
+            );
+            return Self::Pinned(MAX_KANBAN_ROWS);
+        }
+        if rows > 0 && rows < MIN_KANBAN_ROWS {
+            tracing::warn!(
+                "LOOPRS_KANBAN_ROWS={rows} is below the smallest band that is a board \
+                 ({MIN_KANBAN_ROWS} rows: header + one bead row + footer); the band is off"
+            );
+            return Self::Pinned(0);
+        }
+        Self::Pinned(rows)
+    }
+}
+
+/// The rows the kanban band can afford in a frame this tall.
+///
+/// A pure function of `(frame_rows, tool_rows, input_rows, budget)` — no env
+/// read, no clock read, no remembered window size. `tool_rows` and `input_rows`
+/// are the *requested* heights, exactly as [`bands`] takes them, and are
+/// resolved through [`bands`] here rather than re-derived, so the number this
+/// function subtracts is the number the frame is going to spend.
+///
+/// The order of subtraction **is** the ladder: the box is taken at full price,
+/// the cards are taken at full price, the transcript's [`MIN_TEXT_ROWS`] floor
+/// is reserved, and the band gets what is left, capped at
+/// [`MAX_KANBAN_ROWS`]. It never asks for anything to be given back.
+///
+/// Returns `0` — no band — rather than a stub whenever the leftover cannot hold
+/// [`MIN_KANBAN_ROWS`], and never returns anything between `0` and that floor,
+/// so the transition at the threshold is 0 → a real band and there is no frame
+/// that draws half of one.
+///
+/// The result never adds demand to the frame: `kanban_rows(...) + tools +
+/// input + STATUS_ROWS + MIN_TEXT_ROWS <= frame_rows` wherever
+/// `tools + input + STATUS_ROWS + MIN_TEXT_ROWS <= frame_rows` already held,
+/// which is what lets [`frame_areas`] lay the band out as a plain
+/// `Constraint::Length` without risking a run past the bottom edge. Where the
+/// frame was already too short for the box alone, the band is 0 rather than one
+/// more claim on rows that do not exist.
+pub fn kanban_rows(frame_rows: u16, tool_rows: u16, input_rows: u16, budget: KanbanBudget) -> u16 {
+    if budget == KanbanBudget::Off {
+        return 0;
+    }
+    // The higher bands are paid first, at the same prices `frame_areas` pays
+    // them. Nothing here can move those numbers.
+    let (tools, input) = bands(tool_rows, input_rows, frame_rows);
+    let surplus = frame_rows.saturating_sub(STATUS_ROWS + tools + input + MIN_TEXT_ROWS);
+    let want = match budget {
+        KanbanBudget::Off => 0,
+        KanbanBudget::Auto => MAX_KANBAN_ROWS,
+        // A pin is clamped here too, not only in `from_raw`: the ceiling is a
+        // property of the band, not of the environment variable that can set
+        // it.
+        KanbanBudget::Pinned(n) => n.min(MAX_KANBAN_ROWS),
+    };
+    if want < MIN_KANBAN_ROWS || surplus < MIN_KANBAN_ROWS {
+        return 0;
+    }
+    want.min(surplus)
+}
+
+/// The window height below which the band is `0` for this chrome — the
+/// threshold the band appears at when the window grows, and disappears below
+/// when it shrinks.
+///
+/// `STATUS_ROWS + tools + input + MIN_TEXT_ROWS + MIN_KANBAN_ROWS`: everything
+/// the higher bands keep, plus the smallest thing that is still a board. Equal
+/// to [`kanban_rows`] returning non-zero for [`KanbanBudget::Auto`] (and for
+/// any pin at or above [`MIN_KANBAN_ROWS`]) at every window height.
+pub fn min_frame_rows_for_board(tool_rows: u16, input_rows: u16) -> u16 {
+    // Resolved against a window that cannot constrain them, because this is the
+    // height at which the *board* becomes affordable, not the height at which
+    // the other bands get cut to make room for it — cutting them is precisely
+    // what this band does not do.
+    let (tools, input) = bands(tool_rows, input_rows, u16::MAX);
+    STATUS_ROWS
+        .saturating_add(tools)
+        .saturating_add(input)
+        .saturating_add(MIN_TEXT_ROWS)
+        .saturating_add(MIN_KANBAN_ROWS)
+}
+
 /// A requested input-box height, clamped into the range the frame supports.
 ///
 /// Every entry point that takes an `input_rows` runs it through this, so the
@@ -168,6 +376,12 @@ pub fn input_rows(text_rows: u16) -> u16 {
 /// The result is *always* spendable: `tools + input + STATUS_ROWS +
 /// MIN_TEXT_ROWS <= frame_rows`, so [`frame_areas`] never runs a fixed band
 /// past the bottom edge of the area it was given.
+///
+/// The kanban band is deliberately **not** in here. It ranks below every band
+/// this function resolves, so it must not be part of what they are measured
+/// against: adding a term for it here is exactly how "the board shrank my input
+/// box" becomes representable. It is granted afterwards, out of the surplus
+/// this function's floor leaves behind — see [`kanban_rows`].
 pub fn bands(tool_rows: u16, input_rows: u16, frame_rows: u16) -> (u16, u16) {
     let input = clamped_input_rows(input_rows);
     let tools = tool_rows
@@ -176,19 +390,27 @@ pub fn bands(tool_rows: u16, input_rows: u16, frame_rows: u16) -> (u16, u16) {
     (tools, input)
 }
 
-/// The frame's four bands, top to bottom: transcript, tool rows, status, input.
+/// The frame's five bands, top to bottom: transcript, tool rows, kanban,
+/// status, input.
 ///
 /// The area it is handed is the whole window: the frame tiles what it is given,
-/// and nothing else. Resolved through [`bands`] against *this* area rather than
-/// a remembered terminal size, so the same arithmetic that decided who gives
-/// way is the arithmetic that spends the rows — anything that made the two
-/// disagree would show up as blank rows inside the frame, which is a bug nobody
-/// can trace from a screenshot.
-pub fn frame_areas(area: Rect, tool_rows: u16, input_rows: u16) -> [Rect; 4] {
+/// and nothing else. Resolved through [`bands`] and [`kanban_rows`] against
+/// *this* area rather than a remembered terminal size, so the same arithmetic
+/// that decided who gives way is the arithmetic that spends the rows — anything
+/// that made the two disagree would show up as blank rows inside the frame,
+/// which is a bug nobody can trace from a screenshot.
+///
+/// The kanban band is [`KanbanBudget::Off`] for every caller until the widget
+/// and its beads-mode gate land, which is what keeps this frame's four
+/// original bands exactly where they have always been: a zero-length
+/// `Constraint::Length(0)` is a band that occupies no row at all.
+pub fn frame_areas(area: Rect, tool_rows: u16, input_rows: u16, kanban: KanbanBudget) -> [Rect; 5] {
     let (tools, input) = bands(tool_rows, input_rows, area.height);
+    let board = kanban_rows(area.height, tool_rows, input_rows, kanban);
     Layout::vertical([
         Constraint::Min(MIN_TEXT_ROWS),
         Constraint::Length(tools),
+        Constraint::Length(board),
         Constraint::Length(STATUS_ROWS),
         Constraint::Length(input),
     ])
@@ -396,68 +618,478 @@ mod tests {
 
     const W: usize = 24;
 
+    /// Every budget the frame can be handed, for the table tests: off, the
+    /// height function, a pin that disables, a pin at the smallest real band,
+    /// and a pin at the ceiling.
+    const BUDGETS: [KanbanBudget; 5] = [
+        KanbanBudget::Off,
+        KanbanBudget::Auto,
+        KanbanBudget::Pinned(0),
+        KanbanBudget::Pinned(MIN_KANBAN_ROWS),
+        KanbanBudget::Pinned(MAX_KANBAN_ROWS),
+    ];
+
+    /// A subscriber that keeps the text of every `warn!` (or worse) raised
+    /// while it is installed.
+    ///
+    /// It exists because "an unparseable value falls back **with a logged
+    /// warning**" is half of the knob's contract, and the other half is worth
+    /// as much on its own: a fallback nobody can see is a knob the user keeps
+    /// turning. Capturing the event rather than reading a log file keeps the
+    /// assertion in the same place as the decision it describes, and thread-
+    /// local, so it cannot pick up another test's noise.
+    #[derive(Debug, Default, Clone)]
+    struct WarnCapture {
+        lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl WarnCapture {
+        /// Run `f` with this subscriber as the thread's only listener, and hand
+        /// back what it was told at WARN or above.
+        fn record<T>(f: impl FnOnce() -> T) -> Vec<String> {
+            let cap = Self::default();
+            let lines = cap.lines.clone();
+            let _guard = tracing::subscriber::set_default(cap);
+            f();
+            lines.lock().unwrap().clone()
+        }
+    }
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            *meta.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            // Nothing here is span-aware; one throwaway id is enough to keep
+            // `span!` calls from having anywhere to be recorded *to*.
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() > tracing::Level::WARN {
+                return;
+            }
+            struct Grab<'a>(&'a mut Vec<String>);
+            impl tracing::field::Visit for Grab<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0.push(format!("{value:?}"));
+                    }
+                }
+            }
+            event.record(&mut Grab(&mut self.lines.lock().unwrap()));
+        }
+    }
+
     // ---------------------------------------------------------------- policy
 
-    /// The whole table of requests, against every window height: the four bands
+    /// The whole table of requests, against every window height: the five bands
     /// tile the frame exactly, in order, with no gaps and no overlap, and no
-    /// band ever runs past the bottom edge.
+    /// band ever runs past the bottom edge — with the board off, on, pinned at
+    /// the floor, and pinned at the ceiling.
     #[test]
     fn the_bands_tile_the_window_at_every_size() {
         for mode_rows in 0u16..=120 {
             for tools in [0u16, 1, 4, 9] {
                 for input in [MIN_INPUT_ROWS, MAX_INPUT_ROWS, NO_INPUT_ROWS] {
-                    let area = Rect::new(0, 0, W as u16, mode_rows);
-                    let [text, card, status, box_band] = frame_areas(area, tools, input);
-                    let tag = format!("rows={mode_rows} tools={tools} input={input}");
+                    for budget in BUDGETS {
+                        let area = Rect::new(0, 0, W as u16, mode_rows);
+                        let [text, card, board, status, box_band] =
+                            frame_areas(area, tools, input, budget);
+                        let tag = format!(
+                            "rows={mode_rows} tools={tools} input={input} board={budget:?}"
+                        );
 
-                    assert_eq!(
-                        text.height as u32
-                            + card.height as u32
-                            + status.height as u32
-                            + box_band.height as u32,
-                        mode_rows as u32,
-                        "{tag}: the bands do not tile the frame"
-                    );
-                    assert_eq!(text.top(), 0, "{tag}");
-                    assert_eq!(text.bottom(), card.top(), "{tag}: gap");
-                    assert_eq!(card.bottom(), status.top(), "{tag}: gap");
-                    assert_eq!(status.bottom(), box_band.top(), "{tag}: gap");
-                    assert_eq!(box_band.bottom(), mode_rows, "{tag}: off the edge");
+                        assert_eq!(
+                            text.height as u32
+                                + card.height as u32
+                                + board.height as u32
+                                + status.height as u32
+                                + box_band.height as u32,
+                            mode_rows as u32,
+                            "{tag}: the bands do not tile the frame"
+                        );
+                        assert_eq!(text.top(), 0, "{tag}");
+                        assert_eq!(text.bottom(), card.top(), "{tag}: gap");
+                        assert_eq!(card.bottom(), board.top(), "{tag}: gap");
+                        assert_eq!(board.bottom(), status.top(), "{tag}: gap");
+                        assert_eq!(status.bottom(), box_band.top(), "{tag}: gap");
+                        assert_eq!(box_band.bottom(), mode_rows, "{tag}: off the edge");
 
-                    // Above the affordability line every band gets exactly the
-                    // rows the ladder counted. Below it the window cannot hold
-                    // the frame that was asked for, and how ratatui's solver
-                    // spreads the shortfall between the constraints is its
-                    // business — the only promise is that nothing runs off the
-                    // bottom edge, which the tiling above already covers.
-                    let (want_tools, want_input) = bands(tools, input, mode_rows);
-                    let afford = want_tools + want_input + STATUS_ROWS + MIN_TEXT_ROWS;
-                    if mode_rows >= afford {
-                        assert_eq!(
-                            box_band.height, want_input,
-                            "{tag}: the box was not paid what the ladder counted"
+                        // Above the affordability line every band gets exactly
+                        // the rows the ladder counted. Below it the window
+                        // cannot hold the frame that was asked for, and how
+                        // ratatui's solver spreads the shortfall between the
+                        // constraints is its business — the only promise is
+                        // that nothing runs off the bottom edge, which the
+                        // tiling above already covers.
+                        let (want_tools, want_input) = bands(tools, input, mode_rows);
+                        let want_board = kanban_rows(mode_rows, tools, input, budget);
+                        let afford =
+                            want_board + want_tools + want_input + STATUS_ROWS + MIN_TEXT_ROWS;
+                        // The board may never add demand to the frame: it is
+                        // paid out of what the ladder left over, so its rows
+                        // are always fewer than the surplus. (The total is not
+                        // always affordable — a 2-row window cannot hold a
+                        // 3-row box, and that shortfall predates the board —
+                        // but every row of it that *is* over is a row the
+                        // higher bands asked for, not a row the board took.)
+                        let spare = mode_rows
+                            .saturating_sub(want_tools + want_input + STATUS_ROWS + MIN_TEXT_ROWS);
+                        assert!(
+                            want_board <= spare,
+                            "{tag}: the board over-sold the frame ({want_board} > {spare})"
                         );
-                        assert_eq!(
-                            card.height, want_tools,
-                            "{tag}: the tool band spent rows the ladder did not grant it"
-                        );
-                        assert_eq!(status.height, STATUS_ROWS, "{tag}");
-                        assert_eq!(
-                            text.height,
-                            mode_rows - afford + MIN_TEXT_ROWS,
-                            "{tag}: the transcript band did not absorb the rest"
-                        );
-                    } else {
-                        for band in [text, card, status, box_band] {
-                            assert!(
-                                band.bottom() <= mode_rows,
-                                "{tag}: {band:?} runs past the frame"
+                        if mode_rows >= afford {
+                            assert_eq!(
+                                box_band.height, want_input,
+                                "{tag}: the box was not paid what the ladder counted"
                             );
+                            assert_eq!(
+                                card.height, want_tools,
+                                "{tag}: the tool band spent rows the ladder did not grant it"
+                            );
+                            assert_eq!(
+                                board.height, want_board,
+                                "{tag}: the board spent rows the budget did not grant it"
+                            );
+                            assert_eq!(status.height, STATUS_ROWS, "{tag}");
+                            assert_eq!(
+                                text.height,
+                                mode_rows - afford + MIN_TEXT_ROWS,
+                                "{tag}: the transcript band did not absorb the rest"
+                            );
+                        } else {
+                            for band in [text, card, board, status, box_band] {
+                                assert!(
+                                    band.bottom() <= mode_rows,
+                                    "{tag}: {band:?} runs past the frame"
+                                );
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    /// **"The board gives way first"** spelled as the frames it cannot cause.
+    /// Turning the board on in a window that already has a box and a wall of
+    /// cards moves exactly one band: the transcript, which pays out of its
+    /// surplus. The box, the cards and the status row keep their rows and their
+    /// positions, because a band that shrank the input box so it could show
+    /// three more closed tickets is the failure this ticket exists to make
+    /// unrepresentable.
+    #[test]
+    fn turning_the_board_on_only_ever_costs_the_transcript_its_surplus() {
+        for total in 0u16..=120 {
+            for tools in [0u16, 1, 4, 9] {
+                for input in [MIN_INPUT_ROWS, MAX_INPUT_ROWS, NO_INPUT_ROWS] {
+                    let area = Rect::new(0, 0, W as u16, total);
+                    let [text_off, cards_off, board_off, status_off, box_off] =
+                        frame_areas(area, tools, input, KanbanBudget::Off);
+                    let [text_on, cards_on, board_on, status_on, box_on] =
+                        frame_areas(area, tools, input, KanbanBudget::Auto);
+                    let tag = format!("rows={total} tools={tools} input={input}");
+
+                    assert_eq!(board_off.height, 0, "{tag}: Off still took rows");
+                    assert_eq!(
+                        box_on.height, box_off.height,
+                        "{tag}: the box lost rows to the board"
+                    );
+                    assert_eq!(box_on.top(), box_off.top(), "{tag}: the box moved");
+                    assert_eq!(
+                        cards_on.height, cards_off.height,
+                        "{tag}: the card wall lost rows to the board"
+                    );
+                    assert_eq!(
+                        status_on.top(),
+                        status_off.top(),
+                        "{tag}: the status row moved"
+                    );
+                    assert_eq!(
+                        text_off.height,
+                        text_on.height + board_on.height,
+                        "{tag}: the board was not paid out of the transcript's surplus"
+                    );
+                    assert!(
+                        text_on.height >= MIN_TEXT_ROWS.min(total),
+                        "{tag}: the board took the transcript's floor"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The height function, end to end: nothing below the threshold, the
+    /// smallest real band at it, the ceiling once the window can pay for it,
+    /// and nothing between 0 and that minimum at any size — so the transition
+    /// at the threshold is 0 → a whole band and never a frame with half one.
+    #[test]
+    fn the_band_is_zero_or_a_whole_board_never_a_stub() {
+        for total in 0u16..=200 {
+            for tools in [0u16, 1, 4, 9] {
+                for input in [MIN_INPUT_ROWS, MAX_INPUT_ROWS, NO_INPUT_ROWS] {
+                    for budget in [KanbanBudget::Auto, KanbanBudget::Pinned(MAX_KANBAN_ROWS)] {
+                        let rows = kanban_rows(total, tools, input, budget);
+                        assert!(
+                            rows == 0 || rows >= MIN_KANBAN_ROWS,
+                            "rows={total} tools={tools} input={input} {budget:?}: a {rows}-row \"board\" is header and footer with nothing between them"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The threshold, named and checkable: below `min_frame_rows_for_board` the
+    /// band is 0, at it the band is exactly the minimum board, and it never
+    /// grows past the ceiling however tall the window gets.
+    #[test]
+    fn the_board_appears_at_its_threshold_and_stops_at_its_ceiling() {
+        for tools in [0u16, 1, 4, 9] {
+            for input in [MIN_INPUT_ROWS, MAX_INPUT_ROWS, NO_INPUT_ROWS] {
+                let at = min_frame_rows_for_board(tools, input);
+                let tag = format!("tools={tools} input={input} threshold={at}");
+                assert_eq!(
+                    kanban_rows(at.saturating_sub(1), tools, input, KanbanBudget::Auto),
+                    0,
+                    "{tag}: a board was drawn one row below the threshold"
+                );
+                assert_eq!(
+                    kanban_rows(at, tools, input, KanbanBudget::Auto),
+                    MIN_KANBAN_ROWS,
+                    "{tag}: at the threshold the band is the smallest thing that is a board"
+                );
+                assert_eq!(
+                    kanban_rows(at + MAX_KANBAN_ROWS, tools, input, KanbanBudget::Auto),
+                    MAX_KANBAN_ROWS,
+                    "{tag}: the band grew past its ceiling"
+                );
+                assert_eq!(
+                    kanban_rows(400, tools, input, KanbanBudget::Auto),
+                    MAX_KANBAN_ROWS,
+                    "{tag}: a 400-row window bought more board, not more transcript"
+                );
+                // And the threshold is the threshold for every *height function*
+                // answer: no window below it grants a band, none above it
+                // grants zero.
+                for total in 0u16..=400 {
+                    let rows = kanban_rows(total, tools, input, KanbanBudget::Auto);
+                    assert_eq!(
+                        rows > 0,
+                        total >= at,
+                        "{tag}: rows={rows} at height {total} does not match the threshold"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The band's height never goes *down* as the window grows — including with
+    /// the pinned budgets, where a pin can be met and then held while the
+    /// window keeps growing.
+    #[test]
+    fn the_band_is_monotonic_non_decreasing_in_window_height() {
+        for tools in [0u16, 1, 4, 9] {
+            for input in [MIN_INPUT_ROWS, MAX_INPUT_ROWS, NO_INPUT_ROWS] {
+                for budget in BUDGETS {
+                    let mut prev = kanban_rows(0, tools, input, budget);
+                    for total in 1u16..=400 {
+                        let now = kanban_rows(total, tools, input, budget);
+                        assert!(
+                            now >= prev,
+                            "{budget:?} tools={tools} input={input}: the band shrank from {prev} to {now} rows as the window grew to {total}"
+                        );
+                        prev = now;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A pinned band is the number the user asked for, in every window that can
+    /// hold it; `0` is off everywhere; and a pin the frame cannot afford
+    /// collapses to zero rather than to a stub or to a shoved status row.
+    #[test]
+    fn a_pinned_band_is_honoured_up_to_what_the_window_can_pay() {
+        // A window with room: every legal pin lands exactly.
+        for pin in MIN_KANBAN_ROWS..=MAX_KANBAN_ROWS {
+            assert_eq!(
+                kanban_rows(60, 0, MIN_INPUT_ROWS, KanbanBudget::Pinned(pin)),
+                pin,
+                "pin {pin} was not paid"
+            );
+        }
+        // A pin above the ceiling *is* the ceiling, and the ceiling is what the
+        // height function would have asked for anyway.
+        assert_eq!(
+            kanban_rows(200, 0, MIN_INPUT_ROWS, KanbanBudget::Pinned(u16::MAX)),
+            MAX_KANBAN_ROWS
+        );
+        assert_eq!(
+            kanban_rows(200, 4, MAX_INPUT_ROWS, KanbanBudget::Pinned(u16::MAX)),
+            kanban_rows(200, 4, MAX_INPUT_ROWS, KanbanBudget::Auto)
+        );
+        // `0` disables at every window size, with any chrome.
+        for total in 0u16..=120 {
+            for tools in [0u16, 4, 9] {
+                for input in [MIN_INPUT_ROWS, MAX_INPUT_ROWS, NO_INPUT_ROWS] {
+                    assert_eq!(kanban_rows(total, tools, input, KanbanBudget::Pinned(0)), 0);
+                }
+            }
+        }
+        // A pin taller than the surplus is cut to the surplus, and the surplus
+        // here is what the frame has left above the transcript's floor.
+        let h = 30u16;
+        assert_eq!(
+            h - STATUS_ROWS - MIN_INPUT_ROWS - MIN_TEXT_ROWS,
+            25,
+            "the surplus this pin is priced against"
+        );
+        assert_eq!(
+            kanban_rows(h, 0, MIN_INPUT_ROWS, KanbanBudget::Pinned(30)),
+            MAX_KANBAN_ROWS,
+            "and even then the ceiling is the last word"
+        );
+        assert_eq!(
+            kanban_rows(h, 0, MIN_INPUT_ROWS, KanbanBudget::Pinned(4)),
+            4,
+            "a pin below the surplus is simply the pin"
+        );
+        // One row above the threshold the surplus is 4, so a pin of 6 is cut
+        // to 4: the frame pays what it has and never takes the difference from
+        // a band above it.
+        assert_eq!(
+            kanban_rows(
+                min_frame_rows_for_board(0, MIN_INPUT_ROWS) + 1,
+                0,
+                MIN_INPUT_ROWS,
+                KanbanBudget::Pinned(6)
+            ),
+            4,
+            "a pin too tall for the window is cut to the window, not to the pin"
+        );
+    }
+
+    /// The environment cannot reach inside the policy: the budget is an
+    /// argument, so the same four numbers always produce the same rows. This is
+    /// the same purity claim [`the_frame_is_a_pure_function_of_the_area_it_gets`]
+    /// makes of the layout, made of the band that decides how tall the board
+    /// is — `LOOPRS_KANBAN_ROWS` is resolved by `main` once, through
+    /// [`KanbanBudget::from_raw`], and nothing in here reads a process value.
+    #[test]
+    fn the_band_is_a_pure_function_of_its_arguments() {
+        for _ in 0..3 {
+            assert_eq!(
+                kanban_rows(40, 4, MAX_INPUT_ROWS, KanbanBudget::Auto),
+                kanban_rows(40, 4, MAX_INPUT_ROWS, KanbanBudget::Auto)
+            );
+            assert_eq!(
+                frame_areas(
+                    Rect::new(0, 0, 80, 40),
+                    4,
+                    MIN_INPUT_ROWS,
+                    KanbanBudget::Pinned(5)
+                ),
+                frame_areas(
+                    Rect::new(0, 0, 80, 40),
+                    4,
+                    MIN_INPUT_ROWS,
+                    KanbanBudget::Pinned(5)
+                )
+            );
+        }
+    }
+
+    /// The whole `LOOPRS_KANBAN_ROWS` mapping, as a table over the string the
+    /// environment holds — including the two failure modes the ticket names:
+    /// an unparseable value falls back to the height function with a logged
+    /// warning rather than a panic, and `0` is off, not "a one-row band".
+    #[test]
+    fn the_env_knob_resolves_onto_the_budget() {
+        let unset: Option<&str> = None;
+        assert_eq!(KanbanBudget::from_raw(unset), KanbanBudget::Auto);
+        assert_eq!(KanbanBudget::from_raw(Some("")), KanbanBudget::Auto);
+        assert_eq!(KanbanBudget::from_raw(Some("   ")), KanbanBudget::Auto);
+        assert_eq!(KanbanBudget::from_raw(Some("0")), KanbanBudget::Pinned(0));
+        assert_eq!(KanbanBudget::from_raw(Some(" 6 ")), KanbanBudget::Pinned(6));
+        assert_eq!(
+            KanbanBudget::from_raw(Some("8")),
+            KanbanBudget::Pinned(MAX_KANBAN_ROWS)
+        );
+        assert_eq!(
+            KanbanBudget::from_raw(Some("999")),
+            KanbanBudget::Pinned(MAX_KANBAN_ROWS),
+            "above the ceiling is clamped, not obeyed"
+        );
+        // Below the smallest board there is nothing to pin, so the honest
+        // resolution is off — with a warning, which the next test checks.
+        assert_eq!(KanbanBudget::from_raw(Some("1")), KanbanBudget::Pinned(0));
+        assert_eq!(KanbanBudget::from_raw(Some("2")), KanbanBudget::Pinned(0));
+        // Garbage is the default, never a panic and never "off".
+        for bad in ["banana", "-3", "3.5", "8 rows", "0x4", "eight"] {
+            assert_eq!(
+                KanbanBudget::from_raw(Some(bad)),
+                KanbanBudget::Auto,
+                "{bad:?} must fall back to the height function"
+            );
+        }
+    }
+
+    /// The fallback *says* something. A silently ignored `LOOPRS_KANBAN_ROWS`
+    /// is a knob the user keeps turning, and a silently clamped one is the
+    /// same. Each refused value warns once; each obeyed value says nothing.
+    #[test]
+    fn the_env_knob_warns_when_it_refuses_an_answer() {
+        let warns = WarnCapture::record(|| {
+            KanbanBudget::from_raw(Some("banana"));
+            KanbanBudget::from_raw(Some("-3"));
+            KanbanBudget::from_raw(Some("999"));
+            KanbanBudget::from_raw(Some("1"));
+        });
+        let joined = warns.join("\n");
+        assert_eq!(
+            warns.len(),
+            4,
+            "each refused value warns exactly once:\n{joined}"
+        );
+        for want in [
+            "is not a number of rows",
+            "above the ceiling",
+            "below the smallest band",
+        ] {
+            assert!(joined.contains(want), "no warning said {want:?}:\n{joined}");
+        }
+
+        // And the values that are obeyed say nothing at all.
+        let quiet = WarnCapture::record(|| {
+            let _ = KanbanBudget::from_raw(None);
+            for ok in ["0", "3", "6", "8", " 6 "] {
+                let _ = KanbanBudget::from_raw(Some(ok));
+            }
+            for _ in 0..10 {
+                let _ = kanban_rows(60, 4, MAX_INPUT_ROWS, KanbanBudget::Auto);
+            }
+        });
+        assert!(
+            quiet.is_empty(),
+            "obeyed values warned:\n{}",
+            quiet.join("\n")
+        );
     }
 
     /// The priority order, spelled as a property: give the box more rows and
@@ -468,7 +1100,8 @@ mod tests {
         // A window that cannot fit both: the wall shrinks, the box does not.
         let tall = MAX_INPUT_ROWS;
         for total in (STATUS_ROWS + tall + MIN_TEXT_ROWS)..=40u16 {
-            let [_, card, _, box_band] = frame_areas(Rect::new(0, 0, W as u16, total), 4, tall);
+            let [_, card, _, _, box_band] =
+                frame_areas(Rect::new(0, 0, W as u16, total), 4, tall, KanbanBudget::Off);
             assert_eq!(
                 box_band.height, tall,
                 "rows={total}: the box was cut before the tool wall was"
@@ -519,8 +1152,12 @@ mod tests {
     fn a_hidden_input_box_leaves_the_status_row_on_the_bottom_edge() {
         for total in 1u16..=60 {
             for tools in [0u16, 1, 4, 9] {
-                let [_, card, status, box_band] =
-                    frame_areas(Rect::new(0, 0, W as u16, total), tools, NO_INPUT_ROWS);
+                let [_, card, _, status, box_band] = frame_areas(
+                    Rect::new(0, 0, W as u16, total),
+                    tools,
+                    NO_INPUT_ROWS,
+                    KanbanBudget::Off,
+                );
                 let tag = format!("rows={total} tools={tools}");
                 assert_eq!(box_band.height, 0, "{tag}: a hidden box still took rows");
                 assert_eq!(
@@ -543,10 +1180,11 @@ mod tests {
     #[test]
     fn the_transcript_band_keeps_its_floor_against_the_chrome() {
         for total in (STATUS_ROWS + MIN_INPUT_ROWS + MIN_TEXT_ROWS)..=60u16 {
-            let [text, _, _, _] = frame_areas(
+            let [text, _, _, _, _] = frame_areas(
                 Rect::new(0, 0, W as u16, total),
                 MAX_TOOL_ROWS,
                 MAX_INPUT_ROWS,
+                KanbanBudget::Off,
             );
             assert!(
                 text.height >= MIN_TEXT_ROWS.min(total),
@@ -568,16 +1206,26 @@ mod tests {
     #[test]
     fn a_growing_box_is_never_cut_and_never_takes_the_transcripts_floor() {
         let total = 20u16;
-        let small = frame_areas(Rect::new(0, 0, W as u16, total), 4, MIN_INPUT_ROWS);
-        let big = frame_areas(Rect::new(0, 0, W as u16, total), 4, MAX_INPUT_ROWS);
-        assert_eq!(small[3].height, MIN_INPUT_ROWS);
+        let small = frame_areas(
+            Rect::new(0, 0, W as u16, total),
+            4,
+            MIN_INPUT_ROWS,
+            KanbanBudget::Off,
+        );
+        let big = frame_areas(
+            Rect::new(0, 0, W as u16, total),
+            4,
+            MAX_INPUT_ROWS,
+            KanbanBudget::Off,
+        );
+        assert_eq!(small[4].height, MIN_INPUT_ROWS);
         assert_eq!(
-            big[3].height, MAX_INPUT_ROWS,
+            big[4].height, MAX_INPUT_ROWS,
             "the box got every row it asked for"
         );
         assert_eq!(
-            small[3].bottom(),
-            big[3].bottom(),
+            small[4].bottom(),
+            big[4].bottom(),
             "the frame did not grow to fit the box: the rows came from above"
         );
         assert!(
@@ -608,8 +1256,8 @@ mod tests {
         let a = Rect::new(0, 0, 80, 40);
         for _ in 0..3 {
             assert_eq!(
-                frame_areas(a, 2, MIN_INPUT_ROWS),
-                frame_areas(a, 2, MIN_INPUT_ROWS)
+                frame_areas(a, 2, MIN_INPUT_ROWS, KanbanBudget::Off),
+                frame_areas(a, 2, MIN_INPUT_ROWS, KanbanBudget::Off)
             );
         }
         // And the same request at a different window is a different frame — the
@@ -617,7 +1265,7 @@ mod tests {
         // no margin above it to keep visible and no pane below it to save room
         // for. A 120-row window spends all 120.
         let big = Rect::new(0, 0, 80, 120);
-        let [big_text, _, _, _] = frame_areas(big, 0, MIN_INPUT_ROWS);
+        let [big_text, _, _, _, _] = frame_areas(big, 0, MIN_INPUT_ROWS, KanbanBudget::Off);
         assert_eq!(
             big_text.height,
             120 - STATUS_ROWS - MIN_INPUT_ROWS,
@@ -853,8 +1501,12 @@ mod tests {
     #[test]
     fn a_narrow_window_still_tiles() {
         for width in 1u16..40 {
-            let [text, card, status, input] =
-                frame_areas(Rect::new(0, 0, width, 12), MAX_TOOL_ROWS, MAX_INPUT_ROWS);
+            let [text, card, _, status, input] = frame_areas(
+                Rect::new(0, 0, width, 12),
+                MAX_TOOL_ROWS,
+                MAX_INPUT_ROWS,
+                KanbanBudget::Off,
+            );
             assert_eq!(
                 (text.width, card.width, status.width, input.width),
                 (width, width, width, width)
@@ -942,7 +1594,7 @@ mod tests {
     }
 
     /// A zero dimension is a pty coming apart, not a window arriving: adopting
-    /// it would forward `rows = 0` to every child pty and lay the four bands
+    /// it would forward `rows = 0` to every child pty and lay the five bands
     /// out on nothing. Refused — and refused *without* retiring the poll,
     /// because the read itself worked and the next one may be real.
     #[test]
