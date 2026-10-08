@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::components::compaction::CompactionState;
 use crate::components::tool::ToolStateCategory;
 use crate::utils::shelltext::{StyleRun, StyledLine};
@@ -80,7 +82,29 @@ pub struct Entry {
 
 #[derive(Default)]
 pub struct Transcript {
-    pub entries: Vec<Entry>,
+    /// Transcript order, oldest at the front.
+    ///
+    /// A `VecDeque` because the two ends of this list are the two ends that get
+    /// worked on: every append lands at the back (through [`Self::push_entry`])
+    /// and the buffer cap takes its victims off the front
+    /// ([`Self::evict_front`]). On a `Vec` that second one is an O(n) memmove of
+    /// every surviving entry, repeated once per entry the cap takes — a trim of k
+    /// entries out of n was O(k·n) on a path that runs on every write
+    /// (looprs-7m5).
+    pub entries: VecDeque<Entry>,
+    /// The running sum of `entries[i].text.len()`.
+    ///
+    /// Maintained by the methods that move the bytes, so that
+    /// [`Transcript::byte_len`] is O(1): the buffer cap asks that question on
+    /// every single write, and used to ask it again *inside* the eviction loop,
+    /// which is what made the whole trim O(k·n) as well as O(k·n) of memmove.
+    ///
+    /// Deliberately **not** `pub`, because a counter anyone can assign is a
+    /// counter that drifts. Every site that changes an entry's text now goes
+    /// through a method that debits or credits this in the same breath, and
+    /// [`Self::debug_assert_bytes`] — run on every write through
+    /// `SessionView::after_write` — is what stops the two from disagreeing.
+    bytes: usize,
     /// The entry index the last submitted Bash command's output starts at, set by
     /// [`Transcript::seal_command`]. This is the command boundary the copy reads:
     /// a Bash session is one long stream of one kind, so without an index there is
@@ -91,18 +115,32 @@ pub struct Transcript {
 impl Transcript {
     pub fn new() -> Self {
         Self {
-            entries: vec![],
+            entries: VecDeque::new(),
+            bytes: 0,
             command_start: None,
         }
     }
+
+    /// The one way a new entry comes into existence.
+    ///
+    /// Every push path is routed through here so "start an entry" cannot mean
+    /// "and leave the byte counter behind".
+    fn push_entry(&mut self, e: Entry) {
+        self.bytes += e.text.len();
+        self.entries.push_back(e);
+    }
+
     /// Streaming append. Same kind as the open entry extends it; a different kind
     /// closes it and starts a new one (thinking -> answer happens automatically).
     pub fn push_delta(&mut self, kind: MessageKind, delta: &str) {
-        match self.entries.last_mut() {
-            Some(e) if e.kind == kind && !e.done => e.text.push_str(delta),
+        match self.entries.back_mut() {
+            Some(e) if e.kind == kind && !e.done => {
+                e.text.push_str(delta);
+                self.bytes += delta.len();
+            }
             _ => {
                 self.finish_last();
-                self.entries.push(Entry {
+                self.push_entry(Entry {
                     kind,
                     text: delta.to_string(),
                     done: false,
@@ -129,11 +167,11 @@ impl Transcript {
         if lines.is_empty() {
             return;
         }
-        match self.entries.last_mut() {
+        match self.entries.back_mut() {
             Some(e) if e.kind == MessageKind::Bash && !e.done => {}
             _ => {
                 self.finish_last();
-                self.entries.push(Entry {
+                self.push_entry(Entry {
                     kind: MessageKind::Bash,
                     text: String::new(),
                     done: false,
@@ -141,9 +179,13 @@ impl Transcript {
                 });
             }
         }
+        // The bytes this call adds: every line's own text plus the `\n` written
+        // after it. Totalled up front, once, because the entry's text is the unit
+        // the counter speaks and this is the only place those bytes arrive.
+        let added: usize = lines.iter().map(|l| l.text.len() + 1).sum();
         let e = self
             .entries
-            .last_mut()
+            .back_mut()
             .expect("the entry above was just created");
         for line in lines {
             let base = e.text.len();
@@ -157,12 +199,13 @@ impl Transcript {
                 });
             }
         }
+        self.bytes += added;
     }
 
     /// Complete, one-shot entries (user message, tool result, error).
     pub fn push_done(&mut self, kind: MessageKind, text: String) {
         self.finish_last();
-        self.entries.push(Entry {
+        self.push_entry(Entry {
             kind,
             text,
             done: true,
@@ -173,7 +216,7 @@ impl Transcript {
     //start of adding tools
     pub fn start_tool(&mut self, id: String, name: String, input: String) {
         self.finish_last();
-        self.entries.push(Entry {
+        self.push_entry(Entry {
             kind: MessageKind::Tool {
                 id,
                 name,
@@ -200,6 +243,11 @@ impl Transcript {
                     ToolStateCategory::Success
                 };
             }
+            // A replacement, not an append: the counter already carries the old
+            // text (nothing else writes it), so this is one credit and one
+            // debit. Credit first so the intermediate cannot underflow.
+            self.bytes += summary.len();
+            self.bytes -= e.text.len();
             e.text = summary;
             e.done = true;
         }
@@ -224,7 +272,7 @@ impl Transcript {
     /// [`Self::finish_compaction`] closes it.
     pub fn start_compaction(&mut self, reason: String) {
         self.finish_last();
-        self.entries.push(Entry {
+        self.push_entry(Entry {
             kind: MessageKind::Compaction {
                 reason,
                 state: CompactionState::Running,
@@ -259,6 +307,10 @@ impl Transcript {
             if let MessageKind::Compaction { state: s, .. } = &mut e.kind {
                 *s = state;
             }
+            // Same credit-then-debit as `finish_tool`: the slot's old contents
+            // are already in the total.
+            self.bytes += detail.len();
+            self.bytes -= e.text.len();
             e.text = detail;
             e.done = true;
             return true;
@@ -288,18 +340,99 @@ impl Transcript {
         }
     }
 
-    /// Total buffered text. The per-view cap (ADR-0002 "Consequences": buffered
-    /// output while hidden is unbounded) measures this so a chatty child that
-    /// nobody is looking at cannot grow the process forever.
+    /// Total buffered text — O(1), from the running [`Self::bytes`].
+    ///
+    /// The per-view cap (ADR-0002 "Consequences": buffered output while hidden
+    /// is unbounded) measures this so a chatty child that nobody is looking at
+    /// cannot grow the process forever. It asks on *every* write, and asked again
+    /// inside each step of the eviction loop, so this is a stored total rather
+    /// than a sum over the entries (looprs-7m5). [`Self::recount_bytes`] is the
+    /// sum, and [`Self::debug_assert_bytes`] is the check that the two agree.
     pub fn byte_len(&self) -> usize {
+        self.bytes
+    }
+
+    /// The same answer as [`Self::byte_len`], the slow way: summed from the
+    /// entries.
+    ///
+    /// Not for any path that runs for real — this is the O(n) the counter exists
+    /// to avoid, and it exists only so the counter has something to be checked
+    /// against. If a future change ever wants a *live* total that is not the
+    /// maintained one, this is the function it should be looking at.
+    pub fn recount_bytes(&self) -> usize {
         self.entries.iter().map(|e| e.text.len()).sum()
+    }
+
+    /// Panic (debug builds) if the running total and the entries disagree.
+    ///
+    /// Cheap where it matters — compiled out of a release build — and loud where
+    /// a drift would be caught: `SessionView::after_write` runs it on every
+    /// write, so a push or removal site that forgot its credit or debit trips
+    /// during the next test that streams anything rather than showing up as a
+    /// marker row that under-reports what the cap ate.
+    pub fn debug_assert_bytes(&self) {
+        debug_assert_eq!(
+            self.bytes,
+            self.recount_bytes(),
+            "transcript byte counter has drifted: running total {}, entries sum {} ({} entries)",
+            self.bytes,
+            self.recount_bytes(),
+            self.entries.len()
+        );
+    }
+
+    /// Take the oldest entry off the front, debiting the bytes it held.
+    ///
+    /// The buffer cap's eviction primitive. O(1) because the entry list is a
+    /// `VecDeque` — on the `Vec` this replaced, each eviction memmoved every
+    /// surviving entry — and single-sourced because "remove an entry" and
+    /// "debit what it held" are one operation, not two that must be remembered
+    /// in the same order at every call site.
+    pub fn evict_front(&mut self) -> Option<Entry> {
+        let gone = self.entries.pop_front()?;
+        self.bytes -= gone.text.len();
+        Some(gone)
+    }
+
+    /// Drop the first `cut` bytes off the front of entry `idx`, clamped to what
+    /// is there, and return how many bytes actually went.
+    ///
+    /// The operation behind the open-entry cap
+    /// ([`SessionView::trim_open_entry`](crate::session::view::SessionView::trim_open_entry)),
+    /// owned by the transcript for two reasons that are really one:
+    ///
+    /// * an entry's `text` and its `styles` are a single invariant — each style
+    ///   run is a byte range into *this* entry's text — so dropping the head and
+    ///   re-basing the runs cannot be done in two places;
+    /// * the running total has to be debited by exactly the bytes that leave,
+    ///   and a caller holding `&mut Entry` cannot do that.
+    ///
+    /// Entry indices do not move: this eats the middle of one entry, it does not
+    /// take anything out of the list.
+    pub fn cut_entry_head(&mut self, idx: usize, cut: usize) -> usize {
+        let Some(e) = self.entries.get_mut(idx) else {
+            return 0;
+        };
+        let cut = cut.min(e.text.len());
+        e.text.drain(..cut);
+        // A run wholly inside the head goes; one straddling the cut keeps the
+        // part still here, which is what saturating the start gives us.
+        if !e.styles.is_empty() {
+            e.styles.retain(|s| s.end > cut);
+            for s in e.styles.iter_mut() {
+                s.start = s.start.saturating_sub(cut);
+                s.end -= cut;
+            }
+        }
+        self.bytes -= cut;
+        cut
     }
 
     pub fn finish_last(&mut self) {
         // only streamed entries close implicitly; a running tool must not be closed
         // by whatever comes next (parallel tools, for example)
         // tools are often run in parallel, so this is required
-        if let Some(e) = self.entries.last_mut().filter(|e| e.kind.is_streamed()) {
+        if let Some(e) = self.entries.back_mut().filter(|e| e.kind.is_streamed()) {
             e.done = true;
         }
     }
@@ -368,8 +501,10 @@ impl Transcript {
         if start >= self.entries.len() {
             return None;
         }
-        let block: Vec<&str> = self.entries[start..]
+        let block: Vec<&str> = self
+            .entries
             .iter()
+            .skip(start)
             .filter(|e| e.kind == MessageKind::Bash && !e.text.trim().is_empty())
             .map(|e| e.text.as_str())
             .collect();
@@ -530,6 +665,9 @@ mod tests {
     }
 
     use crate::components::compaction::CompactionState;
+    use crate::utils::shelltext::StyledLine;
+    use ratatui::style::Style;
+    use std::time::Instant;
 
     fn compaction_in(state: CompactionState) -> impl Fn(&&Entry) -> bool {
         move |e| matches!(&e.kind, MessageKind::Compaction { state: s, .. } if *s == state)
@@ -627,6 +765,251 @@ mod tests {
         assert!(
             matches!(&reported.kind, MessageKind::Tool { state, .. } if *state == ToolStateCategory::Success),
             "and the one that reported back keeps its answer"
+        );
+    }
+
+    // ───────── the running byte counter (looprs-7m5) ─────────
+    //
+    // `byte_len` is O(1) because it reads a counter instead of summing, and a
+    // counter is a second copy of a fact — the classic place for a drift to live.
+    // `recount_bytes` is the ground truth (it *is* the definition), so these
+    // tests are not comparing two implementations of the same idea: they are
+    // checking the maintained number against the sum it stands for, after every
+    // shape of write the module has. A new push or removal path that forgets its
+    // credit or debit should fail one of these, and `debug_assert_bytes` — run on
+    // every write through `SessionView::after_write` — catches it in a debug
+    // build even where no test thinks to look.
+
+    /// The counter and the entries must say the same number, at this point in the
+    /// script, or the buffer cap is deciding with a wrong figure.
+    fn agrees(t: &Transcript, step: &str) {
+        let sum = t.recount_bytes();
+        assert_eq!(
+            t.byte_len(),
+            sum,
+            "byte counter drifted at: {step} (running {}, entries sum {sum}, {} entries)",
+            t.byte_len(),
+            t.entries.len()
+        );
+    }
+
+    /// Every write shape in this module, in roughly the order a session hits
+    /// them, each one followed by the check. Append is the easy half; the two
+    /// **replacement** paths (`finish_tool`, `finish_compaction`) and the two
+    /// **removal** paths (`evict_front`, `cut_entry_head`) are where a counter
+    /// written against "we added text" goes wrong, so they are all here.
+    #[test]
+    fn the_running_counter_is_the_sum_of_the_entries_after_every_shape_of_write() {
+        let mut t = Transcript::new();
+        agrees(&t, "empty");
+
+        t.push_delta(MessageKind::Answer, "half an ");
+        agrees(&t, "a delta opens an entry");
+        t.push_delta(MessageKind::Answer, "answer");
+        agrees(&t, "a delta extends the open entry");
+        t.push_delta(MessageKind::Thinking, "hm");
+        agrees(&t, "a new kind closes one entry and opens another");
+
+        t.push_done(MessageKind::User, "run the tests please".into());
+        agrees(&t, "a one-shot entry");
+
+        t.push_shell_lines(&[shell_line("$ make test"), shell_line("running 700 tests")]);
+        agrees(&t, "styled shell lines, each with its own newline");
+
+        t.start_tool("t1".into(), "bash".into(), "make test".into());
+        agrees(&t, "a tool card opens with no result text");
+
+        // A replacement into a slot the counter holds at zero: the credit side.
+        t.finish_tool("t1".into(), "690 passed, 0 failed".into(), false);
+        agrees(&t, "a tool result replaces the card's empty text");
+
+        // And a replacement in the other direction — shorter than what was
+        // there — which is the one a `+=` alone would leave too high.
+        t.finish_tool("t1".into(), "ok".into(), false);
+        agrees(&t, "a second result is *shorter* than the first");
+
+        t.start_compaction("threshold".into());
+        t.finish_compaction(CompactionState::Done, "150.0k -> 32.0k".into());
+        agrees(&t, "a compaction card opens empty and closes with detail");
+
+        let before = t.byte_len();
+        let idx = t.entries.len() - 1;
+        let cut = t.cut_entry_head(idx, 4);
+        assert_eq!(cut, 4, "it reports what it took");
+        assert_eq!(t.byte_len(), before - 4, "and the total went with it");
+        agrees(&t, "the head of an entry was cut off");
+
+        while !t.entries.is_empty() {
+            let before = t.byte_len();
+            let gone = t.evict_front().unwrap();
+            assert_eq!(
+                t.byte_len(),
+                before - gone.text.len(),
+                "eviction left the entry's bytes behind"
+            );
+            agrees(&t, "evicting down to empty");
+        }
+        assert_eq!(
+            t.byte_len(),
+            0,
+            "an empty transcript is zero, not a residue"
+        );
+    }
+
+    /// The three removal edges that a caller could get wrong and this method
+    /// refuses to: no entry at that index, more bytes asked than the entry
+    /// holds, and style runs left pointing at bytes that are gone.
+    #[test]
+    fn a_head_cut_takes_what_exists_and_nothing_that_does_not() {
+        let mut t = Transcript::new();
+        t.push_done(MessageKind::User, "short".into());
+
+        assert_eq!(t.cut_entry_head(9, 2), 0, "no entry there: nothing removed");
+        agrees(&t, "a cut against a missing entry");
+
+        // More than exists takes all of it, not a wrapped-around negative.
+        assert_eq!(t.cut_entry_head(0, 999), 5, "clamped to the entry's length");
+        assert!(t.entries[0].text.is_empty());
+        agrees(&t, "a cut larger than the entry");
+
+        // And the runs that straddle the cut are re-based onto the text that is
+        // left, which is the reason the cut lives here at all.
+        let mut t = Transcript::new();
+        t.push_shell_lines(&[StyledLine {
+            text: "0123456789".into(),
+            runs: vec![
+                // wholly inside the first 4 bytes: goes with them
+                StyleRun {
+                    start: 1,
+                    end: 3,
+                    style: Style::default(),
+                },
+                // straddles: keeps the part still here, re-based
+                StyleRun {
+                    start: 3,
+                    end: 8,
+                    style: Style::default(),
+                },
+            ],
+            cells: 10,
+        }]);
+        t.cut_entry_head(0, 4);
+        let e = &t.entries[0];
+        assert_eq!(e.text, "456789\n");
+        assert_eq!(
+            e.styles,
+            vec![StyleRun {
+                start: 0,
+                end: 4,
+                style: Style::default(),
+            }],
+            "the run inside the head went, the run across it came back re-based"
+        );
+        agrees(&t, "a cut that moved the style runs");
+    }
+
+    /// Eviction is the cap's whole inner loop, so it gets checked on its own:
+    /// front-most entry out, its bytes out of the total, order intact, and an
+    /// empty transcript as harmless as a full one.
+    #[test]
+    fn eviction_takes_the_oldest_first_and_owes_nothing_back() {
+        let mut t = Transcript::new();
+        for i in 0..5 {
+            t.push_done(MessageKind::Answer, format!("entry {i}"));
+        }
+        let total = t.byte_len();
+        assert!(total > 0);
+
+        for i in 0..5 {
+            let before = t.byte_len();
+            let gone = t.evict_front().expect("five entries were pushed");
+            assert_eq!(
+                gone.text,
+                format!("entry {i}"),
+                "the front is the oldest, which is the end the cap eats from"
+            );
+            assert_eq!(t.byte_len(), before - gone.text.len());
+            agrees(&t, &format!("evicting entry {i}"));
+        }
+
+        assert!(
+            t.evict_front().is_none(),
+            "evicting an empty transcript is `None`, not a panic — the cap loops \
+             against its own total and must be able to arrive here"
+        );
+        assert_eq!(t.byte_len(), 0);
+    }
+
+    /// What the rewrite bought, measured rather than asserted-in-prose. Ignored
+    /// because it is a benchmark — a few hundred milliseconds in a debug build —
+    /// and because a timing that runs on every `cargo test` is a timing that gets
+    /// re-tuned to whatever the CI box did that morning.
+    ///
+    /// ```text
+    /// cargo test state::transcript -- --ignored --nocapture
+    /// ```
+    ///
+    /// Both sides do the same work on the same data: one `byte_len`-shaped
+    /// question and one front eviction, K times, over a transcript of N entries.
+    /// The old shape is spelled out here on purpose (`sum` per question,
+    /// `Vec::remove(0)` per eviction) so the comparison is with the code that
+    /// was actually replaced and not with a guess at it. The assertion is a
+    /// ratio, not an absolute: both sides run on the same machine in the same
+    /// run, so the only thing the number depends on is the complexity, not the
+    /// box.
+    #[test]
+    #[ignore = "benchmark: measures the O(k·n) it replaced; run it deliberately"]
+    fn evicting_k_entries_costs_k_steps_not_k_walks_over_n() {
+        const N: usize = 20_000;
+        const K: usize = 1_000;
+
+        let text = |i: usize| format!("line {i:05} of a transcript big enough to cap");
+
+        // The shape that was here before: `Vec`, a sum per question, `remove(0)`
+        // per eviction — which is what `enforce_buffer` used to do, twice over.
+        let mut old: Vec<Entry> = (0..N)
+            .map(|i| Entry {
+                kind: MessageKind::Answer,
+                text: text(i),
+                done: true,
+                styles: Vec::new(),
+            })
+            .collect();
+        let t0 = Instant::now();
+        let mut old_dropped = 0usize;
+        for _ in 0..K {
+            let _ = old.iter().map(|e| e.text.len()).sum::<usize>();
+            let gone = old.remove(0);
+            old_dropped += gone.text.len();
+        }
+        let old_dur = t0.elapsed();
+
+        // The shape now: O(1) question, O(1) eviction.
+        let mut t = Transcript::new();
+        for i in 0..N {
+            t.push_done(MessageKind::Answer, text(i));
+        }
+        let t1 = Instant::now();
+        let mut new_dropped = 0usize;
+        for _ in 0..K {
+            let _ = t.byte_len();
+            let gone = t.evict_front().expect("N entries were pushed");
+            new_dropped += gone.text.len();
+        }
+        let new_dur = t1.elapsed();
+
+        agrees(&t, "after the benchmark's evictions");
+        assert_eq!(
+            old_dropped, new_dropped,
+            "both sides dropped the same content, or they are not comparable"
+        );
+        println!(
+            "evict {K} of {N}: before {old_dur:?}, after {new_dur:?} ({:.0}x)",
+            old_dur.as_secs_f64() / new_dur.as_secs_f64().max(f64::MIN_POSITIVE)
+        );
+        assert!(
+            new_dur * 10 < old_dur,
+            "the new shape is not the constant-factor win it claims: before {old_dur:?}, after {new_dur:?}"
         );
     }
 }

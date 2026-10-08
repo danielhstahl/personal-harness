@@ -982,6 +982,12 @@ impl SessionView {
     fn after_write(&mut self) {
         self.journal_finalised();
         self.enforce_buffer();
+        // The buffer counter is the one number in this view that no single
+        // structure owns: the transcript keeps it, the cap reads it, eviction
+        // debits it. Checked here, on the one edge every write passes, so a site
+        // that moves bytes without moving the counter is caught in a debug build
+        // by whatever test streams anything (looprs-7m5).
+        self.transcript.debug_assert_bytes();
     }
 
     /// Push every entry that has become final, and only those, to the journal.
@@ -1074,10 +1080,21 @@ impl SessionView {
         // said so once, and a number that counts the same loss twice is a
         // number nobody believes.
         let mut skipped = self.source_skipped;
+        // `bytes` mirrors the transcript's running total for the duration of the
+        // loop. Not for speed — `byte_len()` is O(1) now — but because this
+        // loop's whole job is to move that number down, and a local mirror says
+        // that in the code: k evictions are k steps, not k passes over n entries
+        // the way it was when the condition re-summed the transcript each time it
+        // asked (looprs-7m5).
+        let mut bytes = self.transcript.byte_len();
         // Always keep one entry: an empty transcript with the cursor past the end is
         // a state nothing downstream is written to expect.
-        while self.transcript.byte_len() > self.limit && self.transcript.entries.len() > 1 {
-            let gone = self.transcript.entries.remove(0);
+        while bytes > self.limit && self.transcript.entries.len() > 1 {
+            let gone = self
+                .transcript
+                .evict_front()
+                .expect("the length check above left at least one entry to take");
+            bytes -= gone.text.len();
             dropped += gone.text.len();
             // The unit the marker speaks: lines of content, counted while the
             // entry is still here to count them. Rows are the store's business;
@@ -1241,23 +1258,17 @@ impl SessionView {
             );
         }
 
-        // Re-base the presentation against the bytes going away. A run wholly
-        // inside the head goes; a run straddling the cut keeps the part that is
-        // still here, which is exactly what saturating the start does.
-        let e = &mut self.transcript.entries[idx];
-        e.text.drain(..cut);
-        if !e.styles.is_empty() {
-            e.styles.retain(|s| s.end > cut);
-            for s in e.styles.iter_mut() {
-                s.start = s.start.saturating_sub(cut);
-                s.end -= cut;
-            }
-        }
+        // Take the bytes out and re-base the presentation in one move: text and
+        // style runs are one fact, and the running total is the debit against it,
+        // so neither belongs at this call site. The returned count is what
+        // actually left — `cut` clamped to the entry's length — and everything
+        // downstream that speaks bytes follows *that*, not the amount asked for.
+        let cut_bytes = self.transcript.cut_entry_head(idx, cut);
         // The flusher reads this entry from a byte offset; follow the bytes down.
         if self.flusher.consumed() == idx {
-            self.flusher.cut_front(cut);
+            self.flusher.cut_front(cut_bytes);
         }
-        self.dropped += cut;
+        self.dropped += cut_bytes;
         tracing::debug!(
             "open-entry cap: {cut} bytes cut from entry {idx}, {} retained against a {target} budget",
             self.transcript.entries[idx].text.len()
@@ -3141,7 +3152,7 @@ mod tests {
         for i in 0..300 {
             v.push_bash(&format!("line {i:04} of a stream that never ends\n"), 80);
             seen.extend(flush_new(&mut v, 80));
-            let text = v.transcript.entries.last().unwrap().text.len();
+            let text = v.transcript.entries.back().unwrap().text.len();
             assert!(
                 v.flusher.emitted() <= text,
                 "the flusher cursor ({}) is past the end of the text it reads ({text})",
@@ -3180,7 +3191,7 @@ mod tests {
             );
         }
 
-        let e = v.transcript.entries.last().unwrap();
+        let e = v.transcript.entries.back().unwrap();
         assert!(
             !e.styles.is_empty(),
             "the stream carried styles at all, or this test proves nothing"
@@ -3229,6 +3240,49 @@ mod tests {
             v.transcript.byte_len() <= 512,
             "and it stayed capped while previewing: {}",
             v.transcript.byte_len()
+        );
+    }
+
+    /// **The cap's decision and the counter's number are one fact, all the way
+    /// down the eviction loop.**
+    ///
+    /// `enforce_buffer` decides with a running total, not with a fresh sum, so
+    /// the two directions a wrong counter can fail are both worth naming: an
+    /// eviction that **under**-debit leaves the loop cutting entries the cap had
+    /// already covered (content lost that nobody had to lose), and one that
+    /// **over**-debit stops the loop with the transcript still over its limit — a
+    /// leak that reports itself as a cap that works. Both are checked every round
+    /// of a stream that keeps the loop biting, against `recount_bytes`, which is
+    /// the sum the counter stands for rather than a second opinion of the same
+    /// arithmetic.
+    #[test]
+    fn the_cap_stops_exactly_where_the_counter_says_it_should() {
+        const CAP: usize = 512;
+        let mut v = SessionView::with_buffer(SessionId::new(TerminalType::Bash, 0), CAP);
+
+        for i in 0..200 {
+            // One-shot entries, so this is the whole-entry eviction path and not
+            // the open-entry cut next door: entries come off the front whole.
+            v.push_note(
+                MessageKind::Answer,
+                format!("answer {i:03}, long enough that the cap is always biting"),
+            );
+            let bytes = v.transcript.byte_len();
+            assert_eq!(
+                bytes,
+                v.transcript.recount_bytes(),
+                "the counter and the entries disagreed mid-stream at round {i}"
+            );
+            assert!(
+                bytes <= CAP,
+                "the cap stopped at {bytes} against a {CAP} cap (round {i})"
+            );
+        }
+
+        assert!(
+            v.dropped_bytes() >= 200 * 40 - CAP,
+            "and it had plenty to drop, or the loop above proved nothing: {}",
+            v.dropped_bytes()
         );
     }
     // ────────── the re-render source is bounded by the cap (looprs-zie) ──────────
