@@ -1,0 +1,191 @@
+# shutdown-e2e-00u23 — captured 2026-10-09T08:59:10Z, tree 43ede27 (dirty tree: uncommitted changes on top of that commit)
+# ran: python3 spikes/shutdown_e2e.py
+[  0.00s] === quit mid-stream: the answer is on screen, then the app is gone ===
+[  0.00s] spawned target/debug/looprs (pid 68324) in a 44x100 pty
+[  1.51s] PASS  the app boots and is alive
+[  4.44s] PASS  the answer is streaming into the live region
+[  4.76s] PASS  the app exits on Ctrl-Q
+[  4.76s] PASS  exit code is 0
+[  4.76s] PASS  no 'cursor position could not be read' anywhere in the run
+[  4.76s] PASS  the run opened by taking the alternate screen and painted nothing before it
+[  4.76s] PASS  no pane erase is written anywhere in the run: the erase went out with the pane
+[  4.76s] PASS  no cursor query in the whole run — a full-screen frame never has to ask the terminal where the cursor is
+[  4.76s] PASS  the alternate screen is left, and nothing at all is written after it
+[  4.77s] PASS  nothing visible was lost: the answer was painted on the screen the frame left
+[  4.77s] PASS  inline quit: alt_screen was switched on
+[  4.77s] PASS  inline quit: alt_screen left exactly once
+[  4.77s] PASS  inline quit: alt_screen is off at the end
+[  4.77s] PASS  inline quit: cursor_hidden was switched on
+[  4.77s] PASS  inline quit: cursor_hidden is off at the end
+[  4.77s] PASS  inline quit: mouse_report was switched on
+[  4.77s] PASS  inline quit: mouse_report left exactly once
+[  4.77s] PASS  inline quit: mouse_report is off at the end
+[  4.77s] PASS  inline quit: mouse_drag was switched on
+[  4.77s] PASS  inline quit: mouse_drag left exactly once
+[  4.77s] PASS  inline quit: mouse_drag is off at the end
+[  4.77s] PASS  inline quit: mouse_sgr was switched on
+[  4.77s] PASS  inline quit: mouse_sgr left exactly once
+[  4.77s] PASS  inline quit: mouse_sgr is off at the end
+[  4.77s] PASS  inline quit: no bracketed_paste leave for a mode nothing switched on
+[  4.77s] PASS  inline quit: the cursor is visible at the end
+[  4.77s] PASS  the tty is cooked again after exit
+[  4.80s] PASS  no bash from the generated rcfile survived
+[  4.85s] PASS  no fake pi survived the app
+[  4.85s] exited 0.32s after the quit key, code 0
+[  4.85s] === quit with a Bash child running: the shell goes with the app ===
+[  8.69s] PASS  the shell is up and busy
+[ 11.11s] PASS  the app exits on Ctrl-Q with a busy shell
+[ 11.11s] PASS  exit code is 0
+[ 11.11s] PASS  the exit stayed inside the budget
+[ 11.18s] PASS  no shell from our rcfile outlived the app
+[ 11.20s] PASS  no stray `sleep 30` from that shell
+[ 11.20s] PASS  the tty is cooked again after exit
+[ 11.20s] PASS  no 'could not be read' error at the end of the run
+[ 11.20s] === a child that will not stop: the budget has to be the answer ===
+[ 14.38s] PASS  the wedged child is up
+[ 16.72s] PASS  the app exits even with a child that ignores everything
+[ 16.72s] PASS  exit code is 0
+[ 16.72s] PASS  the exit stayed inside the 8.0s budget
+[ 16.79s] PASS  the wedged child was killed, not left behind
+[ 16.79s] PASS  the tty is cooked again after exit
+[ 16.79s] exited 2.34s after the quit key against a child that ignored SIGTERM
+[ 16.79s] === the whole mode set: alt screen, mouse, bracketed paste, hidden cursor ===
+[ 18.81s] PASS  the app boots with every mode on
+[ 18.81s] PASS  the app is in the alternate screen
+[ 18.81s] PASS  all three mouse modes are switched on
+[ 18.81s] PASS  bracketed paste is on
+[ 18.81s] PASS  the app hides the cursor for its own frames
+[ 19.12s] PASS  the app exits on Ctrl-Q with the whole mode set
+[ 19.12s] PASS  exit code is 0
+[ 19.12s] PASS  alt-screen quit: alt_screen was switched on
+[ 19.12s] PASS  alt-screen quit: alt_screen left exactly once
+[ 19.12s] PASS  alt-screen quit: alt_screen is off at the end
+[ 19.12s] PASS  alt-screen quit: cursor_hidden was switched on
+[ 19.12s] PASS  alt-screen quit: cursor_hidden is off at the end
+[ 19.12s] PASS  alt-screen quit: mouse_report was switched on
+[ 19.12s] PASS  alt-screen quit: mouse_report left exactly once
+[ 19.12s] PASS  alt-screen quit: mouse_report is off at the end
+[ 19.12s] PASS  alt-screen quit: mouse_drag was switched on
+[ 19.12s] PASS  alt-screen quit: mouse_drag left exactly once
+[ 19.12s] PASS  alt-screen quit: mouse_drag is off at the end
+[ 19.12s] PASS  alt-screen quit: mouse_sgr was switched on
+[ 19.12s] PASS  alt-screen quit: mouse_sgr left exactly once
+[ 19.12s] PASS  alt-screen quit: mouse_sgr is off at the end
+[ 19.12s] PASS  alt-screen quit: bracketed_paste was switched on
+[ 19.12s] PASS  alt-screen quit: bracketed_paste left exactly once
+[ 19.12s] PASS  alt-screen quit: bracketed_paste is off at the end
+[ 19.12s] PASS  alt-screen quit: the cursor is visible at the end
+[ 19.12s] PASS  mouse modes are silent: nothing left to report a drag into the shell
+[ 19.12s] PASS  the app left the alternate screen
+[ 19.12s] PASS  the alternate-screen leave is the last thing the app wrote
+[ 19.12s] PASS  alt-screen quit: no cursor query after the hand-back
+[ 19.12s] PASS  the tty is cooked again after exit
+[ 19.12s] exited 0.31s after the quit key, code 0
+[ 19.12s] === a full-screen child killed while it holds the screen ===
+[ 23.36s] PASS  the run is on the alternate screen while the child holds it — the frame's screen, not the child's
+[ 25.79s] PASS  the app exits on Ctrl-Q while the child still holds the screen
+[ 25.79s] PASS  exit code is 0
+[ 25.79s] PASS  not in the alternate screen after the exit
+[ 25.79s] PASS  the alternate screen was left exactly once
+[ 25.79s] PASS  the child's `?1049h` never reached the wire: one enter for the run, the app's own
+[ 25.79s] PASS  no pane erase is written on the way out: the inline pane is gone, and so is its erase
+[ 25.79s] PASS  no cursor query anywhere: nothing on this path has to ask where the cursor is
+[ 25.79s] PASS  the run ends on the app's own leave: nothing after the alternate screen
+[ 25.79s] PASS  child-held screen: alt_screen was switched on
+[ 25.79s] PASS  child-held screen: alt_screen left exactly once
+[ 25.79s] PASS  child-held screen: alt_screen is off at the end
+[ 25.79s] PASS  child-held screen: cursor_hidden was switched on
+[ 25.79s] PASS  child-held screen: cursor_hidden is off at the end
+[ 25.79s] PASS  child-held screen: mouse_report was switched on
+[ 25.79s] PASS  child-held screen: mouse_report left exactly once
+[ 25.79s] PASS  child-held screen: mouse_report is off at the end
+[ 25.79s] PASS  child-held screen: mouse_drag was switched on
+[ 25.79s] PASS  child-held screen: mouse_drag left exactly once
+[ 25.79s] PASS  child-held screen: mouse_drag is off at the end
+[ 25.79s] PASS  child-held screen: mouse_sgr was switched on
+[ 25.79s] PASS  child-held screen: mouse_sgr left exactly once
+[ 25.79s] PASS  child-held screen: mouse_sgr is off at the end
+[ 25.79s] PASS  child-held screen: no bracketed_paste leave for a mode nothing switched on
+[ 25.79s] PASS  child-held screen: the cursor is visible at the end
+[ 25.79s] PASS  the tty is cooked again after exit
+[ 25.79s]   tee'd modes still on at exit: none
+[ 25.79s] exited 2.43s after the quit key, code 0
+[ 25.79s] === the whole mode set: SIGTERM with the ledger holding all ===
+[ 28.00s] PASS  the app is up before SIGTERM
+[ 28.00s] PASS  the modes asked for are actually on (all)
+[ 28.32s] PASS  the app leaves on SIGTERM by itself
+[ 28.32s] PASS  exit code is 0 after SIGTERM
+[ 28.32s] PASS  the SIGTERM exit stayed inside the budget
+[ 28.32s] PASS  SIGTERM exit: alt_screen was switched on
+[ 28.32s] PASS  SIGTERM exit: alt_screen left exactly once
+[ 28.32s] PASS  SIGTERM exit: alt_screen is off at the end
+[ 28.32s] PASS  SIGTERM exit: cursor_hidden was switched on
+[ 28.32s] PASS  SIGTERM exit: cursor_hidden is off at the end
+[ 28.32s] PASS  SIGTERM exit: mouse_report was switched on
+[ 28.32s] PASS  SIGTERM exit: mouse_report left exactly once
+[ 28.32s] PASS  SIGTERM exit: mouse_report is off at the end
+[ 28.32s] PASS  SIGTERM exit: mouse_drag was switched on
+[ 28.32s] PASS  SIGTERM exit: mouse_drag left exactly once
+[ 28.32s] PASS  SIGTERM exit: mouse_drag is off at the end
+[ 28.32s] PASS  SIGTERM exit: mouse_sgr was switched on
+[ 28.32s] PASS  SIGTERM exit: mouse_sgr left exactly once
+[ 28.32s] PASS  SIGTERM exit: mouse_sgr is off at the end
+[ 28.32s] PASS  SIGTERM exit: bracketed_paste was switched on
+[ 28.32s] PASS  SIGTERM exit: bracketed_paste left exactly once
+[ 28.32s] PASS  SIGTERM exit: bracketed_paste is off at the end
+[ 28.32s] PASS  SIGTERM exit: the cursor is visible at the end
+[ 28.32s] PASS  SIGTERM exit: no cursor query after the hand-back
+[ 28.32s] PASS  the tty is cooked again after SIGTERM
+[ 28.32s] exited 0.31s after SIGTERM, code 0
+[ 28.32s] === the plain inline run: SIGHUP with the ledger holding the default modes ===
+[ 30.53s] PASS  the app is up before SIGHUP
+[ 30.53s] PASS  the modes asked for are actually on (None)
+[ 30.85s] PASS  the app leaves on SIGHUP by itself
+[ 30.85s] PASS  exit code is 0 after SIGHUP
+[ 30.85s] PASS  the SIGHUP exit stayed inside the budget
+[ 30.85s] PASS  SIGHUP exit: alt_screen was switched on
+[ 30.85s] PASS  SIGHUP exit: alt_screen left exactly once
+[ 30.85s] PASS  SIGHUP exit: alt_screen is off at the end
+[ 30.85s] PASS  SIGHUP exit: cursor_hidden was switched on
+[ 30.85s] PASS  SIGHUP exit: cursor_hidden is off at the end
+[ 30.85s] PASS  SIGHUP exit: mouse_report was switched on
+[ 30.85s] PASS  SIGHUP exit: mouse_report left exactly once
+[ 30.85s] PASS  SIGHUP exit: mouse_report is off at the end
+[ 30.85s] PASS  SIGHUP exit: mouse_drag was switched on
+[ 30.85s] PASS  SIGHUP exit: mouse_drag left exactly once
+[ 30.85s] PASS  SIGHUP exit: mouse_drag is off at the end
+[ 30.85s] PASS  SIGHUP exit: mouse_sgr was switched on
+[ 30.85s] PASS  SIGHUP exit: mouse_sgr left exactly once
+[ 30.85s] PASS  SIGHUP exit: mouse_sgr is off at the end
+[ 30.85s] PASS  SIGHUP exit: no bracketed_paste leave for a mode nothing switched on
+[ 30.85s] PASS  SIGHUP exit: the cursor is visible at the end
+[ 30.85s] PASS  SIGHUP exit: no cursor query after the hand-back
+[ 30.85s] PASS  the tty is cooked again after SIGHUP
+[ 30.85s] exited 0.31s after SIGHUP, code 0
+[ 30.85s] === a panic inside the draw: the ledger still leaves everything once ===
+[ 31.20s] PASS  the app is gone after panicking in the frame
+[ 31.20s] PASS  the exit code says something failed
+[ 31.20s] PASS  it panicked where the fault injector put it
+[ 31.20s] PASS  the frame did get as far as switching the modes on
+[ 31.20s] PASS  panic in draw: alt_screen was switched on
+[ 31.20s] PASS  panic in draw: alt_screen left exactly once
+[ 31.20s] PASS  panic in draw: alt_screen is off at the end
+[ 31.20s] PASS  panic in draw: cursor_hidden was switched on
+[ 31.20s] PASS  panic in draw: cursor_hidden is off at the end
+[ 31.20s] PASS  panic in draw: mouse_report was switched on
+[ 31.20s] PASS  panic in draw: mouse_report left exactly once
+[ 31.20s] PASS  panic in draw: mouse_report is off at the end
+[ 31.20s] PASS  panic in draw: mouse_drag was switched on
+[ 31.20s] PASS  panic in draw: mouse_drag left exactly once
+[ 31.20s] PASS  panic in draw: mouse_drag is off at the end
+[ 31.20s] PASS  panic in draw: mouse_sgr was switched on
+[ 31.20s] PASS  panic in draw: mouse_sgr left exactly once
+[ 31.20s] PASS  panic in draw: mouse_sgr is off at the end
+[ 31.20s] PASS  panic in draw: bracketed_paste was switched on
+[ 31.20s] PASS  panic in draw: bracketed_paste left exactly once
+[ 31.20s] PASS  panic in draw: bracketed_paste is off at the end
+[ 31.20s] PASS  panic in draw: the cursor is visible at the end
+[ 31.20s] PASS  panic in draw: no cursor query after the hand-back
+[ 31.20s] PASS  the tty is cooked again after the panic
+[ 31.20s] exited code 101 with the whole mode set held at the moment of the panic
+[ 31.21s] 171/171 checks passed

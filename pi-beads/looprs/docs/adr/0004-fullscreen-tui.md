@@ -715,7 +715,8 @@ inline pane:
   forces) against the same 1.5 ms budget, and carries two non-vacuity checks so a
   run that did nothing cannot pass for a measured one. The control inverted: the
   pre-pdl.4 binary fails it with **26 partial erases, 1.83–3.58 ms holes**
-  (`spikes/results/flash-e2e-pdl4-control.log`); the migrated binary passes 4/4.
+  (`spikes/results/flash-e2e-pdl4-control.log`); the migrated binary passes
+  **4/4** (`spikes/results/flash-e2e.log`).
 * `shutdown_e2e.py` — the erase-anchored checks ("the live pane is erased", "the
   live tail landed above the erase line", "one closing newline after the erase")
   measured a pane that no longer exists. In their place: nothing is painted before
@@ -723,7 +724,10 @@ inline pane:
   run; the answer was painted on the screen the frame left; and **nothing at all
   is written after the `?1049l`** — the closing newline belonged to the inline
   pane's last row, and after the leave the cursor is the user's prompt's cursor.
-  149 → 153 checks, all passing.
+  149 (`spikes/results/shutdown-e2e-pdl3.log`) → 153 checks
+  (`spikes/results/shutdown-e2e.log`), all passing; the same spike on the tree
+  this site documents prints 171
+  (`spikes/results/shutdown-e2e-00u23.log`).
 * `status_e2e.py` — "nothing was flushed to the alt screen" asserted the old
   premise head-on. It now asserts the app took the alternate screen **exactly
   once**, because a second `?1049h` mid-run re-saves the user's own contents as
@@ -901,7 +905,7 @@ Rule → measurement map, so no rule rests on an adjective:
 
 | Rule | Measurement |
 | --- | --- |
-| R1, R3, R4 | `?1049` parks and restores screen + cursor; the ledger hands every mode back **exactly once** across quit / `LOOPRS_MODES=all` / `SIGTERM` / `SIGHUP` / panic-in-draw / killed-child-holds-the-screen — ADR-0006: **149/149**, against **85/112** for the same spike on the pre-ticket binary (`shutdown-e2e-pdl3.log`, `…-control.log`) |
+| R1, R3, R4 | `?1049` parks and restores screen + cursor; the ledger hands every mode back **exactly once** across quit / `LOOPRS_MODES=all` / `SIGTERM` / `SIGHUP` / panic-in-draw / killed-child-holds-the-screen — ADR-0006: **149/149** (`spikes/results/shutdown-e2e-pdl3.log`), against **85/112** for the same spike on the pre-ticket binary (`spikes/results/shutdown-e2e-pdl3.log`, `spikes/results/shutdown-e2e-pdl3-control.log`); on the tree this site documents, **171/171** (`spikes/results/shutdown-e2e-00u23.log`) |
 | R6, R8, R20, R21 | `clipboard-cost.log`: pbcopy write 8.9–9.7 ms, read-back 9.7–10.7 ms, byte-exact at 128 B → 1 MiB |
 | R6, R7, R9, R10 | `terminal-matrix.md`: WezTerm OSC 52 byte-exact at every size to **1 MiB**, **0.01 s**, no prompt; Apple Terminal **0 B in 6.01 s**; SSH remote→local **4,117 B whole in 0.13 s**; read-back query answered by nobody (`bytes_back=0`) |
 | R7 | `mouse-clipboard-ssh.log`: the hop carries the bytes; without a far-side pty **21/21 bytes arrive and 0 events decode** — the transport is not the problem, the tty is |

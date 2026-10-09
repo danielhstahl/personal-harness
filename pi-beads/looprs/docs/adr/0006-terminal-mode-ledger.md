@@ -267,8 +267,10 @@ the bytes are the contract:
 * `a_signal_sent_to_this_process_is_received` — the handler is wired to what the loop awaits.
 
 The pty proof extends `spikes/shutdown_e2e.py` rather than adding a file, as the ticket
-asked. It now runs 8 scenarios and 149 checks
-(`spikes/results/shutdown-e2e-pdl3.log`), and the spike **keeps its own ledger** of the
+asked. It ran 8 scenarios and 149 checks at `pdl.3`
+(`spikes/results/shutdown-e2e-pdl3.log`); the same spike on the tree this site now
+documents prints 171 (`spikes/results/shutdown-e2e-00u23.log`), and the spike **keeps its
+own ledger** of the
 bytes on the wire (`ModeTrace`): the app's ledger and the driver's ledger are independent,
 which is the only way "we handed it all back" can be a check rather than a claim. There is
 no terminal emulator behind a pty anyway, so a real `DECRQM` would go unanswered — what is
@@ -309,11 +311,13 @@ LOOPRS_BIN=/tmp/base-target/debug/looprs python3 spikes/shutdown_e2e.py \
 Against the new binary: `viewport_e2e` 16/16, `status_e2e` 20/20, `cancel_e2e` 19/19,
 `bash_e2e` 20/20, `cargo test` green (440 tests, 3 ignored).
 
-`fullscreen_e2e` is **18/21** — and 18/21 against the pre-ticket binary too, the same three
+`fullscreen_e2e` is **18/21**<!-- spike-count: unverified 18/21 fullscreen_e2e — this ADR's run was never captured, and the spike has since been rewritten to 70/70 (spikes/results/fullscreen-e2e.log) --> — and 18/21 against the pre-ticket binary too, the same three
 vim-keystroke needles. Nothing in this ticket touches the keystroke path; the numbers are quoted
 side by side rather than rounded away.
 
-`flash_e2e` is **0/3** — 25 reshapes where ≤19.5 are allowed, worst hole ~3.6 ms against a
+`flash_e2e` is **0/3** (`spikes/results/flash-e2e-control.log` prints 0/3; the specific run
+this paragraph timed was never captured, which is why its millisecond figures cannot be checked
+against a log) — 25 reshapes where ≤19.5 are allowed, worst hole ~3.6 ms against a
 1.5 ms budget. That is **not this ticket**: it fails with identical numbers against the
 pre-ticket binary (`LOOPRS_BIN=/tmp/base-target/debug/looprs python3 spikes/flash_e2e.py`
 → 25 reshapes, 3.54 ms), so it regressed after the flash fix and before this branch, and

@@ -6,10 +6,11 @@
 #   ./scripts/docs_check.sh                # the gate
 #   ./scripts/docs_check.sh --fix-keymap  # regenerate docs/guide/keymap.md's tables
 #   ./scripts/docs_check.sh --list-knobs  # every LOOPRS_* the code reads, with file:line
+#   ./scripts/docs_check.sh --list-captures  # every spike capture, its total, which is current
 #
 # Runs in well under a second, needs no network and no cargo, and is a step of
-# ./scripts/check.sh. See the Python file for what the three checks are and why
-# each one is worth a gate.
+# ./scripts/check.sh. See the Python file for what the checks are and why each one
+# is worth a gate.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if ! command -v python3 >/dev/null 2>&1; then

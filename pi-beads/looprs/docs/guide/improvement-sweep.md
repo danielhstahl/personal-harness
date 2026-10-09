@@ -84,7 +84,7 @@ Four shapes recur, and the fifth is the one people miss:
 * **a comment or doc that no longer matches the code** — the header block that
   documents a filename casing the program does not produce (`looprs-00u.21`);
 * **a doc that claims an enforcement that does not exist** — "this diagram is
-  checked by the docs gate", where the gate has three checks and none of them is
+  checked by the docs gate", where the gate then had three checks and none of them is
   that (`looprs-00u.22`). This is the most expensive kind, because a false
   enforcement claim stops the next reader from verifying the thing it describes.
 

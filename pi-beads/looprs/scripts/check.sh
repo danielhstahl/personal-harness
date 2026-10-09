@@ -21,8 +21,11 @@
 #         `unused_dependencies = "allow"` blanket could be deleted rather than
 #         argued about.
 #   7. `scripts/docs_check.sh` — no dead link or orphan page, every `LOOPRS_*` the
-#         code reads is documented, no two defaults disagree, and the keymap tables
-#         still match `CHORD_TABLE`
+#         code reads is documented, no two defaults disagree, the keymap tables
+#         still match `CHORD_TABLE`, and every spike check count written into prose
+#         matches a committed capture in `spikes/results/` (looprs-00u.23: three
+#         pages said "149 checks" while the tree printed 171, and the 171 run was
+#         never captured, so nothing in the repo could contradict the page)
 #
 # The order is deliberate: fmt and clippy are seconds-long and explain themselves, so
 # they run before the ~20s test suite rather than after it. Step 7 runs last for the
@@ -77,7 +80,7 @@ python3 "$(dirname "${BASH_SOURCE[0]}")/dead_audit.py" --gate
 echo "==> dependency-surface audit"
 python3 "$(dirname "${BASH_SOURCE[0]}")/dep_audit.py" --gate
 
-echo "==> docs rot gate (links, knob coverage, keymap coverage)"
+echo "==> docs rot gate (links, knob coverage, keymap coverage, measurement claims)"
 "$(dirname "${BASH_SOURCE[0]}")/docs_check.sh"
 
 echo

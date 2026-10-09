@@ -351,8 +351,8 @@ they can be re-captured and diffed):
 | `viewport_e2e.py` | **16/16** |
 | `cancel_e2e.py` | **19/19** |
 | `status_e2e.py` | **20/20** |
-| `shutdown_e2e.py` | **25/26** — `exactly one closing newline after the erase` fails **identically on the pre-change control** (`HEAD` built to its own target dir: 25/26, same check). Pre-existing, unrelated to shell output; not chased here and not hidden |
-| `flash_e2e.py` | **0/3** (worst erase→content hole 8.80–9.26 ms) — the pre-change control fails the same way at **9.44 ms**. Pre-existing, same magnitude, not introduced by this ticket. Recorded rather than fixed: it is a frame-scheduling problem in the inline viewport's erase/paint split, which looprs-pdl.4 replaces wholesale |
+| `shutdown_e2e.py` | **25/26** (`spikes/results/shutdown-e2e-at-pdl5.log`) — `exactly one closing newline after the erase` fails **identically on the pre-change control** (`HEAD` built to its own target dir: 25/26, same check). Pre-existing, unrelated to shell output; not chased here and not hidden |
+| `flash_e2e.py` | **0/3** (`spikes/results/flash-e2e-at-pdl5.log`; worst erase→content hole 8.80–9.26 ms) — the pre-change control fails the same way at **9.44 ms**. Pre-existing, same magnitude, not introduced by this ticket. Recorded rather than fixed: it is a frame-scheduling problem in the inline viewport's erase/paint split, which looprs-pdl.4 replaces wholesale |
 
 Both pre-existing failures are committed as evidence: `spikes/results/flash-e2e-at-pdl5.log`
 and `spikes/results/shutdown-e2e-at-pdl5.log`, taken against this binary, alongside the
@@ -410,7 +410,8 @@ will look rather than left for them to rediscover mid-migration.
   for that yet — it is a candidate for a `debug_assert` in whoever next owns that pair.
 - **flash / shutdown spike failures** recorded above as pre-existing; both die with the inline
   viewport in pdl.4. **Outcome after `pdl.4`:** both are gone. `shutdown_e2e.py` passes
-  **153/153** with its erase-anchored checks replaced by alternate-screen shape checks, and
-  `flash_e2e.py` passes **4/4** with its premise rewritten — zero partial erases on the wire,
-  with the pre-pdl.4 binary now failing that check at **26 erases / 1.83–3.58 ms**
+  **153/153** (`spikes/results/shutdown-e2e.log`) with its erase-anchored checks replaced by
+  alternate-screen shape checks, and `flash_e2e.py` passes **4/4**
+  (`spikes/results/flash-e2e.log`) with its premise rewritten — zero partial erases on the
+  wire, with the pre-pdl.4 binary now failing that check at **26 erases / 1.83–3.58 ms**
   (`spikes/results/flash-e2e-pdl4-control.log`). See the spike table in `docs/testing.md`.

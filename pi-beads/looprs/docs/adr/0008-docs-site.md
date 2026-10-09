@@ -245,7 +245,11 @@ from `SUMMARY.md`, so a page cannot exist outside the tree.
 * the generator is now *ours* — **1,136 lines of Rust** in
   [`docs/tools/gen/src/main.rs`](../../docs/tools/gen/src/main.rs), plus
   **519 lines** of gate in
-  [`scripts/docs_check.py`](../../scripts/docs_check.py), which no upstream
+  [`scripts/docs_check.py`](../../scripts/docs_check.py) at this ADR's writing —
+  `looprs-00u.23`'s measurement-claim check has grown it since, and the number to
+  quote is `wc -l` on the file rather than this sentence, because a line count kept
+  in prose is the exact shape of number this ticket is about
+  — which no upstream
   maintains. That is a real cost and it is paid knowingly: ~80% of the generator is
   the two jobs a generic generator gets wrong for this corpus (outward path mapping
   and GitHub-compatible heading slugs), the rest is HTML chrome, and both of the
@@ -285,3 +289,15 @@ from `SUMMARY.md`, so a page cannot exist outside the tree.
    generated between markers; editing them by hand is overwritten and, if the gate
    is bypassed, undetectable — so the gate is the rule, and `--fix-keymap` is the
    only sanctioned way to change them.
+8. **No check count in prose that no capture agrees with.** A number like `149/149`
+   is a claim about one run, not a property of the tree, so it has to resolve to a
+   committed capture under `spikes/results/` — the newest capture of the spike it
+   names, or a capture named in the same sentence. A count whose run was never
+   captured says so in the page (`<!-- spike-count: unverified N/M <spike> — why -->`),
+   and the marker is checked in both directions: a claim with no capture and no
+   marker fails, and a marker that no longer backs a claim fails. Added after
+   `looprs-00u.23`: three pages quoted `shutdown_e2e`'s 149 checks
+   (`spikes/results/shutdown-e2e-pdl3.log`, the count at `pdl.3`) while the tree
+   printed 171 (`spikes/results/shutdown-e2e-00u23.log` is now committed, and the
+   three pages name their captures), and before this check nothing in the repo could
+   have contradicted them.

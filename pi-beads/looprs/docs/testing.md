@@ -37,8 +37,10 @@ multi-process, three-backend TUI without a model, a board, or a terminal.
 7. `scripts/docs_check.sh` — the docs rot gate: no dead internal link, no page
    outside the site tree, every `LOOPRS_*` the code reads is in the
    [configuration reference](guide/configuration.md), no two pages state a
-   different default for one knob, and the
-   [keymap](guide/keymap.md) tables still match `CHORD_TABLE`
+   different default for one knob, the
+   [keymap](guide/keymap.md) tables still match `CHORD_TABLE`, and every spike
+   check count written into prose matches a committed capture in
+   `spikes/results/` (looprs-00u.23)
 
 The same gate is declared three ways, because each one catches a different kind of
 person:
@@ -53,10 +55,20 @@ The docs step is new with the docs site and follows the same shape on purpose: t
 half a prose review catches is not checkable, but a dead link, an undocumented knob
 and a drifted table all are, and a docs rule that is not checked has a half-life of
 about a month. `./scripts/docs_check.sh` runs in under a second, needs no network
-and no cargo, and its three checks are described in
+and no cargo, and its four checks are described in
 [ADR-0008](adr/0008-docs-site.md) and in
 [the contributor guide](guide/contributing.md). The generator itself is
 `./scripts/docs.sh` (`build` / `serve` / `check`).
+
+The fourth check is the newest and answers a mistake this page made: it restated a
+spike's check count in three places, the spike grew, and the prose stayed where it
+was. A count in a page is now read as a claim about a *run*, and the run's home is a
+committed capture — `171/171` is true of the tree while
+`spikes/results/shutdown-e2e-00u23.log` is in it, and stops being true when the
+next capture says something else. Take captures with
+[`./scripts/capture.sh`](../scripts/capture.sh), which heads the log with the UTC
+time, the tree rev and the command that produced it, and commit the fresh capture in
+the same commit that changed the count.
 
 CI runs `scripts/check.sh` (`.github/workflows/looprs-gate.yml`, at the repo root,
 path-filtered to `pi-beads/looprs/**`).
@@ -489,7 +501,7 @@ screen with the terminal's stale save.
 | the tee reports it | `app::tests` | `a_teed_alt_screen_is_a_screen_we_owe_the_terminal_back`, `a_screen_switch_that_was_never_teed_owes_nothing` |
 | the command boundary | `session::bash::tests` | `quitting_while_a_full_screen_program_holds_the_screen_leaves_the_alt_screen` |
 | the signals | `signals::tests` | `the_signals_install_inside_a_runtime`, `a_signal_sent_to_this_process_is_received` |
-| the real pty | `spikes/shutdown_e2e.py` | 8 scenarios. The count is the spike's own printed total and the captures in `spikes/results/shutdown-e2e-*.log` are the numbers to quote — the 149/149 of the `pdl.12` capture, and the 85/112 control whose 27 failures were the ticket. This cell points at logs rather than a count on purpose: the tree now prints more than 149 and no capture of that exists yet (`looprs-00u.23`) |
+| the real pty | `spikes/shutdown_e2e.py` | 8 scenarios, **171/171** on the tree this page documents — `spikes/results/shutdown-e2e-00u23.log`, taken by [`./scripts/capture.sh`](../scripts/capture.sh) so the log names the rev it ran on. Quote the capture and not a remembered count: the `pdl.3` run was 149/149 (`spikes/results/shutdown-e2e-pdl3.log`), and the 85/112 whose 27 failures were the ticket is `spikes/results/shutdown-e2e-pdl3-control.log`. Until `looprs-00u.23` this cell quoted a count that matched nothing in the tree, which is what the gate now refuses |
 
 The spike keeps its **own** ledger of the wire (`ModeTrace`) instead of reading the app's:
 "not in the alternate screen after exit" is not something the app may be asked at exit —
