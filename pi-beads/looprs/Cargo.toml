@@ -29,6 +29,7 @@ portable-pty = "0.9.0"
 reqwest = "0.13.5"
 
 [dev-dependencies]
+strip-ansi-escapes = "0.2"
 # examples/spike_bash.rs (the ADR-0001 spike) uses portable-pty, which is now a
 # regular dependency, so there is nothing left to declare here.
 
