@@ -277,13 +277,36 @@ impl BdList {
     }
 }
 
-/// Run `bd` with args, bounded, with stdout and stderr both captured.
+/// A `bd` that ran, with all three of its answers kept whatever they were.
 ///
-/// The single place that touches `Stdio`, so "stderr is never discarded" is a
-/// property of one function rather than a habit. stdout is returned only on exit
-/// code 0; anything else is a [`BdError`] that carries stderr with it.
-async fn run(bin: &str, args: &[&str]) -> Result<Vec<u8>, BdError> {
-    let args_joined = args.join(" ");
+/// This exists because "stdout only, and only on success" is the wrong shape for
+/// the events journal probe: `bd events tail` answers a *refusal* with a JSON
+/// object on stdout and a non-zero exit, and answers a **success** with an
+/// explanatory note on stderr. A wrapper that throws away one of the three can
+/// see neither, and "the journal is disabled" and "bd is broken" are the last
+/// two things in this file that may be confused (looprs-037).
+struct RawRun {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    code: Option<i32>,
+    success: bool,
+}
+
+impl RawRun {
+    fn stdout_text(&self) -> String {
+        String::from_utf8_lossy(&self.stdout).to_string()
+    }
+    fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(&self.stderr).to_string()
+    }
+}
+
+/// Spawn, await under [`BD_TIMEOUT`], and hand back whatever came out.
+///
+/// Fails only on the two things that mean "there is no answer at all": the
+/// process could not be started, or it never finished. A non-zero exit is an
+/// *answer* and comes back in the [`RawRun`] for the caller to read.
+async fn run_raw(bin: &str, args: &[&str]) -> Result<RawRun, BdError> {
     let spawned = Command::new(bin)
         .args(args)
         .env("BD_JSON_ENVELOPE", "1")
@@ -310,7 +333,7 @@ async fn run(bin: &str, args: &[&str]) -> Result<Vec<u8>, BdError> {
         Err(_) => {
             return Err(BdError::Timeout {
                 bin: bin.to_string(),
-                args: args_joined,
+                args: args.join(" "),
             });
         }
         Ok(Err(e)) => {
@@ -322,12 +345,29 @@ async fn run(bin: &str, args: &[&str]) -> Result<Vec<u8>, BdError> {
         Ok(Ok(out)) => out,
     };
 
-    if !out.status.success() {
+    Ok(RawRun {
+        stdout: out.stdout,
+        stderr: out.stderr,
+        code: out.status.code(),
+        success: out.status.success(),
+    })
+}
+
+/// Run `bd` with args, bounded, with stdout and stderr both captured.
+///
+/// The single place that touches `Stdio`, so "stderr is never discarded" is a
+/// property of one function rather than a habit. stdout is returned only on exit
+/// code 0; anything else is a [`BdError`] that carries stderr with it.
+async fn run(bin: &str, args: &[&str]) -> Result<Vec<u8>, BdError> {
+    let args_joined = args.join(" ");
+    let out = run_raw(bin, args).await?;
+
+    if !out.success {
         return Err(BdError::Failed {
             bin: bin.to_string(),
             args: args_joined,
-            code: out.status.code(),
-            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+            code: out.code,
+            stderr: out.stderr_text(),
         });
     }
     Ok(out.stdout)
@@ -382,6 +422,222 @@ pub async fn board_read_with(bin: &str) -> Result<Vec<Bead>, BdError> {
         &["--readonly", "list", "--all", "--limit", "0", "--json"],
     )
     .await
+}
+
+// ─────────────────────── the events journal ───────────────────────
+
+/// What `bd` puts in every journal record that this crate cares about.
+///
+/// Only `seq` is read. Deliberately: each record also carries the **whole issue
+/// as it stood after the mutation** (`{"seq":..,"op":..,"issue":{…}}`), which at
+/// a few hundred bytes to a few kilobytes a row is the payload this crate is
+/// trying *not* to pay for on a five-second timer. Serde skips the rest.
+#[derive(Debug, Deserialize)]
+struct JournalRecordSeq {
+    seq: i64,
+}
+
+/// `bd`'s refusal when a checkpoint has been pruned away, verbatim shape:
+///
+/// ```json
+/// {"code":"events_journal_truncated","error":"…","floor":150,"head":202,
+///  "schema_version":1,"since":0}
+/// ```
+#[derive(Debug, Deserialize)]
+struct JournalTruncated {
+    code: String,
+    #[serde(default)]
+    floor: i64,
+    #[serde(default)]
+    head: i64,
+}
+
+/// The code string `bd` uses for the one journal failure a consumer can recover
+/// from on its own, because the answer names where to resume.
+const JOURNAL_TRUNCATED: &str = "events_journal_truncated";
+
+/// What a journal probe found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JournalProbe {
+    /// The `seq` of every record newer than the `since` we asked with, ascending.
+    /// **Empty is an answer, not a failure** — it means nothing was mutated since
+    /// that point. This is the one place in this file where an empty response is
+    /// read as "nothing" rather than as [`BdError::Malformed`], and it is the
+    /// whole reason the journal is worth probing: see the note on
+    /// [`journal_probe_with`].
+    pub seqs: Vec<i64>,
+    /// `bd` said the events journal is **disabled for this workspace** (it puts
+    /// that on stderr even on a successful, empty read). Nothing new will ever
+    /// arrive here, which is not an error but *is* a fact the caller has to know
+    /// so it can keep refreshing the board some other way.
+    pub disabled: bool,
+}
+
+impl JournalProbe {
+    /// Nothing newer than the watermark.
+    pub fn is_quiet(&self) -> bool {
+        self.seqs.is_empty()
+    }
+
+    /// The highest seq this probe covered — the watermark to adopt once the
+    /// change has been reflected in a full board read.
+    pub fn head(&self) -> Option<i64> {
+        self.seqs.last().copied()
+    }
+
+    /// Whether the probe filled its `--limit`, i.e. there may be more records
+    /// behind it and this consumer is still behind the head of the journal.
+    pub fn hit_limit(&self, limit: i64) -> bool {
+        limit > 0 && self.seqs.len() as i64 >= limit
+    }
+}
+
+/// How a journal probe can come back.
+///
+/// Its own error type rather than a [`BdError`] arm, because a journal failure is
+/// **not** a board failure and must never reach the band's failure table by
+/// accident: `BoardRead` has no arm for "the change detector broke", and it
+/// should not. Every variant here means one thing to the poller — *go and read the
+/// board* — and two of them additionally say where to resume from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JournalError {
+    /// Our checkpoint is below the retained window, so the records between it and
+    /// the floor are gone. Carries what `bd` named: `floor` (oldest retained seq)
+    /// and `head` (highest ever assigned), which is exactly enough to
+    /// re-baseline against a fresh full read.
+    Truncated { since: i64, floor: i64, head: i64 },
+    /// The probe could not be answered at all — `bd` is missing, wedged, or
+    /// said something this build cannot read. Either way: unknown, and unknown is
+    /// never "nothing changed".
+    Unusable(BdError),
+}
+
+impl std::fmt::Display for JournalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JournalError::Truncated { since, floor, head } => write!(
+                f,
+                "events journal truncated: checkpoint {since} is below the retained window \
+                 [{floor}..{head}]"
+            ),
+            JournalError::Unusable(err) => write!(f, "events journal unreadable: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for JournalError {}
+
+/// `bd --readonly events tail --since <since> --limit <limit> --json` — ask the
+/// journal whether anything has been mutated since `since`, **without re-reading
+/// the board**.
+///
+/// This is the cheap half of the board's polling (ADR-0007 §7): measured on this
+/// repo's board at **~0.15 s wall / ~0.09 s CPU** against the full board read's
+/// **~0.45 s / ~0.18 s**, and its cost scales with the number of records since
+/// the watermark rather than with the size of the board — so an idle board costs
+/// the poller a fraction of what a tick used to cost it.
+///
+/// Three things about this read are load-bearing and are the reason the return
+/// type is a struct rather than a `Vec`:
+///
+/// * **Empty means "nothing changed", not "unreadable"** — the opposite of the
+///   rule every other read in this file follows. That inversion is safe only
+///   because a mutation *cannot* be journaled invisibly while the journal is on;
+///   the cases where it *can* (a disabled journal, a `bd dolt pull` whose rows
+///   arrived as data, `bd sql`) are surfaced by the `disabled` flag and by the
+///   poller's periodic full re-read, never silently swallowed.
+/// * **A refusal on stdout is a typed answer.** `--since` below the retention
+///   floor exits non-zero with a JSON object naming `floor` and `head`; that is
+///   [`JournalError::Truncated`] and it is recoverable.
+/// * **`--readonly` still leads**, for the same reason the board read leads with
+///   it: "the band cannot change the board" stays a property of the command line
+///   across every read the band makes.
+pub async fn journal_probe_with(
+    bin: &str,
+    since: i64,
+    limit: i64,
+) -> Result<JournalProbe, JournalError> {
+    let since_arg = since.to_string();
+    let limit_arg = limit.to_string();
+    let args = [
+        "--readonly",
+        "events",
+        "tail",
+        "--since",
+        &since_arg,
+        "--limit",
+        &limit_arg,
+        "--json",
+    ];
+    let out = run_raw(bin, &args).await.map_err(JournalError::Unusable)?;
+    let stdout = out.stdout_text();
+    let stderr = out.stderr_text();
+    // The disabled note arrives on stderr alongside a successful empty read; it
+    // is the difference between "this board is quiet" and "this board will never
+    // report anything here", and only the poller's full re-read keeps the band
+    // honest in the second case.
+    let disabled = stderr.contains("events journal is disabled");
+
+    if !out.success {
+        // A refusal, in the one shape `bd` documents for it. Anything else that
+        // exited non-zero is just a broken `bd`, wrapped so the caller can say
+        // which.
+        if let Some(t) = parse_truncation(&stdout) {
+            return Err(JournalError::Truncated {
+                since,
+                floor: t.floor,
+                head: t.head,
+            });
+        }
+        return Err(JournalError::Unusable(BdError::Failed {
+            bin: bin.to_string(),
+            args: args.join(" "),
+            code: out.code,
+            stderr,
+        }));
+    }
+
+    let seqs = journal_seqs(&stdout).map_err(|e| {
+        // A half-parsable journal is read as *unknown*, never as "no
+        // changes": a probe that quietly reported nothing would freeze the board
+        // on stale rows while the footer said `bd ok`.
+        JournalError::Unusable(BdError::Malformed {
+            bin: bin.to_string(),
+            args: args.join(" "),
+            reason: format!("journal record is not a `{{\"seq\":…}}` line: {e}"),
+            raw: stdout.clone(),
+        })
+    })?;
+    Ok(JournalProbe { seqs, disabled })
+}
+
+/// The JSONL body `bd events tail --json` answers with, as seq numbers.
+///
+/// Split out of [`journal_probe_with`] so the one thing that must not be
+/// guessed at — "was that a record, or was that the end of the stream?" — is
+/// testable against a string rather than only against a subprocess.
+fn journal_seqs(raw: &str) -> Result<Vec<i64>, serde_json::Error> {
+    let mut seqs = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        seqs.push(serde_json::from_str::<JournalRecordSeq>(line)?.seq);
+    }
+    Ok(seqs)
+}
+
+/// Parse `bd`'s truncation refusal out of a stdout blob. `None` for any other
+/// payload — including a well-formed JSON object with a different `code`, which
+/// is somebody else's problem and reads as `Unusable`.
+fn parse_truncation(stdout: &str) -> Option<JournalTruncated> {
+    let t: JournalTruncated = serde_json::from_str(stdout.trim()).ok()?;
+    if t.code == JOURNAL_TRUNCATED {
+        Some(t)
+    } else {
+        None
+    }
 }
 
 /// `bd ready --json` — the beads the loop may pick up, in bd's own priority order.
@@ -773,5 +1029,196 @@ mod tests {
         let result = serde_json::from_str::<BdList>(raw_data).unwrap().into_vec();
         assert_eq!(result[0].title, "hello world".to_string());
         assert_eq!(result[0].status(), BeadStatus::Open);
+    }
+
+    // ────────────────────── the events journal probe ──────────────────────
+
+    /// The probe's command line, flag for flag. `--readonly` leads for the same
+    /// reason it leads the board read — "the band cannot change the board" is a
+    /// property of every command line the band runs, not just the big one — and
+    /// the watermark and the batch size are where `bd` expects them.
+    #[tokio::test]
+    async fn the_journal_probe_is_a_readonly_tail_at_the_watermark() {
+        let fakes = Fakes::new(
+            "probe-cmd",
+            crate::testing::PiFake::Started,
+            BdFake::Ok,
+            EMPTY_BOARD,
+        );
+        journal_probe_with(fakes.bd_bin(), 41, 1).await.unwrap();
+        assert_eq!(
+            fakes.bd_log().as_slice(),
+            &["--readonly events tail --since 41 --limit 1 --json".to_string()],
+            "one fixed shape, two numbers in it"
+        );
+    }
+
+    /// **An empty journal answers quiet, not broken.** This is the one place in
+    /// this file where an empty stdout is *not* [`BdError::Malformed`], and it
+    /// is worth writing down as its own test because the rule is the exact
+    /// opposite of the one every other read here follows — and the reason it is
+    /// safe is the poller's sweep, not anything about this response.
+    #[tokio::test]
+    async fn an_empty_journal_is_quiet_and_not_a_parse_failure() {
+        let fakes = Fakes::new(
+            "probe-empty",
+            crate::testing::PiFake::Started,
+            BdFake::Ok,
+            EMPTY_BOARD,
+        );
+        let probe = journal_probe_with(fakes.bd_bin(), 0, 512).await.unwrap();
+        assert!(probe.is_quiet(), "{probe:?}");
+        assert!(!probe.disabled, "an empty journal is not a disabled one");
+        assert_eq!(probe.head(), None);
+    }
+
+    /// Records above the watermark come back as their seq numbers and nothing
+    /// else: the whole issue payload each record carries is skipped, which is
+    /// the economy the probe exists for.
+    #[tokio::test]
+    async fn the_probe_returns_records_above_the_watermark_as_seq_only() {
+        let fakes = Fakes::new(
+            "probe-records",
+            crate::testing::PiFake::Started,
+            BdFake::Ok,
+            EMPTY_BOARD,
+        );
+        // Records with the payload shape real `bd` writes — the full issue after
+        // the mutation — to prove the parser ignores all of it.
+        fakes.set_journal(
+            "{\"seq\":1,\"ts\":\"2026-01-01T00:00:00Z\",\"op\":\"create\",\"issue_id\":\"l-1\",\"actor\":\"a\",\"issue\":{\"id\":\"l-1\",\"title\":\"a big long payload nobody reads\",\"status\":\"open\"}}\n{\"seq\":2,\"op\":\"close\",\"issue_id\":\"l-1\",\"issue\":{\"id\":\"l-1\",\"status\":\"closed\"}}\n{\"seq\":3,\"op\":\"dep_add\",\"issue_id\":\"l-2\",\"dep\":{\"kind\":\"blocks\",\"target\":\"l-1\",\"metadata\":null}}\n",
+        );
+
+        let all = journal_probe_with(fakes.bd_bin(), 0, 10).await.unwrap();
+        assert_eq!(all.seqs, vec![1, 2, 3]);
+        assert_eq!(all.head(), Some(3));
+        assert!(!all.hit_limit(10));
+
+        let since_one = journal_probe_with(fakes.bd_bin(), 1, 10).await.unwrap();
+        assert_eq!(since_one.seqs, vec![2, 3], "the watermark is exclusive");
+
+        let capped = journal_probe_with(fakes.bd_bin(), 0, 2).await.unwrap();
+        assert_eq!(capped.seqs, vec![1, 2]);
+        assert!(capped.hit_limit(2), "a full batch means \"still behind\"");
+        assert!(!capped.hit_limit(10));
+        // …and a 0 limit is "no cap", same as the CLI's.
+        assert!(!capped.hit_limit(0));
+    }
+
+    /// A checkpoint the retention floors pruned away is the one journal failure
+    /// that carries its own repair: `bd` names the floor it could not read below
+    /// and the head it is at, which is enough to re-baseline against a fresh
+    /// board read.
+    #[tokio::test]
+    async fn a_pruned_watermark_is_a_typed_answer_with_the_resume_address_in_it() {
+        let fakes = Fakes::new(
+            "probe-pruned",
+            crate::testing::PiFake::Started,
+            BdFake::Ok,
+            EMPTY_BOARD,
+        );
+        fakes.truncate_journal(5, 99);
+        let err = journal_probe_with(fakes.bd_bin(), 0, 1).await.unwrap_err();
+        assert_eq!(
+            err,
+            JournalError::Truncated {
+                since: 0,
+                floor: 5,
+                head: 99
+            },
+            "{err}"
+        );
+        // Above the floor the same probe is fine again — the refusal is about the
+        // checkpoint, not about the journal.
+        assert!(
+            journal_probe_with(fakes.bd_bin(), 99, 1)
+                .await
+                .unwrap()
+                .is_quiet()
+        );
+    }
+
+    /// A workspace with the journal switched off answers the probe *successfully
+    /// and quietly*, forever, with its explanation on stderr. Carrying that note
+    /// out is what lets the poller say out loud that the band is now riding on
+    /// the sweep rather than on the change.
+    #[tokio::test]
+    async fn a_disabled_journal_says_so_on_stderr_and_the_probe_carries_it() {
+        let fakes = Fakes::new(
+            "probe-disabled",
+            crate::testing::PiFake::Started,
+            BdFake::Ok,
+            EMPTY_BOARD,
+        );
+        fakes.bump_journal(3);
+        fakes.disable_journal(true);
+        let probe = journal_probe_with(fakes.bd_bin(), 0, 10).await.unwrap();
+        assert!(
+            probe.is_quiet(),
+            "a disabled journal says nothing: {probe:?}"
+        );
+        assert!(probe.disabled, "and says why, and we kept the why");
+    }
+
+    /// A probe whose `bd` exited non-zero **without** the truncation shape stays
+    /// `Unusable` and keeps its exit code — a broken `bd` must not be able to
+    /// dress up as a recoverable re-baseline.
+    #[tokio::test]
+    async fn a_refusal_that_is_not_truncation_stays_unusable() {
+        let fakes = Fakes::new(
+            "probe-refused",
+            crate::testing::PiFake::Started,
+            BdFake::Ok,
+            EMPTY_BOARD,
+        );
+        fakes.fail_journal(true);
+        let err = journal_probe_with(fakes.bd_bin(), 0, 1).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                JournalError::Unusable(BdError::Failed { code: Some(5), .. })
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A missing `bd` is `Unusable` carrying `Unavailable` — looprs-037's rule
+    /// reaching the probe the same way it reaches every other read: no answer is
+    /// never the same as an empty answer.
+    #[tokio::test]
+    async fn a_bd_that_cannot_be_run_is_unusable_not_quiet() {
+        let err = journal_probe_with("/nonexistent/looprs/bd-not-installed", 0, 1)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, JournalError::Unusable(BdError::Unavailable { .. })),
+            "{err:?}"
+        );
+    }
+
+    /// The line parser itself, against strings — including the two shapes that
+    /// must be errors rather than a short answer. The fake filters what it will
+    /// emit, so this is the only place a garbage journal line can be tested.
+    #[test]
+    fn journal_lines_are_records_or_errors_never_a_short_read() {
+        assert_eq!(journal_seqs("").unwrap(), Vec::<i64>::new());
+        assert_eq!(journal_seqs("\n  \n").unwrap(), Vec::<i64>::new());
+        assert_eq!(journal_seqs("{\"seq\":7}").unwrap(), vec![7]);
+        assert_eq!(
+            journal_seqs("{\"seq\": 8 }\n{\"seq\":9,\"op\":\"close\"}\n").unwrap(),
+            vec![8, 9]
+        );
+        // Trailing blank lines are the end of the stream, not a bad record.
+        assert_eq!(journal_seqs("{\"seq\":1}\n\n\n").unwrap(), vec![1]);
+        // Not JSON at all, and JSON that is not a record: both errors.
+        assert!(journal_seqs("not a record").is_err());
+        assert!(journal_seqs("{\"seq\":\"seven\"}").is_err());
+        assert!(
+            journal_seqs("{}") // a record with no seq
+                .is_err()
+        );
+        // And an error partway through does not come back as the records that
+        // parsed before it: a partial answer is not an answer.
+        assert!(journal_seqs("{\"seq\":1}\ngarbage\n{\"seq\":2}").is_err());
     }
 }

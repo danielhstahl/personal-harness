@@ -10,12 +10,18 @@ the board right now?" into a glance instead of a transcript read or a second ter
 * **When it is there.** Only while the **Beads** mode is what is on screen. In Bash and in Pi
   the band is **zero rows** — not hidden, not blank, *zero* — so the frame in those modes is
   exactly the frame it was before the board existed.
-* **It is read-only.** Nothing on this path changes a bead. The read is issued as
-  `bd --readonly list --all --limit 0 --json`, so "the board cannot change the board" is a
-  property of the command line rather than of the widget not having a `&mut`.
+* **It is read-only.** Nothing on this path changes a bead. Both of the reads it makes
+  run under `bd --readonly` — the board read (`bd --readonly list --all --limit 0
+  --json`) and the change probe (`bd --readonly events tail --since <watermark>
+  --json`) — so "the board cannot change the board" is a property of the command
+  lines rather than of the widget not having a `&mut`.
 * **It has its own task.** The board is polled in a long-lived tokio task that outlives every
   session: it keeps working while the beads loop is idle, parked on another tab, or being
   respawned, and it never sits on the session's hot path.
+* **Most ticks do not read the board.** Each tick asks `bd`'s events journal what has
+  been *mutated* since the last look, and reads the whole board only when the answer
+  says something did, or when the periodic sweep is due — see
+  [How the band is refreshed](#how-the-band-is-refreshed).
 
 The decision behind all of this — the status mapping and its rationale, the freshness states,
 why one read per tick, what the read costs measured — is
@@ -128,6 +134,48 @@ Two rules hold it together, and both are tested rather than asserted in prose:
   keeps meaning exactly one thing — *these rows are from the last good read* — instead of
   "some of this band is old", which is not a fact anybody can act on.
 
+## How the band is refreshed
+
+Two reads share one tick:
+
+1. **The probe** — `bd --readonly events tail --since <watermark> --json`. `bd`
+   journals every mutation made through its write paths, so this asks the question
+   the poller actually has — *has anything happened?* — for about 40 % of the
+   wall-clock cost of looking at the board (~0.18 s against ~0.46 s on this repo's
+   50-bead board), at a price that does not grow with the board.
+2. **The board** — `bd --readonly list --all --limit 0 --json`, run when the probe
+   reported records, when the sweep is due, or when the probe could not answer.
+   The rows always come from here: the journal is read for **whether**, never for
+   **what**.
+
+So an idle board costs a probe every 5 s instead of a full read, and a board with
+something happening still moves within one tick.
+
+**The sweep, and why it is not optional.** The journal records what *this*
+workspace mutated; it is not a mirror of the board. Changes that arrive by
+`bd dolt pull` or a merge, anything written with `bd sql`, and everything at all
+in a workspace with `events-journal` switched off are invisible to it. So every
+`LOOPRS_KANBAN_RECONCILE_MS` (30 s by default) the band reads the board in full
+whatever the journal said. That interval is the entire cost of trusting the
+journal: those four kinds of change can reach the band up to half a minute late
+instead of five. Everything a loop or a person does through normal `bd` writes
+stays on the 5 s tick.
+
+**What the footer's age means under this.** `bd ok · Ns ago` is the age of the
+**rows** — the last full board read — not the age of the last probe. On a board
+where nothing happens it therefore counts up toward the sweep interval and resets,
+instead of sitting between 0 and 5 s. It is the same promise it always made: *bd
+last told us what is on this board N seconds ago*. A number that refreshed on a
+probe would have the band claiming its rows are three seconds old when they are
+forty.
+
+**When the journal breaks, the band keeps moving and says so once.** A probe that
+cannot be answered is never read as "nothing changed": the poller falls back to
+reading the board that tick and every tick after, and logs the break a single time
+(`grep 'change detector' looprs.log`) rather than every five seconds. Recovery is
+logged too. A journal that has been switched off entirely is called out the same
+way, because a quiet answer that will never say anything is worth knowing about.
+
 ## The knobs
 
 Every `LOOPRS_*` variable the board has, with its default:
@@ -136,7 +184,9 @@ Every `LOOPRS_*` variable the board has, with its default:
 | --- | --- | --- |
 | `LOOPRS_KANBAN` | *(unset — the board is **on**)* | `0` / `off` / `no` / `false` takes the board off entirely: no poller task, no `bd` read, no band. Anything else — including nonsense — leaves it **on**, so a typo in a variable you did not mean to set cannot take a feature away. |
 | `LOOPRS_KANBAN_ROWS` | *(unset — the height function decides)* | A fixed band height: `3`–`8`. `0` = off. `1` or `2` = off, **with a warning** (header + footer leaves no row for a bead, so there is no board to be had). Above `8` is clamped to `8`, with a warning. A pin is a **ceiling on the request**, never a guarantee: a window that cannot hold it gets no band rather than a stub. |
-| `LOOPRS_KANBAN_POLL_MS` | `5000` | The read interval. Values below the `250` ms floor are clamped up with a warning; `0` is refused with a warning pointing at `LOOPRS_KANBAN=0` (a zero interval means "`bd` back-to-back against a database forever"). Unparseable falls back to 5 s with a warning. |
+| `LOOPRS_KANBAN_POLL_MS` | `5000` | The tick. Values below the `250` ms floor are clamped up with a warning; `0` is refused with a warning pointing at `LOOPRS_KANBAN=0` (a zero interval means "`bd` back-to-back against a database forever"). Unparseable falls back to 5 s with a warning. |
+| `LOOPRS_KANBAN_EVENTS` | *(unset — the change detector is **on**)* | `0` / `off` / `no` / `false` takes the detector off: every tick is a full board read, the way this worked before the journal was used, and the journal is never touched. Anything else leaves it on. |
+| `LOOPRS_KANBAN_RECONCILE_MS` | `30000` | How long the poller may go without a full board read, however quiet the journal is. Lower it if this workspace takes changes by `bd dolt pull` / merge and you want them on screen sooner; raise it to lean harder on the journal. `0` means "sweep every tick", which makes the detector pointless — `LOOPRS_KANBAN_EVENTS=0` says that on purpose, and says it better. |
 | `LOOPRS_BD_BIN` | `bd` | Which `bd` binary reads the board — deliberately the same binary the beads loop uses, because two binaries in one run means two boards. |
 
 Nothing here is re-read per frame: the environment is read **once at startup**, resolved into

@@ -13,6 +13,13 @@
 - **Measured by:** [`spikes/board_poll_cost.py`](../../spikes/board_poll_cost.py),
   committed output
   [`spikes/results/board-poll-cost.log`](../../spikes/results/board-poll-cost.log)
+- **Amended 2026-10-08 by [§7](#7-the-change-detector-asking-the-journal-instead-of-re-reading-the-board):**
+  §3's "one read per tick" survives as *one consistent read per tick that reads
+  the board*. Most ticks no longer read the board at all — they ask
+  `bd events tail` whether anything moved. The mapping, the freshness states,
+  the accounting invariant and every prohibition below are unchanged by it;
+  what changes is where a tick's ~0.46 s goes, and the addition of the sweep
+  that keeps the journal from being trusted beyond what it can see.
 
 ---
 
@@ -246,6 +253,109 @@ both decisions about what the band is allowed to take.
 
 ---
 
+### 7. The change detector: asking the journal instead of re-reading the board
+
+**Every tick asks `bd --readonly events tail --since <watermark>` what has been
+mutated, and reads the whole board only when the answer says something did, when
+the periodic sweep is due, or when the probe could not answer.** The rows still
+come from `bd --readonly list --all --limit 0 --json`, mapped by the same total
+function, published latest-wins over the same `watch`. Nothing the band *shows*
+is replayed out of the journal; the journal is read for **whether**, never for
+**what**.
+
+Measured on this repo's board (50 beads, `bd 1.3.1`, macOS / Apple Silicon,
+re-measured 2026-10-08 on a quiet machine, five runs each, medians):
+
+| read | wall | CPU | what it costs scales with |
+|---|---|---|---|
+| `--readonly list --all --limit 0 --json` | ~0.46 s | ~0.23 s | the size of the board |
+| `--readonly events tail --since <head> --json` | ~0.18 s | ~0.10 s | nothing, when quiet |
+
+An idle band therefore stops paying for a busy one: a quiet 5 s tick costs
+**about 40 % of the wall and 45 % of the CPU it used to**, and the changes a
+worker actually makes in this workspace still land on the next tick. That is the whole win, and it is bought
+against one new thing that can be wrong — **the journal is not a mirror of the
+board** — which is why the sweep is not optional.
+
+**Four ways a board can change without a journal record on this replica.** Each
+is documented in `bd`'s own words, and each is a way a poller that trusted the
+journal alone would freeze the band on rows it had no reason to re-read:
+
+1. **`bd dolt pull` / a merge.** The journal records what *this replica*
+   mutated through its write paths. Rows that arrived as data are not journaled;
+   `bd` tells consumers to re-baseline after a sync.
+2. **`bd sql`** and anything else that bypasses the write paths — explicitly
+   unjournaled.
+3. **`events-journal` switched off.** The probe answers with *nothing*, on a
+   successful exit, forever. The empty answer is indistinguishable from a quiet
+   board, which is exactly the trap: a quiet answer that never says anything is
+   a silent lie unless somebody still goes and looks at the board now and then.
+4. **Retention.** The floors prune the prefix, so a consumer's checkpoint can
+   be pruned out from under it. `bd` fails that read rather than skipping
+   ahead, and names `floor` and `head` — which is why the failure is a *typed*
+   answer ([`JournalError::Truncated`](../../src/services/bd.rs)) and not a
+   string.
+
+So: **`LOOPRS_KANBAN_RECONCILE_MS`, default 30 s** — whatever the journal
+says, the board is read in full on that interval. That is the entire cost of
+trusting the journal: a change that never journalled shows up on the band up to
+half a minute late instead of one tick late, and *only* for the four cases
+above. Everything a loop or a human does through normal `bd` writes stays on
+the 5 s tick.
+
+**Three rules make the watermark safe** (stated in
+[`decide`](../../src/services/board_poller.rs), which is pure so the policy is
+tested as a table rather than raced against a subprocess):
+
+1. **Nothing has ever been read ⇒ always read.** "Quiet since the watermark"
+   is a statement relative to a watermark; with no picture on screen it would
+   keep `reading the board…` up forever over a board that is perfectly well
+   populated.
+2. **A probe that failed is never "nothing changed".** It reads the board.
+   The inverted failure — a probe that could not answer reporting a quiet
+   board — is the only way this design can freeze a band on stale rows while
+   the footer says `bd ok`, so it is the one thing the design refuses.
+3. **The watermark adopts only what the probe saw *before* the read it
+   triggers.** A read is later than the probe that caused it, so the only
+   watermark that cannot outrun the rows is the probe's own. Adopting a seq
+   observed after the read would let a mutation that landed mid-read be marked
+   covered by rows that do not contain it: a lost change, silent forever.
+   This rule costs one redundant read the next tick. That is not a trade worth
+   hesitating over.
+   And a **failed** read adopts nothing at all — the changes that tick was
+   reacting to have not been reflected in anything, so the watermark stays
+   behind and the next tick reports them again.
+
+**While behind, drain in bounded batches.** Against a journal with history the
+poller cannot know how far behind it is without reading something, so it chews
+`CATCHUP_LIMIT` (512) records per tick until a batch comes back short, then
+switches to asking for one (`PROBE_LIMIT`). While draining it reads the whole
+board every tick — it has to, since it does not know whether the records it has
+not read touched a bead — which is what makes a large journal *delay* the
+savings rather than cost more than the pre-detector poller ever did. `bd` gives
+no cheap `head` (there is no `--last`, and `--limit` reads the oldest N), so
+this is the shape that costs nothing to be wrong about.
+
+**`--follow` was considered and rejected.** `bd events tail --follow` streams new
+records with no polling at all. It replaces a bounded request held under
+`BD_TIMEOUT` with a long-lived child holding a connection into a Dolt-backed
+board that the beads loop has to write to, plus its own restart, backoff,
+reconnect-on-EOF and "did the stream miss anything" stories. The poller's whole
+argument is that one task `.await`s one bounded read at a time; a permanent
+child is strictly more ways to be wrong for a saving on top of an already cheap
+probe.
+
+**A quiet tick publishes nothing.** A `watch` wakes its reader on every send,
+and a send carrying no news is a wake for nothing to do. This does not stall the
+footer's freshness, and cannot: the age was never carried by the send. It is
+re-derived from the last read's own `fetched_at` on the App's tick, so the last
+painted frame keeps telling the truth about how old the rows are whether or not
+the last tick sent anything. What a quiet tick does change is that the age can
+only go **up** until the sweep resets it — bounded by `reconcile`, and
+explained in `docs/kanban.md`.
+
+---
+
 ## The accounting invariant
 
 Everything above is one property, stated once, and it is testable at the snapshot
@@ -266,6 +376,25 @@ not in the widget.
 ---
 
 ## Costs, measured, and deliberately not done here
+
+The change detector's half, measured the same way against the same board
+(`bd 1.3.1`, this repo's own 50-bead board, and the scratch board's 200-record
+journal):
+
+| Read | board | wall | CPU | payload |
+|---|---|---|---|---|
+| `--readonly list --all --limit 0 --json` | 50 | **~0.46 s** | ~0.23 s | 243 KiB |
+| `--readonly events tail --since <head> --json` (quiet) | 50 | **~0.18 s** | ~0.10 s | empty |
+| `--readonly events tail --since 0 --limit 512 --json` | 200 records | ~0.2 s | ~0.1 s | ~3 KiB / 512 recs |
+
+The idle-board saving is the one that matters, because an idle board is what a
+band spends most of its life showing: **~60 % less wall and ~55 % less CPU per
+quiet tick**, and the quiet tick's cost does not move with the size of the board
+at all. A busy board is unchanged in the worst case — one board read per tick,
+the same as before the detector existed — because the tick, not the journal, is
+what paces the poller.
+
+The older numbers, for the read itself:
 
 From [`spikes/results/board-poll-cost.log`](../../spikes/results/board-poll-cost.log)
 (macOS / Apple Silicon, `BD_JSON_ENVELOPE=1` on every leg, medians):
@@ -352,3 +481,26 @@ inside the frame.
     functions each working out where the gutter is is how a junction ends up one
     cell off the line, which reads as a rendering bug nobody can reproduce from
     the code.
+14. **Do not build the board out of journal records.** The journal is read for
+    *whether*, and the rows come from one `bd --readonly list --all --limit 0
+    --json`. A replayed picture would make what the band shows depend on
+    retention floors, on which mutations this replica happened to see, and on
+    records that arrive by merge and are not journaled at all — and it would
+    break I1, because a set of replayed mutations is not one consistent read.
+15. **Do not treat a probe that failed as a quiet board.** A journal that could
+    not answer says nothing, and nothing is not "nothing changed". Same failure
+    class as §4's "an error never renders as an empty board", one layer under
+    it: the poller that swallowed the probe's error and kept its old rows would
+    show `bd ok` over a board nobody had looked at.
+16. **Do not advance the watermark from anything but a probe taken before a
+    read that succeeded.** Both halves are load-bearing. Adopting a seq seen
+    after the read loses any change that landed during it; adopting one after a
+    *failed* read loses the change the read was going to bring back.
+17. **Do not remove the sweep, or stretch it past a few minutes, without naming
+    what it is being traded against.** The four cases in §7 are changes the band
+    cannot see any other way. `LOOPRS_KANBAN_RECONCILE_MS` is allowed to be
+    long; it is not allowed to be forgotten.
+18. **Do not let the change detector change what the footer's age means.** It
+    is the age of the **rows** — the last full read — not the age of the last
+    probe. Making a probe refresh it would have the band claim its rows are
+    three seconds old when they are forty.

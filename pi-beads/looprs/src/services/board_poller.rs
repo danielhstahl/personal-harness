@@ -1,6 +1,7 @@
-//! The board poller: one task, one read per tick, one **newest** snapshot
-//! (looprs-5o4.2, under ADR-0007 — `docs/adr/0007-kanban-board.md`; the
-//! operator-facing page for what this feeds is `docs/kanban.md`).
+//! The board poller: one task, one cheap probe per tick, the whole board only
+//! when it is owed, one **newest** snapshot (looprs-5o4.2, under ADR-0007 —
+//! `docs/adr/0007-kanban-board.md`; the operator-facing page for what this
+//! feeds is `docs/kanban.md`).
 //!
 //! The user's ask was "it could have its own thread that periodically checks for
 //! bead status". In this codebase that is a `tokio` task, and the precedent is
@@ -30,11 +31,16 @@
 //!   [`MissedTickBehavior::Delay`], so a read that overruns the interval pushes
 //!   the next tick out instead of firing a burst of catch-up reads.
 //! * **The read.** [`bd::board_read_with`](crate::services::bd::board_read_with)
-//!   — `bd --readonly list --all --limit 0 --json`, one per tick, already
-//!   `tokio::process` under
+//!   — `bd --readonly list --all --limit 0 --json`, one per tick that is owed
+//!   one, already `tokio::process` under
 //!   [`BD_TIMEOUT`](crate::services::bd::BD_TIMEOUT). Nothing in this path is a
 //!   blocking `std::process::Command`, which is the whole reason the UI does not
 //!   stall behind a Dolt-backed board (looprs-037).
+//! * **The change detector.**
+//!   [`bd::journal_probe_with`](crate::services::bd::journal_probe_with) —
+//!   `bd --readonly events tail --since <watermark>`, a fraction of the cost of
+//!   the board read and flat in the size of the board, plus the sweep that keeps
+//!   it honest. The whole section below is about it.
 //! * **The mapping, by delegation.** [`BoardSnapshot::from_beads`] owns the
 //!   status→column function; this file never learns that a column exists.
 //!
@@ -69,23 +75,85 @@
 //!    populated board going blank because `bd` hiccuped — "bd is broken" read
 //!    as "the board is empty", which is looprs-037's conflation rebuilt one
 //!    layer up. (§"What it never does" below.)
-//! 3. **A poll that changed nothing paints nothing.** The poller still
-//!    *publishes* every tick — it has to, because the value carries
+//! 3. **A poll that changed nothing paints nothing.** Under the change detector
+//!    a quiet tick does not even *publish* — there is no news to carry, and a
+//!    `watch` wakes its reader on every send. What that makes safe is that the
+//!    footer's freshness never came from the publish anyway: the value carries
 //!    [`fetched_at`](crate::state::board::BoardSnapshot::fetched_at) and the
-//!    footer's `bd ok · Ns ago` is a fact the frame re-reads rather than news —
-//!    but it must not *cost a frame*. That half is enforced on the consumer's
-//!    side, in [`crate::App::adopt_board`], which compares the incoming
-//!    snapshot with [`BoardSnapshot::same_paint_as`]: the drawn fields — the
-//!    read's state, the columns, the deferred count — and deliberately **not**
-//!    the two clocks. The failure prevented: a board that has not moved making
-//!    an untouched terminal repaint every tick forever, which is the exact
-//!    opposite of the "the band costs nothing while nothing happens" claim it is
-//!    sold on, and a busy loop next to a session that is trying to use the CPU.
+//!    frame re-derives the age from it on the App's own tick
+//!    ([`crate::App::on_tick`]), so the last painted frame keeps stating the
+//!    age of the rows whether or not the last tick sent anything. The failure
+//!    prevented: a board that has not moved making an untouched terminal repaint
+//!    every tick forever, which is the exact opposite of the "the band costs
+//!    nothing while nothing happens" claim it is sold on, and a busy loop next to
+//!    a session that is trying to use the CPU.
 //!
-//!    Deduplicating in the **poller** is the tempting wrong shape: suppress the
-//!    publish and the footer freezes at the age of the last *change*, so the
-//!    freshness marker starts telling the opposite of the truth about how long
-//!    it has been since anybody looked. Publish the age; let the paint decide.
+//!    Deduplicating in the **poller** by *suppressing the age* is the tempting
+//!    wrong shape and is still what this rule is against: freeze the freshness
+//!    marker and it starts telling the opposite of the truth about how long it
+//!    has been since anybody looked. What changed with the detector is that a
+//!    quiet tick publishes nothing; what has not changed is that the age is
+//!    never the thing being deduplicated, and never frozen. (The other half of
+//!    the rule still runs on every read that *does* happen: `adopt_board`'s
+//!    [`BoardSnapshot::same_paint_as`] comparison is what stops a re-read of an
+//!    unchanged board costing a frame.)
+//!
+//! # The change detector: ask what changed, don't re-look at everything
+//!
+//! Every tick used to cost a whole `bd list`: ~0.45 s of wall and ~0.18 s of CPU in
+//! a second 130 MB process, whether or not anything had happened since the last
+//! tick. `bd` keeps a **durable events journal** — every mutation through its write
+//! paths recorded in-transaction as an ordered, replayable row — and reading it
+//! answers the question the poller actually asks. Measured on this repo's board:
+//!
+//! | read | wall | CPU |
+//! |---|---|---|
+//! | `--readonly list --all --limit 0 --json` (what a tick used to be) | ~0.45 s | ~0.18 s |
+//! | `--readonly events tail --since <head> --json` (a quiet tick now) | ~0.15 s | ~0.09 s |
+//!
+//! So a tick is: probe the journal, and read the board **only** when it reports
+//! records, when the periodic sweep is due, or when the probe could not answer.
+//! Changes a worker makes in this workspace still land on the next 5 s tick; what
+//! changed is that the idle board no longer pays for the busy one. The band still
+//! never replays history into the picture — the journal is read for *whether*, never
+//! for *what*, and the rows always come from one consistent `bd list`.
+//!
+//! **The journal is not a mirror of the board, so the sweep is not optional.** Four
+//! things can change what the band shows without a journal record here:
+//!
+//! * `bd dolt pull` / a merge — the rows arrived as data, not as a mutation this
+//!   replica made, and `bd` says plainly that they are not journaled;
+//! * `bd sql` and anything else that bypasses the write paths;
+//! * a workspace with `events-journal` switched off — which answers the probe with
+//!   *nothing*, on a successful exit, forever;
+//! * retention: the floors prune the prefix, so a watermark can be pruned out from
+//!   under the consumer.
+//!
+//! Hence [`JournalConfig::reconcile`]: whatever the journal says, the board is read
+//! in full every 30 s by default. That bound is the whole cost of trusting the
+//! journal — a change that never journalled is visible on the band up to half a
+//! minute later instead of one tick later — and it is tunable, including down to
+//! "every tick", which is the pre-journal behaviour.
+//!
+//! **The watermark is what makes the probe safe, and it moves only on a successful
+//! read.** [`decide`] states the three rules that keep it honest; the one worth
+//! stating twice is that the seq adopted after a full read is the one the probe saw
+//! *before* that read started. Adopting a later one would let a mutation that landed
+//! mid-read be marked covered by rows that do not contain it, which is a silently
+//! lost change; the rule instead costs one redundant read next tick.
+//!
+//! **A quiet tick publishes nothing.** Nothing was learned that the picture already
+//! had, and a `watch` send wakes the run loop whether or not the value moved. The
+//! footer's age is not carried by the send — see rule 3 above — so nothing about
+//! what the user sees depends on it.
+//!
+//! **Why not `bd events tail --follow`?** A streaming child would answer new records
+//! with no polling at all, and it is not taken: it replaces a bounded request under
+//! `BD_TIMEOUT` with a long-lived process holding a connection into a Dolt-backed
+//! board that the beads loop has to write to, plus its own restart, backoff and
+//! EOF-reconnect story. The poller's whole shape is one task that `.await`s one
+//! bounded read at a time; a permanent child is a different shape with strictly more
+//! that can go wrong, and the remaining win over a 0.15 s probe is small.
 //!
 //! # What it never does
 //!
@@ -173,7 +241,11 @@ pub const MIN_POLL_MS: u64 = 250;
 ///
 /// The resolution itself is [`BoardConfig::resolve`], a pure function of three
 /// strings: `main` reads the environment and decides nothing, and hands what it
-/// read to something that can be table-tested without mutating a process.
+/// read to something that can be table-tested without mutating a process. The
+/// change detector's two knobs resolve next door, in
+/// [`JournalConfig::resolve`], and [`BoardConfig::from_env`] composes the two;
+/// they are kept apart because they are read by different code and a knob that
+/// shares a resolver with three others can only be tested alongside them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoardConfig {
     /// The `bd` binary to read: `$LOOPRS_BD_BIN`, else `bd` — the same binary
@@ -184,6 +256,117 @@ pub struct BoardConfig {
     pub interval: Duration,
     /// `LOOPRS_KANBAN=0` turns the whole board off.
     pub enabled: bool,
+    /// The events-journal change detector: what to ask between the full reads,
+    /// and how long it may be since one was last taken on trust.
+    pub journal: JournalConfig,
+}
+
+/// The default full re-read period: **30 s**.
+///
+/// This is the bound on the one thing the journal cannot see — a change that
+/// arrived rather than a change that happened: rows landing through
+/// `bd dolt pull` / a merge are not journaled on this replica, and neither is
+/// anything written with `bd sql`, nor anything at all while the journal is
+/// switched off. Six ticks of the default poll, so the band is at worst half a
+/// minute behind on those, while the changes a worker actually makes in this
+/// workspace still land on the next 5 s tick.
+pub const DEFAULT_RECONCILE_MS: u64 = 30_000;
+
+/// The normal journal probe asks for **one** record.
+///
+/// The question is "has anything changed since my watermark?", and one record is
+/// enough evidence to answer it. Asking for more would pay for payloads — every
+/// journal record carries the whole issue as it stood after the mutation — that
+/// nothing here reads.
+pub const PROBE_LIMIT: i64 = 1;
+
+/// What the probe asks for while the poller is still **behind** the head of the
+/// journal.
+///
+/// A poller that starts against a journal with history in it cannot know its
+/// watermark is 40 000 records back without reading something, so it drains a
+/// bounded batch per tick instead. The cost stays honest because while it is
+/// behind it re-reads the whole board every tick anyway — which is what it has
+/// to do, not knowing whether the records it has not read yet touched a bead —
+/// so a big journal *delays* the savings rather than costing more than the old
+/// always-read behaviour. 512 records is a few hundred KB of transient payload
+/// per tick, and ~10 ticks drains 5 000 records.
+pub const CATCHUP_LIMIT: i64 = 512;
+
+/// The change detector: the cheap read that decides whether the expensive one is
+/// owed this tick.
+///
+/// Two knobs, one policy (ADR-0007 §7):
+///
+/// * **every tick, ask the journal** what has been mutated since the watermark —
+///   ~0.15 s wall against the full board read's ~0.45 s, and flat in the size
+///   of the board;
+/// * **every `reconcile`, read the board regardless**, because the journal is
+///   not a record of everything that can change what the band shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalConfig {
+    /// `LOOPRS_KANBAN_EVENTS=0` takes the detector off: every tick is a full
+    /// board read, exactly as this poller worked before the journal existed.
+    pub enabled: bool,
+    /// The longest the poller may go without a full board read, however quiet the
+    /// journal is.
+    pub reconcile: Duration,
+}
+
+impl Default for JournalConfig {
+    /// On, with the ADR's 30 s sweep — the same pair
+    /// [`JournalConfig::resolve`] falls back to when it is given nothing.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reconcile: Duration::from_millis(DEFAULT_RECONCILE_MS),
+        }
+    }
+}
+
+impl JournalConfig {
+    /// Resolve the detector's two raw values.
+    ///
+    /// Same lenient-and-loud rules as every other knob in this file: strings in,
+    /// explained values out, no environment touched.
+    ///
+    /// * `events` — off only for an explicit `0` / `off` / `no` / `false`, the
+    ///   rule [`BoardConfig`] uses for the board itself.
+    /// * `reconcile_ms` — a millisecond count. Unparseable falls back to
+    ///   [`DEFAULT_RECONCILE_MS`] with a warning. `0` is accepted rather than
+    ///   refused: unlike the poll interval it cannot mean "spin", because the
+    ///   tick still paces the poller — `0` simply makes every tick sweep, i.e.
+    ///   the detector stops saving anything, which is what
+    ///   `LOOPRS_KANBAN_EVENTS=0` says it wants and is said better there, so it
+    ///   is worth a note on the way through.
+    pub fn resolve(events: Option<&str>, reconcile_ms: Option<&str>) -> Self {
+        let default = Duration::from_millis(DEFAULT_RECONCILE_MS);
+        let reconcile = match trimmed(reconcile_ms) {
+            None => default,
+            Some(raw) => match raw.parse::<u64>() {
+                Err(_) => {
+                    tracing::warn!(
+                        "LOOPRS_KANBAN_RECONCILE_MS={raw:?} is not a millisecond count; sweeping \
+                         the full board every {DEFAULT_RECONCILE_MS}ms instead"
+                    );
+                    default
+                }
+                Ok(0) => {
+                    tracing::warn!(
+                        "LOOPRS_KANBAN_RECONCILE_MS=0 re-reads the whole board on every tick, which \
+                         is what the change detector exists to avoid (to take it off outright, say \
+                         LOOPRS_KANBAN_EVENTS=0)"
+                    );
+                    Duration::ZERO
+                }
+                Ok(ms) => Duration::from_millis(ms),
+            },
+        };
+        Self {
+            enabled: !is_off(events),
+            reconcile,
+        }
+    }
 }
 
 impl BoardConfig {
@@ -194,11 +377,16 @@ impl BoardConfig {
     /// height because something else exported `LOOPRS_KANBAN` mid-run is a bug
     /// nobody can reproduce.
     pub fn from_env() -> Self {
-        Self::resolve(
+        let mut cfg = Self::resolve(
             env_value("LOOPRS_KANBAN").as_deref(),
             env_value("LOOPRS_KANBAN_POLL_MS").as_deref(),
             Some(&bd::bd_bin_from_env()),
-        )
+        );
+        cfg.journal = JournalConfig::resolve(
+            env_value("LOOPRS_KANBAN_EVENTS").as_deref(),
+            env_value("LOOPRS_KANBAN_RECONCILE_MS").as_deref(),
+        );
+        cfg
     }
 
     /// Resolve the three raw values into a config.
@@ -219,6 +407,11 @@ impl BoardConfig {
             bin: trimmed(bin).unwrap_or("bd").to_string(),
             interval: resolve_interval(poll_ms),
             enabled: !is_off(enabled),
+            // The detector's own knobs have their own resolver and their own
+            // entry point through `from_env`; a `resolve` that was handed two
+            // strings it knows nothing about would have to guess them, so it
+            // takes the documented default and says so.
+            journal: JournalConfig::default(),
         }
     }
 }
@@ -314,13 +507,26 @@ impl BoardPoller {
             );
             return (Self { task: None }, BoardHandle { rx, enabled: false });
         }
-        tracing::info!(
-            "kanban board: reading `{} --readonly list --all --limit 0 --json` every {:?} \
-             (LOOPRS_KANBAN_POLL_MS to retune, LOOPRS_KANBAN=0 for none)",
-            cfg.bin,
-            cfg.interval,
-        );
-        let task = tokio::spawn(poll_task(tx, cfg.bin, cfg.interval));
+        if cfg.journal.enabled {
+            tracing::info!(
+                "kanban board: watching `{} --readonly events tail` every {:?}, reading `{} \
+                 --readonly list --all --limit 0 --json` on a change or every {:?} \
+                 (LOOPRS_KANBAN_POLL_MS / LOOPRS_KANBAN_RECONCILE_MS to retune, \
+                 LOOPRS_KANBAN_EVENTS=0 to read the board every tick, LOOPRS_KANBAN=0 for none)",
+                cfg.bin,
+                cfg.interval,
+                cfg.bin,
+                cfg.journal.reconcile,
+            );
+        } else {
+            tracing::info!(
+                "kanban board: reading `{} --readonly list --all --limit 0 --json` every {:?} \
+                 (change detector off — LOOPRS_KANBAN_EVENTS=0; the full read is the only read)",
+                cfg.bin,
+                cfg.interval,
+            );
+        }
+        let task = tokio::spawn(poll_task(tx, cfg.bin, cfg.interval, cfg.journal));
         (Self { task: Some(task) }, BoardHandle { rx, enabled: true })
     }
 }
@@ -398,8 +604,178 @@ impl BoardHandle {
     }
 }
 
-/// The task: tick, read, publish. Until nobody is listening.
-async fn poll_task(tx: Sender<BoardSnapshot>, bin: String, interval: Duration) {
+/// Why a tick owes the board a full read. Carried for the log and nothing else:
+/// every one of these produces the same command line, and the reason is the only
+/// thing an operator reading `looprs.log` can act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadReason {
+    /// Nothing has been read yet, so the band has no picture to be quiet about.
+    First,
+    /// The journal reported mutations since the watermark.
+    Journal,
+    /// The periodic sweep: the detector cannot see everything, so the board gets
+    /// asked directly every so often regardless (ADR-0007 §7).
+    Sweep,
+    /// The probe could not be answered. Unknown, and unknown is never "nothing
+    /// changed".
+    ProbeFailed,
+    /// Our checkpoint had been pruned out from under us; re-baselined at the head
+    /// `bd` named.
+    Rebaselined,
+    /// `LOOPRS_KANBAN_EVENTS=0`: no detector, so the tick *is* the read.
+    DetectorOff,
+}
+
+/// One tick's decision, made by [`decide`] out of the probe's answer.
+#[derive(Debug, PartialEq, Eq)]
+struct Decision {
+    /// `Some` = read the whole board this tick, and why.
+    read: Option<ReadReason>,
+    /// The watermark a **successful** board read this tick adopts. `None` when
+    /// there is nothing new to adopt, or when the read failed (see the task).
+    adopt: Option<i64>,
+    /// Whether the watermark is now proved to sit at the head of the journal,
+    /// which is what lets the next probe ask for one record instead of a batch.
+    at_head: bool,
+    /// The detector's complaint, if it has one. The words are carried so the
+    /// loud-once log line can say something specific.
+    broken: Option<String>,
+    /// `bd` said the events journal is disabled for this workspace.
+    disabled: bool,
+}
+
+/// Decide one tick from one probe answer.
+///
+/// Pure, and split out of the task for the reason every other decision in this
+/// crate is split out: this is the part carrying the safety argument, and a
+/// policy that can only be exercised by racing a subprocess is observed, not
+/// tested.
+///
+/// Three rules do all the work here, and each is the answer to a way the band
+/// could lie:
+///
+/// 1. **`never_read` always reads.** A quiet journal is quiet *relative to a
+///    watermark*; with no picture on screen there is nothing for that quiet to
+///    be about, and the band would sit on `reading the board…` forever on a
+///    board that is perfectly well populated.
+/// 2. **A probe that failed never reads as "nothing changed"** — hence
+///    `ProbeFailed` reading the board. The inverted failure, where a probe that
+///    could not answer reported a quiet board, is the one way this design could
+///    freeze the band on stale rows while the footer said `bd ok`.
+/// 3. **`adopt` is what the probe saw *before* the read, never after.** The
+///    read is a snapshot taken later than the probe, so the only watermark that
+///    cannot outrun the rows is the probe's own. Adopting a seq observed after
+///    the read would let a mutation that landed during the read be marked as
+///    covered by rows that do not contain it — a lost change, silent forever.
+///    The cost of this rule is one redundant read the next tick, which is the
+///    correct trade by a wide margin.
+fn decide(
+    probe: Result<bd::JournalProbe, bd::JournalError>,
+    limit: i64,
+    never_read: bool,
+    sweep_due: bool,
+) -> Decision {
+    match probe {
+        Err(err @ bd::JournalError::Truncated { head, .. }) => Decision {
+            read: Some(ReadReason::Rebaselined),
+            // `head` came from `bd` before the board read that follows, so rule 3
+            // holds: anything newer still has a seq above it.
+            adopt: Some(head),
+            at_head: true,
+            // Reported as broken, and honestly so: until the re-baselined probe
+            // comes back clean, this consumer *is* below the retained window. The
+            // loud-once logging is what keeps a truncation that keeps failing
+            // from becoming 720 lines an hour.
+            broken: Some(err.to_string()),
+            disabled: false,
+        },
+        Err(err) => Decision {
+            read: Some(ReadReason::ProbeFailed),
+            adopt: None,
+            // Stay where we were, including "behind": a probe that could not
+            // answer tells us nothing about where the head is, and the safe guess
+            // is the one that keeps draining.
+            at_head: false,
+            broken: Some(err.to_string()),
+            disabled: false,
+        },
+        Ok(p) => {
+            let disabled = p.disabled;
+            // A batch shorter than what was asked for means the journal has no
+            // more records behind it — with the empty batch spelled out first,
+            // because "quiet" and "drained to the head" are the same answer
+            // arrived at two different ways and both count.
+            let drained = p.is_quiet() || !p.hit_limit(limit);
+            let read = match (p.head(), never_read, sweep_due) {
+                (_, true, _) => Some(ReadReason::First),
+                (Some(_), _, _) => Some(ReadReason::Journal),
+                (None, false, true) => Some(ReadReason::Sweep),
+                (None, false, false) => None,
+            };
+            Decision {
+                read,
+                // Rule 3: the watermark adopted is the probe's own highest seq,
+                // never anything observed later. Nothing new in, nothing to
+                // adopt, and `head()` is exactly that statement.
+                adopt: p.head(),
+                at_head: drained,
+                broken: None,
+                disabled,
+            }
+        }
+    }
+}
+
+/// Log the detector's state at the volume it deserves: **loud once**.
+///
+/// Three facts worth an operator's attention, each worth exactly one line: the
+/// detector broke (the band is now refreshing on the sweep alone, not on the
+/// change), the journal is disabled (nothing will ever arrive here), and the
+/// detector came back. Everything past the first is `debug` — a detector that
+/// stays broken and warns every five seconds is 720 identical lines an hour,
+/// which is not a signal but the reason people stop reading the log.
+fn report_detector(
+    decision: &Decision,
+    reconcile: Duration,
+    broken: &mut bool,
+    disabled_reported: &mut bool,
+) {
+    if decision.disabled && !*disabled_reported {
+        *disabled_reported = true;
+        tracing::warn!(
+            "kanban board: `bd` reports the events journal is disabled for this workspace — the \
+             change detector will never report a change here, so the band refreshes on the full-board \
+             sweep every {reconcile:?} instead (LOOPRS_KANBAN_EVENTS=0 says the same thing on purpose)"
+        );
+    }
+    match &decision.broken {
+        Some(why) => {
+            if *broken {
+                tracing::debug!("board change detector still unusable: {why}");
+            } else {
+                tracing::warn!(
+                    "board change detector unusable: {why} — the band still gets a full board read \
+                     every {reconcile:?}, just not the moment something moves"
+                );
+            }
+            *broken = true;
+        }
+        None => {
+            if *broken {
+                tracing::info!("board change detector usable again");
+            }
+            *broken = false;
+        }
+    }
+}
+
+/// The task: probe, read if it is owed, publish. Until nobody is listening.
+async fn poll_task(
+    tx: Sender<BoardSnapshot>,
+    bin: String,
+    interval: Duration,
+    journal: JournalConfig,
+) {
     let mut tick = tokio::time::interval(interval);
     // `Delay`, not the default `Burst`, so the schedule re-baselines off the
     // tick that was actually received instead of banking missed ticks to hand
@@ -421,6 +797,26 @@ async fn poll_task(tx: Sender<BoardSnapshot>, bin: String, interval: Duration) {
     // being the next problem.
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+    // The **watermark**: the highest journal seq that a *successful full board
+    // read* has reflected. Not "the highest seq we have seen", and the gap
+    // between those two is where a lost change would live — see rule 3 on
+    // [`decide`]. `0` is "nothing reflected yet", which combined with
+    // `never_read` is also what forces the first tick.
+    let mut since: i64 = 0;
+    // Whether `since` is proved to sit at the head of the journal. False to
+    // start, because against a journal with history in it the poller *is*
+    // behind, and the honest way to find out is to drain a bounded batch per
+    // tick rather than to guess.
+    let mut at_head = false;
+    // When the last full board read started. `None` until the first one, which
+    // is the same fact as `never_read` and carries the sweep's clock too.
+    let mut last_full_read: Option<Instant> = None;
+    // Loud-once bookkeeping: the detector breaking is worth an operator's
+    // attention exactly once per break, and worth `debug` every time after, for
+    // the same reason a broken board is not logged 720 times an hour.
+    let mut detector_broken = false;
+    let mut disabled_reported = false;
+
     loop {
         tick.tick().await;
 
@@ -431,7 +827,7 @@ async fn poll_task(tx: Sender<BoardSnapshot>, bin: String, interval: Duration) {
             return;
         }
 
-        // The stamp is taken **before** the read goes out, not when it comes
+        // The stamp is taken **before** anything goes out, not when it comes
         // back, and that ordering does real work: it makes the distance between
         // two consecutive snapshots `max(interval, read)` — the next read cannot
         // start until its tick is due *and* the previous one has returned — so
@@ -446,8 +842,71 @@ async fn poll_task(tx: Sender<BoardSnapshot>, bin: String, interval: Duration) {
         // freshness marker; "not quite this fresh" is the direction that gets
         // people a stale board read as a live one.
         let taken_at = Instant::now();
+        let sweep_due = last_full_read
+            .is_none_or(|at| taken_at.saturating_duration_since(at) >= journal.reconcile);
+
+        // ── 1. the cheap read: what has been done to the board lately? ──
+        let limit = if at_head { PROBE_LIMIT } else { CATCHUP_LIMIT };
+        let decision = if journal.enabled {
+            decide(
+                bd::journal_probe_with(&bin, since, limit).await,
+                limit,
+                last_full_read.is_none(),
+                sweep_due,
+            )
+        } else {
+            Decision {
+                read: Some(ReadReason::DetectorOff),
+                adopt: None,
+                at_head: false,
+                broken: None,
+                disabled: false,
+            }
+        };
+        at_head = decision.at_head;
+        report_detector(
+            &decision,
+            journal.reconcile,
+            &mut detector_broken,
+            &mut disabled_reported,
+        );
+
+        let Some(reason) = decision.read else {
+            // The quiet tick — and the whole point of the change detector. The
+            // board on screen is still the board `bd` has, so nothing is
+            // published: a `watch` wakes its reader on every send, and a send
+            // carrying no news is a wake for nothing to do.
+            //
+            // What the footer says is unaffected, and this is the one place a
+            // later editor could break the freshness rule by mistake. The age is
+            // not carried by the publish: it is re-derived from the last read's
+            // own `fetched_at` on the App's tick (`App::on_tick` →
+            // `restamp_age`), so the frame keeps telling the truth about how old
+            // the rows are whether or not this tick sent anything. What *is*
+            // true, and worth knowing, is that the number therefore never goes
+            // *down* on a quiet tick — it counts to the sweep, which resets it.
+            tracing::debug!(
+                "board poll: journal quiet at seq {since} (limit {limit}), no board read this tick"
+            );
+            continue;
+        };
+
+        // ── 2. the expensive read: the board itself ──
         match bd::board_read_with(&bin).await {
             Ok(beads) => {
+                // The watermark moves **only** here, and only with what the probe
+                // had seen before this read started. A read that failed must not
+                // take the watermark with it: the changes this tick was reacting
+                // to have not been reflected in anything, and leaving `since`
+                // behind is what makes the next tick report them again.
+                if let Some(upto) = decision.adopt {
+                    since = since.max(upto);
+                }
+                last_full_read = Some(taken_at);
+                tracing::debug!(
+                    "board poll: full read ({:?}), watermark now {since}",
+                    reason
+                );
                 let snap = BoardSnapshot::from_beads(&beads, Some(taken_at.elapsed()))
                     .stamped_at(taken_at);
                 if tx.send(snap).is_err() {
@@ -493,13 +952,45 @@ fn log_read_error(err: &BdError, already_failing: bool) {
 mod tests {
     use super::*;
     use crate::state::board::{BoardRead, Column};
-    use crate::testing::{BOARD_VARIETY, BdFake, EMPTY_BOARD, Fakes, PiFake, process_alive};
+    use crate::testing::{
+        BOARD_VARIETY, BdFake, EMPTY_BOARD, Fakes, ONE_BEADED_BOARD, PiFake, process_alive,
+    };
     use std::time::Instant;
+
+    /// The board read, exactly as ADR-0007 §3 fixes it — the string the tests
+    /// count command lines against.
+    const BOARD_READ: &str = "--readonly list --all --limit 0 --json";
 
     /// How long a test waits before concluding the poller is not going to answer.
     /// Everything awaited here is answered by a fake in milliseconds, so timing
     /// out means it is broken, not that the machine was slow.
     const WAIT: Duration = Duration::from_secs(10);
+
+    /// The change detector with its sweep pinned to the tick: every tick is a
+    /// sweep, so the read cadence is exactly what it was before the detector
+    /// existed.
+    ///
+    /// Tests about *the tick* — its cadence, its error ladder, its shutdown,
+    /// the three states it publishes — take this. They are not asking what the
+    /// journal saved; leaving the production 30 s sweep in them would mean they
+    /// read once and then wait for nothing to happen.
+    fn sweep_every(interval: Duration) -> JournalConfig {
+        JournalConfig {
+            enabled: true,
+            reconcile: interval,
+        }
+    }
+
+    /// A detector that will not sweep within the test's lifetime: the journal is
+    /// then the *only* thing that can make the poller re-read the board, which is
+    /// what turns "the board moved because something said it did" into a real
+    /// assertion rather than one the sweep quietly satisfies.
+    fn never_sweep() -> JournalConfig {
+        JournalConfig {
+            enabled: true,
+            reconcile: Duration::from_secs(3600),
+        }
+    }
 
     /// A poller plus its fake `bd`, kept alive together for the test's duration.
     ///
@@ -520,11 +1011,24 @@ mod tests {
     /// for real — and it keeps the whole slow-fake group at about a second of
     /// wall clock.
     fn running(tag: &str, fake: BdFake, board: &str, interval: Duration) -> Running {
+        running_journal(tag, fake, board, interval, sweep_every(interval))
+    }
+
+    /// A poller aimed at a fake `bd`, with the detector's own knobs set by the
+    /// test rather than defaulted to "sweep every tick".
+    fn running_journal(
+        tag: &str,
+        fake: BdFake,
+        board: &str,
+        interval: Duration,
+        journal: JournalConfig,
+    ) -> Running {
         let fakes = Fakes::new(tag, PiFake::Started, fake, board);
         let (poller, handle) = BoardPoller::spawn(BoardConfig {
             bin: fakes.bd_bin().to_string(),
             interval,
             enabled: true,
+            journal,
         });
         Running {
             _poller: poller,
@@ -550,6 +1054,64 @@ mod tests {
     async fn wait_reads(fakes: &Fakes, n: usize) {
         until(&format!("{n} completed board read(s)"), WAIT, || {
             fakes.bd_stops() >= n
+        })
+        .await;
+    }
+
+    // ───────────────── reading the poller's own command log ─────────────────
+    //
+    // The watermark is state inside a task a test cannot reach, so every
+    // assertion about it is made against the one place it is observable: the
+    // `--since` number that went out on the last probe. That is also the
+    // stronger form of the claim — it is the watermark as `bd` saw it, not as
+    // the poller remembers it.
+
+    /// The board-read lines in the fake's log, in order.
+    fn board_reads(fakes: &Fakes) -> Vec<String> {
+        fakes
+            .bd_log()
+            .into_iter()
+            .filter(|l| l.as_str() == BOARD_READ)
+            .collect()
+    }
+
+    /// The journal-probe lines in the fake's log, in order.
+    fn probes(fakes: &Fakes) -> Vec<String> {
+        fakes
+            .bd_log()
+            .into_iter()
+            .filter(|l| l.starts_with("--readonly events tail"))
+            .collect()
+    }
+
+    /// One `--flag <value>` out of a logged command line.
+    fn flag(line: &str, want: &str) -> i64 {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        parts
+            .iter()
+            .position(|p| *p == want)
+            .and_then(|i| parts.get(i + 1))
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or_else(|| panic!("no {want} <number> in {line:?}"))
+    }
+
+    /// The `--since` of every probe, in order: the watermark's trajectory.
+    fn probe_since(fakes: &Fakes) -> Vec<i64> {
+        probes(fakes).iter().map(|l| flag(l, "--since")).collect()
+    }
+
+    /// The `--limit` of every probe, in order: which end of the catch-up /
+    /// steady-state pair each tick was asking with.
+    fn probe_limit(fakes: &Fakes) -> Vec<i64> {
+        probes(fakes).iter().map(|l| flag(l, "--limit")).collect()
+    }
+
+    /// Wait until the poller's first board read has landed and it has had at
+    /// least `ticks` probes since — i.e. it is settled and quiet, which is the
+    /// state every detector test starts from.
+    async fn wait_settled(r: &Running, ticks: usize) {
+        until("the first read plus a settled probe stream", WAIT, || {
+            probes(&r.fakes).len() >= ticks && !board_reads(&r.fakes).is_empty()
         })
         .await;
     }
@@ -659,11 +1221,15 @@ mod tests {
             std::env::set_var("LOOPRS_KANBAN", "0");
             std::env::set_var("LOOPRS_KANBAN_POLL_MS", "1234");
             std::env::set_var("LOOPRS_BD_BIN", "/tmp/looprs-test/bd");
+            std::env::set_var("LOOPRS_KANBAN_EVENTS", "0");
+            std::env::set_var("LOOPRS_KANBAN_RECONCILE_MS", "9000");
         }
         let cfg = BoardConfig::from_env();
         assert!(!cfg.enabled, "LOOPRS_KANBAN=0 must turn it off: {cfg:?}");
         assert_eq!(cfg.interval, Duration::from_millis(1234), "{cfg:?}");
         assert_eq!(cfg.bin, "/tmp/looprs-test/bd", "{cfg:?}");
+        assert!(!cfg.journal.enabled, "LOOPRS_KANBAN_EVENTS=0: {cfg:?}");
+        assert_eq!(cfg.journal.reconcile, Duration::from_secs(9), "{cfg:?}");
 
         // SAFETY: as above; removed rather than blanked, so the second reading
         // is the *unset* case and not the blank-value one.
@@ -671,42 +1237,64 @@ mod tests {
             std::env::remove_var("LOOPRS_KANBAN");
             std::env::remove_var("LOOPRS_KANBAN_POLL_MS");
             std::env::remove_var("LOOPRS_BD_BIN");
+            std::env::remove_var("LOOPRS_KANBAN_EVENTS");
+            std::env::remove_var("LOOPRS_KANBAN_RECONCILE_MS");
         }
         let bare = BoardConfig::from_env();
         assert!(bare.enabled);
         assert_eq!(bare.interval, Duration::from_secs(5));
         assert_eq!(bare.bin, "bd");
+        assert!(
+            bare.journal.enabled,
+            "the detector is on by default: {bare:?}"
+        );
+        assert_eq!(
+            bare.journal.reconcile,
+            Duration::from_millis(DEFAULT_RECONCILE_MS)
+        );
     }
 
     // ───────────────────────── the read it runs ─────────────────────────
 
-    /// One read per tick, and the read is ADR-0007 §3's command line.
-    ///
-    /// The ADR forbids three per-status queries per frame (2.9× the cost, and
-    /// three reads of one board can disagree with each other inside one frame),
-    /// so the assertion is not "the command is right" but **"every command,
-    /// always the same one, and never one that writes"**.
     #[tokio::test]
-    async fn every_tick_is_the_one_board_read_and_never_a_write() {
+    async fn the_poller_runs_two_fixed_reads_and_never_a_write() {
         let r = running(
             "poll-once",
             BdFake::Ok,
             BOARD_VARIETY,
             Duration::from_millis(60),
         );
-        wait_reads(&r.fakes, 3).await;
+        wait_reads(&r.fakes, 4).await;
 
         let lines = r.fakes.bd_log();
-        assert!(lines.len() >= 3, "expected several reads: {lines:?}");
+        assert!(lines.len() >= 4, "expected several reads: {lines:?}");
         for line in &lines {
-            assert_eq!(
-                line, "--readonly list --all --limit 0 --json",
-                "the board is one fixed read, not a per-column query"
+            let is_board = line == BOARD_READ;
+            let is_probe = line.starts_with("--readonly events tail --since ")
+                && line.contains(" --limit ")
+                && line.ends_with("--json");
+            assert!(
+                is_board || is_probe,
+                "the poller ran {line:?}, which is neither the board read nor the journal probe: \
+                 {lines:?}"
             );
         }
+        // Both halves actually ran, or this passed by running only one of them.
+        assert!(
+            lines.iter().any(|l| l == BOARD_READ),
+            "no board read at all: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("--readonly events tail")),
+            "no journal probe at all: {lines:?}"
+        );
         // The band cannot change the board — as a property of the command line.
         let joined = lines.join(" ");
-        for forbidden in ["update", "claim", "create", "close", "ready"] {
+        for forbidden in [
+            "update", "claim", "create", "close", "ready", "delete", "label", "prune",
+        ] {
             assert!(
                 !joined.contains(forbidden),
                 "the poller ran {forbidden:?}, which either writes or re-derives: {lines:?}"
@@ -756,6 +1344,7 @@ mod tests {
             bin: fakes.bd_bin().to_string(),
             interval: Duration::from_millis(60),
             enabled: true,
+            journal: sweep_every(Duration::from_millis(60)),
         });
 
         let snap = handle.borrow();
@@ -1131,6 +1720,7 @@ mod tests {
             bin: fakes.bd_bin().to_string(),
             interval: Duration::from_millis(60),
             enabled: true,
+            journal: sweep_every(Duration::from_millis(60)),
         });
         // Wait for a read that is *in flight* — started, and not yet finished.
         until("the fake bd to have a read in flight", WAIT, || {
@@ -1175,6 +1765,7 @@ mod tests {
             bin: fakes.bd_bin().to_string(),
             interval: Duration::from_millis(60),
             enabled: false,
+            journal: sweep_every(Duration::from_millis(60)),
         });
 
         assert!(!handle.is_enabled(), "the handle knows too");
@@ -1209,19 +1800,528 @@ mod tests {
             bin: fakes.bd_bin().to_string(),
             interval: Duration::from_millis(40),
             enabled: true,
+            journal: sweep_every(Duration::from_millis(40)),
         });
         wait_reads(&fakes, 1).await;
         // The poller itself stays alive the whole time, so the only thing that
         // can stop the task is this: nobody left to publish to.
         assert!(handle.changed().await, "the second read never arrived");
         drop(handle);
+        // Let whatever tick was in flight when the reader left finish, then take
+        // the baseline. The poller checks `receiver_count` at the top of every
+        // tick, so this window — ten ticks' worth — is far more than the one it
+        // needs to notice and return.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let before_reads = board_reads(&fakes).len();
         let before = fakes.bd_starts();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            fakes.bd_starts() <= before + 1,
-            "reads kept going after the last reader left: {before} -> {}",
+        // And now nothing: no probe, no read, no process. Six ticks' worth of
+        // silence is the assertion — a poller that had not stopped would have
+        // run several of each by now.
+        tokio::time::sleep(Duration::from_millis(240)).await;
+        assert_eq!(
+            fakes.bd_starts(),
+            before,
+            "`bd` ran after the last reader left: {} -> {}",
+            before,
             fakes.bd_starts()
         );
+        assert_eq!(
+            board_reads(&fakes).len(),
+            before_reads,
+            "a board read happened with nobody left to see it"
+        );
         assert!(poller.task.is_some(), "a running board owns a task");
+    }
+
+    // ═══════════════════ the change detector (ADR-0007 §7) ═══════════════════
+    //
+    // Everything below is the same claim from different sides: the journal is
+    // what the poller asks, the board is what it reads, and **no variation of
+    // "the probe said nothing" may ever leave a changed board unpainted**. The
+    // first two tests are the saving; the rest are the safety.
+
+    /// The saving this whole change is for: a quiet board costs a probe, not a
+    /// board read.
+    #[tokio::test]
+    async fn a_quiet_journal_costs_no_board_read_after_the_first_one() {
+        let r = running_journal(
+            "detector-quiet",
+            BdFake::Ok,
+            BOARD_VARIETY,
+            Duration::from_millis(40),
+            never_sweep(),
+        );
+        wait_settled(&r, 3).await;
+        // Several more ticks, and the board is still read exactly once — the
+        // first one, which is not optional.
+        tokio::time::sleep(Duration::from_millis(240)).await;
+        assert_eq!(
+            board_reads(&r.fakes).len(),
+            1,
+            "a quiet journal re-read the board: probes {:?}",
+            probe_since(&r.fakes)
+        );
+        // …and that is not the skip-forever failure masquerading as saving: the
+        // board *was* read, and is on the handle.
+        assert_eq!(r.handle.borrow().total(), 6, "the first read landed");
+        assert!(r.handle.borrow().read.is_ok());
+        assert!(
+            probes(&r.fakes).len() >= 5,
+            "it stopped probing rather than stopping reading"
+        );
+    }
+
+    /// One record in the journal buys **one** board read — not one per record,
+    /// and not one per tick afterwards.
+    #[tokio::test]
+    async fn one_journal_record_buys_exactly_one_board_read() {
+        let r = running_journal(
+            "detector-moved",
+            BdFake::Ok,
+            BOARD_VARIETY,
+            Duration::from_millis(40),
+            never_sweep(),
+        );
+        wait_settled(&r, 2).await;
+        let before = board_reads(&r.fakes).len();
+
+        r.fakes.bump_journal(1);
+        until("the read the journal asked for", WAIT, || {
+            board_reads(&r.fakes).len() > before
+        })
+        .await;
+
+        // And it settles: the read it just did covered the change, so the next
+        // several ticks are quiet ticks again. A detector that re-read on every
+        // tick after a single record is no detector at all.
+        tokio::time::sleep(Duration::from_millis(240)).await;
+        assert_eq!(
+            board_reads(&r.fakes).len(),
+            before + 1,
+            "one record caused more than one read: probes {:?}",
+            probe_since(&r.fakes)
+        );
+    }
+
+    /// **The watermark rule, tested as a lost change would appear.**
+    ///
+    /// The dangerous implementation is the poller that adopts the highest seq it
+    /// has ever *seen* — including one seen after the board read that is meant
+    /// to have covered it. That loses the change silently: the rows never
+    /// contain it, the watermark is past it, and the band never asks again. With
+    /// the safe rule (adopt only what the probe saw *before* the read) the same
+    /// race costs one extra read, which is what this asserts.
+    ///
+    /// `BdFake::Slow` is what makes the window wide enough to matter: 350 ms of
+    /// read against a 20 ms tick is ~17 ticks of room to drop a change into.
+    #[tokio::test]
+    async fn a_change_that_lands_during_a_read_is_still_picked_up() {
+        let r = running_journal(
+            "detector-midread",
+            BdFake::Slow,
+            BOARD_VARIETY,
+            Duration::from_millis(20),
+            never_sweep(),
+        );
+        wait_settled(&r, 2).await;
+        let before = board_reads(&r.fakes).len();
+
+        // First change: this is the read that will be running when the second
+        // one arrives.
+        r.fakes.bump_journal(1);
+        until("a `bd` in flight for the first change", WAIT, || {
+            r.fakes.bd_starts() > r.fakes.bd_stops()
+        })
+        .await;
+        // Second change, dropped into the middle of that read.
+        r.fakes.bump_journal(1);
+
+        until(
+            "a second read, for the change that arrived mid-read",
+            WAIT,
+            || board_reads(&r.fakes).len() >= before + 2,
+        )
+        .await;
+        // And the watermark moved past both records: the detector is not stuck
+        // replaying them, and it is not ahead of them either.
+        until("the watermark to pass seq 2", WAIT, || {
+            probe_since(&r.fakes).last().copied().unwrap_or(0) >= 2
+        })
+        .await;
+    }
+
+    /// The sweep, and nothing else, is what can see a change the journal did not
+    /// record — `bd dolt pull`, `bd sql`, a workspace with the journal off.
+    #[tokio::test]
+    async fn an_unjournaled_change_lands_on_the_sweep_and_the_journal_never_claimed_it() {
+        let sweep = Duration::from_millis(150);
+        let r = running_journal(
+            "detector-sweep",
+            BdFake::Ok,
+            ONE_BEADED_BOARD,
+            Duration::from_millis(25),
+            JournalConfig {
+                enabled: true,
+                reconcile: sweep,
+            },
+        );
+        wait_settled(&r, 2).await;
+        assert_eq!(r.handle.borrow().total(), 1);
+
+        // Change the board **without** a journal record. Nothing the probe can
+        // see has happened.
+        r.fakes.set_board_unjournaled(BOARD_VARIETY);
+        let watermark_at_change = *probe_since(&r.fakes).last().expect("a probe ran");
+
+        until(
+            "the sweep to notice what the journal could not",
+            WAIT,
+            || r.handle.borrow().total() == 6,
+        )
+        .await;
+        assert_eq!(
+            *probe_since(&r.fakes).last().expect("a probe ran"),
+            watermark_at_change,
+            "the watermark moved, so this was the journal taking credit for a change \
+             it never saw"
+        );
+    }
+
+    /// A probe that cannot be answered is never read as "nothing changed". The
+    /// board keeps getting read while the detector is down, and goes quiet again
+    /// when it comes back.
+    #[tokio::test]
+    async fn a_probe_that_cannot_answer_never_reads_as_a_quiet_board() {
+        let r = running_journal(
+            "detector-broken",
+            BdFake::Ok,
+            BOARD_VARIETY,
+            Duration::from_millis(40),
+            never_sweep(),
+        );
+        wait_settled(&r, 2).await;
+        let before = board_reads(&r.fakes).len();
+
+        r.fakes.fail_journal(true);
+        until("the board read that a broken probe owes", WAIT, || {
+            board_reads(&r.fakes).len() > before
+        })
+        .await;
+        // …every tick, not once: with the detector down the poller is back to
+        // asking the board directly.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            board_reads(&r.fakes).len() >= before + 4,
+            "a broken probe stopped the board being read: probes {:?}",
+            probe_since(&r.fakes)
+        );
+
+        // Recovery is not sticky either.
+        r.fakes.fail_journal(false);
+        // Give the detector a few ticks to notice it can answer again; reads
+        // stop the tick a quiet probe lands.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let settled = board_reads(&r.fakes).len();
+        tokio::time::sleep(Duration::from_millis(240)).await;
+        assert_eq!(
+            board_reads(&r.fakes).len(),
+            settled,
+            "still reading after the detector recovered: {:?}",
+            probe_since(&r.fakes)
+        );
+    }
+
+    /// A watermark the retention floors pruned away is a **typed** answer with
+    /// an address in it, and the poller goes there: read the board, resume from
+    /// the head `bd` named, do not re-probe the pruned prefix forever.
+    #[tokio::test]
+    async fn a_pruned_watermark_rebaselines_at_the_head_bd_named() {
+        let r = running_journal(
+            "detector-truncated",
+            BdFake::Ok,
+            BOARD_VARIETY,
+            Duration::from_millis(40),
+            never_sweep(),
+        );
+        wait_settled(&r, 2).await;
+        assert_eq!(*probe_since(&r.fakes).last().unwrap(), 0, "starts at zero");
+
+        r.fakes.truncate_journal(10, 42);
+        until("a probe above the retention floor", WAIT, || {
+            *probe_since(&r.fakes).last().unwrap() >= 42
+        })
+        .await;
+        assert!(
+            board_reads(&r.fakes).len() >= 2,
+            "the re-baseline did not come with a fresh board read"
+        );
+        // And the truncation is not a permanent condition: it settled at the
+        // head instead of looping on the refusal.
+        let settled = board_reads(&r.fakes).len();
+        tokio::time::sleep(Duration::from_millis(240)).await;
+        assert_eq!(
+            board_reads(&r.fakes).len(),
+            settled,
+            "looping on the truncation: {:?}",
+            probe_since(&r.fakes)
+        );
+    }
+
+    /// A workspace with the journal switched off answers the probe with *nothing*,
+    /// successfully, forever. That is the case the sweep is there for, and the
+    /// band must keep following the board.
+    #[tokio::test]
+    async fn a_disabled_journal_is_a_quiet_lie_the_sweep_covers() {
+        let r = running_journal(
+            "detector-disabled",
+            BdFake::Ok,
+            ONE_BEADED_BOARD,
+            Duration::from_millis(25),
+            JournalConfig {
+                enabled: true,
+                reconcile: Duration::from_millis(120),
+            },
+        );
+        wait_settled(&r, 2).await;
+
+        r.fakes.disable_journal(true);
+        r.fakes.set_board_unjournaled(BOARD_VARIETY);
+        until("a sweep past the disabled journal", WAIT, || {
+            r.handle.borrow().total() == 6
+        })
+        .await;
+        // The probe is still being asked (cheap), it just never says anything.
+        assert!(!probes(&r.fakes).is_empty());
+    }
+
+    /// A journal with more in it than one batch can carry is **drained**, not
+    /// guessed at — and while it is being drained the poller reads the board
+    /// every tick, because it cannot know whether the records it has not read
+    /// touched a bead. That is the property that makes a big journal delay the
+    /// savings rather than cost more than the pre-detector poller ever did.
+    #[tokio::test]
+    async fn a_big_journal_drains_in_bounded_batches_and_then_starts_saving() {
+        let fakes = Fakes::new(
+            "detector-catchup",
+            PiFake::Started,
+            BdFake::Ok,
+            BOARD_VARIETY,
+        );
+        let mut prefill = String::new();
+        for seq in 1..=(CATCHUP_LIMIT * 2) {
+            prefill.push_str(&format!(
+                r#"{{"seq":{seq},"op":"update","issue_id":"looprs-old-{seq}"}}"#
+            ));
+            prefill.push('\n');
+        }
+        fakes.set_journal(&prefill);
+        let (_poller, handle) = BoardPoller::spawn(BoardConfig {
+            bin: fakes.bd_bin().to_string(),
+            interval: Duration::from_millis(30),
+            enabled: true,
+            journal: never_sweep(),
+        });
+
+        until("the drain to reach the head", WAIT, || {
+            probes(&fakes).len() >= 4 && probe_limit(&fakes).last() == Some(&PROBE_LIMIT)
+        })
+        .await;
+
+        // Every batch was bounded: no single probe was asked to swallow the lot.
+        let limits = probe_limit(&fakes);
+        assert_eq!(limits[0], CATCHUP_LIMIT, "starts in catch-up");
+        assert!(
+            limits.iter().all(|l| *l <= CATCHUP_LIMIT),
+            "an unbounded probe: {limits:?}"
+        );
+        // The watermark walked the journal in CATCHUP_LIMIT steps.
+        let since = probe_since(&fakes);
+        assert!(
+            since.windows(2).all(|w| w[1] >= w[0]),
+            "the watermark went backwards: {since:?}"
+        );
+        assert!(
+            since.contains(&(CATCHUP_LIMIT * 2)),
+            "never drained to the head: {since:?}"
+        );
+        // While draining, every tick that found records read the board: two
+        // full batches in, two reads out. Skipping them would be the lost-change
+        // bug wearing a different name.
+        assert!(
+            board_reads(&fakes).len() >= 2,
+            "drained the journal without reading the board it was behind: reads {}, probes {:?}",
+            board_reads(&fakes).len(),
+            since
+        );
+        // And once drained, it stops.
+        let settled = board_reads(&fakes).len();
+        tokio::time::sleep(Duration::from_millis(240)).await;
+        assert_eq!(
+            board_reads(&fakes).len(),
+            settled,
+            "still reading after catching up: {:?}",
+            probe_since(&fakes)
+        );
+        assert_eq!(handle.borrow().total(), 6);
+    }
+
+    /// `LOOPRS_KANBAN_EVENTS=0`: the pre-detector poller, exactly. Every tick a
+    /// board read, and the journal is never touched at all.
+    #[tokio::test]
+    async fn detector_off_reads_the_board_every_tick_and_never_the_journal() {
+        let r = running_journal(
+            "detector-off",
+            BdFake::Ok,
+            BOARD_VARIETY,
+            Duration::from_millis(40),
+            JournalConfig {
+                enabled: false,
+                reconcile: Duration::from_secs(3600),
+            },
+        );
+        wait_reads(&r.fakes, 4).await;
+        assert!(
+            board_reads(&r.fakes).len() >= 4,
+            "the board stopped being read every tick: {:?}",
+            r.fakes.bd_log()
+        );
+        assert!(
+            probes(&r.fakes).is_empty(),
+            "LOOPRS_KANBAN_EVENTS=0 still probed the journal: {:?}",
+            probes(&r.fakes)
+        );
+    }
+
+    // ─────────────────── the decision table, with no subprocess ───────────────────
+
+    /// [`decide`] as a table. The task-level tests above prove it works; these
+    /// prove the three rules that make it safe, in the cases a running poller is
+    /// awkward to put in exactly the right state for.
+    #[test]
+    fn the_decision_table() {
+        type Probe = Result<bd::JournalProbe, bd::JournalError>;
+        let quiet: Probe = Ok(bd::JournalProbe {
+            seqs: vec![],
+            disabled: false,
+        });
+        let one_record: Probe = Ok(bd::JournalProbe {
+            seqs: vec![7],
+            disabled: false,
+        });
+        let filled_batch: Probe = Ok(bd::JournalProbe {
+            seqs: vec![8, 9],
+            disabled: false,
+        });
+        let disabled: Probe = Ok(bd::JournalProbe {
+            seqs: vec![],
+            disabled: true,
+        });
+        let pruned: Probe = Err(bd::JournalError::Truncated {
+            since: 0,
+            floor: 5,
+            head: 99,
+        });
+        let broken: Probe = Err(bd::JournalError::Unusable(BdError::Timeout {
+            bin: "bd".into(),
+            args: "events tail".into(),
+        }));
+
+        // Rule 1: never read ⇒ always read, however quiet the journal is.
+        let d = decide(quiet.clone(), CATCHUP_LIMIT, true, false);
+        assert_eq!(d.read, Some(ReadReason::First), "{d:?}");
+        assert!(d.adopt.is_none(), "nothing new to adopt: {d:?}");
+
+        // Quiet, board already read, no sweep ⇒ skip. This is the saving.
+        let d = decide(quiet.clone(), PROBE_LIMIT, false, false);
+        assert_eq!(d.read, None, "{d:?}");
+        assert!(d.at_head);
+
+        // Quiet but the sweep is due ⇒ read, and the journal still owns nothing.
+        let d = decide(quiet, PROBE_LIMIT, false, true);
+        assert_eq!(d.read, Some(ReadReason::Sweep), "{d:?}");
+        assert!(d.adopt.is_none());
+
+        // A record ⇒ read, adopt exactly what the probe saw.
+        let d = decide(one_record, CATCHUP_LIMIT, false, false);
+        assert_eq!(d.read, Some(ReadReason::Journal), "{d:?}");
+        assert_eq!(d.adopt, Some(7));
+        assert!(d.at_head, "a short batch means the drain reached the head");
+
+        // A batch that filled its limit ⇒ behind, and not at the head yet.
+        let d = decide(filled_batch, 2, false, false);
+        assert_eq!(d.read, Some(ReadReason::Journal));
+        assert_eq!(d.adopt, Some(9));
+        assert!(!d.at_head, "{d:?}");
+
+        // Pruned ⇒ re-baseline at the head `bd` named, and report it.
+        let d = decide(pruned, PROBE_LIMIT, false, false);
+        assert_eq!(d.read, Some(ReadReason::Rebaselined), "{d:?}");
+        assert_eq!(d.adopt, Some(99), "resume where the refusal pointed");
+        assert!(d.at_head, "there is nothing behind the floor to drain");
+        assert!(d.broken.is_some(), "and it is worth saying out loud");
+
+        // Rule 2, the one that matters most: a probe that could not answer
+        // reads the board, and adopts NOTHING. Moving the watermark here is the
+        // lost change.
+        let d = decide(broken, PROBE_LIMIT, false, false);
+        assert_eq!(d.read, Some(ReadReason::ProbeFailed), "{d:?}");
+        assert_eq!(
+            d.adopt, None,
+            "a failed probe must never move the watermark"
+        );
+        assert!(
+            !d.at_head,
+            "a probe that failed says nothing about the head"
+        );
+        assert!(d.broken.is_some());
+
+        // A disabled journal answers quiet and says so; that is not a failure,
+        // but it is not a reason to stop sweeping either.
+        let d = decide(disabled, PROBE_LIMIT, false, true);
+        assert_eq!(d.read, Some(ReadReason::Sweep), "{d:?}");
+        assert!(d.disabled);
+        assert!(d.broken.is_none());
+    }
+
+    /// The detector's own two knobs, as a table.
+    #[test]
+    fn the_detector_knobs_resolve_leniently() {
+        assert!(JournalConfig::resolve(None, None).enabled, "on by default");
+        assert_eq!(
+            JournalConfig::resolve(None, None).reconcile,
+            Duration::from_millis(DEFAULT_RECONCILE_MS)
+        );
+        for off in ["0", "off", "OFF", "  no ", "False"] {
+            assert!(
+                !JournalConfig::resolve(Some(off), None).enabled,
+                "{off:?} should mean off"
+            );
+        }
+        for on in ["1", "yes", "on", "kanban", "nonsense"] {
+            assert!(
+                JournalConfig::resolve(Some(on), None).enabled,
+                "{on:?} is not an explicit no"
+            );
+        }
+        assert_eq!(
+            JournalConfig::resolve(None, Some("60000")).reconcile,
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            JournalConfig::resolve(None, Some(" nonsense ")).reconcile,
+            Duration::from_millis(DEFAULT_RECONCILE_MS),
+            "unparseable falls back, loudly"
+        );
+        assert_eq!(
+            JournalConfig::resolve(None, Some("   ")).reconcile,
+            Duration::from_millis(DEFAULT_RECONCILE_MS),
+            "blank is unset, not zero"
+        );
+        // `0` is honoured rather than refused: the tick paces the poller, so it
+        // cannot spin. It just makes the detector pointless, which is warned.
+        assert_eq!(
+            JournalConfig::resolve(None, Some("0")).reconcile,
+            Duration::ZERO
+        );
     }
 }

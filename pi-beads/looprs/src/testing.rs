@@ -413,6 +413,10 @@ pub struct Fakes {
     bd_log: PathBuf,
     board_file: PathBuf,
     show_file: PathBuf,
+    /// The fake **events journal**: one JSON record per line, appended to, never
+    /// rewritten. It is a separate file from the board on purpose — see the header
+    /// of `tests/fixtures/fake_bd.sh` for why the two are not one thing.
+    journal_file: PathBuf,
     /// The sink the loop under test was handed, so a test can read completions off
     /// the same `Fakes` it reads `bd`'s log from.
     pub notifier: RecordingNotifier,
@@ -431,6 +435,7 @@ impl Fakes {
         let bd_log = dir.join("bd.log");
         let board_file = dir.join("board.json");
         let show_file = dir.join("show.json");
+        let journal_file = dir.join("journal.jsonl");
         let pi_bin = dir.join("pi");
         let bd_bin = dir.join("bd");
 
@@ -444,6 +449,7 @@ impl Fakes {
                 &show_file,
                 &dir.join("fail"),
                 &dir.join("refuse_claim"),
+                &journal_file,
                 bd,
             ),
         );
@@ -451,6 +457,11 @@ impl Fakes {
         // No bead is known to `bd show` until a test says otherwise: an unset
         // show file reads as "no such bead", which is the safe default.
         std::fs::write(&show_file, "[]").unwrap();
+        // And the journal starts empty, which is a *real* state a board can be in
+        // (the journal is young, or was only just switched on) and not a hole in
+        // the fake: an empty journal answers "nothing has changed", and the
+        // board's own periodic full re-read is what keeps that answer honest.
+        std::fs::write(&journal_file, "").unwrap();
 
         Self {
             dir,
@@ -460,13 +471,127 @@ impl Fakes {
             bd_log,
             board_file,
             show_file,
+            journal_file,
             notifier: RecordingNotifier::default(),
         }
     }
 
     /// Point the loop's fakes at a different board without restarting them.
+    ///
+    /// This **also appends one journal record**, because that is what a real
+    /// `set_board` is: a mutation through `bd`'s write path, which journals in
+    /// the same transaction. Without the paired record the board's change
+    /// detector (ADR-0007 §7) would never fire in a test and every test that
+    /// means "the board moved" would silently be testing only the periodic
+    /// sweep. Use [`Self::set_board_unjournaled`] when you want the other case.
     pub fn set_board(&self, board: &str) {
         std::fs::write(&self.board_file, board).unwrap();
+        self.bump_journal(1);
+    }
+
+    /// Change the board **without** journalling it — the `bd dolt pull` case, the
+    /// one mutation path the journal legitimately never sees.
+    ///
+    /// This is the sharpest thing a test can do to the change detector: a poller
+    /// that trusted the journal alone would keep its old rows here forever. What
+    /// must happen instead is the periodic full re-read, and this is how that
+    /// gets observed.
+    pub fn set_board_unjournaled(&self, board: &str) {
+        std::fs::write(&self.board_file, board).unwrap();
+    }
+
+    /// The fake journal's raw contents, one record per line.
+    pub fn journal(&self) -> Vec<String> {
+        let raw = self.read(&self.journal_file);
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The highest seq the fake journal holds, or `0` when it holds nothing.
+    pub fn journal_head(&self) -> i64 {
+        self.journal()
+            .last()
+            .and_then(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .ok()
+                    .and_then(|v| v.get("seq").and_then(|s| s.as_i64()))
+            })
+            .unwrap_or(0)
+    }
+
+    /// Replace the journal wholesale with `jsonl` (one record per line).
+    pub fn set_journal(&self, jsonl: &str) {
+        std::fs::write(&self.journal_file, jsonl).unwrap();
+    }
+
+    /// Append `n` records, continuing the sequence from what is already there.
+    ///
+    /// The lever for "something was mutated on this replica" without changing the
+    /// board file at all — which is the mirror-image case of
+    /// [`Self::set_board_unjournaled`]: here the detector sees a change the
+    /// board's contents do not contradict, and a full re-read follows.
+    pub fn bump_journal(&self, n: usize) {
+        let mut body = self.read(&self.journal_file);
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        let mut seq = self.journal_head();
+        for _ in 0..n {
+            seq += 1;
+            body.push_str(&format!(
+                r#"{{"seq":{seq},"ts":"1970-01-01T00:00:00Z","op":"update","issue_id":"looprs-fake-{seq}","actor":"fake"}}"#
+            ));
+            body.push('\n');
+        }
+        std::fs::write(&self.journal_file, body).unwrap();
+    }
+
+    /// Make every probe with `--since` below `floor` come back as the truncation
+    /// refusal the real CLI returns, naming `floor` and `head`.
+    ///
+    /// The journal's retention floors prune a consumer's checkpoint for real; a
+    /// poller that read that as "no records" would read a pruned prefix as "no
+    /// changes" and never recover.
+    pub fn truncate_journal(&self, floor: i64, head: i64) {
+        std::fs::write(self.journal_trunc_mark(), format!("{floor} {head}\n")).unwrap();
+    }
+
+    /// Take the journal off entirely: `bd` answers the probe with nothing and
+    /// puts its "disabled for this workspace" note on stderr.
+    pub fn disable_journal(&self, on: bool) {
+        let mark = self.journal_disabled_mark();
+        if on {
+            std::fs::write(&mark, b"").unwrap();
+        } else {
+            let _ = std::fs::remove_file(&mark);
+        }
+    }
+
+    /// Make the **probe** fail (exit 5) while every board read keeps working.
+    ///
+    /// Distinct from [`Self::fail_bd`] for the same reason `refuse_claim` is:
+    /// failing everything proves only that a dead `bd` stops the poller, not
+    /// that a dead *journal* leaves the board readable — and the two failures
+    /// must not be able to read as one another.
+    pub fn fail_journal(&self, on: bool) {
+        let mark = self.journal_fail_mark();
+        if on {
+            std::fs::write(&mark, b"").unwrap();
+        } else {
+            let _ = std::fs::remove_file(&mark);
+        }
+    }
+
+    fn journal_trunc_mark(&self) -> PathBuf {
+        self.journal_file.with_extension("trunc")
+    }
+    fn journal_disabled_mark(&self) -> PathBuf {
+        self.journal_file.with_extension("disabled")
+    }
+    fn journal_fail_mark(&self) -> PathBuf {
+        self.journal_file.with_extension("fail")
     }
 
     /// Make every *subsequent* fake `bd` call fail (exit 3), without restarting it.
@@ -820,26 +945,42 @@ fn bd_script(
     show: &Path,
     fail_mark: &Path,
     refuse_mark: &Path,
+    journal: &Path,
     mode: BdFake,
 ) -> String {
-    // (read verb, `bd show`, write verb) per personality.
-    let (read_cmd, show_cmd, write_cmd): (String, String, String) = match mode {
-        BdFake::Fails => ("exit 3".into(), "exit 3".into(), "exit 3".into()),
+    // (read verb, `bd show`, write verb, `events tail`) per personality.
+    //
+    // The events column answers the change detector the same way the personality
+    // answers everything else — including `Slow`, where the probe is slow too,
+    // because a fake that was quick at the cheap read and slow at the expensive
+    // one would be modelling a `bd` that does not exist.
+    let journal_tail = r#"journal_tail "$ev_since" "$ev_limit""#.to_string();
+    let slow_journal = format!("sleep {}; {journal_tail}", SLOW_FAKE_READ.as_secs_f64());
+    let (read_cmd, show_cmd, write_cmd, events_cmd): (String, String, String, String) = match mode {
+        BdFake::Fails => (
+            "exit 3".into(),
+            "exit 3".into(),
+            "exit 3".into(),
+            "exit 3".into(),
+        ),
         BdFake::Malformed => (
             "printf 'not json at all\\n'".into(),
             "printf 'not json at all\\n'".into(),
             "exit 0".into(),
+            "printf 'not json at all\\n'".into(),
         ),
-        BdFake::EmptyOutput => ("true".into(), "true".into(), "exit 0".into()),
+        BdFake::EmptyOutput => ("true".into(), "true".into(), "exit 0".into(), "true".into()),
         BdFake::Ok => (
             format!("cat {}", board.display()),
             "printf '[]\\n'".into(),
             "exit 0".into(),
+            journal_tail.clone(),
         ),
         BdFake::ShowStatus => (
             format!("cat {}", board.display()),
             format!("cat {}", show.display()),
             "exit 0".into(),
+            journal_tail.clone(),
         ),
         BdFake::Slow => (
             format!(
@@ -849,6 +990,7 @@ fn bd_script(
             ),
             "printf '[]\\n'".into(),
             "exit 0".into(),
+            slow_journal,
         ),
     };
     FAKE_BD
@@ -858,6 +1000,20 @@ fn bd_script(
         .replace("{{READ_CMD}}", &read_cmd)
         .replace("{{SHOW_CMD}}", &show_cmd)
         .replace("{{WRITE_CMD}}", &write_cmd)
+        .replace("{{EVENTS_CMD}}", &events_cmd)
+        .replace("{{JOURNAL}}", &journal.display().to_string())
+        .replace(
+            "{{JOURNAL_TRUNC}}",
+            &journal.with_extension("trunc").display().to_string(),
+        )
+        .replace(
+            "{{JOURNAL_DISABLED}}",
+            &journal.with_extension("disabled").display().to_string(),
+        )
+        .replace(
+            "{{JOURNAL_FAIL}}",
+            &journal.with_extension("fail").display().to_string(),
+        )
 }
 
 /// Is this pid still a live process (not a reaped one)?
