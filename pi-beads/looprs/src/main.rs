@@ -52,7 +52,7 @@ use crate::teardown::{Mode, Teardown, install_panic_hook, panic_injected};
 
 fn init_logging() -> anyhow::Result<WorkerGuard> {
     //let dir = std::env::temp_dir(); // or a proper data dir, e.g. via the `dirs` crate
-    let dir = std::env::current_dir().unwrap();
+    let dir = std::env::temp_dir();
     let appender = tracing_appender::rolling::never(&dir, "looprs.log");
     let (writer, guard) = tracing_appender::non_blocking(appender);
 
