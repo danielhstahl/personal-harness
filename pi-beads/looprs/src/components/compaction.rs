@@ -16,7 +16,7 @@ use ratatui::text::Line;
 
 use crate::components::status::fmt_tokens;
 use crate::state::transcript::{Entry, MessageKind};
-use crate::theme::styles::{BLUE, RED};
+use crate::theme::styles::{BLUE, GREEN, RED};
 use crate::utils::render::FRAMES;
 use crate::wire::WireValue;
 
@@ -45,7 +45,7 @@ impl CompactionState {
     fn color(self) -> Color {
         match self {
             Self::Running => BLUE,
-            Self::Done => Color::Green,
+            Self::Done => GREEN,
             Self::Aborted => Color::DarkGray,
             Self::Failed => RED,
         }

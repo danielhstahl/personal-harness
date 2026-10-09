@@ -3,7 +3,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use crate::state::transcript::{Entry, MessageKind};
-use crate::theme::styles::{BLUE, RED};
+use crate::theme::styles::{BLUE, GREEN, RED};
 use crate::utils::render::FRAMES;
 
 /// The tool card.
@@ -49,7 +49,7 @@ impl ToolStateCategory {
         match self {
             Self::InProgress => BLUE,
             Self::Error => RED,
-            Self::Success => Color::Green,
+            Self::Success => GREEN,
             Self::Aborted => Color::DarkGray,
         }
     }

@@ -28,6 +28,8 @@ pub const BLUE: Color = Color::Indexed(111);
 /// saturation, which is where the harshness actually lived.
 pub const RED: Color = Color::Indexed(210);
 
+pub const GREEN: Color = Color::Indexed(28);
+
 /// The band a submitted user message sits on.
 ///
 /// A **background**, not a glyph: the chevron this replaced said "mine" in one
