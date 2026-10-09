@@ -5,7 +5,8 @@
 #
 #   ./scripts/docs.sh build   # build the site into docs/_site and print where it is
 #   ./scripts/docs.sh serve   # build, then serve on http://localhost:3000 with live reload
-#   ./scripts/docs.sh check   # the rot gate (links, knob coverage, keymap coverage)
+#   ./scripts/docs.sh check   # the rot gate (links, knob coverage, keymap and
+#                             wire-protocol coverage, measurement claims)
 #
 # Why a generator at all, and why this one: ADR-0008 Q1 priced `mdbook`, a
 # hand-rolled generator and "markdown only on the git host" against each other.

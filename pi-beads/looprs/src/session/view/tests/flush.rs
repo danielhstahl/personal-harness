@@ -7,6 +7,7 @@
 
 use crate::session::TerminalType;
 use crate::state::transcript::MessageKind;
+use crate::wire::CompactionReason;
 
 use super::*;
 
@@ -70,7 +71,7 @@ fn sealing_closes_cards_left_running_so_the_transcript_keeps_flushing() {
     let mut v = view(TerminalType::Pi);
     v.transcript
         .start_tool("t1".into(), "bash".into(), "sleep 100".into());
-    v.transcript.start_compaction("threshold".into());
+    v.transcript.start_compaction(CompactionReason::Threshold);
     v.transcript
         .push_delta(MessageKind::Answer, "said after both\n");
 

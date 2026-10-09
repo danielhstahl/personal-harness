@@ -38,7 +38,7 @@ fn ended(session: SessionId, role: &str, u: Option<Usage>) -> Msg {
         session,
         event: PiEvent::MessageEnd {
             message: WireMessage {
-                role: role.to_string(),
+                role: EntryRole::parse(role),
                 usage: u,
             },
         },
@@ -350,7 +350,7 @@ fn a_compaction_shows_a_live_card_while_it_runs() {
     app.update(Msg::Agent {
         session: pi_id(),
         event: PiEvent::CompactionStart {
-            reason: "threshold".into(),
+            reason: CompactionReason::Threshold,
         },
     });
 
@@ -387,13 +387,13 @@ fn a_finished_compaction_reaches_the_scrollback_with_what_it_freed() {
     app.on_pi(
         pi_id(),
         PiEvent::CompactionStart {
-            reason: "threshold".into(),
+            reason: CompactionReason::Threshold,
         },
     );
     app.on_pi(
         pi_id(),
         PiEvent::CompactionEnd {
-            reason: Some("threshold".into()),
+            reason: Some(CompactionReason::Threshold),
             aborted: false,
             error_message: None,
             result: Some(CompactionResult {
@@ -431,7 +431,7 @@ fn an_aborted_compaction_says_aborted_and_a_failed_one_says_why() {
     app.on_pi(
         beads_id(),
         PiEvent::CompactionEnd {
-            reason: Some("manual".into()),
+            reason: Some(CompactionReason::Manual),
             aborted: true,
             error_message: None,
             result: None,
@@ -444,7 +444,7 @@ fn an_aborted_compaction_says_aborted_and_a_failed_one_says_why() {
     app.on_pi(
         beads_id(),
         PiEvent::CompactionEnd {
-            reason: Some("overflow".into()),
+            reason: Some(CompactionReason::Overflow),
             aborted: false,
             error_message: Some("provider refused the summary".into()),
             result: None,
@@ -470,7 +470,7 @@ fn a_compaction_end_with_no_open_card_is_recorded_anyway() {
     app.on_pi(
         pi_id(),
         PiEvent::CompactionEnd {
-            reason: Some("overflow".into()),
+            reason: Some(CompactionReason::Overflow),
             aborted: false,
             error_message: None,
             result: None,
@@ -492,7 +492,7 @@ fn closing_the_compaction_card_releases_what_came_behind_it() {
     app.on_pi(
         pi_id(),
         PiEvent::CompactionStart {
-            reason: "threshold".into(),
+            reason: CompactionReason::Threshold,
         },
     );
     app.on_pi(
@@ -512,7 +512,7 @@ fn closing_the_compaction_card_releases_what_came_behind_it() {
     app.on_pi(
         pi_id(),
         PiEvent::CompactionEnd {
-            reason: Some("threshold".into()),
+            reason: Some(CompactionReason::Threshold),
             aborted: false,
             error_message: None,
             result: None,
@@ -531,7 +531,9 @@ fn closing_the_compaction_card_releases_what_came_behind_it() {
 #[test]
 fn the_compaction_wire_format_parses() {
     let s = parse(&serde_json::json!({"type":"compaction_start","reason":"overflow"})).unwrap();
-    assert!(matches!(s, PiEvent::CompactionStart { reason } if reason == "overflow"));
+    assert!(
+        matches!(s, PiEvent::CompactionStart { reason } if reason == CompactionReason::Overflow)
+    );
 
     let e = parse(&serde_json::json!({
         "type": "compaction_end",
@@ -548,7 +550,7 @@ fn the_compaction_wire_format_parses() {
             error_message,
             result,
         } => {
-            assert_eq!(reason.as_deref(), Some("threshold"));
+            assert_eq!(reason, Some(CompactionReason::Threshold));
             assert!(!aborted);
             assert!(error_message.is_none());
             let r = result.expect("the result was parsed");

@@ -32,17 +32,28 @@ CRATE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(CRATE)
 
 
-def reason_on(attr_line):
+def reason_on(lines, i):
     """The reason a human wrote next to the attribute: the trailing comment, or
-    the `//` line directly under it. Empty means there is none — which the
-    module doc in `src/session/mod.rs` calls "a warning we deleted rather than
-    answered"."""
-    tail = attr_line.split("dead_code)", 1)[-1].strip()
+    the `//` line directly under it — which is where rustfmt puts a trailing
+    comment once it stops fitting the width — or the `//` line directly above
+    it. Empty means there is none — which the module doc in `src/session/mod.rs`
+    calls "a warning we deleted rather than answered".
+
+    Reading only the attribute line, as this used to, reported a reason-less
+    allow for every attribute whose comment `cargo fmt` had pushed onto its own
+    line — which is most of them, and made this function's own docstring a
+    claim about a tool that did not do what it said.
+    """
+    tail = lines[i].split("dead_code)", 1)[-1].strip()
     if tail.startswith("]"):
         tail = tail[1:].strip()
     if tail.startswith("//"):
-        tail = tail[2:].strip()
-    return tail
+        return tail[2:].strip()
+    if i + 1 < len(lines) and lines[i + 1].strip().startswith("//"):
+        return lines[i + 1].strip()[2:].strip()
+    if i > 0 and lines[i - 1].strip().startswith("//"):
+        return lines[i - 1].strip()[2:].strip()
+    return ""
 
 
 def src_files():
@@ -144,7 +155,7 @@ def main():
                 "item": lines[st].strip()[:80],
                 "dead_lines": dead_here,
                 "state": "dead" if dead_here else "redundant",
-                "why": reason_on(l),
+                "why": reason_on(lines, i),
             })
     if as_json:
         json.dump(rows, open(as_json, "w"), indent=1)

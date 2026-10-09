@@ -18,6 +18,7 @@ use crate::components::status::fmt_tokens;
 use crate::state::transcript::{Entry, MessageKind};
 use crate::theme::styles::{BLUE, RED};
 use crate::utils::render::FRAMES;
+use crate::wire::WireValue;
 
 /// Where this session's compaction has got to.
 ///
@@ -86,12 +87,15 @@ pub fn compaction_line(e: &Entry, spinner: usize) -> Line<'static> {
     // on a failure — is the entry's `text`, the same slot a tool's result summary
     // uses, so both card kinds carry their detail the same way.
     let detail = &e.text;
-    // `reason` ("manual" / "threshold" / "overflow") is dropped when it is empty,
-    // which happens for the one card that never saw its `compaction_start` — a
-    // lone `·` at the end of the row would read as a field that lost its value.
+    // `reason` is `CompactionReason`, printed with its own wire spelling, and
+    // dropped when there is none — which happens for the one card that never saw
+    // its `compaction_start`. A lone `·` at the end of the row would read as a
+    // field that lost its value. A reason this harness has not named is *not*
+    // dropped: `compacting context · quantum` is still a row about a real
+    // compaction, and naming the thing is the whole point of showing it.
     let mut text = format!("{} {}", state.icon(spinner), state.verb());
-    if !reason.is_empty() {
-        text.push_str(&format!(" · {reason}"));
+    if let Some(reason) = reason {
+        text.push_str(&format!(" · {}", reason.as_str()));
     }
     if !detail.is_empty() {
         text.push_str(&format!(" · {detail}"));
@@ -102,13 +106,11 @@ pub fn compaction_line(e: &Entry, spinner: usize) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::CompactionReason;
 
-    fn card(reason: &str, state: CompactionState, detail: &str) -> Entry {
+    fn card(reason: Option<CompactionReason>, state: CompactionState, detail: &str) -> Entry {
         Entry {
-            kind: MessageKind::Compaction {
-                reason: reason.into(),
-                state,
-            },
+            kind: MessageKind::Compaction { reason, state },
             text: detail.into(),
             done: state != CompactionState::Running,
             styles: Vec::new(),
@@ -117,7 +119,14 @@ mod tests {
 
     #[test]
     fn a_running_compaction_says_so_and_wears_the_spinner() {
-        let l = compaction_line(&card("threshold", CompactionState::Running, ""), 3);
+        let l = compaction_line(
+            &card(
+                Some(CompactionReason::Threshold),
+                CompactionState::Running,
+                "",
+            ),
+            3,
+        );
         let s = l.to_string();
         assert!(s.contains("compacting context"), "{s}");
         assert!(s.contains("threshold"), "why it started: {s}");
@@ -130,7 +139,11 @@ mod tests {
     #[test]
     fn a_finished_one_reports_what_it_freed() {
         let d = token_delta(150_000, 32_000);
-        let s = compaction_line(&card("threshold", CompactionState::Done, &d), 0).to_string();
+        let s = compaction_line(
+            &card(Some(CompactionReason::Threshold), CompactionState::Done, &d),
+            0,
+        )
+        .to_string();
         assert!(s.starts_with('✓'), "{s}");
         assert!(s.contains("150.0k → 32.0k"), "{s}");
     }
@@ -140,8 +153,18 @@ mod tests {
     /// two things the wire says a user must not have to guess about.
     #[test]
     fn aborted_is_grey_and_failed_is_red() {
-        let aborted = compaction_line(&card("manual", CompactionState::Aborted, ""), 0);
-        let failed = compaction_line(&card("overflow", CompactionState::Failed, "boom"), 0);
+        let aborted = compaction_line(
+            &card(Some(CompactionReason::Manual), CompactionState::Aborted, ""),
+            0,
+        );
+        let failed = compaction_line(
+            &card(
+                Some(CompactionReason::Overflow),
+                CompactionState::Failed,
+                "boom",
+            ),
+            0,
+        );
         assert!(aborted.to_string().contains("aborted"), "{aborted}");
         assert!(failed.to_string().contains("boom"), "{failed}");
         assert_ne!(
@@ -160,9 +183,27 @@ mod tests {
     /// A card that never saw its start event still reads as a complete sentence —
     /// no dangling separator where the missing reason would have been.
     #[test]
-    fn an_unknown_reason_leaves_no_trailing_separator() {
-        let s = compaction_line(&card("", CompactionState::Done, ""), 0).to_string();
+    fn no_reason_at_all_leaves_no_trailing_separator() {
+        let s = compaction_line(&card(None, CompactionState::Done, ""), 0).to_string();
         assert_eq!(s.trim_end(), "✓ context compacted", "{s}");
         assert!(!s.contains("· "), "{s}");
+    }
+
+    /// A reason this enum has no name for prints as itself. The `Unknown` arm is
+    /// the difference between a protocol addition that shows up and one that
+    /// quietly becomes the empty string.
+    #[test]
+    fn a_reason_we_have_not_named_prints_its_own_spelling() {
+        let s = compaction_line(
+            &card(
+                Some(CompactionReason::parse("quantum")),
+                CompactionState::Running,
+                "",
+            ),
+            0,
+        )
+        .to_string();
+        assert!(s.contains("quantum"), "the value survives to the row: {s}");
+        assert!(CompactionReason::parse("quantum").as_str() == "quantum");
     }
 }

@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use crate::components::compaction::CompactionState;
 use crate::components::tool::ToolStateCategory;
 use crate::utils::shelltext::{StyleRun, StyledLine};
+use crate::wire::CompactionReason;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MessageKind {
@@ -29,11 +30,17 @@ pub enum MessageKind {
     /// an unambiguous thing to look up
     /// ([`Transcript::finish_compaction`]).
     Compaction {
-        /// `"manual"`, `"threshold"` or `"overflow"` — why the run stopped to
-        /// do this. Empty when the card was opened by a `compaction_end` that
-        /// never saw its `compaction_start`; the renderer drops the segment then
-        /// rather than printing a bare separator.
-        reason: String,
+        /// Why the run stopped to do this — [`CompactionReason`]: `manual`,
+        /// `threshold`, `overflow`, or a reason pi added later, which keeps its
+        /// own spelling rather than becoming one of those three.
+        ///
+        /// `None` is "this card has no reason to show": the one case is a card
+        /// opened by a `compaction_end` that never saw its `compaction_start`.
+        /// The renderer drops the segment then rather than printing a bare
+        /// separator, which is why this is an `Option` and not an empty string —
+        /// the two states are not the same fact, and `""` reads like a value that
+        /// lost its contents.
+        reason: Option<CompactionReason>,
         state: CompactionState,
     },
     /// Loop/harness status lines ("working looprs-1", "board empty, awaiting input").
@@ -270,11 +277,11 @@ impl Transcript {
 
     /// pi is pausing the run to compact the context. Opens the card; the matching
     /// [`Self::finish_compaction`] closes it.
-    pub fn start_compaction(&mut self, reason: String) {
+    pub fn start_compaction(&mut self, reason: CompactionReason) {
         self.finish_last();
         self.push_entry(Entry {
             kind: MessageKind::Compaction {
-                reason,
+                reason: Some(reason),
                 state: CompactionState::Running,
             },
             // What the card adds after the reason — `150k → 32k` on a success,
@@ -683,7 +690,7 @@ mod tests {
     #[test]
     fn the_end_event_finds_the_running_card_whatever_sits_above_it() {
         let mut t = Transcript::new();
-        t.start_compaction("threshold".into());
+        t.start_compaction(CompactionReason::Threshold);
         t.push_delta(MessageKind::Answer, "text that arrived mid-compaction\n");
 
         assert!(
@@ -718,9 +725,9 @@ mod tests {
     #[test]
     fn a_finished_card_is_left_alone_by_the_next_compaction() {
         let mut t = Transcript::new();
-        t.start_compaction("threshold".into());
+        t.start_compaction(CompactionReason::Threshold);
         t.finish_compaction(CompactionState::Done, "first".into());
-        t.start_compaction("manual".into());
+        t.start_compaction(CompactionReason::Manual);
         t.finish_compaction(CompactionState::Aborted, String::new());
 
         let cards: Vec<&Entry> = t
@@ -746,7 +753,7 @@ mod tests {
         t.push_done(MessageKind::User, "a prompt".into());
         t.start_tool("t1".into(), "bash".into(), "make test".into());
         t.start_tool("t2".into(), "read".into(), "src/app.rs".into());
-        t.start_compaction("overflow".into());
+        t.start_compaction(CompactionReason::Overflow);
         t.finish_tool("t1".into(), "ok".into(), false);
         assert_eq!(t.open_cards().count(), 2, "t2 and the compaction");
 
@@ -828,7 +835,7 @@ mod tests {
         t.finish_tool("t1".into(), "ok".into(), false);
         agrees(&t, "a second result is *shorter* than the first");
 
-        t.start_compaction("threshold".into());
+        t.start_compaction(CompactionReason::Threshold);
         t.finish_compaction(CompactionState::Done, "150.0k -> 32.0k".into());
         agrees(&t, "a compaction card opens empty and closes with detail");
 

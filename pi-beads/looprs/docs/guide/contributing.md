@@ -85,7 +85,7 @@ page is incomplete, which is the failure mode it is written against.
 
 | module | owns | must never own |
 | --- | --- | --- |
-| [`wire.rs`](../../src/wire.rs) | the message vocabulary: `Msg`, `UiCommand`, `SessionEvent` | transport, buffering, policy |
+| [`wire.rs`](../../src/wire.rs) | the message vocabulary: `Msg`, `UiCommand`, `SessionEvent`; the named value sets (`EntryRole`, `CompactionReason`, `StopReason`) and `WIRE_INVENTORY`, the table the [protocol page](wire-protocol.md) is generated from | transport, buffering, policy |
 | [`bus.rs`](../../src/bus.rs) | the bounded UI byte lane: the cap, the merge rule for `BashOutput`, the back-pressure on producers | any app semantics. It is a queue with opinions about bytes and nothing else |
 
 ### Sessions
@@ -207,6 +207,23 @@ Each is a procedure, in order, with the files to touch.
 5. If it renders, add the component case. Do not add a `String` field to the App to
    make a renderer happy.
 
+### Add a pi protocol value (a role, an event type, a reason)
+
+1. `wire.rs` — add the variant. If it belongs to one of the three `WireValue`
+   types, you must also classify it in that type's **exhaustive `outcome()`
+   match**: a new value nobody has decided the fate of does not compile. That is
+   the point. `Unknown(_)` is not the lazy answer to a new value either — it is
+   the arm for values that do not exist yet, which is why it carries the string.
+2. Add its row to `WIRE_INVENTORY`: what happens to it, who reads it, and — if
+   nobody reads it today — what it is waiting for. `reader: None` without a
+   `waiting_on` fails `app::tests::wire_protocol`, on the same rule that makes
+   every `#[allow(dead_code)]` carry a reason.
+3. Handle the arm in `app.rs` (or say why the existing arm covers it). A role
+   nothing renders must still be *visible*: see the unrendered-role note.
+4. `./scripts/docs_check.py --fix-wire` and read the diff. A value in the type
+   with no row on the protocol page fails the gate; so does hand-editing the
+   page instead of regenerating it.
+
 ### Add a band, or change a band's row budget
 
 1. `viewport.rs` — there is an **"Adding a band" checklist** at the top of the
@@ -303,6 +320,7 @@ rung a change has to touch**:
 | a keystroke's effect | the App tests + the `CHORD_TABLE` audits | `cargo test app::tests` |
 | "what is painted" | `TestBackend` tests in `main.rs` / components | `cargo test` |
 | "what reaches the wire" | a real-pty spike (`spikes/*_e2e.py`) with a **control run** against the previous build | `python3 spikes/status_e2e.py` |
+| "the protocol page still says what the code does" | the generated tables vs `WIRE_INVENTORY`, plus the inventory tests that run each role through `apply_pi` | `./scripts/docs_check.py --fix-wire && cargo test wire_protocol` |
 | a spike's check count quoted in a page | the capture committed under `spikes/results/`, which the docs gate reads back against the prose | `./scripts/capture.sh <spike> <capture-name>` then `./scripts/docs_check.sh` (`--list-captures` shows every total and which capture is current) |
 | memory / cost claims | `src/measure.rs` (needs `LOOPRS_MEASURE_CORPUS`), `spikes/*.py` | `cargo test -- --ignored` |
 | anything behind a cargo feature | the **same** suite over that build; the seam is not allowed to change shape | `cargo test --features notify` |

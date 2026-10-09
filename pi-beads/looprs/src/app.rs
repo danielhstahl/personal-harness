@@ -30,7 +30,9 @@ use crate::state::selection::{BandSnapshot, Selection};
 use crate::state::transcript::MessageKind;
 use crate::state::wheel::WheelDir;
 use crate::viewport::{self};
-use crate::wire::{AssistantEvent, Msg, PiEvent, UiCommand, print_json_value_to_string};
+use crate::wire::{
+    AssistantEvent, EntryRole, Msg, PiEvent, UiCommand, WireValue, print_json_value_to_string,
+};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
@@ -1751,18 +1753,54 @@ fn apply_pi(view: &mut SessionView, ev: PiEvent) {
                 _ => {}
             }
         }
-        // user messages are already echoed locally on submit; ignore pi's copy
-        PiEvent::MessageEnd { message } if message.role == "assistant" => {
-            view.finish_stream();
-            // The authoritative per-message accounting, folded into this view's
-            // window. Only ever here, and never from `message_update`'s `usage`,
-            // because that figure is cumulative for the message still streaming —
-            // see [`Tokens::add`]. One `message_end` per API call is every bit as
-            // live as the row needs, and cannot be double counted.
-            if let Some(u) = message.usage {
-                view.tokens.add(&u);
+        // The **role** decides what a finished message means here, and every role
+        // `EntryRole` declares has an arm. Before this the distinction was a
+        // string compare against "assistant", which answered nothing about the
+        // other five roles pi declares (or about one a host invented) and made
+        // "what happens on a role we have never seen" an unanswerable question —
+        // the answer was: it falls off the end and renders as nothing.
+        //
+        // The `wire_protocol` tests drive every role in `WIRE_INVENTORY` through
+        // this arm and check the outcome against the row, so the table in
+        // `docs/guide/wire-protocol.md` is a claim these tests hold rather than
+        // a description nobody re-runs.
+        PiEvent::MessageEnd { message } => match message.role {
+            // The answer is finished: seal the live region, and take the
+            // accounting from the only record that is authoritative for it.
+            EntryRole::Assistant => {
+                view.finish_stream();
+                // The authoritative per-message accounting, folded into this
+                // view's window. Only ever here, and never from
+                // `message_update`'s `usage`, because that figure is cumulative
+                // for the message still streaming — see [`Tokens::add`]. One
+                // `message_end` per API call is every bit as live as the row
+                // needs, and cannot be double counted.
+                if let Some(u) = message.usage {
+                    view.tokens.add(&u);
+                }
             }
-        }
+            // The user's own words coming back from the child. The box echoed
+            // them on submit; painting this prints every prompt twice.
+            EntryRole::User => {}
+            // A tool's result record. Its card came off `tool_execution_start`
+            // and `tool_execution_end`, which carry the same record earlier; a
+            // second copy of it here would be a second card for one call.
+            EntryRole::ToolResult => {}
+            // Everything else — `system`, `bashExecution`, `custom`, the two
+            // summary roles, and any `Unknown` an augmented host merges into the
+            // union — is a message this harness has no picture for. That is a
+            // fact the operator is allowed to see, with the value named, on the
+            // same principle as the kanban band's `?` for a status it cannot
+            // classify. Silence here is what the `String` role guaranteed, and it
+            // is why a new role used to arrive as nothing at all.
+            other => view.push_note(
+                MessageKind::System,
+                format!(
+                    "pi ended a `{}` message; this harness renders nothing for that role",
+                    other.as_str()
+                ),
+            ),
+        },
         PiEvent::ToolExecutionStart {
             tool_call_id,
             tool_name,
@@ -1833,13 +1871,7 @@ fn apply_pi(view: &mut SessionView, ev: PiEvent) {
             // happened, and a compaction that finishes unseen is the same bug in
             // the other direction.
             if !view.finish_compaction(state, detail.clone()) {
-                view.push_note(
-                    MessageKind::Compaction {
-                        reason: reason.unwrap_or_default(),
-                        state,
-                    },
-                    detail,
-                );
+                view.push_note(MessageKind::Compaction { reason, state }, detail);
             }
             view.chat = ChatState::Stopped;
         }

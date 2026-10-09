@@ -16,6 +16,7 @@
 use crate::session::view::SessionView;
 
 use crate::state::transcript::MessageKind;
+use crate::wire::CompactionReason;
 
 impl SessionView {
     /// Rows that became final since the last call. Call once per frame, for the
@@ -154,7 +155,12 @@ impl SessionView {
     }
 
     /// pi is pausing the run to compact the context.
-    pub fn start_compaction(&mut self, reason: String) {
+    ///
+    /// The reason arrives typed ([`CompactionReason`]) and stays typed all the way
+    /// to the card: the wire value, the transcript entry and the row the user
+    /// reads are one chain out of one enum, with no stringly handoff in the
+    /// middle that a second source of truth could grow in.
+    pub fn start_compaction(&mut self, reason: CompactionReason) {
         self.flush_shell_pending();
         self.transcript.start_compaction(reason);
         self.after_write();

@@ -38,9 +38,11 @@ multi-process, three-backend TUI without a model, a board, or a terminal.
    outside the site tree, every `LOOPRS_*` the code reads is in the
    [configuration reference](guide/configuration.md), no two pages state a
    different default for one knob, the
-   [keymap](guide/keymap.md) tables still match `CHORD_TABLE`, and every spike
-   check count written into prose matches a committed capture in
-   `spikes/results/` (looprs-00u.23)
+   [keymap](guide/keymap.md) tables still match `CHORD_TABLE`, the
+   [wire protocol](guide/wire-protocol.md) tables still match `WIRE_INVENTORY`
+   and no `#[allow(dead_code)]` in `src/wire.rs` is missing the reason it
+   carries, and every spike check count written into prose matches a committed
+   capture in `spikes/results/` (looprs-00u.23)
 
 The same gate is declared three ways, because each one catches a different kind of
 person:

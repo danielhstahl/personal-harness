@@ -60,6 +60,7 @@ bottom of that page.
 | **know how it differs** from a plain agent CLI, tmux, an IDE agent, `aider`, or its own TypeScript predecessor in [`../loop`](../loop) | [docs/guide/differences.md](docs/guide/differences.md) |
 | **use it well** — first session, driving the beads loop, living with a transcript | [first session](docs/guide/first-session.md) · [the loop](docs/guide/beads-loop.md) · [the transcript](docs/guide/transcript.md) |
 | **the keys** | [docs/guide/keymap.md](docs/guide/keymap.md) — generated from `CHORD_TABLE`, per mode, with a printable cheat sheet |
+| **the wire** — every role, event and reason that crosses the session boundary, and who reads each one | [docs/guide/wire-protocol.md](docs/guide/wire-protocol.md) — generated from `WIRE_INVENTORY` |
 | **the knobs** — all 23 `LOOPRS_*` variables, defaults, combination examples | [docs/guide/configuration.md](docs/guide/configuration.md) |
 | **recover something** — where the transcript went, what to attach to a bug report | [docs/guide/operator.md](docs/guide/operator.md) |
 | **change the code** — the module map, the data-flow diagram, recipes | [docs/guide/contributing.md](docs/guide/contributing.md) |
@@ -79,8 +80,9 @@ bottom of that page.
 are one statement. ~20 s, no network, no model calls.
 
 Docs-only edits run the same gate: the rot step needs no cargo and no network, and a
-dead link, an undocumented knob or a keymap table that drifted from `CHORD_TABLE`
-fails the build the same way a clippy warning does.
+dead link, an undocumented knob, a keymap table that drifted from `CHORD_TABLE`, or a
+wire value missing from the [protocol page](docs/guide/wire-protocol.md) fails the
+build the same way a clippy warning does.
 
 ## Not this
 

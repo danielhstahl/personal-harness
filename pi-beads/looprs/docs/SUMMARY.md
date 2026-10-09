@@ -10,6 +10,7 @@
   * [Keymap and chords](guide/keymap.md)
   * [Configuration reference](guide/configuration.md)
   * [Files, logs and recovery](guide/operator.md)
+  * [The wire protocol](guide/wire-protocol.md)
   * [The kanban band](kanban.md)
   * [How this documentation is organised](README.md)
   * [The project README](../README.md)

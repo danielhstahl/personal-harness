@@ -21,7 +21,10 @@
 //! * [`user_band`](user_band) — the user's own rows: the background that says
 //!   "mine", and the copy that must carry none of it;
 //! * [`chord_table`](chord_table) — the `Ctrl-S` family, driven keystroke by
-//!   keystroke against the table in `session::view`.
+//!   keystroke against the table in `session::view`;
+//! * [`wire_protocol`](wire_protocol) — the wire inventory read as data: every
+//!   declared value checked against the type that parses it and, for the
+//!   message roles, against what this `App` actually does with it.
 //!
 //! What more than one section drives lives here: the one `App` builder, the
 //! session ids the fixtures share, and the paint/geometry readers a test points
@@ -32,7 +35,9 @@
 use super::*;
 use crate::session::view::Tokens;
 use crate::session::{ActiveBead, BeadStep, ByteStream, ExitReason, SessionStatus};
-use crate::wire::{CompactionResult, Usage, WireMessage, parse};
+use crate::wire::{
+    CompactionReason, CompactionResult, EntryRole, Usage, WireMessage, WireValue, parse,
+};
 use serde_json::Value;
 
 mod chord_table;
@@ -46,6 +51,7 @@ mod status_row;
 mod token_window;
 mod user_band;
 mod wheel;
+mod wire_protocol;
 
 const W: u16 = 80;
 

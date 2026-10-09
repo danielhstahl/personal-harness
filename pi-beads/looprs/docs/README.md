@@ -35,6 +35,7 @@ that states a default the reference contradicts.
 | [guide/beads-loop.md](guide/beads-loop.md) | driving the loop that costs money: what a pass is, what the band shows during one, what `Tab` and `Esc` do mid-pass, finished vs wedged |
 | [guide/transcript.md](guide/transcript.md) | the pin-to-tail rule, the "N new" pill, the bounded store and the file behind it, selection vs chords, what does *not* re-wrap on resize |
 | [guide/keymap.md](guide/keymap.md) | every keystroke per mode, generated from `CHORD_TABLE`; the copy family, `Esc` semantics, the mouse, and a one-screen cheat sheet |
+| [guide/wire-protocol.md](guide/wire-protocol.md) | what crosses the session/UI boundary, generated from `WIRE_INVENTORY` in `src/wire.rs`: every role, event and reason, who reads it, and what the unread records are waiting for |
 | [guide/configuration.md](guide/configuration.md) | all 23 `LOOPRS_*` variables the code reads, with defaults, values, `read in`, groups, harness-only variables, and combinations that were actually run |
 | [guide/operator.md](guide/operator.md) | where every file is written, recovery recipes, the diagnostic grep index, what to attach to a bug report, and the privacy note |
 | [guide/contributing.md](guide/contributing.md) | the module map (every file in `src/` accounted for), the end-to-end data-flow diagram, how-to recipes, the testing ladder, house style |

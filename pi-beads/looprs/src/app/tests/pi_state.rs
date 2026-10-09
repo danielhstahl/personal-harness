@@ -118,7 +118,7 @@ fn pi_copies_of_the_user_message_never_reach_the_transcript() {
             session: pi_id(),
             event: PiEvent::MessageStart {
                 message: WireMessage {
-                    role: role.to_string(),
+                    role: EntryRole::parse(role),
                     usage: None,
                 },
             },
@@ -127,7 +127,7 @@ fn pi_copies_of_the_user_message_never_reach_the_transcript() {
             session: pi_id(),
             event: PiEvent::MessageEnd {
                 message: WireMessage {
-                    role: role.to_string(),
+                    role: EntryRole::parse(role),
                     usage: None,
                 },
             },
@@ -166,7 +166,7 @@ fn pi_copies_of_the_user_message_never_reach_the_transcript() {
         session: pi_id(),
         event: PiEvent::MessageEnd {
             message: WireMessage {
-                role: "assistant".to_string(),
+                role: EntryRole::Assistant,
                 usage: None,
             },
         },

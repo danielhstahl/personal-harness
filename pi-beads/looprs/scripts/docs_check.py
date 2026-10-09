@@ -475,6 +475,405 @@ def check_keymap(fix: bool) -> list[str]:
     return bad
 
 
+# ─────────────── check 5: the wire protocol inventory ───────────────
+#
+# `docs/guide/wire-protocol.md` is generated out of `WIRE_INVENTORY` in
+# `src/wire.rs` exactly the way the keymap tables are generated out of
+# `CHORD_TABLE` (looprs-00u.7). Doing it to the wire as well was
+# looprs-00u.19, which found the hole this closes: `role: String` with
+# `"user" | "assistant" | "toolResult" …` behind it in a comment. A page that
+# has to be written from pi's own docs is a second source of truth, and the
+# ellipsis is where it drifts. A page rendered from the enum cannot: adding a
+# value without its row makes the gate fail rather than making the page quietly
+# stay silent about the new value.
+#
+# The Rust side of the same contract is `app::tests::wire_protocol`, which
+# checks each row against the type that parses it and, for the message roles,
+# against what `App::apply_pi` really does.
+
+WIRE_RS = SRC / "wire.rs"
+
+WIRE_MARKER_GROUPS = [
+    "role",
+    "event",
+    "assistant-event",
+    "compaction-reason",
+    "stop-reason",
+]
+
+
+def _rust_string(literal: str) -> str:
+    """The contents of a Rust string literal, minus the quotes, with the escapes
+    this file actually uses resolved."""
+    m = re.match(r'"((?:[^"\\]|\\.)*)"', literal.strip())
+    if not m:
+        return ""
+    text = m.group(1)
+    for esc, ch in ((r"\"", '"'), (r"\\", "\\"), (r"\n", "\n")):
+        text = text.replace(esc, ch)
+    return re.sub(
+        r"\\u\{([0-9a-fA-F]+)\}", lambda m: chr(int(m.group(1), 16)), text
+    )
+
+
+def _rust_option(literal: str) -> str | None:
+    lit = literal.strip()
+    if lit == "None":
+        return None
+    m = re.match(r'Some\("((?:[^"\\]|\\.)*)"\)', lit)
+    return _rust_string(f'"{m.group(1)}"') if m else None
+
+
+def _rust_field(block: str, name: str) -> str:
+    """The literal value of `name:` inside one `WireRow { … }` block.
+
+    A scanner rather than a regex because the fields are not one-per-line in any
+    meaningful sense and the values are not all plain strings: `Some("…")`,
+    `Outcome::Silent("…")` and a bare `None` all have to come out whole, and a
+    regex that stops at the first comma stops inside `Some("a, b")` while one
+    that stops at the first newline stops inside a folded string. This walks the
+    value at bracket depth, respecting string escapes, and stops at the comma or
+    closing brace that actually ends it.
+    """
+    m = re.search(rf"\b{name}:\s*", block)
+    if not m:
+        return ""
+    rest = block[m.end():]
+    depth = 0
+    in_str = False
+    esc = False
+    for i, ch in enumerate(rest):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                return rest[:i].strip()
+            depth -= 1
+        elif ch == "," and depth == 0:
+            return rest[:i].strip()
+    return rest.strip()
+
+
+def wire_inventory() -> list[dict]:
+    """The `WIRE_INVENTORY` rows out of `src/wire.rs`.
+
+    Same shape as `parse_chord_table`: a `const` array of literal structs, read
+    with the line-continuation pre-pass so a backslash-folded string joins. The
+    rows are written one field-group per line under `#[rustfmt::skip]`, which is
+    what keeps this a field grep rather than a Rust parser.
+    """
+    raw = WIRE_RS.read_text(encoding="utf-8")
+    raw = re.sub(r"\\\n[ \t]*", "", raw)
+    start = raw.index("pub const WIRE_INVENTORY")
+    end = raw.index("\n];", start)
+    body = raw[start:end]
+    rows = []
+    for block in re.findall(r"WireRow\s*\{(.*?)\n    \},", body, re.S):
+        def field(name: str) -> str:
+            return _rust_field(block, name)
+
+        outcome_lit = field("outcome")
+        if "SurfacesAsNote" in outcome_lit:
+            kind, text = "SurfacesAsNote", ""
+        else:
+            m = re.match(r'Outcome::(Renders|Silent)\("((?:[^"\\]|\\.)*)"\)', outcome_lit)
+            kind, text = (m.group(1), _rust_string(f'"{m.group(2)}"')) if m else ("?", outcome_lit)
+
+        rows.append(
+            {
+                "group": _rust_string(field("group")),
+                "wire": _rust_string(field("wire")),
+                "variant": _rust_string(field("variant")),
+                "outcome": kind,
+                "outcome_text": text,
+                "reader": _rust_option(field("reader")),
+                "waiting_on": _rust_option(field("waiting_on")),
+                "note": _rust_string(field("note")),
+            }
+        )
+    return rows
+
+
+def outcome_label(kind: str, text: str) -> str:
+    """The page's wording for one outcome.
+
+    `wire.rs`'s `Outcome::label` is the definition; `the_three_outcomes_read_
+    differently` in `app::tests::wire_protocol` pins these three strings, so
+    the page and the type cannot describe the same outcome two different ways
+    without a test noticing.
+    """
+    if kind == "Renders":
+        return f"renders: {text}"
+    if kind == "Silent":
+        return f"not painted — {text}"
+    if kind == "SurfacesAsNote":
+        return "surfaces as a transcript note naming the value"
+    return f"{kind}({text})"
+
+
+def render_wire_table(group: str, rows) -> str:
+    sel = [r for r in rows if r["group"] == group]
+    out = [
+        "| on the wire | the variant that catches it | what looprs does with it | who reads it | note |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for r in sel:
+        who = r["reader"] or f"*nothing today — waiting on: {r['waiting_on']}*"
+        out.append(
+            f"| `{r['wire']}` | `{r['variant']}` | {outcome_label(r['outcome'], r['outcome_text'])}"
+            f" | {who} | {r['note']} |"
+        )
+    return "\n".join(out)
+
+
+def _reason_next_to(lines: list[str], i: int) -> str:
+    """The reason a human wrote next to a `#[allow(dead_code)]` at line `i`.
+
+    Three shapes, in the order they should be read:
+
+    1. the trailing comment on the attribute line itself;
+    2. the `//` line directly **under** it, which is where rustfmt puts a
+       trailing comment that no longer fits in the width — the reason is
+       unchanged in meaning, only in column;
+    3. the `//` line directly **above** it, the shape several records in
+       `wire.rs` were first written in.
+
+    Empty means there is no reason anywhere next to the attribute, which is the
+    thing both this checker and `scripts/dead_audit.py` treat as unanswered.
+    """
+    stripped = lines[i].strip()
+    tail = stripped.split("dead_code)", 1)[-1].strip()
+    if tail.startswith("]"):
+        tail = tail[1:].strip()
+    if tail.startswith("//"):
+        return tail[2:].strip()
+    if i + 1 < len(lines) and lines[i + 1].strip().startswith("//"):
+        return lines[i + 1].strip()[2:].strip()
+    if i > 0 and lines[i - 1].strip().startswith("//"):
+        return lines[i - 1].strip()[2:].strip()
+    return ""
+
+
+def wire_allow_reasons() -> list[dict]:
+    """Every `#[allow(dead_code)]` in `wire.rs` with the reason written beside it.
+
+    `scripts/dead_audit.py` asks the compiler whether the guarded item is still
+    dead. This asks the other half, mechanically: is there a reason at all. The
+    rule is individually justified, never blanket (looprs-6ol), and "individually
+    justified" is only real if a gate can tell a reason from no reason — the same
+    reason `WIRE_INVENTORY` makes a `reader: None` carry a `waiting_on`.
+    """
+    lines = WIRE_RS.read_text(encoding="utf-8").split("\n")
+    out = []
+    for i, line in enumerate(lines):
+        if not line.strip().startswith("#[allow(dead_code)]"):
+            continue
+        reason = _reason_next_to(lines, i)
+        item_at = i
+        j = i + 1
+        while j < len(lines):
+            nxt = lines[j].strip()
+            if nxt.startswith("//") or nxt.startswith("#["):
+                j += 1
+                continue
+            item_at = j
+            break
+        kind, name = _item_of(lines[item_at]) if item_at != i else ("other", "(nothing)")
+        # A type that is itself the guarded item has no enclosing type to name it:
+        # `Outcome` is `Outcome`, not `CompactionResult::Outcome`.
+        owner = "" if kind == "type" else _owner_above(lines, item_at)
+        out.append(
+            {"line": i + 1, "reason": reason, "owner": owner, "item": name, "kind": kind}
+        )
+    return out
+
+
+#: `impl|enum|struct|trait|fn|const name [for Target]`, with the visibility and
+#: `default` prefixes a declaration can carry.
+DECL_RE = re.compile(
+    r"^(?:pub\s+)?(?:default\s+)?(impl|enum|struct|trait|fn|const)\s+([A-Za-z0-9_<>&]+)"
+    r"(?:\s+for\s+([A-Za-z0-9_<>&]+))?"
+)
+#: An enum variant: a bare `CamelCase` name, with or without its field list.
+VARIANT_RE = re.compile(r"^([A-Z][A-Za-z0-9_]*)$")
+#: A struct or variant field: a `snake_case` name with a type after the colon.
+FIELD_RE = re.compile(r"^(?:pub\s+)?([a-z_][a-z0-9_]*)\s*:")
+#: Only these kinds can own another item.
+OWNER_RE = re.compile(
+    r"^(?:pub\s+)?(impl|enum|struct|trait)\s+([A-Za-z0-9_<>&]+)"
+    r"(?:\s+for\s+([A-Za-z0-9_<>&]+))?"
+)
+
+
+def _item_of(line: str) -> tuple[str, str]:
+    """`(kind, printed name)` for the line an allow guards — a variant, a field,
+    a method, a const, a type — so the table says *what* is unread rather than
+    reprinting a line of source with its braces and trailing comma still on it."""
+    code = _strip_code_noise(line).strip().rstrip(",;").strip()
+    code = code.rstrip("{").strip()
+    m = DECL_RE.match(code)
+    if m:
+        kind, name, for_whom = m.group(1), m.group(2), m.group(3)
+        if kind == "impl":
+            return "impl", f"impl {name}" + (f" for {for_whom}" if for_whom else "")
+        if kind == "fn":
+            return "fn", f"{name}()"
+        if kind == "const":
+            return "const", name
+        return "type", name
+    m = VARIANT_RE.match(code)
+    if m:
+        return "variant", m.group(1)
+    m = FIELD_RE.match(code)
+    if m:
+        return "field", m.group(1)
+    return "other", code
+
+
+def _owner_above(lines: list[str], i: int) -> str:
+    """The `impl` / `enum` / `struct` / `trait` the item at line `i` sits in.
+
+    A bare `content_index` or `variant()` says nothing about which type holds it,
+    and this table is read as the record of who owns which unread value, so the
+    enclosing type is part of the name.
+    """
+    for k in range(i - 1, -1, -1):
+        code = _strip_code_noise(lines[k]).strip()
+        if not code:
+            continue
+        # Only the leftmost column can hold a declaration that owns a whole
+        # block; anything indented further in is a member of that block (an enum
+        # variant, a nested brace) and not a candidate owner. So: skip inward,
+        # and read the first line flush left. A free `fn` or `const` at column 0
+        # is its own thing and has no owner — which beats the nearest
+        # plausible-looking type three declarations back.
+        if _indent(lines[k]) > 0:
+            continue
+        m = OWNER_RE.match(code)
+        if m:
+            name, for_whom = m.group(2), m.group(3)
+            return f"{name} for {for_whom}" if for_whom else name
+        return ""
+    return ""
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _strip_code_noise(line: str) -> str:
+    """Drop comments and string literals, so the keyword matching above reads the
+    structure of the file rather than its prose."""
+    out = []
+    i = 0
+    while i < len(line):
+        if line.startswith("//", i):
+            break
+        if line[i] == '"':
+            i += 1
+            while i < len(line) and line[i] != '"':
+                i += 2 if line[i] == "\\" else 1
+            i += 1
+            continue
+        out.append(line[i])
+        i += 1
+    return "".join(out)
+
+
+def render_wire_unread_table() -> str:
+    out = [
+        "| the record kept unread | why it stays |",
+        "| --- | --- |",
+    ]
+    for r in wire_allow_reasons():
+        name = f"{r['owner']}::{r['item']}" if r["owner"] else r["item"]
+        out.append(f"| `{name}` | {r['reason']} |")
+    return "\n".join(out)
+
+
+def check_wire(fix: bool) -> list[str]:
+    page = DOCS / "guide" / "wire-protocol.md"
+    if not page.exists():
+        return [f"{rel(page)}: missing — the wire protocol page is generated, not hand-written"]
+
+    bad = []
+    rows = wire_inventory()
+
+    # The declaration order the page prints in must be the order the enum is
+    # declared in, and every declared group must be printed.
+    declared_groups = re.findall(
+        r'WIRE_GROUPS: &\[&str\] = &\[(.*?)\n\];',
+        WIRE_RS.read_text(encoding="utf-8"),
+        re.S,
+    )
+    if declared_groups:
+        in_code = re.findall(r'"([^"]+)"', declared_groups[0])
+        if in_code != WIRE_MARKER_GROUPS:
+            bad.append(
+                "src/wire.rs: WIRE_GROUPS is "
+                f"{in_code} but this checker prints {WIRE_MARKER_GROUPS} — "
+                "a group added to the enum needs its section here and in the page"
+            )
+
+    # An allow with no reason next to it is the blanket allow by another name.
+    for r in wire_allow_reasons():
+        if not r["reason"]:
+            bad.append(
+                f"src/wire.rs:{r['line']}: `#[allow(dead_code)]` on `{r['item']}` "
+                "has no reason written next to it (looprs-6ol: individually "
+                "justified, never blanket)"
+            )
+
+    text = page.read_text(encoding="utf-8")
+    changed = text
+    sections = [(f"wire:{g}", render_wire_table(g, rows)) for g in WIRE_MARKER_GROUPS]
+    sections.append(("wire:unread", render_wire_unread_table()))
+    for slug, expected in sections:
+        begin = f"<!-- BEGIN GENERATED:{slug} -->"
+        end = f"<!-- END GENERATED:{slug} -->"
+        if begin not in changed or end not in changed:
+            bad.append(f"{rel(page)}: missing generated markers for {slug}")
+            continue
+        pre, rest = changed.split(begin, 1)
+        old, post = rest.split(end, 1)
+        if old.strip() != expected.strip():
+            if fix:
+                changed = pre + begin + "\n" + expected + "\n" + end + post
+            else:
+                old_rows = {ln for ln in old.strip().splitlines() if ln.startswith("| ")}
+                new_rows = {ln for ln in expected.strip().splitlines() if ln.startswith("| ")}
+                missing = sorted(new_rows - old_rows)
+                stale = sorted(old_rows - new_rows)
+                bits = []
+                if missing:
+                    bits.append(f"{len(missing)} row(s) missing from the page")
+                if stale:
+                    bits.append(f"{len(stale)} row(s) in the page with no inventory row")
+                detail = "\n".join(
+                    [f"    expected: {ln}" for ln in missing[:3]]
+                    + [f"    found:    {ln}" for ln in stale[:3]]
+                )
+                bad.append(
+                    f"{rel(page)}: the generated {slug} table disagrees with "
+                    f"WIRE_INVENTORY ({'; '.join(bits) or 'formatting'}). Run: "
+                    f"./scripts/docs_check.py --fix-wire"
+                    + ("\n" + detail if detail else "")
+                )
+    if fix and changed != text:
+        page.write_text(changed, encoding="utf-8")
+    return bad
+
+
 # ─────────────── check 4: measurement claims (spike check counts) ───────────────
 #
 # The failure this closes (looprs-00u.23): a spike's check count is a fact about
@@ -959,6 +1358,14 @@ def rel(p: Path) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fix-keymap", action="store_true", help="regenerate the keymap tables")
+    ap.add_argument(
+        "--fix-wire", action="store_true",
+        help="regenerate the wire protocol tables in docs/guide/wire-protocol.md",
+    )
+    ap.add_argument(
+        "--list-wire", action="store_true",
+        help="print the wire inventory and every unread wire record with its stated reason",
+    )
     ap.add_argument("--list-knobs", action="store_true", help="print the knobs the code reads")
     ap.add_argument(
         "--list-captures", action="store_true",
@@ -986,17 +1393,29 @@ def main() -> int:
                 print(f"  {name:38s} {_fmt(r):>10s}  [{tag}]{star}")
         return 0
 
+    if args.list_wire:
+        for group in WIRE_MARKER_GROUPS:
+            print(f"{group}")
+            for r in [x for x in wire_inventory() if x["group"] == group]:
+                who = r["reader"] or f"nothing today, waiting on: {r['waiting_on']}"
+                print(f"  {r['wire']:20s} {r['variant']:18s} {who}")
+        print("unread records in wire.rs (allow + reason)")
+        for r in wire_allow_reasons():
+            print(f"  {r['line']:>5d}  {r['item']:34s} {r['reason']}")
+        return 0
+
     pages = corpus_pages()
     violations: list[str] = []
     violations += check_links(pages)
     violations += check_orphans(pages)
     violations += check_knobs()
     violations += check_keymap(fix=args.fix_keymap)
+    violations += check_wire(fix=args.fix_wire)
     measurement_violations, claims_checked = check_measurement_claims(pages)
     violations += measurement_violations
 
-    if args.fix_keymap and not violations:
-        print("docs_check: regenerated the keymap tables; no other violations")
+    if (args.fix_keymap or args.fix_wire) and not violations:
+        print("docs_check: regenerated the generated tables; no other violations")
         return 0
 
     if violations:
@@ -1013,7 +1432,8 @@ def main() -> int:
         print(
             f"docs_check: clean ({len(pages)} page(s), "
             f"{len(code_knobs())} knob(s), {len(parse_chord_table())} chord row(s), "
-            f"{claims_checked} measurement claim(s) backed by spikes/results/)"
+            f"{len(wire_inventory())} wire value(s), {claims_checked} measurement claim(s) "
+            "backed by spikes/results/)"
         )
     return 0
 

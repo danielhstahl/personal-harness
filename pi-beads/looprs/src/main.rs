@@ -836,7 +836,7 @@ mod tests {
     use super::*;
     use crate::session::{BeadStep, SessionId, SessionStatus};
     use crate::state::transcript::MessageKind;
-    use crate::wire::PiEvent;
+    use crate::wire::{CompactionReason, PiEvent};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1142,7 +1142,7 @@ mod tests {
         app.update(Msg::Agent {
             session: SessionId::new(TerminalType::Pi, 1),
             event: PiEvent::CompactionStart {
-                reason: "threshold".into(),
+                reason: CompactionReason::Threshold,
             },
         });
 
@@ -1181,14 +1181,14 @@ mod tests {
     fn a_cancelled_and_a_failed_compaction_are_drawn_differently() {
         let cancel = compaction_row(|mut e| {
             e.kind = MessageKind::Compaction {
-                reason: "manual".into(),
+                reason: Some(CompactionReason::Manual),
                 state: crate::components::compaction::CompactionState::Aborted,
             };
             e
         });
         let failure = compaction_row(|mut e| {
             e.kind = MessageKind::Compaction {
-                reason: "overflow".into(),
+                reason: Some(CompactionReason::Overflow),
                 state: crate::components::compaction::CompactionState::Failed,
             };
             e.text = "provider refused the summary".into();

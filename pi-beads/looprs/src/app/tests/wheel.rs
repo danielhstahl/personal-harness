@@ -130,7 +130,7 @@ fn the_live_card_band_is_not_transcript_and_does_not_scroll() {
     app.update(Msg::Agent {
         session: SessionId::new(TerminalType::Pi, 1),
         event: PiEvent::CompactionStart {
-            reason: "threshold".into(),
+            reason: CompactionReason::Threshold,
         },
     });
     let h = 26u16;
