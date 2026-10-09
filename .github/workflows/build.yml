@@ -74,3 +74,28 @@ jobs:
         working-directory: pi-beads
         run: |
           docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/danielhstahl/pi-beads:${{ github.event.release.tag_name }} -f Dockerfile . --push
+
+  build_docs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: generate docs
+        working-directory: pi-beads/looprs
+        run: |
+            ./scripts/docs.sh check
+            ./scripts/docs.sh build
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "pi-beads/looprs/docs/_site"
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

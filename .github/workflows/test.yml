@@ -44,3 +44,16 @@ jobs:
 
       - name: fmt, clippy -D warnings, tests
         run: ./scripts/check.sh
+
+  check_docs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: generate docs
+        working-directory: pi-beads/looprs
+        run: |
+            ./scripts/docs.sh check
