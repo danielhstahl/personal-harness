@@ -48,8 +48,9 @@ lrwxr-xr-x  …  last-Pi    -> …/session-20261009T034004Z-84354-Pi.txt
 * **One file per run per mode that actually ran**, named so they sort
   chronologically: `session-<UTC timestamp>Z-<pid>-<Mode>.txt`.
 * **The mode name is `TerminalType::label()`** — capitalised `Beeds`, `Pi`, `Bash`.
-  (`journal.rs`'s own header shows it lowercase; the file on disk is the truth, and
-  the comment has a ticket.)
+  The module header in `journal.rs` now spells it the same way, and
+  `the_header_block_names_the_files_the_writer_actually_writes` fails the build if
+  the header block and `session_path` ever drift apart again.
 * **Written as it finalises, not at exit.** Each entry is appended and flushed on a
   writer task while the session runs. That is what makes it survive `kill -9`, an
   OOM kill, a panic inside the draw, and a laptop out of power. A journal written
@@ -295,7 +296,7 @@ LOOPRS_BIN=/tmp/ctl-target/debug/looprs python3 spikes/status_e2e.py --control
 
 In order of usefulness:
 
-1. **the transcript file** — `~/.local/share/looprs/transcripts/session-…-<mode>.txt`
+1. **the transcript file** — `~/.local/share/looprs/transcripts/session-…-<Mode>.txt`
    (or the `last` symlink copied out). This is the single most useful artefact;
 2. **the log** — `"$LOG"` (see [§3](#3-the-log)); `echo "$LOG"` prints the path
    you are talking about. Trim it if it is huge: the startup lines (first ~15) plus
