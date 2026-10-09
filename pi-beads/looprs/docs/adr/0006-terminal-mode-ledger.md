@@ -269,7 +269,7 @@ the bytes are the contract:
 The pty proof extends `spikes/shutdown_e2e.py` rather than adding a file, as the ticket
 asked. It ran 8 scenarios and 149 checks at `pdl.3`
 (`spikes/results/shutdown-e2e-pdl3.log`); the same spike on the tree this site now
-documents prints 171 (`spikes/results/shutdown-e2e-00u23.log`), and the spike **keeps its
+documents prints 189 (`spikes/results/shutdown-e2e-00u24.log`), and the spike **keeps its
 own ledger** of the
 bytes on the wire (`ModeTrace`): the app's ledger and the driver's ledger are independent,
 which is the only way "we handed it all back" can be a check rather than a claim. There is
@@ -305,6 +305,29 @@ git worktree add --detach /tmp/looprs-pdl3-ctrl HEAD
 LOOPRS_BIN=/tmp/base-target/debug/looprs python3 spikes/shutdown_e2e.py \
     | tee spikes/results/shutdown-e2e-pdl3-control.log
 ```
+
+### "No child may survive" is a claim about *this run's* children (`looprs-00u.24`)
+
+The looprs-ecr rule quoted above — nothing the app spawned may outlive it — was checked with
+`pgrep -f`, which scans every process on the box. That makes the check's subject the machine
+rather than the build under test. Measured on one machine, same binary: **189/189** in a clean
+session (`spikes/results/shutdown-e2e-00u24.log`) and **168/171** for the pre-`00u.24` spike
+on the same box deliberately dirtied with abandoned shells, every failure on the leak checks
+(`spikes/results/shutdown-e2e-00u24-globalpgrep-control.log`) — and the mirrored defect is
+worse still, because a leak the build *did* cause hides in that same pile and nothing about the
+result says which pile it came from.
+
+The rule is unchanged and no check was deleted; what changed is what they look at. The spike now
+records the pids under the app **while the app is alive** — after it dies its children are
+reparented to pid 1 and no later scan can give them back — and asserts on those. Earlier runs'
+debt gets reaped rather than judged: a shell carrying a generated `looprs-bash-integration-<pid>-<n>.sh`
+marker whose owner pid is gone, plus its subtree and its rc file, is orphaned by the arithmetic
+in its own name, so `reap_stale_leftovers` clears it and the run *prints the count* instead of
+failing for it. Liveness of that owner pid is the only test, so a running looprs — the user's
+own, or another window's spike — is never touched. And because a check scoped to a recorded set
+fails silently when the recording breaks, `leak` in the spike SIGKILLs the app over a live shell
+and requires the scoped check to name the pid it recorded before reaping its own mess.
+Written up in [the testing guide](../testing.md).
 
 ### Rest of the suite
 

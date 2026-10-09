@@ -208,6 +208,7 @@ several of them exist only to make a test's assertion possible.
 | `LOOPRS_SPIKE`, `LOOPRS_SPIKE_N`, `LOOPRS_SPIKE_SCALE`, `LOOPRS_SPIKE_PROBES`, `LOOPRS_SPIKE_TRACE`, `LOOPRS_SPIKE_BASH`, `LOOPRS_SPIKE_BD` | the spike harness | spike-internal: scale, probe set, trace flag, which fake binary |
 | `LOOPRS_E2E_RAW`, `LOOPRS_E2E_TIMELINE` | e2e spike drivers | capture/debug levers in the pty drivers |
 | `LOOPRS_FAKE_HOLD` | the fakes | makes the fake `pi` hold a run open so a test can watch a run in flight |
+| `LOOPRS_NO_REAP` | `spikes/shutdown_e2e.py` | `1` leaves other runs' abandoned shells and generated rc files where they are instead of reaping them at startup and exit. The spike's leak checks are scoped to the pids it spawned, so this changes only the cleanup and the count printed at the top of the log — a control run uses it to look at the debris rather than clear it (looprs-00u.24) |
 | `LOOPRS_REWRAP_REPLY` | the rewrap spike | the reply text the fake emits, for re-wrap assertions |
 
 The rule the last two columns encode: **if the variable's purpose is to make a test

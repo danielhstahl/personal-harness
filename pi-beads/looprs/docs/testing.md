@@ -63,8 +63,8 @@ and no cargo, and its four checks are described in
 The fourth check is the newest and answers a mistake this page made: it restated a
 spike's check count in three places, the spike grew, and the prose stayed where it
 was. A count in a page is now read as a claim about a *run*, and the run's home is a
-committed capture — `171/171` is true of the tree while
-`spikes/results/shutdown-e2e-00u23.log` is in it, and stops being true when the
+committed capture — `189/189` is true of the tree while
+`spikes/results/shutdown-e2e-00u24.log` is in it, and stops being true when the
 next capture says something else. Take captures with
 [`./scripts/capture.sh`](../scripts/capture.sh), which heads the log with the UTC
 time, the tree rev and the command that produced it, and commit the fresh capture in
@@ -501,7 +501,7 @@ screen with the terminal's stale save.
 | the tee reports it | `app::tests` | `a_teed_alt_screen_is_a_screen_we_owe_the_terminal_back`, `a_screen_switch_that_was_never_teed_owes_nothing` |
 | the command boundary | `session::bash::tests` | `quitting_while_a_full_screen_program_holds_the_screen_leaves_the_alt_screen` |
 | the signals | `signals::tests` | `the_signals_install_inside_a_runtime`, `a_signal_sent_to_this_process_is_received` |
-| the real pty | `spikes/shutdown_e2e.py` | 8 scenarios, **171/171** on the tree this page documents — `spikes/results/shutdown-e2e-00u23.log`, taken by [`./scripts/capture.sh`](../scripts/capture.sh) so the log names the rev it ran on. Quote the capture and not a remembered count: the `pdl.3` run was 149/149 (`spikes/results/shutdown-e2e-pdl3.log`), and the 85/112 whose 27 failures were the ticket is `spikes/results/shutdown-e2e-pdl3-control.log`. Until `looprs-00u.23` this cell quoted a count that matched nothing in the tree, which is what the gate now refuses |
+| the real pty | `spikes/shutdown_e2e.py` | 9 scenarios, **189/189** on the tree this page documents — `spikes/results/shutdown-e2e-00u24.log`, taken by [`./scripts/capture.sh`](../scripts/capture.sh) so the log names the rev it ran on. Quote the capture and not a remembered count: the `pdl.3` run was 149/149 (`spikes/results/shutdown-e2e-pdl3.log`), and the 85/112 whose 27 failures were the ticket is `spikes/results/shutdown-e2e-pdl3-control.log`. Until `looprs-00u.23` this cell quoted a count that matched nothing in the tree, which is what the gate now refuses |
 
 The spike keeps its **own** ledger of the wire (`ModeTrace`) instead of reading the app's:
 "not in the alternate screen after exit" is not something the app may be asked at exit —
@@ -511,12 +511,56 @@ driver folds the capture the way a terminal would, and counts the leaves rather 
 the final state: a mode turned off twice and one turned off once end in the same place, and
 only one of those was promised.
 
+### A leak check measures the run, not the machine (`looprs-00u.24`)
+
+The same discipline applies to the process table, and the same mistake was living there.
+Every "no child survived" check in this spike used `pgrep -f`, which answers *"is anything
+on this box running a command line that looks like X?"* — not *"did the binary we just ran
+leak?"*. On a machine with abandoned runs under it the two come apart:
+
+| Run | Machine | Result |
+| --- | --- | --- |
+| old spike, clean session | nothing stale planted | 171/171 (`spikes/results/shutdown-e2e-00u23.log`) |
+| old spike, dirtied with 3 planted stale shells | debris from *earlier* runs | **168/171** — `no bash from the generated rcfile survived`, `no shell from our rcfile outlived the app`, `no stray \`sleep 30\` from that shell` (`spikes/results/shutdown-e2e-00u24-globalpgrep-control.log`) |
+| new spike, dirtied the same way | same debris, same binary | 189/189, the dirt counted at the top of the log: `stale leftovers from earlier runs: 18 orphaned process(es) killed, 3 generated rc file(s) removed` (`spikes/results/shutdown-e2e-00u24-stale.log`); replanted and run again, it cleared 6 processes and 3 rc files and passed 189/189 too (`spikes/results/shutdown-e2e-00u24-stale-again.log`) |
+
+The old failures were not the build's. The check had no way to tell this run's children from
+someone else's, so it reported the machine's history as a verdict on the binary — which also
+means the reverse: on a machine that noisy, a real leak hides in the same pile. Either way
+the result was not attributable to the thing under test.
+
+The fix has three parts, and the third is the one that keeps the check honest:
+
+1. **Scope to the run.** `RunLedger` records the pids under the app *while the app is
+   alive*, because the instant it dies its children are reparented to pid 1 and no later
+   scan can give them back to us. A driver records continuously (a child appears whenever a
+   keystroke says so — a tab change starts a shell, that shell forks a `sleep`) and once more
+   synchronously just before the quit key, the signal, or the kill.
+2. **Reap what is provably orphaned, and say how much.** The generated rc file is named
+   `looprs-bash-integration-<owner pid>-<seq>.sh`, so "is the app that made this still
+   running?" is answerable from the argv alone. `reap_stale_leftovers` kills those shells and
+   their subtrees and unlinks their rc files — **liveness of the owner pid is the only test**,
+   so a running looprs, whether the user's own or another window's spike, is never touched —
+   and the count lands in the log so a dirty machine is visible instead of fatal.
+   `LOOPRS_NO_REAP=1` turns the reaper off.
+3. **Prove the check can still fail.** A check scoped to a recorded set passes exactly as
+   quietly when the recording is broken as when the run is clean, so
+   `scenario_leak_is_named` makes a real leak — `SIGKILL`, the one exit no `Drop`, no
+   `kill_and_reap` and no rc-file removal covers — and requires the scoped check to name the
+   pid it recorded, the shell from the generated rc file and the busy child inside it, before
+   reaping what it leaked. Plant the dirt with
+   [`./scripts/plant_stale_debris.sh`](../scripts/plant_stale_debris.sh).
+
 Run it:
 
 ```sh
 cargo build
 python3 spikes/shutdown_e2e.py | tee spikes/results/shutdown-e2e-pdl3.log
-python3 spikes/shutdown_e2e.py alt child sigterm sighup panic   # one group at a time
+python3 spikes/shutdown_e2e.py alt child leak sigterm sighup panic   # one group at a time
+
+# dirty the machine the way an abandoned run does, then run the spike over it
+./scripts/plant_stale_debris.sh 3     # or: LOOPRS_NO_REAP=1 to leave the debris alone
+python3 spikes/shutdown_e2e.py | tail -1   # the pass count does not move; the reap line says how much it cleared
 
 # the control: the same spike against the pre-looprs-pdl.3 binary
 git worktree add --detach /tmp/looprs-pdl3-ctrl HEAD
@@ -533,6 +577,7 @@ LOOPRS_BIN=/tmp/base-target/debug/looprs python3 spikes/shutdown_e2e.py \
 | `SIGHUP`, default modes | `raw`, `alt_screen`, `cursor_hidden` | same |
 | `LOOPRS_PANIC=draw` | every mode, panicked inside the frame | each mode still left exactly once, exit code 101, tty cooked |
 | full-screen child killed while it holds the screen | nothing: the frame hosts the alternate screen, so the child's `?1049h` is **cut** and replaced by the canvas (ADR-0001 amendment 4) | the child painted on the screen it was handed; one `?1049h` in the whole run (the app's own); **no debt to pay and no leave from the session**; exactly one `?1049l`, at exit; nothing after it; tty cooked |
+| `SIGKILL` over a live shell (`leak`) | a child this run spawned, deliberately orphaned — no `Drop`, no `kill_and_reap`, no rc-file removal | **the leak check fires**: the recorded shell from the generated rc file and the busy child inside it are both named by pid; the scenario then reaps its own leak and ends clean. This is the non-vacuity half — a scoped check that never fired on a real leak would be passing on an empty list |
 
 **Rewritten by `pdl.4`, not silenced.** `flash_e2e.py` used to be this file's named
 exception — 0/3, 25 reshapes against a ≤19.5 budget, worst hole ~3.6 ms — and it stayed that
