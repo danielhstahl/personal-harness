@@ -147,7 +147,7 @@ page is incomplete, which is the failure mode it is written against.
 | module | owns |
 | --- | --- |
 | [`testing.rs`](../../src/testing.rs) | `Fakes`: builds real executables in a temp dir per test, the board/journal/show/fail levers, the log pollers |
-| [`measure.rs`](../../src/measure.rs) | the working-set and resize-transient measurements over a real corpus (`LOOPRS_MEASURE_*`) |
+| [`measure.rs`](../../src/measure.rs) | the working-set, resize-transient and live-preview-per-frame measurements over a real corpus (`LOOPRS_MEASURE_*`); the live-preview numbers are in [`spikes/results/live-preview-cost.log`](../../spikes/results/live-preview-cost.log) |
 | [`app/tests/*.rs`](../../src/app/tests) | the App-level behaviour suites, one file per concern: chord table, drag selection, copy-on-select, scrollback band, status row, token window, wheel, screen-held, input box, pi state, user band |
 
 ## The no-environment rule

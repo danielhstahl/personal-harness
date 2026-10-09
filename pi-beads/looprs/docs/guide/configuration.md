@@ -185,6 +185,7 @@ several of them exist only to make a test's assertion possible.
 | `LOOPRS_MEASURE_CORPUS` | `src/measure.rs` | a real `pi` session file or directory to replay for the working-set measurement. Both measurement tests are `#[ignore]`d and print a helpful message without it |
 | `LOOPRS_MEASURE_TICKETS` | `src/measure.rs` | how many corpus files to replay (default 12, oldest first) |
 | `LOOPRS_MEASURE_BUFFER` | `src/measure.rs` | `0` disables the buffer for the resize-transient measurement |
+| `LOOPRS_MEASURE_CHUNK` | `src/measure.rs` | bytes of a real answer handed to the live entry per simulated frame in the live-preview-cost measurement (default 128). A stand-in for how much arrives between two network reads; the frame cost is what the run measures, so this only sets how many frames an answer takes |
 | `LOOPRS_BIN` | the spike drivers | which binary a spike runs — the control-run lever, so a spike can run the same script against the pre-change build |
 | `LOOPRS_SPIKE`, `LOOPRS_SPIKE_N`, `LOOPRS_SPIKE_SCALE`, `LOOPRS_SPIKE_PROBES`, `LOOPRS_SPIKE_TRACE`, `LOOPRS_SPIKE_BASH`, `LOOPRS_SPIKE_BD` | the spike harness | spike-internal: scale, probe set, trace flag, which fake binary |
 | `LOOPRS_E2E_RAW`, `LOOPRS_E2E_TIMELINE` | e2e spike drivers | capture/debug levers in the pty drivers |

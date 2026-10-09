@@ -37,6 +37,7 @@ use crate::{
 };
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use std::cell::{Cell, RefCell};
 use syntect::easy::HighlightLines;
 
 /// One finalized line, as the flusher hands it to the scrollback store.
@@ -97,6 +98,111 @@ fn render_simple(e: &Entry, w: u16) -> Vec<Wrapped> {
 pub struct Flusher {
     first: usize, // entries[..first] are fully written to scrollback
     cur: Cursor,  // progress within entries[first]
+    /// The last live tail this flusher rendered, with the inputs that made it.
+    ///
+    /// A cache, so it is behind a `RefCell` rather than a `mut`: `preview` is a
+    /// read of the transcript and stays a read (the frame takes it through
+    /// `App::preview_active` while holding the app immutably), and nothing else
+    /// in this type behaves differently because it is here.
+    ///
+    /// See [`Flusher::preview`] for what invalidates it and why that list is
+    /// exactly the inputs.
+    tail: RefCell<Option<CachedTail>>,
+    /// How many `preview` calls were answered from [`Self::tail`] and how many
+    /// had to render.
+    ///
+    /// Not needed by anything that draws. It is there because a cache whose hit
+    /// rate is invisible is a cache nobody can tell the difference between and
+    /// one that silently stopped working, and "we saved N frames of parsing" is
+    /// the claim this whole change rests on. Read by the tests and by
+    /// [`crate::measure`].
+    tail_hits: Cell<u64>,
+    tail_misses: Cell<u64>,
+}
+
+/// One rendered live tail and the complete set of inputs that produced it.
+///
+/// The rule that makes this cache legal (ADR-0002 Q5, and looprs-00u.14's own
+/// note on it): **the count that sizes the live pane and the pixels that fill it
+/// must not describe different things.** So a hit is only allowed on every input
+/// that can change either — which is what [`CachedTail::is_for`] spells out, byte
+/// for byte against the live slice rather than against a fingerprint that could
+/// collide. Nothing here is a proxy for the input: the `src` copy *is* the input,
+/// and `lines` is what rendering exactly those bytes at exactly `width` gave.
+struct CachedTail {
+    /// Index of the entry the tail was cut from. Re-rendering identical bytes is
+    /// safe in itself, but naming the entry makes "same tail" mean *the same tail*
+    /// and not two paragraphs that happen to read alike.
+    entry: usize,
+    /// Which renderer produced the rows. Same bytes, different mode, different
+    /// rows: `Raw`/`Fence` hand over the text verbatim, `Markdown` re-flows it.
+    mode: Tail,
+    /// Content width the rows were wrapped at. A row's length *is* its shape, so
+    /// a width change is a different answer even with no new bytes.
+    width: u16,
+    /// The style `restyle` folded into every span (`style_for(kind)`).
+    style: Style,
+    /// The bytes the rows were rendered from, copied out of the entry.
+    ///
+    /// Copied rather than borrowed because the entry's text grows under us: a
+    /// `&str` here would either have to be re-borrowed (which is what the
+    /// comparison below does anyway) or would dangle. Kept as one `String` and
+    /// `clear`-ed on refill, so a steady stream costs no new allocation once
+    /// the largest paragraph has been seen.
+    src: String,
+    /// The rendered, restyled rows.
+    lines: Vec<Line<'static>>,
+}
+
+impl CachedTail {
+    /// Is this the rendering of exactly this tail?
+    ///
+    /// Every field of [`LiveTail`] appears here, in the order it is cheapest to
+    /// compare: three integers first, the style, then the bytes. The byte
+    /// comparison is the expensive one and it is last; on a stream where the
+    /// length changed it is not even reached, because a different `src.len()`
+    /// fails `String == str` immediately.
+    fn is_for(&self, t: &LiveTail<'_>, width: u16) -> bool {
+        self.entry == t.entry
+            && self.mode == t.mode
+            && self.width == width
+            && self.style == t.style
+            && self.src == t.text
+    }
+}
+
+/// How the live tail renders. Part of the tail's identity: the same bytes take a
+/// different path depending on which of these they are standing in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tail {
+    /// Shell output — verbatim, never markdown, never re-wrapped
+    /// (ADR-0001 rule 1).
+    Raw,
+    /// Inside an open fenced code block — the current line, verbatim, with the
+    /// highlighter's styling from the fence's own syntax state.
+    Fence,
+    /// The open prose block — parsed as markdown and wrapped.
+    Markdown,
+}
+
+/// What the live tail *is*, cut out of the transcript in one place.
+///
+/// Extracted from the body of [`Flusher::preview`] (looprs-00u.14) so that
+/// "which bytes are live" is a question with one answer. The cache below keys on
+/// it, the measurement in `crate::measure` buckets by it, and a preview that
+/// decided what to render somewhere else would be a cache that can be lied to.
+pub struct LiveTail<'a> {
+    /// Index of the entry the tail was cut from — `Flusher::first`.
+    pub entry: usize,
+    /// Which renderer it takes.
+    pub mode: Tail,
+    /// The style the rows get rendered with.
+    pub style: Style,
+    /// The live bytes themselves: `text[scan..]` for a verbatim tail,
+    /// `text[block..]` for prose. Its length is what a render of this tail
+    /// costs a pass over, which is the number the measurement in
+    /// [`crate::measure`] buckets by.
+    pub text: &'a str,
 }
 
 #[derive(Default)]
@@ -111,6 +217,9 @@ impl Flusher {
         Self {
             first: 0,
             cur: Cursor::default(),
+            tail: RefCell::new(None),
+            tail_hits: Cell::new(0),
+            tail_misses: Cell::new(0),
         }
     }
 
@@ -124,6 +233,12 @@ impl Flusher {
     pub fn reseat(&mut self, first: usize) {
         self.first = first;
         self.cur = Cursor::default();
+        // The cached rows were rendered from the entry `cur` was reading, and
+        // that entry is gone from under this cursor now. Dropping the cache is
+        // not needed to keep a *hit* correct (`is_for` compares the bytes, so
+        // a moved cursor cannot match) — it is here so the cache is never the
+        // thing that has to be reasoned about at a reseat.
+        self.tail.borrow_mut().take();
     }
 
     /// Everything written to scrollback: `entries[..consumed]`. The per-view buffer
@@ -161,6 +276,12 @@ impl Flusher {
     pub fn cut_front(&mut self, n: usize) {
         self.cur.scan = self.cur.scan.saturating_sub(n);
         self.cur.block = self.cur.block.saturating_sub(n);
+        // Same reason as in `reseat`, with a sharper edge: a cut changes the
+        // bytes at the head of the live slice while leaving the tail's *length*
+        // able to match the cached one. The `src` comparison would still catch
+        // it; dropping the cache means the buffer cap and the preview never have
+        // to be reasoned about together.
+        self.tail.borrow_mut().take();
     }
 
     /// Everything that became final since the last call, with provenance. Call
@@ -208,29 +329,139 @@ impl Flusher {
             }
             self.first += 1;
             self.cur = Cursor::default();
+            // The entry that the cached tail belonged to is finished: its rows
+            // are in the store now, and the live region is a different piece of
+            // text. Free them here rather than at the next preview, which may
+            // never come.
+            self.tail.borrow_mut().take();
         }
         out
     }
 
-    /// The not-yet-final tail of the active entry. A pure read: same data, same cursor.
-    pub fn preview(&self, t: &Transcript, term_width: u16) -> Vec<Line<'static>> {
-        let Some(e) = t.entries.get(self.first).filter(|e| !e.done) else {
-            return vec![];
-        };
+    /// `(hits, misses)` for the live-tail cache: how many `preview` calls were
+    /// answered from [`Self::tail`], how many had to render.
+    ///
+    /// Nothing that draws reads this. A cache whose hit rate is invisible is a
+    /// cache whose failure is invisible too, and "we stopped re-parsing frames
+    /// that did not need it" is the whole claim looprs-00u.14 makes — so the
+    /// counter is cheap and always on, read by the tests that pin the behaviour
+    /// and by the measurement that reports the rate.
+    #[allow(dead_code)] // measurement + test seam: `measure.rs` reports the hit rate the live-preview cache earns
+    pub fn tail_cache_stats(&self) -> (u64, u64) {
+        (self.tail_hits.get(), self.tail_misses.get())
+    }
+
+    /// What the live tail is right now, cut by the same cursor rules the renderer
+    /// uses. `None` when there is nothing live: no entry, or the entry this
+    /// flusher stands on has finished.
+    ///
+    /// The one place that answers "which bytes are the preview", so that the
+    /// cache in [`Flusher::preview`] cannot be handed a different definition of
+    /// live than the one it was filled with.
+    pub fn live_tail<'a>(&self, t: &'a Transcript) -> Option<LiveTail<'a>> {
+        let e = t.entries.get(self.first).filter(|e| !e.done)?;
         let c = &self.cur;
-        let lines = if e.kind.is_raw() {
+        let (mode, start) = if e.kind.is_raw() {
             // The unfinished last line of shell output: verbatim, and never
             // re-flowed through the markdown path.
-            vec![Line::from(e.text[c.scan..].to_string())]
+            (Tail::Raw, c.scan)
         } else if c.fence.is_some() {
-            vec![Line::from(e.text[c.scan..].to_string())]
+            (Tail::Fence, c.scan)
         } else {
-            md::render_markdown(&e.text[c.block..], content_width(term_width))
+            (Tail::Markdown, c.block)
         };
-        lines
-            .into_iter()
-            .map(|l| restyle(l, style_for(&e.kind)))
-            .collect()
+        Some(LiveTail {
+            entry: self.first,
+            mode,
+            style: style_for(&e.kind),
+            text: &e.text[start..],
+        })
+    }
+
+    /// The not-yet-final tail of the active entry. A pure read of the
+    /// transcript: same data, same cursor, same rows.
+    ///
+    /// It is *cached*, and asking for it twice has to cost a clone.
+    ///
+    /// Before looprs-00u.14 this re-rendered the whole open prose block on
+    /// every call, and the frame calls it on every draw — 60 fps while the row
+    /// animation turns, whether or not a byte arrived. Two facts decided what to
+    /// do about it, both measured over this repo's own `pi` corpus; the numbers
+    /// are in `spikes/results/live-preview-cost.log` and they are not the ones
+    /// the ticket expected:
+    ///
+    /// * the re-parse is **not the answer, it is the paragraph**. `Cursor::block`
+    ///   restarts at every blank line, so the live slice is the open paragraph:
+    ///   p50 119 B, p99 1,120 B, max 3,039 B, while the entries it is cut from
+    ///   reach 56,362 B. There is no cost that grows with the answer, and the
+    ///   worst block measured re-rendered in 313 µs (dev) — under the 1 ms the
+    ///   ticket set as its own bar for "no code change needed";
+    /// * what *was* real is the bytes, and the frames that changed nothing.
+    ///   A draw of a 2–4 KiB paragraph allocated 91,496 B; pooled over the
+    ///   corpus, 18,840 B per call, ~1.1 MB/s of churn from one streaming
+    ///   view at 60 fps. And the redraw clock ticks faster than deltas arrive,
+    ///   so a large share of those frames re-render bytes that had not changed.
+    ///
+    /// So the fix is the first one off the ticket's list — *skip when nothing
+    /// changed* — and it lands on the floor it sets: a hit costs 3.9 µs /
+    /// 1,626 B against the 26.5 µs / 18,840 B it replaced (**6.8x** the time,
+    /// **11.6x** the bytes), which is exactly what cloning the rows costs.
+    /// A miss costs the old work *plus* the clone handed back and the `src`
+    /// copy kept for the comparison — +5.6 µs (+21%) on a frame that carries
+    /// news, against −22.6 µs on one that does not.
+    ///
+    /// Correctness is the [`CachedTail::is_for`] list, and the invariant it
+    /// protects is ADR-0002 Q5's: the count that sizes the live pane and the
+    /// pixels that fill it must not describe different things. A width change
+    /// is a miss (rows are their shape — measured: a width change still costs a
+    /// full parse, 15.8 µs → 19.2 µs, and never an answer from the other
+    /// width); a style change is a miss; the bytes themselves are compared, not
+    /// hashed. `mod tests` pins each of those with the hit/miss counter rather
+    /// than a stopwatch.
+    pub fn preview(&self, t: &Transcript, term_width: u16) -> Vec<Line<'static>> {
+        let Some(tail) = self.live_tail(t) else {
+            // Nothing live. Drop what the cache was holding rather than keep a
+            // rendered paragraph that no screen will ask for again — an answer's
+            // last paragraph stays on the heap after the answer is over
+            // otherwise, per view, forever.
+            self.tail.borrow_mut().take();
+            return vec![];
+        };
+        let width = content_width(term_width);
+
+        if let Some(c) = self.tail.borrow().as_ref()
+            && c.is_for(&tail, width)
+        {
+            self.tail_hits.set(self.tail_hits.get() + 1);
+            return c.lines.clone();
+        }
+        self.tail_misses.set(self.tail_misses.get() + 1);
+
+        let lines: Vec<Line<'static>> = match tail.mode {
+            Tail::Raw | Tail::Fence => vec![Line::from(tail.text.to_string())],
+            Tail::Markdown => md::render_markdown(tail.text, width),
+        };
+        let lines: Vec<Line<'static>> = lines.into_iter().map(|l| restyle(l, tail.style)).collect();
+
+        let mut slot = self.tail.borrow_mut();
+        let c = slot.get_or_insert_with(|| CachedTail {
+            entry: 0,
+            mode: Tail::Markdown,
+            width,
+            style: tail.style,
+            src: String::new(),
+            lines: Vec::new(),
+        });
+        c.entry = tail.entry;
+        c.mode = tail.mode;
+        c.width = width;
+        c.style = tail.style;
+        // Reuse the buffer: `clear` keeps the allocation, so a stream that only
+        // ever grows the paragraph stops allocating after its longest one.
+        c.src.clear();
+        c.src.push_str(tail.text);
+        c.lines = lines;
+        c.lines.clone()
     }
 }
 
@@ -341,4 +572,250 @@ fn lang_of(line: &str) -> &str {
         .split([' ', ','])
         .next()
         .unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::transcript::Transcript;
+    use ratatui::style::Modifier;
+
+    /// Stream one answer into a transcript+flusher pair and take the preview,
+    /// in the order the frame does: settle, then look at what is still live.
+    fn live(text: &str, width: u16) -> (Transcript, Flusher) {
+        let mut t = Transcript::default();
+        let mut f = Flusher::new();
+        t.push_delta(MessageKind::Answer, text);
+        let _ = f.drain_rows(&t, width);
+        (t, f)
+    }
+
+    fn text_of(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|l| crate::utils::render::plain(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **The cache is doing its job.** Two previews of an unchanged live tail,
+    /// and the second one is not allowed to render.
+    ///
+    /// The counter is the assertion: timing a debug-build parse against a clone
+    /// says "probably faster", which is not a fact anyone can defend in six
+    /// months. Hits and misses either happened or they did not.
+    #[test]
+    fn an_unchanged_live_tail_is_served_from_the_cache() {
+        let (t, f) = live(
+            "The quick brown fox jumps over the lazy dog, and then the whole \
+             paragraph sits still while the redraw clock turns over.\n",
+            60,
+        );
+        let first = f.preview(&t, 60);
+        assert!(!first.is_empty(), "the tail rendered at all");
+        assert_eq!(f.tail_cache_stats(), (0, 1), "first call rendered");
+
+        let second = f.preview(&t, 60);
+        assert_eq!(second, first, "the same bytes draw the same rows");
+        assert_eq!(
+            f.tail_cache_stats(),
+            (1, 1),
+            "and the second call did not render them again"
+        );
+    }
+
+    /// **New bytes are never served the old answer.** The whole reason a cache
+    /// of a live region is allowed to exist is that the region's own bytes are
+    /// part of the key; this is the case where getting it wrong is a user-facing
+    /// bug — the answer on screen silently stops being the answer.
+    #[test]
+    fn new_bytes_in_the_live_tail_repaint_and_never_reuse_the_stale_rows() {
+        let (mut t, f) = live("The answer is going to be ", 60);
+        let before = f.preview(&t, 60);
+        assert_eq!(text_of(&before), "The answer is going to be");
+
+        t.push_delta(MessageKind::Answer, "quite clearly 42, and not 7.");
+        let after = f.preview(&t, 60);
+        assert!(
+            text_of(&after).contains("42"),
+            "the new words are on screen: {:?}",
+            text_of(&after)
+        );
+        assert_ne!(after, before, "the rows changed, as they had to");
+        assert_eq!(
+            f.tail_cache_stats(),
+            (0, 2),
+            "a changed tail is a miss, whatever the widths happen to be"
+        );
+    }
+
+    /// **A width change repaints in both directions.** Rows are their shape, so
+    /// a window change is a change to the answer itself — the ADR-0002 Q5 case:
+    /// the count that sizes the live pane and the pixels that fill it have to
+    /// agree, and they cannot if a hit is allowed across a width.
+    #[test]
+    fn a_width_change_rerenders_and_going_back_rerenders_again() {
+        let long = "A paragraph long enough that the number of rows it makes depends \
+                   on the window it is drawn in, which is the only property this \
+                   test is actually about. "
+            .repeat(3);
+        let (t, f) = live(&long, 80);
+
+        let wide = f.preview(&t, 80);
+        let narrow = f.preview(&t, 40);
+        assert!(
+            narrow.len() > wide.len(),
+            "the narrow window wraps more rows: {} vs {}",
+            narrow.len(),
+            wide.len()
+        );
+
+        let back = f.preview(&t, 80);
+        assert_eq!(
+            back, wide,
+            "back at 80 the rows are the 80-col rows, not last frame's 40-col ones"
+        );
+        assert_ne!(back, narrow);
+        assert_eq!(
+            f.tail_cache_stats(),
+            (0, 3),
+            "every width in that sequence had to render — a cache that answered \
+             any of them across widths would be drawing the wrong shape"
+        );
+
+        let again = f.preview(&t, 80);
+        assert_eq!(again, back);
+        assert_eq!(f.tail_cache_stats(), (1, 3), "and only now a hit");
+    }
+
+    /// **A finished entry has no live tail, and leaves nothing cached behind.**
+    /// Otherwise a later entry whose first paragraph matched the last paragraph
+    /// of the old one could be drawn with the old entry's rows — same words,
+    /// wrong message, wrong styling.
+    #[test]
+    fn a_finished_entry_previews_empty_and_clears_what_it_had_cached() {
+        let words = "The very same sentence, twice, in two different entries.\n";
+        let (mut t, mut f) = live(words, 60);
+        let answer = f.preview(&t, 60);
+        assert!(!answer.is_empty());
+
+        t.finish_last();
+        assert!(
+            f.preview(&t, 60).is_empty(),
+            "a done entry is not live: nothing to preview"
+        );
+
+        let _ = f.drain_rows(&t, 60);
+        t.push_delta(MessageKind::Thinking, words);
+        let thought = f.preview(&t, 60);
+        assert!(!thought.is_empty(), "the new entry previews");
+        assert_ne!(
+            thought, answer,
+            "same bytes, different entry: the rows are not the old answer's"
+        );
+        assert!(
+            thought
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .all(|s| s.style.add_modifier.contains(Modifier::ITALIC)),
+            "and they carry thinking's style, not the answer's — \
+             a cached row would have brought the old one"
+        );
+    }
+
+    /// **A cut under the cursor cannot leave cut bytes on screen.**
+    ///
+    /// The per-view buffer cap eats the head of the entry the flusher is still
+    /// reading. That moves the live slice's *contents* while leaving its length
+    /// able to match a cached entry's — the one shape of change a length-based
+    /// cache would answer with stale text.
+    #[test]
+    fn cutting_the_head_off_the_open_entry_does_not_preview_the_cut_bytes() {
+        let mut t = Transcript::default();
+        let mut f = Flusher::new();
+        t.push_delta(
+            MessageKind::Answer,
+            "HEAD-SENTINEL the head gets eaten here, and the tail survives the cut.\n",
+        );
+        let _ = f.drain_rows(&t, 60);
+        let before = f.preview(&t, 60);
+        assert!(text_of(&before).starts_with("HEAD-SENTINEL"));
+
+        let cut = t.cut_entry_head(0, "HEAD-SENTINEL the head gets eaten here".len());
+        f.cut_front(cut);
+        let after = f.preview(&t, 60);
+        assert!(
+            !text_of(&after).contains("HEAD-SENTINEL"),
+            "the eaten bytes are not on screen: {:?}",
+            text_of(&after)
+        );
+        assert!(
+            text_of(&after).starts_with(", and the tail survives"),
+            "what is left of the tail is: {:?}",
+            text_of(&after)
+        );
+        assert_eq!(f.tail_cache_stats(), (0, 2), "the cut was a miss");
+    }
+
+    /// **A reseat invalidates.** Same reasoning as the cut, from the other
+    /// direction the buffer cap can move the cursor: `reseat` points the
+    /// flusher at a different entry entirely.
+    #[test]
+    fn a_reseat_does_not_hand_back_the_previous_entrys_rows() {
+        let (t, mut f) = live("First entry's live paragraph, cached.\n", 60);
+        let _ = f.preview(&t, 60);
+        f.reseat(0);
+        let after = f.preview(&t, 60);
+        assert_eq!(
+            text_of(&after),
+            "First entry's live paragraph, cached.",
+            "re-reading the same entry still reads the same text"
+        );
+        assert_eq!(
+            f.tail_cache_stats(),
+            (0, 2),
+            "but the reseat dropped the cache rather than being checked against it"
+        );
+    }
+
+    /// **The verbatim tail is cached on the same terms.** Shell output takes the
+    /// `Raw` branch — no markdown, one line — and it is redrawn on every frame
+    /// of a fast-filling shell just like prose. Same rule, same cache; and the
+    /// mode is in the key, so a byte-identical tail that switched branch (a
+    /// fence opening) is not answered across branches.
+    #[test]
+    fn a_raw_tail_is_cached_and_a_branch_change_is_a_miss() {
+        let mut t = Transcript::default();
+        let mut f = Flusher::new();
+        t.push_delta(
+            MessageKind::Bash,
+            "ls -l /tmp\nsome shell output, still arriving",
+        );
+        let _ = f.drain_rows(&t, 60);
+        let a = f.preview(&t, 60);
+        assert_eq!(text_of(&a), "some shell output, still arriving");
+        let b = f.preview(&t, 60);
+        assert_eq!(a, b);
+        assert_eq!(f.tail_cache_stats(), (1, 1), "raw hits too");
+
+        // Same text, but this time the branch is Fence rather than Raw: the
+        // mode is part of the identity, so the raw render must not answer it.
+        let mut t2 = Transcript::default();
+        let mut f2 = Flusher::new();
+        t2.push_delta(MessageKind::Answer, "some shell output, still arriving");
+        let _ = f2.drain_rows(&t2, 60);
+        // open a fence by hand so the branch is Fence with identical bytes
+        f2.cur.fence = Some(("```".into(), md::highlighter().start("rust")));
+        f2.cur.scan = 0;
+        let c = f2.preview(&t2, 60);
+        assert_eq!(text_of(&c), "some shell output, still arriving");
+        assert_eq!(
+            f2.tail_cache_stats(),
+            (0, 1),
+            "a fresh flusher renders; and a second call hits on the Fence key"
+        );
+        let d = f2.preview(&t2, 60);
+        assert_eq!(c, d);
+        assert_eq!(f2.tail_cache_stats(), (1, 1));
+    }
 }

@@ -780,6 +780,33 @@ impl SessionView {
             .sum()
     }
 
+    /// How many bytes the live tail currently holds — the length of what a
+    /// [`Self::preview`] renders, in bytes.
+    ///
+    /// Measurement seam (looprs-00u.14): `crate::measure` buckets the per-frame
+    /// preview cost by exactly this number, because "how long is the live block"
+    /// is the question the ticket's whole argument turns on and the answer is a
+    /// cursor fact (`text[block..]`), not something a caller can re-derive
+    /// without duplicating the flusher's rules.
+    #[allow(dead_code)] // measurement seam: `measure.rs` buckets live-preview cost by this number
+    pub fn preview_len(&self) -> usize {
+        self.flusher
+            .live_tail(&self.transcript)
+            .map(|t| t.text.len())
+            .unwrap_or(0)
+    }
+
+    /// `(hits, misses)` of this view's live-tail preview cache.
+    ///
+    /// The flusher's counters, asked through the door the frame uses, so a test
+    /// of `SessionView::preview` can say "that second call was served from the
+    /// cache" rather than inferring it from a stopwatch. See
+    /// [`crate::components::line_render::Flusher::tail_cache_stats`].
+    #[allow(dead_code)] // measurement + test seam: `measure.rs` reports the live-preview cache's hit rate
+    pub fn preview_cache_stats(&self) -> (u64, u64) {
+        self.flusher.tail_cache_stats()
+    }
+
     /// The not-yet-final tail, for the live preview region.
     pub fn preview(&self, width: u16) -> Vec<Line<'static>> {
         // A Bash view's live tail is in the resolver, not in the entry: the entry
