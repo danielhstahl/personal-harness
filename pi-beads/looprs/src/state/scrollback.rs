@@ -1688,6 +1688,173 @@ mod tests {
         );
     }
 
+    /// The marker's sentence, pinned by **equality** rather than by `contains`.
+    ///
+    /// Two pages quote this row verbatim — `docs/guide/transcript.md` shows it
+    /// in a fenced block (`⌄ scrollback trimmed: 412 earlier lines dropped`)
+    /// and `docs/testing.md` quotes the same sentence with the count written as
+    /// `N` — and every other marker assertion in the tree asks only
+    /// `contains("scrollback trimmed")`: the test above, `selection.rs:1484`,
+    /// `session/view/tests/{evict,retention,rewrap}.rs`. `contains` survives a
+    /// reword of either end of the sentence, so it is weaker than the claim the
+    /// docs make; the page quotes a whole row, so the test pins a whole row.
+    ///
+    /// The glyph is written as `\u{2304}` (U+2304 DOWN ARROWHEAD) on purpose: the
+    /// lookalikes a reword could reach for — carons, breve, tilde, a bare `v` —
+    /// all read the same in a diff, and only this one is what the site renders.
+    #[test]
+    fn the_marker_says_the_exact_sentence_the_docs_quote() {
+        assert_eq!(
+            marker_text(1, None),
+            "\u{2304} scrollback trimmed: 1 earlier lines dropped"
+        );
+        assert_eq!(
+            marker_text(412, None),
+            "\u{2304} scrollback trimmed: 412 earlier lines dropped"
+        );
+        // The thousands separator is part of the quoted shape, not a detail of
+        // the counter: this is the row `spikes/results/scrollback-cost.log`
+        // captured on a real 16k-line trim.
+        assert_eq!(
+            marker_text(16_834, None),
+            "\u{2304} scrollback trimmed: 16,834 earlier lines dropped"
+        );
+
+        // And the *rendered head row* of a trimmed store is that string, not
+        // merely what the helper returns: what the docs describe is the row.
+        let cap = cost("gone gone") + 1;
+        let mut s = Scrollback::with_cap(20, cap);
+        s.push(vec![hard(0, "gone gone")]);
+        s.push(vec![hard(1, "kept kept")]);
+        assert!(
+            s.rows()[0].is_trim_marker(),
+            "precondition: row 0 is the marker"
+        );
+        assert_eq!(
+            s.rows()[0].to_string(),
+            "\u{2304} scrollback trimmed: 1 earlier lines dropped"
+        );
+    }
+
+    /// The half `docs/testing.md` promises in prose — "*and names the journal
+    /// file that kept what the store dropped*" — pinned as a whole row.
+    ///
+    /// The path arrives through [`Scrollback::set_trim_hint`], which
+    /// `SessionView::set_journal` fills from `FileJournal::display_path` (the
+    /// stable per-mode `last-<mode>` symlink). Pinning the joined row fixes the
+    /// words around the path and the U+00B7 middot that binds them; asserting the
+    /// path alone would leave "full transcript:" free to become "see also:".
+    #[test]
+    fn the_marker_names_the_journal_that_still_has_what_it_dropped() {
+        // The shape `transcript_file::display_path` actually hands back: home
+        // abbreviated, one stable symlink per mode.
+        let journal = "~/.local/share/looprs/transcripts/last-beads";
+        assert_eq!(
+            marker_text(412, Some(journal)),
+            "\u{2304} scrollback trimmed: 412 earlier lines dropped \
+             \u{00b7} full transcript: ~/.local/share/looprs/transcripts/last-beads"
+        );
+
+        // Through the store as well as through the helper, and in the order the
+        // app really does it: the journal is attached *after* content exists
+        // (`set_journal` is called on a running view), so the hint has to
+        // re-word the row that is already sitting at the head of the store.
+        let cap = cost("gone gone") + 1;
+        let mut s = Scrollback::with_cap(20, cap);
+        s.push(vec![hard(0, "gone gone")]);
+        s.push(vec![hard(1, "kept kept")]);
+        s.set_trim_hint(Some(journal.to_string()));
+        assert!(s.rows()[0].is_trim_marker());
+        assert_eq!(s.rows()[0].to_string(), marker_text(1, Some(journal)));
+
+        // Losing the journal loses the tail of the sentence with it — separator
+        // included. A store that cannot name a file must not point at one.
+        s.set_trim_hint(None);
+        let row = s.rows()[0].to_string();
+        assert_eq!(row, "\u{2304} scrollback trimmed: 1 earlier lines dropped");
+        assert!(!row.contains("full transcript"), "{row:?}");
+    }
+
+    /// The same pin aimed the other way: the pages that quote the marker must
+    /// quote a row this code renders.
+    ///
+    /// The literal-equality tests above fail when the wording changes and the
+    /// docs are left behind; nothing failed when the *docs* changed and the code
+    /// was left behind. `include_str!` closes that side at compile time — no
+    /// filesystem at test time, and a moved or deleted page is a compile error
+    /// rather than a test that quietly stopped checking anything.
+    ///
+    /// The count is blanked before comparing because the two pages use
+    /// different numbers (`412` in the guide, a literal `N` in the testing
+    /// page); the contract is the shape of the sentence, and any number written
+    /// into either page is allowed to be any number. A quoted row may be either
+    /// rendered form — bare, or with the journal named — since both are real.
+    #[test]
+    fn the_pages_that_quote_the_marker_quote_a_row_this_code_renders() {
+        let pages = [
+            (
+                "docs/guide/transcript.md",
+                include_str!("../../docs/guide/transcript.md"),
+            ),
+            ("docs/testing.md", include_str!("../../docs/testing.md")),
+        ];
+        // The two forms this row renders in: bare, and with the journal named.
+        // Both go in, because a page is allowed to quote either one.
+        let journal = "~/.local/share/looprs/transcripts/last-beads";
+        let templates: Vec<String> = vec![
+            marker_text(12_345, None).replace("12,345", "<N>"),
+            marker_text(12_345, Some(journal)).replace("12,345", "<N>"),
+        ];
+        for template in &templates {
+            assert!(
+                template.contains("<N>"),
+                "the marker puts its count between two fixed halves: {template:?}"
+            );
+        }
+
+        for (name, page) in pages {
+            let quotes = quoted_marker_rows(page);
+            assert!(
+                !quotes.is_empty(),
+                "{name}: no U+2304 marker row found — the page was rewritten and this test went vacuous"
+            );
+            for quote in quotes {
+                let matched = templates.iter().any(|template| {
+                    let (prefix, suffix) = template.split_once("<N>").unwrap();
+                    quote
+                        .strip_prefix(prefix)
+                        .and_then(|rest| rest.strip_suffix(suffix))
+                        .is_some_and(|count| {
+                            !count.is_empty()
+                                && count
+                                    .chars()
+                                    .all(|c| c.is_ascii_digit() || c == ',' || c == 'N')
+                        })
+                });
+                assert!(
+                    matched,
+                    "{name}: {quote:?} is not a marker this code renders — it matches neither {:?} nor {:?}",
+                    templates[0], templates[1]
+                );
+            }
+        }
+    }
+
+    /// Every marker row quoted by a page: from the arrow to the end of its
+    /// line, stopping early at a closing backtick so an inline code span in
+    /// prose yields the row alone and not the sentence wrapped around it.
+    fn quoted_marker_rows(page: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = page;
+        while let Some(pos) = rest.find('\u{2304}') {
+            let from = &rest[pos..];
+            let end = from.find(['\n', '`']).unwrap_or(from.len());
+            out.push(from[..end].trim_end().to_string());
+            rest = &from[end..];
+        }
+        out
+    }
+
     /// The marker counts **content lines**, not the rows our wrap cut them into,
     /// and it counts a line once even when it went over two trims. Three
     /// soft-wrapped rows of one paragraph is one line lost; reporting three (or

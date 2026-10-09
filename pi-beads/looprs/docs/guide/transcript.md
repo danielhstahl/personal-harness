@@ -74,7 +74,9 @@ all: [`src/bus.rs`](../../src/bus.rs).
 
 and that marker is the honest version of a failure that would otherwise be silent —
 you cannot scroll up to something that is not there, so the store has to name the
-loss. It also names where the loss went:
+loss. With a journal attached the same row carries where the loss went, appending
+` · full transcript: <path>` to the sentence above (the per-mode symlink, so the
+path a user types tomorrow is the one they read today):
 
 > the dropped lines are not lost. They are in the journal file.
 

@@ -553,6 +553,8 @@ what the store dropped. The view no longer inserts a `… N bytes dropped (buffe
 gone because the marker row says the same thing where the user can see it). The row
 spends the room on cost instead.
 
+That quoted sentence is pinned in both directions: `state::scrollback::tests::the_marker_says_the_exact_sentence_the_docs_quote` asserts the rendered row by *equality* (its journal half by `the_marker_names_the_journal_that_still_has_what_it_dropped`), and `the_pages_that_quote_the_marker_quote_a_row_this_code_renders` reads the pages that quote the row — this one and `docs/guide/transcript.md` — and fails if a reword on either side leaves the other behind. Rewording the marker is allowed; leaving a page quoting a row nobody renders is not.
+
 ### A compaction says so (the compaction card)
 
 pi pauses a run to summarise its own history whenever the context crosses its
