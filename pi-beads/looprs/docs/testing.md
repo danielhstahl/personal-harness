@@ -44,9 +44,14 @@ multi-process, three-backend TUI without a model, a board, or a terminal.
    carries, every spike check count written into prose matches a committed
    capture in `spikes/results/` (looprs-00u.23), every test name a page
    quotes in backticks answers to a real `fn` of that name in the tree
-   (looprs-00u.25), and every driver under `spikes/` has a row in
+   (looprs-00u.25), every driver under `spikes/` has a row in
    [`spikes/README.md`](../spikes/README.md) while no row there points at a
-   driver that is gone (looprs-00u.26)
+   driver that is gone (looprs-00u.26), and no table row that says it *includes*
+   another row quotes a smaller line count than the row it includes — nor a
+   stated difference that does not equal the subtraction it claims
+   (looprs-00u.27: ADR-0008's own corpus table said 7,071 lines under `docs/`
+   and 7,056 including `spikes/`, and the table whose job was to be the
+   measurement was the thing that could not be true)
 
 The same gate is declared three ways, because each one catches a different kind of
 person:
@@ -61,7 +66,7 @@ The docs step is new with the docs site and follows the same shape on purpose: t
 half a prose review catches is not checkable, but a dead link, an undocumented knob
 and a drifted table all are, and a docs rule that is not checked has a half-life of
 about a month. `./scripts/docs_check.sh` runs in under a second, needs no network
-and no cargo, and its six checks are described in
+and no cargo, and its seven checks are described in
 [ADR-0008](adr/0008-docs-site.md) and in
 [the contributor guide](guide/contributing.md). The generator itself is
 `./scripts/docs.sh` (`build` / `serve` / `check`).
@@ -127,6 +132,33 @@ grep: the compaction row above (`an_unknown_reason_…` for a test called
 with a test written about the **byte** cap — not only a wrong identifier, a wrong
 unit. Both now quote what the code calls them. Renaming a test to match a page is
 the forbidden direction: the page is the thing that was wrong.
+
+The seventh check is the failure that a reader catches by eye and no tool caught:
+an **inclusive size** that is smaller than the thing it includes. ADR-0008's
+corpus table — the table a reader goes to in order to be told a *number* — said
+the site serves **7,071 lines** of Markdown under `docs/` and **7,056 lines**
+*including* `spikes/`, i.e. adding a directory subtracted fifteen lines. That is
+not a measurement that went stale, it is an arithmetic impossibility, and the two
+figures behind it had been typed at different times. The gate now takes a row whose
+label says `including` / `plus` / `all of` / `total`, reads its headline line
+count and the nearest preceding row with a line count in the same column, and fails
+if the superset is smaller — and, when the row also quotes a difference ("the
+377-line difference"), fails unless that difference equals the subtraction it
+claims, because a third number written beside two totals is a number that can
+disagree with both. The pair itself is no longer something to trust: `--list-corpus`
+prints today's counts with the command that produced each one,
+
+```text
+$ ./scripts/docs_check.py --list-corpus
+Markdown under docs/         8,395 lines  find docs -name '*.md' -not -path 'docs/_site/*' | xargs wc -l | tail -1
+…including spikes/          8,772 lines  find docs spikes -name '*.md' -not -path 'docs/_site/*' | xargs wc -l | tail -1
+spikes/ on its own            377 lines  find spikes -name '*.md' | xargs wc -l | tail -1
+```
+
+so a size quoted in a page is a size that was produced by a command rather than a
+size that was typed. It is cheap and it generalises: the check needs no baseline and
+no filesystem knowledge beyond the two rows it is comparing, so it will still be
+true of the eighth and ninth ADR that quote a total.
 
 CI runs `scripts/check.sh` (`.github/workflows/looprs-gate.yml`, at the repo root,
 path-filtered to `pi-beads/looprs/**`).

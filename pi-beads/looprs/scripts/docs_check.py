@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The documentation rot gate (looprs-00u.10 / ADR-0008).
 
-Six checks that keep the site true after the day it was written:
+Seven checks that keep the site true after the day it was written:
 
 1. **Links and orphans** — every relative link in every Markdown page resolves,
    every `#anchor` exists in the page it names, and every `.md` under `docs/` is
@@ -41,6 +41,17 @@ Six checks that keep the site true after the day it was written:
    which is why this check is the orphan check with the noun changed — including
    the direction that only bites later: an index that keeps advertising a driver
    somebody deleted is the same lie, told forward.
+7. **Inclusive sizes** (looprs-00u.27) — a table row that says it **includes**
+   another row cannot quote a *smaller* line count than the row it includes, and a
+   "N-line difference" stated beside two totals has to equal the difference. The
+   table whose whole job is to be the measurement — ADR-0008's corpus table —
+   shipped as "7,071 lines under `docs/`" and "7,056 lines including `spikes/`":
+   a superset 15 lines **smaller** than its own part, which no amount of
+   re-reading can make true and nothing in the repo could contradict. Both figures
+   were stale and had been typed at different times, and the table that existed to
+   settle the question instead printed the impossibility. `--list-corpus` prints
+   today's counts with the command that produced each one, so the next re-count is
+   a re-run rather than a re-type.
 
 Run from anywhere; runs in well under a second; no network, no cargo, no build.
 
@@ -49,6 +60,7 @@ Run from anywhere; runs in well under a second; no network, no cargo, no build.
     ./scripts/docs_check.py --list-knobs    # what the code reads, with file:line
     ./scripts/docs_check.py --list-captures # every committed capture and its total
     ./scripts/docs_check.py --list-spikes   # every driver, indexed or not, with its captures
+    ./scripts/docs_check.py --list-corpus   # today's corpus line counts, by the book
 """
 
 from __future__ import annotations
@@ -75,6 +87,20 @@ EXTRA_PAGES = [ROOT / "spikes" / "README.md", ROOT / "README.md"]
 
 KNOB_RE = re.compile(r"LOOPRS_[A-Z0-9_]+")
 LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+
+# A table row whose label declares it is *more than* the row above it. Worded on
+# purpose: this is the shape that made ADR-0008's corpus table print "7,071 lines"
+# and then "7,056 lines including spikes/", and `including` is how a human writes a
+# superset. "total"/"all of" are here for the same sentence said the other way.
+INCLUSIVE_LABEL_RE = re.compile(
+    r"\binclud(?:e|es|ing)\b|\bplus\b|\ball of\b|\bwith .* includ|\btotal\b", re.I
+)
+# A size the reader takes away: "8,347 lines", "**7,071 lines**", "4,558 line".
+LINE_COUNT_RE = re.compile(r"(\d[\d,]*)\s*(?:\*\*)?\s*(?:lines?|lines\b)", re.I)
+# A stated gap between two totals, which has to equal the actual difference.
+DELTA_LINE_RE = re.compile(
+    r"(\d[\d,]*)[- ]line(?:s)?\s+(?:difference|gap|larger|bigger|more|higher)", re.I
+)
 
 
 # ─────────────────────────────── shared ───────────────────────────────
@@ -1567,6 +1593,120 @@ def spike_index_entries() -> list[tuple[str, int]]:
     return out
 
 
+def check_size_rows(pages) -> tuple[list[str], int]:
+    """A row that includes another row is never smaller than it.
+
+    The failure this closes is arithmetic, not prose: ADR-0008's corpus table said
+    the site serves 7,071 lines of Markdown under `docs/` and 7,056 lines
+    *including* `spikes/`. Adding a directory cannot subtract fifteen lines. Each
+    number had been typed from a different moment in the day, and the table — the
+    one place a reader goes to be told a size — printed an impossibility that was
+    checkable by eye and checked by nothing.
+
+    The rule is deliberately narrow and needs no filesystem, so it stays true as
+    the corpus grows and never needs a baseline:
+
+    * a row counts as **inclusive** when its label says so (`including`, `plus`,
+      `with X included`, `total`), and its *headline* size is the first line count
+      in its own size cell — the number the reader takes away;
+    * the **parent** is the nearest preceding row of the same table with a line
+      count in the same column, which is what "the row it includes" means in every
+      table this repo writes;
+    * the inclusive headline must be `>=` the parent's, and any difference quoted
+      in the inclusive row ("a 377-line difference") must equal `inclusive -
+      parent` exactly — a delta typed next to two totals is a third number that can
+      disagree with both.
+
+    Returns `(violations, pairs_checked)`.
+    """
+    bad: list[str] = []
+    checked = 0
+    for page in pages:
+        text = page.read_text(encoding="utf-8")
+        # column index -> (line_no, headline size, label) for the nearest row above
+        # **in the same table**. `md_tables` hands back the same header object for
+        # every row of one table, so a change of header is the table boundary; a
+        # page-scoped parent would let a total in one table get compared against a
+        # row in the next one, which is a false positive waiting for a second table.
+        above: dict[int, tuple[int, int, str]] = {}
+        table_key = None
+        for header, lineno, cells in md_tables(text):
+            if not cells:
+                continue
+            if tuple(header) != table_key:
+                table_key = tuple(header)
+                above = {}
+            label = strip_md(cells[0])
+            inclusive = bool(INCLUSIVE_LABEL_RE.search(label))
+            for idx, cell in enumerate(cells):
+                plain = strip_md(cell)
+                deltas = [int(m.group(1).replace(",", "")) for m in DELTA_LINE_RE.finditer(plain)]
+                counts = [
+                    int(m.group(1).replace(",", ""))
+                    for m in LINE_COUNT_RE.finditer(DELTA_LINE_RE.sub(" ", plain))
+                ]
+                if not counts:
+                    continue
+                headline = counts[0]
+                parent = above.get(idx)
+                if inclusive and parent is not None:
+                    checked += 1
+                    p_line, p_size, p_label = parent
+                    if headline < p_size:
+                        bad.append(
+                            f"{rel(page)}:{lineno}: {cells[0]!r} includes the row "
+                            f"at line {p_line} ({p_label!r}) but quotes a smaller "
+                            f"size — {headline:,} lines vs {p_size:,}. A superset "
+                            f"cannot be smaller than its own part; the two "
+                            f"numbers were measured at different times. "
+                            f"Re-measure with `./scripts/docs_check.py "
+                            f"--list-corpus` instead of re-typing one of them"
+                        )
+                    for d in deltas:
+                        diff = headline - p_size
+                        if d != diff:
+                            bad.append(
+                                f"{rel(page)}:{lineno}: {cells[0]!r} quotes a "
+                                f"{d:,}-line difference from the row at line "
+                                f"{p_line}, but {headline:,} - {p_size:,} = "
+                                f"{diff:,}. A difference stated beside two totals "
+                                f"is a third number that has to reconcile with "
+                                f"both"
+                            )
+                above[idx] = (lineno, headline, label)
+    return bad, checked
+
+
+def corpus_sizes() -> list[tuple[str, str, int]]:
+    """Today's corpus counts: `(what, the command that says so, lines)`.
+
+    These are printed rather than asserted: the corpus grows on every page, so a
+    count is a dated measurement, not a property of the tree. What is asserted is
+    that the pair *reconciles* — see `check_size_rows`.
+    """
+    def counted(cmd: str) -> int:
+        # Run the command that is printed beside the number, so the number in the
+        # page is the number the command prints rather than a parallel
+        # implementation of the same idea.
+        out = subprocess.run(
+            cmd, shell=True, cwd=ROOT, capture_output=True, text=True, check=False
+        ).stdout.strip()
+        m = re.search(r"(\d[\d,]*)\s+total\Z", out)
+        if not m:
+            raise SystemExit(f"corpus_sizes: `{cmd}` printed no total: {out!r}")
+        return int(m.group(1).replace(",", ""))
+
+    docs_cmd = "find docs -name '*.md' -not -path 'docs/_site/*' | xargs wc -l | tail -1"
+    both_cmd = "find docs spikes -name '*.md' -not -path 'docs/_site/*' | xargs wc -l | tail -1"
+    spikes_cmd = "find spikes -name '*.md' | xargs wc -l | tail -1"
+    docs_lines, both_lines, spikes_lines = (counted(c) for c in (docs_cmd, both_cmd, spikes_cmd))
+    return [
+        ("Markdown under docs/", docs_cmd, docs_lines),
+        ("…including spikes/", both_cmd, both_lines),
+        ("spikes/ on its own", spikes_cmd, spikes_lines),
+    ]
+
+
 def check_spike_index() -> tuple[list[str], int]:
     """Every driver under `spikes/` is indexed, and the index names no ghost.
 
@@ -1669,8 +1809,14 @@ def main() -> int:
         help="print every test-shaped name the docs quote, where it resolves, and what is excused",
     )
     ap.add_argument(
-        "--list-spikes", action="store_true",
+        "--list-spikes",
+        action="store_true",
         help="print every driver under spikes/, whether the index carries it, and its captures",
+    )
+    ap.add_argument(
+        "--list-corpus",
+        action="store_true",
+        help="print today's corpus line counts with the command that produces each one",
     )
     args = ap.parse_args()
 
@@ -1746,6 +1892,11 @@ def main() -> int:
             print(f"{rel(drv):32s} {state:12s} {caps or 'no capture committed'}")
         return 0
 
+    if args.list_corpus:
+        for what, cmd, lines in corpus_sizes():
+            print(f"{what:26s} {lines:>7,d} lines  {cmd}")
+        return 0
+
     pages = corpus_pages()
     violations: list[str] = []
     violations += check_links(pages)
@@ -1759,6 +1910,8 @@ def main() -> int:
     violations += name_violations
     index_violations, drivers_checked = check_spike_index()
     violations += index_violations
+    size_violations, size_pairs_checked = check_size_rows(pages)
+    violations += size_violations
 
     if (args.fix_keymap or args.fix_wire) and not violations:
         print("docs_check: regenerated the generated tables; no other violations")
@@ -1782,7 +1935,9 @@ def main() -> int:
             f"{len(wire_inventory())} wire value(s), {claims_checked} measurement "
             f"claim(s) backed by spikes/results/, {names_checked} quoted test "
             f"name(s) resolved to a function in the tree, {drivers_checked} "
-            "driver(s) under spikes/ all indexed in spikes/README.md)"
+            f"driver(s) under spikes/ all indexed in spikes/README.md, "
+            f"{size_pairs_checked} inclusive size row(s) reconciled against their "
+            f"parent row)"
         )
     return 0
 

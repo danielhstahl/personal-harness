@@ -30,9 +30,10 @@ it is published.
 
 | thing | size |
 | --- | --- |
-| Markdown under `docs/` (after this epic's pages) | **7,071 lines** as first published; **7,281 lines** re-measured 2026-10-09 in the improvement sweep |
-| …including `spikes/` (which the site carries) | **7,565 lines** in that same re-measurement |
-| How either number is obtained | `find docs spikes -name '*.md' -not -path 'docs/_site/*' \| xargs wc -l \| tail -1`. Re-run it; do not re-type it. The pair originally written here was "7,071 / 7,056", which cannot both be true — the superset was 15 lines *smaller* than its own part. Corrected by the sweep (`looprs-00u.27`) |
+| Markdown under `docs/` (after this epic's pages) | **8,395 lines** as measured 2026-10-09 (this page's own first published figure was 7,071; 7,281 once the sweep's own pages had landed) |
+| …including `spikes/` (which the site carries) | **8,772 lines** in that same measurement — the harness is the 377-line difference |
+| How the first two rows are obtained | docs only: `find docs -name '*.md' -not -path 'docs/_site/*' \| xargs wc -l \| tail -1`. With the harness: `find docs spikes -name '*.md' -not -path 'docs/_site/*' \| xargs wc -l \| tail -1`. The harness alone: `find spikes -name '*.md' \| xargs wc -l \| tail -1`. All three at once: `./scripts/docs_check.py --list-corpus`. Re-run one of these rather than re-typing a number into this table |
+| The pair that made this row a ticket | "7,071 / 7,056" — a superset 15 lines *smaller* than its own part. That is not a stale measurement, it is an impossible one: the two figures were typed at different times and neither reconciled with the other. The sweep corrected the pair and then closed the shape (`looprs-00u.27`): `docs_check`'s seventh check fails any "including X" size row that is smaller than the row it includes, so a transposed or mismatched pair cannot come back by way of a re-type |
 | Markdown before this epic | 4,558 lines (`docs/`), 5,003 with `spikes/` |
 | Distinct relative link targets outside `docs/` | `src/*.rs`, `spikes/*.py`, `spikes/results/*.log`, `examples/*.rs`, `tests/fixtures` |
 | Existing cross-links that must keep working | `../../spikes/results/…`, `../src/session/mod.rs`, `adr/0007-kanban-board.md#1-the-status--column-mapping` |
@@ -327,3 +328,17 @@ no index, because the reader trusts it first.
    by noticing one name in `docs/guide/contributing.md` was ungreppable; the gate
    written against it found two more, one of which credited the *row* cap with a
    test written about the **byte** cap.
+10. **No size in prose that no command prints.** A line count, a byte count or a
+    duration quoted in a page is a claim about a measurement, and the measurement
+    has to be re-runnable from the page that makes it: print the one-liner beside
+    the number (the corpus table's caption row, `--list-corpus`, `wc -l` on the
+    file) so the next re-count is a re-run rather than a re-type. A number that
+    cannot be re-run is folklore with a comma in it, and folklore drifts silently —
+    two figures typed an hour apart can disagree with no diff to argue about. Where
+    a row claims to *include* another, the arithmetic itself is now gated: the
+    inclusive row cannot be smaller than the row it includes, and a difference
+    quoted beside two totals has to equal the subtraction. Added after
+    `looprs-00u.27`, which found this ADR's own corpus table stating 7,071 lines
+    under `docs/` and 7,056 *including* `spikes/` — fifteen lines of subtraction
+    where there should have been an addition, in the one table a reader trusts to
+    be the measurement.

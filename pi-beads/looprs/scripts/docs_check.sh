@@ -9,6 +9,10 @@
 #   ./scripts/docs_check.sh --list-captures  # every spike capture, its total, which is current
 #   ./scripts/docs_check.sh --list-test-names  # every test name the docs quote, and what resolved it
 #
+#   ./scripts/docs_check.sh --list-corpus  # today's corpus line counts, each with
+#         the command that produced it — the re-count that looprs-00u.27 asked to
+#         be a re-run rather than a re-type
+#
 # Runs in well under a second, needs no network and no cargo, and is a step of
 # ./scripts/check.sh. See the Python file for what the checks are and why each one
 # is worth a gate.

@@ -35,7 +35,13 @@
 #         while no row points at a driver that is gone (looprs-00u.26: two pages
 #         call that file *the* index of what each spike measures, and it was
 #         missing three drivers — two of them linked from those pages by name, so
-#         the index said a cited file did not exist)
+#         the index said a cited file did not exist), and no table row that says it
+#         *includes* another row quotes a smaller line count than the row it
+#         includes, nor a difference that does not equal the subtraction it claims
+#         (looprs-00u.27: the table whose whole job is to be the measurement —
+#         ADR-0008's corpus table — said 7,071 lines under `docs/` and 7,056
+#         *including* `spikes/`, a superset fifteen lines smaller than its own
+#         part, typed from two different moments and contradicted by nothing)
 #
 # The order is deliberate: fmt and clippy are seconds-long and explain themselves, so
 # they run before the ~20s test suite rather than after it. Step 7 runs last for the
