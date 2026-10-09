@@ -6,7 +6,7 @@
 - **Decides for:** the `syntect =` line in `Cargo.toml`; the warm list in
   [`src/utils/md.rs`](../../src/utils/md.rs) (`WARM_PROBES`); the first lines
   `main()` runs; and the sentence in
-  [`src/session/view.rs`](../../src/session/view.rs) that has been saying
+  [`src/session/view/buffer.rs`](../../src/session/view/buffer.rs) that has been saying
   "syntect's syntax set — megabytes paid once on the first highlight" since
   before anyone had a number for it
 - **Measured by:** [`spikes/regex_backend_cost.sh`](../../spikes/regex_backend_cost.sh)

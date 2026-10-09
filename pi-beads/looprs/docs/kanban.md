@@ -256,9 +256,10 @@ is the smallest band that is still a board.
 * **The frame.** `src/viewport.rs` owns the five bands, the ladder that pays for them, and the
   "Adding a band" checklist. The board's row budget is `viewport::kanban_rows`; its floor is
   3 rows (header + one bead + footer) and its ceiling is 8.
-* **The poller.** `src/services/board_poller.rs` owns the schedule, the read and the
-  latest-wins publish. Its contract — three rules a later editor is most likely to break — is
-  written at the top of that file.
+* **The poller.** `src/services/board_poller/` owns the knobs (`config.rs`), the schedule
+  (`schedule.rs`), the read and the latest-wins publish (`read.rs`), and the state it
+  publishes (`board_poller.rs` itself). Its contract — three rules a later editor is most
+  likely to break — is written at the top of `board_poller.rs`.
 * **The mapping.** `src/state/board.rs` owns the status → column function and the snapshot.
   The mapping itself is decided in ADR-0007 §1; this is its rendering.
 * **The widget.** `src/components/kanban.rs` is a pure function of *snapshot + area*: no

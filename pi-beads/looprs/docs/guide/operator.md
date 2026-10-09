@@ -219,7 +219,7 @@ The transcript of that mode, which is the `last-Beeds` file above. If the pass
 died mid-tool-card, the card gets sealed as `Aborted` on the way out rather than
 leaving an open card that stalls the flush — so the tail you read is complete even
 when the process was not
-([`SessionView::seal`](../../src/session/view.rs)).
+([`SessionView::seal`](../../src/session/view/flush.rs)).
 
 ### "Did the board actually change, or did the UI lie to me?"
 

@@ -38,7 +38,7 @@ one is a feature rather than an implementation detail:
 **A planner pass is not believed until the board agrees.** `agent_settled` means
 "the planner stopped talking", which is not "there is a plan". The loop snapshots
 the open board *before* spawning the planner and diffs it afterwards
-([`BeadsLoop::verify_plan`](../../src/session/beads.rs)). What falls out: zero new
+([`BeadsLoop::verify_plan`](../../src/session/beads/machine.rs)). What falls out: zero new
 tickets is a loud error that quotes the planner's own last words and parks instead
 of advancing; a real plan is listed as `id: title` in the transcript **before** a
 worker is paid to read it; and "the board could not be read" is its own verdict and

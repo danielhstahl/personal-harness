@@ -91,7 +91,7 @@ between.
 per hop. `Ctrl-Q` quits from every state. `Ctrl-C` means two different things
 depending on the mode and that is deliberate; [the keymap](guide/keymap.md) is
 where it is spelled out per mode, from the same
-[`CHORD_TABLE`](../src/session/view.rs) the app's own rule tests read.
+[`CHORD_TABLE`](../src/session/view/chord_table.rs) the app's own rule tests read.
 
 ## The 60-second version
 

@@ -1,7 +1,7 @@
 # Keymap and chords
 
 Every keystroke looprs claims, per mode, generated from the same table the app's own
-rule tests read: [`CHORD_TABLE`](../../src/session/view.rs) — a typed row per chord
+rule tests read: [`CHORD_TABLE`](../../src/session/view/chord_table.rs) — a typed row per chord
 with `mode`, `key`, `keys`, `state`, `owner`, `does` and a `note`. The tables below
 are **generated from that table** (see [generated, not typed](#generated-not-typed)),
 so they cannot disagree with the binary they describe.
@@ -249,7 +249,7 @@ One screen, printable, 120 columns, no scrolling:
 
 The three per-mode tables between the `BEGIN GENERATED` / `END GENERATED` markers in
 [this file's source](keymap.md) are rendered from
-[`CHORD_TABLE`](../../src/session/view.rs) by
+[`CHORD_TABLE`](../../src/session/view/chord_table.rs) by
 [`scripts/docs_check.py`](../../scripts/docs_check.py):
 
 ```sh

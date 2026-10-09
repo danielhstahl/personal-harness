@@ -94,11 +94,26 @@ page is incomplete, which is the failure mode it is written against.
 | --- | --- | --- |
 | [`session/mod.rs`](../../src/session/mod.rs) | `TerminalType`, `SessionId` + generation, the `Session` trait, `SwitchAway`, the dead-code policy written out where the blanket `allow` used to be | rendering |
 | [`session/router.rs`](../../src/session/router.rs) | who owns a session, key routing, the shutdown grace, spawn/respawn | deciding what a keystroke means to a session beyond delivering it |
-| [`session/beads.rs`](../../src/session/beads.rs) | the planner/worker loop: the step machine, the claim guard, `verify_plan`, the drain-then-park rule | the UI. It reports `SessionEvent` and does not reach into a `Msg` type any more |
+| [`session/beads.rs`](../../src/session/beads.rs) | the beads session half: `BeadsCmd`, the handle the Router holds, the pieces wired together | the UI. It reports `SessionEvent` and does not reach into a `Msg` type any more |
+| [`session/beads/machine.rs`](../../src/session/beads/machine.rs) | the pass boundary: the claim guard, `verify_plan`, `verify_worker_pass`, which cause a pass answers for | whether a pass may start right now (the guards decide that) |
+| [`session/beads/task.rs`](../../src/session/beads/task.rs) | the owning task: the parked-state flags, settle / abort / shutdown handling, the mirrors a stale reader sees | the pass itself (the machine decides that) |
+| [`session/beads/guards.rs`](../../src/session/beads/guards.rs) | the pure decision layer: `PassGate`, `StepCause`, the cancel and stall-timer predicates | a clock, a process, or a mutation — it answers, it does not act |
+| [`session/beads/notes.rs`](../../src/session/beads/notes.rs) | the wording: the worker prompt, and every note about a plan, a claim or a pass | the verdict the note is attached to |
 | [`session/pi_chat.rs`](../../src/session/pi_chat.rs) | the `pi --mode rpc` child: one child, many turns, queueing, abort | the beads loop's notion of a pass |
-| [`session/bash.rs`](../../src/session/bash.rs) | the real pty: spawn `bash -i`, readiness markers, the command boundary, resize forwarding, raw key passthrough | re-writing the child's bytes ([ADR-0001 rule 1](../adr/0001-bash-terminal-state-pty.md)) |
+| [`session/bash.rs`](../../src/session/bash.rs) | the Bash session half: `BashCmd`, the handle the Router holds, the `Esc` decision reached in terms of the cancel state machine | the pty itself |
+| [`session/bash/pty.rs`](../../src/session/bash/pty.rs) | the real pty: spawn `bash -i`, the exit-marker rcfile, the blocking reader thread and its byte lane | re-writing the child's bytes ([ADR-0001 rule 1](../adr/0001-bash-terminal-state-pty.md)) |
+| [`session/bash/task.rs`](../../src/session/bash/task.rs) | the owning task: the command queue, `ensure_shell`, the output pump, the exit marker, stream end, shutdown | `Esc` (interrupt does) and the screen handover (screen does) |
+| [`session/bash/interrupt.rs`](../../src/session/bash/interrupt.rs) | `Esc`: a queued command taken out, or `0x03` on the master, and the stalled-cancel report | the grace window (`session/cancel.rs` owns that) |
+| [`session/bash/screen.rs`](../../src/session/bash/screen.rs) | resize, and the full-screen handover that gives the child the terminal and takes it back | who hosts the screen (the frame decides that) |
+| [`session/bash/reap.rs`](../../src/session/bash/reap.rs) | the never-reap-alone rule (looprs-2ck) and the wording around a dead shell | the cancel escalation policy itself |
 | [`session/cancel.rs`](../../src/session/cancel.rs) | the cancel state machine and the grace window | deciding what `Esc` means per mode (the chord table does) |
-| [`session/view.rs`](../../src/session/view.rs) | the view contract: `SessionView` per mode, the flush, `CHORD_TABLE`, sealing open cards | touching a clock or the environment (there is a `MAX_VIEWS`/buffer budget constant each) |
+| [`session/view.rs`](../../src/session/view.rs) | the view contract: `SessionView` per mode, how each is built, the answers read off it | touching a clock or the environment (there is a `MAX_VIEWS`/buffer budget constant each) |
+| [`session/view/flush.rs`](../../src/session/view/flush.rs) | the one door every finalized line goes through, and the record/push verbs around it | the width policy (rewrap owns that) |
+| [`session/view/rewrap.rs`](../../src/session/view/rewrap.rs) | rebuild at a new width from the source slice the budget covers, and the drop accounting for what it cannot reach | the store (scrollback owns rows) |
+| [`session/view/buffer.rs`](../../src/session/view/buffer.rs) | the retained-history ceiling and the two ways a view lets go when it runs over | what one row costs the screen |
+| [`session/view/shell_tail.rs`](../../src/session/view/shell_tail.rs) | the Bash tail: pty chunks in, sealed transcript entries out | the command boundary (bash decides that) |
+| [`session/view/chord.rs`](../../src/session/view/chord.rs) | the keyboard vocabulary: `KeySym`, `Effect`, `Owner`, `ChordState`, `ChordRow` | the rows themselves |
+| [`session/view/chord_table.rs`](../../src/session/view/chord_table.rs) | `CHORD_TABLE`: the keymap as data, generated against by `docs/guide/keymap.md` | dispatch code — the table is read by rule tests, not by the key path |
 
 ### State (the store)
 
@@ -119,7 +134,10 @@ page is incomplete, which is the failure mode it is written against.
 | [`services/journal.rs`](../../src/services/journal.rs) | the running transcript file: per-entry append and flush, the `last` symlinks, `0600`/`0700` | being read back. Nothing parses the journal |
 | [`services/transcript_file.rs`](../../src/services/transcript_file.rs) | the `Ctrl-S t` dump: path resolution, `~` folding, the polled receipt | being the journal (it is not) |
 | [`services/notification.rs`](../../src/services/notification.rs) | the ntfy publish: envelope, headers, byte limits, bounded retries | deciding *when* to notify (the beads loop does that, once) |
-| [`services/board_poller.rs`](../../src/services/board_poller.rs) | the board schedule, the change probe, the latest-wins publish, one read at a time | being on the session's hot path, or being read inside the draw |
+| [`services/board_poller.rs`](../../src/services/board_poller.rs) | the state the poller publishes: the owner `main` holds, and the `BoardHandle` every reader takes | the decision of which read is owed (schedule decides that) |
+| [`services/board_poller/config.rs`](../../src/services/board_poller/config.rs) | the knobs, resolved once from strings by pure functions | a policy the operator did not ask for |
+| [`services/board_poller/schedule.rs`](../../src/services/board_poller/schedule.rs) | the watermark logic: `ReadReason`, `Decision`, `decide` | calling `bd` (read does) |
+| [`services/board_poller/read.rs`](../../src/services/board_poller/read.rs) | the tick loop and the `bd` calls it makes, one read at a time | deciding whether this tick owes one |
 | [`services/bd.rs`](../../src/services/bd.rs) | every `bd` invocation, its parsing, and the "a failing `bd` is not an empty board" rule | the board's visual meaning |
 | [`services/pi.rs`](../../src/services/pi.rs) | the `pi` binary resolution and the rpc envelope | the conversation model |
 | [`services/prompts.rs`](../../src/services/prompts.rs) | the prompt text handed to planner and worker | the loop's control flow |
@@ -205,7 +223,7 @@ Each is a procedure, in order, with the files to touch.
 
 ### Add a key / chord
 
-1. `session/view.rs` — add a row to `CHORD_TABLE`: `mode`, `key`, `keys`,
+1. `session/view/chord_table.rs` — add a row to `CHORD_TABLE`: `mode`, `key`, `keys`,
    `state`, `owner`, `does`, `note`. **Every row names one mode explicitly**; a row
    that says "all modes" hides the fact that `Ctrl-C` does not mean the same thing
    in all of them.
@@ -229,7 +247,7 @@ This is the expensive one, and the table is where the cost lands.
 2. A `Session` implementation; a spawn arm in the factory; a `SessionId`
    generation per the existing rule.
 3. `session/router.rs` — the new arm.
-4. `session/view.rs` — `MAX_VIEWS` is `TerminalType::ALL.len()`, so the retained
+4. `session/view/buffer.rs` — `MAX_VIEWS` is `TerminalType::ALL.len()`, so the retained
    byte ceiling moves: `RETAINED_BYTES_WORST_CASE = MAX_VIEWS * (store + buffer)`.
    Re-read the startup log line and make sure the number is one you want.
 5. `CHORD_TABLE` rows for the new mode for **every** chord. The table has no

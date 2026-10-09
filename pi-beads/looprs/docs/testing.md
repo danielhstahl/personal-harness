@@ -174,27 +174,27 @@ The scenarios the chore (looprs-6ol) listed, each with the tests that carry it.
 
 ### Startup with ready beads (looprs-26r)
 
-- `session::beads::tests::a_non_empty_board_self_starts_a_prompted_worker`
-- `session::beads::tests::an_empty_board_parks_without_spawning`
-- `session::beads::tests::constructing_a_loop_spawns_nothing`
-- `session::beads::tests::a_pi_that_dies_during_startup_is_reported`
+- `session::beads::tests::startup::a_non_empty_board_self_starts_a_prompted_worker`
+- `session::beads::tests::startup::an_empty_board_parks_without_spawning`
+- `session::beads::tests::startup::constructing_a_loop_spawns_nothing`
+- `session::beads::tests::startup::a_pi_that_dies_during_startup_is_reported`
 
 ### Settle routing (looprs-msj)
 
-- `session::beads::tests::the_loop_takes_its_next_pass_from_its_own_workers_settle`
-- `session::beads::tests::a_settle_from_a_pass_this_loop_does_not_own_moves_nothing`
-- `session::beads::tests::driving_the_loop_reaps_the_previous_worker`
+- `session::beads::tests::drive::the_loop_takes_its_next_pass_from_its_own_workers_settle`
+- `session::beads::tests::drive::a_settle_from_a_pass_this_loop_does_not_own_moves_nothing`
+- `session::beads::tests::startup::driving_the_loop_reaps_the_previous_worker`
 - `session::router::tests::the_router_has_no_beads_advance_path_left`
-- `app::tests::no_settle_ever_turns_into_a_command_from_the_app`
+- `app::tests::pi_state::no_settle_ever_turns_into_a_command_from_the_app`
 
 ### Claim / close guard (looprs-w7q)
 
-- `session::beads::tests::the_harness_claims_the_ticket_it_is_paying_for`
-- `session::beads::tests::a_claim_bd_refuses_buys_no_worker`
-- `session::beads::tests::a_ticket_that_is_never_closed_stops_the_loop_instead_of_spinning`
-- `session::beads::tests::the_active_ticket_is_published_when_taken_and_when_released`
-- `session::beads::tests::the_worker_is_told_its_ticket_not_invited_to_go_shopping`
-- pure: `session::beads::tests::the_claim_guard_skips_refuses_and_works_in_that_order_pure`
+- `session::beads::tests::claim::the_harness_claims_the_ticket_it_is_paying_for`
+- `session::beads::tests::claim::a_claim_bd_refuses_buys_no_worker`
+- `session::beads::tests::claim::a_ticket_that_is_never_closed_stops_the_loop_instead_of_spinning`
+- `session::beads::tests::announce::the_active_ticket_is_published_when_taken_and_when_released`
+- `session::beads::tests::claim::the_worker_is_told_its_ticket_not_invited_to_go_shopping`
+- pure: `session::beads::tests::tables::the_claim_guard_skips_refuses_and_works_in_that_order_pure`
 
 ### Out-of-band notification (the completion edge)
 
@@ -210,7 +210,7 @@ announced" assertable instead of unfalsifiable.
 
 | ending | announced |
 | --- | --- |
-| the board says closed | `session::beads::tests::a_closed_ticket_is_announced_once_with_the_title_it_was_claimed_under` |
+| the board says closed | `session::beads::tests::announce::a_closed_ticket_is_announced_once_with_the_title_it_was_claimed_under` |
 | settled, ticket still open | `…::a_ticket_that_was_never_closed_announces_nothing` |
 | `Esc` cancelled the pass | `…::a_pass_the_user_cancelled_announces_nothing` |
 | the planner's settle | `…::a_planner_settling_announces_nothing_even_though_its_plan_worked` |
@@ -237,28 +237,28 @@ The ntfy wire format itself is checked against a loopback listener, under
 
 ### Bash echo / exit / cwd persistence (looprs-553)
 
-- `session::bash::tests::echo_streams_its_output_and_reports_exit_0`
-- `session::bash::tests::a_failing_command_is_loudly_not_zero`
-- `session::bash::tests::cwd_persists_across_commands`
-- `session::bash::tests::exported_variables_persist_across_commands`
-- `session::bash::tests::stderr_and_stdout_arrive_in_the_programs_own_order`
+- `session::bash::tests::roundtrip::echo_streams_its_output_and_reports_exit_0`
+- `session::bash::tests::roundtrip::a_failing_command_is_loudly_not_zero`
+- `session::bash::tests::roundtrip::cwd_persists_across_commands`
+- `session::bash::tests::roundtrip::exported_variables_persist_across_commands`
+- `session::bash::tests::roundtrip::stderr_and_stdout_arrive_in_the_programs_own_order`
 
 ### Esc cancellation (looprs-5g7)
 
 - `session::cancel::tests::the_grace_is_a_warning_window_not_a_hope`
 - `session::cancel::tests::arm_delivers_the_command_after_the_grace`
-- `session::bash::tests::esc_interrupts_a_running_command_without_killing_the_shell`
-- `session::bash::tests::esc_says_cancelling_before_the_command_reports_itself_done`
-- `session::bash::tests::an_esc_aimed_at_a_queued_command_takes_it_out_of_the_queue` — the
+- `session::bash::tests::interrupt::esc_interrupts_a_running_command_without_killing_the_shell`
+- `session::bash::tests::interrupt::esc_says_cancelling_before_the_command_reports_itself_done`
+- `session::bash::tests::interrupt::an_esc_aimed_at_a_queued_command_takes_it_out_of_the_queue` — the
   cold-start window, held open on purpose with `/bin/cat` as the "shell" (it never prints the
   readiness marker, so the command cannot leave the queue underneath the test)
 - `session::cancel::tests::the_queued_cancel_names_the_command_and_says_it_never_ran`
 - `session::pi_chat::tests::esc_clears_the_queue_before_aborting_and_gives_the_words_back`
 - `session::pi_chat::tests::a_pi_that_ignores_the_abort_is_killed_said_so_and_the_mode_recovers`
-- `session::beads::tests::a_worker_that_ignores_the_abort_is_killed_and_leaves_the_bead_named`
+- `session::beads::tests::drive::a_worker_that_ignores_the_abort_is_killed_and_leaves_the_bead_named`
 - `session::router::tests::cancel_reaches_the_active_session_only`
-- pure: `session::beads::tests::esc_is_absorbed_while_a_cancel_is_unwinding_and_only_while`
-- pure: `session::beads::tests::a_stall_timer_only_answers_for_the_attempt_that_armed_it`
+- pure: `session::beads::tests::tables::esc_is_absorbed_while_a_cancel_is_unwinding_and_only_while`
+- pure: `session::beads::tests::tables::a_stall_timer_only_answers_for_the_attempt_that_armed_it`
 
 #### A cold shell makes `Running` mean "pending", and that is not "started"
 
@@ -289,8 +289,8 @@ Four tests drive a real pty and cannot be made hermetic without lying about the 
 they check: `esc_interrupts_…`, `esc_says_cancelling_…`,
 `a_command_that_traps_the_interrupt_…`, `a_full_screen_program_is_handed_the_screen_…`.
 They used to fail under the full suite's CPU contention, and the honest-sounding
-answer was a list of names to re-run. Four rules replaced the list, all in
-`src/session/bash.rs`'s test module:
+answer was a list of names to re-run. Four rules replaced the list, all in the
+shared harness `src/session/bash/tests/mod.rs`:
 
 | rule | the helper | what it replaced |
 | --- | --- | --- |
@@ -338,7 +338,7 @@ it proves more and waits less.
 ### The shutdown hang the `--skip` used to shadow (`looprs-2ck`)
 
 This page used to run the stress command above with
-`--skip=session::bash::tests::shutdown_leaves_no_shell_running`, and said the skip
+`--skip=session::bash::tests::shutdown::shutdown_leaves_no_shell_running`, and said the skip
 was "a test that never returns under load", which was true and was not the end of
 it. The skip is gone, and so is the hang it stood over.
 
@@ -361,7 +361,7 @@ can see past it, because the test never reaches its assertions. A quit during a 
 command — Ctrl-Q with `yes` still pouring, an exit while the transcript is draining —
 is a terminal the user has to go and kill by hand.
 
-The rule in `src/session/bash.rs` now is **never reap alone**:
+The rule in `src/session/bash/reap.rs` now is **never reap alone**:
 
 * **The reap drains while it waits.** `reap_while_draining` takes the byte lane with
   it on every turn. That is not a courtesy to the transcript: every buffer the reader
@@ -409,8 +409,8 @@ of the things those rounds are actually testing.
 - `services::bd::tests::a_missing_bd_is_named_not_gossiped_around`
 - `services::bd::tests::a_failing_bd_is_not_an_empty_board`
 - `services::bd::tests::silence_from_bd_is_malformed_never_empty`
-- `session::beads::tests::a_failing_bd_is_reported_and_parks`
-- `session::bash::tests::a_missing_path_shows_its_stderr`
+- `session::beads::tests::startup::a_failing_bd_is_reported_and_parks`
+- `session::bash::tests::roundtrip::a_missing_path_shows_its_stderr`
 
 ### The pure state machines (this chore's first bullet)
 
@@ -426,10 +426,10 @@ No subprocess, no fake, no channel wait — just the decision layer, enumerated.
 
 **Beads step machine (`AwaitInput → CreateTickets → WorkTickets → AwaitInput`)**
 
-- `session::beads::tests::every_step_cause_lands_on_one_step_and_says_so` — the
+- `session::beads::tests::tables::every_step_cause_lands_on_one_step_and_says_so` — the
   table, and the fact that a transition is *published* and not merely stored
-- `session::beads::tests::the_machine_walks_await_plan_work_and_home_again`
-- `session::beads::tests::the_step_table_is_a_bijection_over_the_whole_enum` — no
+- `session::beads::tests::tables::the_machine_walks_await_plan_work_and_home_again`
+- `session::beads::tests::tables::the_step_table_is_a_bijection_over_the_whole_enum` — no
   orphan step, no unmapped cause, no two causes claiming one step
 
 The machine takes a `StepCause` (`Planning` / `Working` / `Awaiting`) rather than a
@@ -438,9 +438,9 @@ lives once instead of being re-implied at six call sites.
 
 **Guards**
 
-- `session::beads::tests::the_pass_gate_has_exactly_one_open_row_in_sixteen` — the
+- `session::beads::tests::tables::the_pass_gate_has_exactly_one_open_row_in_sixteen` — the
   one gate in front of "start a pass", all 16 rows, exactly one yes
-- `session::beads::tests::each_flag_closes_the_pass_gate_by_itself`
+- `session::beads::tests::tables::each_flag_closes_the_pass_gate_by_itself`
 
 ### Status row (looprs-guh)
 
@@ -517,12 +517,12 @@ reason above. Those live in `status.rs`'s width tests and `main.rs`'s
 
 | claim | where |
 | --- | --- |
-| the wire shape parses as pi writes it — camelCase, every field independently optional, **absent ≠ zero** | `app::tests::the_wire_usage_record_parses_as_pi_writes_it` |
+| the wire shape parses as pi writes it — camelCase, every field independently optional, **absent ≠ zero** | `app::tests::token_window::the_wire_usage_record_parses_as_pi_writes_it` |
 | the same shape through a real child's stdout, not a hand-written string | `session::pi_chat::tests::the_wire_usage_record_survives_the_real_pipes` |
-| only an assistant `message_end` adds; a `user` / `toolResult` message and a usage-less message add nothing | `app::tests::every_assistant_message_adds_and_nothing_else_does` |
-| the beads window opens on a claim and **survives the release** | `app::tests::the_beads_window_opens_on_a_claim_and_survives_the_release` |
-| a respawned generation owes nothing for the dead one's run | `app::tests::a_new_generation_starts_the_window_at_nothing` |
-| nothing reported prints nothing, rather than `↑0 ↓0` | `app::tests::the_row_prints_the_window_it_is_handed` |
+| only an assistant `message_end` adds; a `user` / `toolResult` message and a usage-less message add nothing | `app::tests::token_window::every_assistant_message_adds_and_nothing_else_does` |
+| the beads window opens on a claim and **survives the release** | `app::tests::token_window::the_beads_window_opens_on_a_claim_and_survives_the_release` |
+| a respawned generation owes nothing for the dead one's run | `app::tests::token_window::a_new_generation_starts_the_window_at_nothing` |
+| nothing reported prints nothing, rather than `↑0 ↓0` | `app::tests::token_window::the_row_prints_the_window_it_is_handed` |
 | the cache detail surrenders its columns before the in/out pair does | `components::status::tests::the_cache_detail_gives_way_before_the_in_out_pair` |
 | the formats stay narrow: `999`, `12.3k`, `1.24M` | `components::status::tests::token_counts_stay_compact_at_every_order_of_magnitude` |
 
@@ -547,7 +547,7 @@ the marker row at the top of the band, which reads
 `⌄ scrollback trimmed: N earlier lines dropped` and names the journal file that kept
 what the store dropped. The view no longer inserts a `… N bytes dropped (buffer cap) …`
 *entry* into the transcript (see
-[`session/view.rs`](../src/session/view.rs), `trim_open_entry`'s doc: the entry is
+[`session/view/buffer.rs`](../src/session/view/buffer.rs), `trim_open_entry`'s doc: the entry is
 gone because the marker row says the same thing where the user can see it). The row
 spends the room on cost instead.
 
@@ -563,13 +563,13 @@ finished row in the scrollback, `✓ context compacted · threshold · 150.0k �
 
 | claim | where |
 | --- | --- |
-| the wire shape parses as pi writes it: `reason` on the start, `result.tokensBefore` / `estimatedTokensAfter` on the end, and no `result` at all when it was aborted | `app::tests::the_compaction_wire_format_parses` |
-| the start puts a live card on the screen, and the height policy is told to budget its row | `app::tests::a_compaction_shows_a_live_card_while_it_runs` |
-| the finished card reaches the scrollback carrying what it freed | `app::tests::a_finished_compaction_reaches_the_scrollback_with_what_it_freed` |
-| cancelled and failed are two different sentences, and a cancel is not painted in failure's red | `app::tests::an_aborted_compaction_says_aborted_and_a_failed_one_says_why`, `components::compaction::tests::aborted_is_grey_and_failed_is_red` |
+| the wire shape parses as pi writes it: `reason` on the start, `result.tokensBefore` / `estimatedTokensAfter` on the end, and no `result` at all when it was aborted | `app::tests::token_window::the_compaction_wire_format_parses` |
+| the start puts a live card on the screen, and the height policy is told to budget its row | `app::tests::token_window::a_compaction_shows_a_live_card_while_it_runs` |
+| the finished card reaches the scrollback carrying what it freed | `app::tests::token_window::a_finished_compaction_reaches_the_scrollback_with_what_it_freed` |
+| cancelled and failed are two different sentences, and a cancel is not painted in failure's red | `app::tests::token_window::an_aborted_compaction_says_aborted_and_a_failed_one_says_why`, `components::compaction::tests::aborted_is_grey_and_failed_is_red` |
 | the card is drawn in the frame's card band, and the two endings draw differently | `main::tests::a_live_compaction_is_drawn_in_the_card_band`, `main::tests::a_cancelled_and_a_failed_compaction_are_drawn_differently` |
-| an `end` whose `start` never arrived is recorded rather than swallowed | `app::tests::a_compaction_end_with_no_open_card_is_recorded_anyway` |
-| closing the card releases everything that queued up behind it | `app::tests::closing_the_compaction_card_releases_what_came_behind_it` |
+| an `end` whose `start` never arrived is recorded rather than swallowed | `app::tests::token_window::a_compaction_end_with_no_open_card_is_recorded_anyway` |
+| closing the card releases everything that queued up behind it | `app::tests::token_window::closing_the_compaction_card_releases_what_came_behind_it` |
 | a missing `reason` leaves no dangling separator on the row | `components::compaction::tests::an_unknown_reason_leaves_no_trailing_separator` |
 
 **A card left open when the session dies is a bug with teeth.** A `!done` entry
@@ -577,7 +577,7 @@ stalls the flush cursor, so a compaction — or a tool — that was still in fli
 when the child died would take the rest of that session's transcript with it:
 exactly the tail the exit drain exists to collect. `SessionView::seal` now closes
 open cards of either kind as `Aborted` —
-`session::view::tests::sealing_closes_cards_left_running_so_the_transcript_keeps_flushing`,
+`session::view::tests::flush::sealing_closes_cards_left_running_so_the_transcript_keeps_flushing`,
 `state::transcript::tests::abandoning_closes_every_open_card_and_nothing_else`.
 A frozen spinner in a transcript whose process is gone is the thing that was
 replaced.

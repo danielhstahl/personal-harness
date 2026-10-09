@@ -83,7 +83,7 @@ has nothing to report
 | any mode, mid-run | `Ctrl-Q` | the same, plus the sessions get [`SHUTDOWN_GRACE`](../../src/session/router.rs) to say their piece and then get killed |
 | Bash, nothing running | `Ctrl-C` | goes to the shell as `0x03`; **the app stays up**, because that key belongs to the shell |
 | Bash, a command running | `Ctrl-C` | SIGINT to the shell's foreground group; the command dies, the shell lives, the app lives |
-| Pi or Beads | `Ctrl-C` | quits the app ([`CHORD_TABLE`](../../src/session/view.rs)) |
+| Pi or Beads | `Ctrl-C` | quits the app ([`CHORD_TABLE`](../../src/session/view/chord_table.rs)) |
 | anything, a full-screen child holds the screen | `Ctrl-Q` | the child is killed on the way out and the alt-screen leave is paid exactly once |
 | the app has wedged | `kill <pid>`, or `kill -9` | the signal path and the panic path both go through the ledger; the tty comes back cooked either way |
 

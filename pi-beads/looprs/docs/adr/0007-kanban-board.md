@@ -304,7 +304,7 @@ above. Everything a loop or a human does through normal `bd` writes stays on
 the 5 s tick.
 
 **Three rules make the watermark safe** (stated in
-[`decide`](../../src/services/board_poller.rs), which is pure so the policy is
+[`decide`](../../src/services/board_poller/schedule.rs), which is pure so the policy is
 tested as a table rather than raced against a subprocess):
 
 1. **Nothing has ever been read ⇒ always read.** "Quiet since the watermark"
