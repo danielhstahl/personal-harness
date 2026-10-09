@@ -1,0 +1,251 @@
+# dependency-cost — looprs-00u.15
+# measured 2026-10-09T07:43Z–08:25Z, Darwin 25.6.0 arm64, macOS,
+# cargo 1.100.0-nightly (495c385d0 2026-09-16), rustc 1.100.0-nightly (1303417c4 2026-09-21)
+#
+# The ticket asked for `cargo build --timings` before and after — clean build wall
+# time, per-crate count, final binary size — and for the default of the `notify`
+# feature to be decided on those numbers rather than on taste. This file is that
+# measurement; every number in the summary was read out of the runs below.
+#
+# Harness: `spikes/dep_cost.sh <label> [cargo flags...]` — one clean `--release`
+# build per configuration, each in its own target directory, plus the graph
+# questions answered from `cargo tree -e normal` (the bin's own edge set: what the
+# shipped binary carries, as opposed to what `cargo test` compiles). Nothing is
+# incremental on purpose — an incremental build answers "what changed since the
+# last build", and the question here is what a cold `cargo build` costs somebody
+# who has never built this crate.
+#
+# Three builds, not two. "before" is the working tree as it stood when this ticket
+# was picked up, with HEAD's `Cargo.toml` restored into it; the two `after` runs are
+# the same tree with the gated manifest, once with the feature on and once as the
+# default. Pinning the **manifest** rather than the commit is what makes the delta
+# the manifest change and nothing else — this tree carries unrelated uncommitted
+# kanban work (`bd.rs`, `board_poller.rs`, `testing.rs`), and diffing against HEAD
+# would have folded that in.
+#
+# The `cargo build --timings` report for each run is committed beside this file:
+#   dependency-cost-timing-before.html
+#   dependency-cost-timing-default-no-notify.html
+#   dependency-cost-timing-notify-on.html
+#
+# Run:
+#   # before: /tmp/depbase = the tree + `git show HEAD:pi-beads/looprs/Cargo.toml`
+#   (cd /tmp/depbase && ./spikes/dep_cost.sh before)
+#   ./spikes/dep_cost.sh default-no-notify
+#   ./spikes/dep_cost.sh notify-on --features notify
+#
+# Knob: none in the app. The build-time knob is `--features notify`.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THE NUMBERS
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# configuration                    shipped   compiled    wall   binary bytes      stripped
+#                                  graph     crates            (release)         (release)
+# -------------------------------  -------   ----------  -----  --------------    -------------
+# before  (HEAD Cargo.toml)            203        218      59 s   13,032,672     10,343,168
+# after   default (no notify)          137        143      31 s    7,133,168      5,531,840
+# after   --features notify            203        218      59 s   13,033,216     10,343,152
+#
+# `shipped graph` = unique packages in `cargo tree -e normal`; `compiled crates` =
+# `Compiling` lines in the cold release build, which additionally covers the
+# build-script and proc-macro units that are not packages of their own in the tree.
+#
+# Raw blocks, as produced:
+#
+# [before]
+#   crates_in_shipped_graph: 203
+#   crossterm_shipped_features: bracketed-paste,default,derive-more,event-stream,events,osc52,windows
+#   base64_0_22_in_shipped_graph: yes
+#   reqwest_in_shipped_graph: yes
+#   clean_release_build_wall_seconds: 59
+#   crates_compiled: 218
+#   binary_bytes: 13032672
+#   binary_bytes_after_strip: 10343168
+#
+# [after, default — no notify]
+#   crates_in_shipped_graph: 137
+#   crossterm_shipped_features: bracketed-paste,default,derive-more,event-stream,events,osc52,windows
+#   base64_0_22_in_shipped_graph: yes
+#   reqwest_in_shipped_graph: no
+#   clean_release_build_wall_seconds: 31
+#   crates_compiled: 143
+#   binary_bytes: 7133168
+#   binary_bytes_after_strip: 5531840
+#
+# [after, --features notify]
+#   crates_in_shipped_graph: 203
+#   crossterm_shipped_features: bracketed-paste,default,derive-more,event-stream,events,osc52,windows
+#   base64_0_22_in_shipped_graph: yes
+#   reqwest_in_shipped_graph: yes
+#   clean_release_build_wall_seconds: 59
+#   crates_compiled: 218
+#   binary_bytes: 13033216
+#   binary_bytes_after_strip: 10343152
+#
+# Two `before` runs were taken (the first before the harness was corrected to pass
+# the feature flags to `cargo tree`): 59 s and 60 s, same 218 crates compiled. The
+# wall numbers are stable to within the noise of a warm machine.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WHAT THE NUMBERS SAY
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 1. THE TICKET'S THIRD BULLET IS THE WHOLE PRIZE, AND IT IS BIGGER THAN EXPECTED.
+#    Dropping `reqwest` out of the default build removes **66 of 203 packages**
+#    from the shipped graph, **75 of 218 crates** from the cold build, **28 of 59
+#    seconds** (47%) of build time, and **5,899,504 of 13,032,672 bytes** (45.3%)
+#    of the release binary — 12.4 MiB down to 6.8 MiB. Stripped, the same shape:
+#    9.9 MiB to 5.3 MiB (−46.5%). A terminal tool that never announces anything
+#    was carrying half its own build in order to be able to.
+#
+# 2. THE FEATURE COSTS NOTHING ON THE PATH THAT KEEPS IT.
+#    `--features notify` after the change is the before build to within 544 bytes
+#    of 13,032,672 (0.004%) and to the same second of wall time. The gating is
+#    not a tax paid by the notifier; it is the *absence* of the notifier doing the
+#    work. Anyone who was happy with the old binary is happy with this one.
+#
+# 3. SO: DEFAULT OFF. That is the decision this file exists to make, and at 45% /
+#    47% it is not a close call — see `[features]` in `Cargo.toml` for the same
+#    numbers in the place a reader is looking. What the flip costs is that a build
+#    which *wants* the doorbell has to say so, so the places that build the
+#    artifact the harness runs now say it out loud: `pi-beads/Dockerfile` and the
+#    GitHub release job both pass `--features notify`. The released container has
+#    exactly the capability it had before this ticket; the crate default is the
+#    slim one.
+#
+# 4. THE `osc52` PREMISE IS WRONG, AND THE "VERIFY FIRST" SECTION EARNED ITS KEEP.
+#    The ticket asserts that "nothing in src/ reaches for" crossterm's OSC 52
+#    writer and that `src/services/clipboard.rs::osc52_bytes` "hand-rolls" it. It
+#    does not: that function is
+#
+#        crossterm::queue!(&mut wire, crossterm::clipboard::CopyToClipboard::to_clipboard_from(…))
+#
+#    i.e. the app's remote-session copy transport (ADR-0004 R7) *is* crossterm's
+#    writer, which is how the spike's measured framing and the app's shipped
+#    framing came to be one implementation rather than two that agree. Removing
+#    `osc52` from `[dependencies]` fails the build with
+#    `cannot find clipboard in crossterm` (verified). The feature stays; the
+#    comment that apologised for it was replaced with what it is actually for.
+#
+#    Second-order correction, same bullet: `osc52 = ["dep:base64"]`, so the whole
+#    dependency weight of the feature is one small crate — `base64 0.22.1`, whose
+#    only parent in the shipped graph is `crossterm`. (The `base64 0.23.1` that
+#    the syntax-highlighting path carries through `plist`/`syntect` is a different
+#    major and stays whatever this ticket does.) The feature was never a weight
+#    problem; it was a *does-anyone-actually-use-this* problem, and the answer is
+#    the app's own remote-copy transport rather than a spike's instrument.
+#
+# 5. THE BLANKET IS GONE — BUT NOT BECAUSE CARGO SAID SO.
+#    `unused_dependencies = "allow"` is deleted and the lint left at cargo's own
+#    `warn`. With the lint on, `cargo check` and `cargo check --all-targets` report
+#    nothing unused. That answer is correct here, and it turned out not to be a
+#    *trustworthy* answer: a deliberately unused `ryu = "1"` added to this same
+#    manifest produced **no report at all** (checked with fresh target dirs, bin
+#    only and `--all-targets`), while the identical mistake in a two-dependency
+#    crate — `serde_json` + an unused `ryu` — was caught immediately:
+#
+#        warning: unused dependency `ryu`        # two-dep crate: CAUGHT
+#        (nothing)                              # looprs, same unused ryu: MISSED
+#
+#    Why the lint goes quiet on the big manifest is not this ticket's problem; the
+#    lesson is that a gate whose silence is indistinguishable from success is not a
+#    gate. So the crate now asks the question itself: `scripts/dep_audit.py`
+#    greps every `[dependencies]` entry by its Rust identifier over `src/` (the
+#    shipped code) and reports the reference counts, failing when an entry is
+#    named nowhere, or is spike/test-only and unjustified. All fifteen pass, with
+#    the counts visible:
+#
+#        anyhow 42 · crossterm 44 · futures 2 · pulldown-cmark 1 · ratatui 106
+#        syntect 5 · tokio 351 · unicode-width 8 · tracing 134
+#        tracing-subscriber 2 · tracing-appender 4 · serde_json 27 · serde 2
+#        portable-pty 1 · reqwest 4        (all named in src/)
+#
+#    The escape hatch is deliberately the same shape as a dead-code allow: a
+#    `dep-audit: <reason>` comment line above the entry, in the manifest, naming
+#    the thing and why the grep is wrong about it.
+#
+# 6. WHAT DID NOT CHANGE: the shipped crate count with the feature on (203), the
+#    crossterm feature list in every configuration, and the behaviour of the
+#    notifier for anybody who turns it on. Three of the four things the ticket
+#    listed to look at turned out to be, respectively, already fine, wrongly
+#    reported, and worth 45% of the binary.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WHAT THE OFF BUILD DOES AT RUNTIME (the "how we would know" half)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Started from a pty with both variables set, against the default (no `notify`)
+# release binary, 2026-10-09T08:22:23Z:
+#
+#   INFO looprs::services::logging: logging: /tmp/notifyoff-log/looprs.log | via LOOPRS_LOG_DIR | level info …
+#   INFO looprs::services::clipboard: clipboard: native+osc52
+#   INFO looprs::services::notification: notifications: off (this binary was built
+#       without the `notify` feature, so LOOPRS_NTFY_URL and LOOPRS_NTFY_TOPIC are
+#       ignored; build with `--features notify` to send them)
+#
+# It starts, it does not reach for the network, and it names both variables it is
+# ignoring rather than answering "off" as though they were unset — which is the
+# only case where "off" would otherwise be ambiguous with the configured-but-dead
+# reading. Both off messages keep the `notifications: off` prefix so
+# `grep 'notifications: off' looprs.log` still answers the operator's question,
+# whichever of the three states the binary is in.
+#
+# With `--features notify` the same two variables produce the pre-existing lines
+# instead — captured from the same kind of run at 2026-10-09T08:26:23Z:
+#
+#   INFO looprs::services::notification: notifications: ntfy → https://ntfy.sh
+#
+# and on the closed edge `notified: <id> — <title>`. That path is unchanged and is
+# still covered by the loopback wire tests in `src/services/notification.rs`.
+#
+# Test counts across the two builds: 846 pass with `notify` (9 ignored), 841 pass
+# without it (7 ignored). The five that move are the ntfy wire/ladder tests, which
+# are `#[cfg(feature = "notify")]` because there is nothing to post to otherwise,
+# and the one added test on the other side —
+# `without_the_feature_no_environment_can_ask_for_a_post` — which asserts that a
+# fully configured environment still resolves to `Noop` when there is no
+# transport to build. `./scripts/check.sh` runs the suite in **both**
+# configurations (step 4) so neither half can rot quietly.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THE LINT BLINDNESS PROBE (kept because it is why scripts/dep_audit.py exists)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#   two-dependency crate, `serde_json` used, `ryu` unused:
+#     $ cargo check
+#     warning: unused dependency `ryu`
+#       = note: `cargo::unused_dependencies` is set to `warn` in `[lints]`
+#
+#   looprs, same tree, one unused `ryu = "1"` added to [dependencies]:
+#     $ cargo check            → Finished. (no report)
+#     $ cargo check --all-targets → Finished. (no report)
+#     (fresh target dir each time; also tried with an explicit rust-version)
+#
+#   Same manifest, `fn main() {}` as the only source: 7 of 15 dependencies
+#   reported, and `ryu` was not among them.
+#
+# Not investigated further: the point is reachable without knowing why. Dropping a
+# blanket on the strength of "the lint says nothing" would have been a guess, and a
+# guess that a four-line grep makes unnecessary.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REPRODUCE
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#   # before, after-off, after-on (each ~0.5 GB of target dir under $TMPDIR, removed on exit)
+#   ./spikes/dep_cost.sh before
+#   ./spikes/dep_cost.sh default-no-notify
+#   ./spikes/dep_cost.sh notify-on --features notify
+#
+#   # the dependency surface, both halves of the tree
+#   ./scripts/dep_audit.py            # the table
+#   ./scripts/dep_audit.py --gate     # what ./scripts/check.sh runs
+#   ./scripts/dep_audit.py --features # plus the resolved feature surface per crate
+#
+#   # the gate in both feature configurations
+#   ./scripts/check.sh
+#
+#   # what the off binary says when asked for a doorbell it cannot build
+#   LOOPRS_NTFY_URL=https://ntfy.sh LOOPRS_NTFY_TOPIC=demo \
+#     script -q /dev/null ./target/release/looprs   # then: grep 'notifications:' <log>

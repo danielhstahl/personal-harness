@@ -9,8 +9,16 @@ COPY pi-beads/looprs/Cargo.lock ./
 # Copy actual source code
 COPY pi-beads/looprs/src ./src
 
-# Build the application
-RUN cargo build --release
+# Build the application.
+#
+# `--features notify` keeps the capability this artifact has always had: the ntfy
+# completion notice. The crate's default build is now without it — that half is
+# 75 of the 218 crates in a cold build and 45% of the binary (measured in
+# looprs/spikes/results/dependency-cost.log, looprs-00u.15) — so the deployment
+# that wants the doorbell says so here rather than inheriting it by accident. A
+# looprs built without it still starts and still reads LOOPRS_NTFY_*; it just logs
+# one line saying it cannot post.
+RUN cargo build --release --features notify
 
 # https://pi.dev/docs/latest/containerization
 FROM nikolaik/python-nodejs:python3.14-nodejs25-slim

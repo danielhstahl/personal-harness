@@ -6,14 +6,26 @@
 #   1. `cargo fmt --check`   — formatted, or not
 #   2. `cargo clippy -D warnings` — no lint left warning, and no blanket `allow`
 #   3. `cargo test`          — everything green, with no network and no model calls
-#   4. `scripts/dead_audit.py --gate` — every `#[allow(dead_code)]` still covers
+#   4. `clippy` + `test` again over **the other build** — `--features notify`. The
+#         default binary is built *without* it (see `[features]` in `Cargo.toml`,
+#         looprs-00u.15), and a feature half that only ever gets compiled by the
+#         person who last touched it is a feature half that rots. Running both is
+#         what makes "the feature does not change the shape of the seam" a checked
+#         claim rather than an intention: the same 840-odd tests pass in both
+#         configurations, and the ones that differ are the ones that need the wire.
+#   5. `scripts/dead_audit.py --gate` — every `#[allow(dead_code)]` still covers
 #         dead code
-#   5. `scripts/docs_check.sh` — no dead link or orphan page, every `LOOPRS_*` the
+#   6. `scripts/dep_audit.py --gate` — every `[dependencies]` entry is named in
+#         `src/`, or answered at its own line in the manifest. This is the
+#         counterpart of step 4 for the other half of the tree, and the reason the
+#         `unused_dependencies = "allow"` blanket could be deleted rather than
+#         argued about.
+#   7. `scripts/docs_check.sh` — no dead link or orphan page, every `LOOPRS_*` the
 #         code reads is documented, no two defaults disagree, and the keymap tables
 #         still match `CHORD_TABLE`
 #
 # The order is deliberate: fmt and clippy are seconds-long and explain themselves, so
-# they run before the ~20s test suite rather than after it. Step 5 runs last for the
+# they run before the ~20s test suite rather than after it. Step 7 runs last for the
 # same reason in reverse: it is the fastest step in the gate (<1s, no cargo, no
 # network) and its failures are prose failures, which are the ones you want to see
 # after the code has stopped shouting — but it is not optional, because a docs check
@@ -55,11 +67,19 @@ cargo clippy --all-targets -- -D warnings
 echo "==> cargo test"
 cargo test
 
+echo "==> clippy + test, the other build (--features notify)"
+cargo clippy --all-targets --features notify -- -D warnings
+cargo test --features notify
+
 echo "==> dead-code allow audit"
 python3 "$(dirname "${BASH_SOURCE[0]}")/dead_audit.py" --gate
+
+echo "==> dependency-surface audit"
+python3 "$(dirname "${BASH_SOURCE[0]}")/dep_audit.py" --gate
 
 echo "==> docs rot gate (links, knob coverage, keymap coverage)"
 "$(dirname "${BASH_SOURCE[0]}")/docs_check.sh"
 
 echo
-echo "gate: clean (fmt, clippy -D warnings, tests, dead-code audit, docs)"
+echo "gate: clean (fmt, clippy -D warnings in both feature configurations, tests in both,"
+echo "        dead-code audit, dependency audit, docs)"

@@ -44,13 +44,28 @@
 //! that cannot close a ticket has no business sending an all-clear about it; if the
 //! alert wants a second trigger later, that is a new decision with its own text,
 //! not this arm widened.
+//!
+//! ## What the `notify` cargo feature gates
+//!
+//! This module is the only thing in the crate that reaches for an HTTP client, and
+//! with it a TLS stack. The feature gates the *transport*, not the seam:
+//! [`Notifier`], [`BeadDone`] and [`Noop`] are always compiled, so the beads loop,
+//! `SessionConfig` and every test are shaped identically either way, and
+//! [`notifier_from_env`] keeps its signature and its `Arc<dyn Notifier>` return.
+//! Off, it resolves to [`Noop`] and says so in one line at startup — including
+//! when `LOOPRS_NTFY_URL` / `LOOPRS_NTFY_TOPIC` are set, which is the case where
+//! a silent answer would cost somebody an afternoon wondering why the phone stayed
+//! quiet. What the feature is worth, measured, is in
+//! [`spikes/results/dependency-cost.log`](../../spikes/results/dependency-cost.log).
 
 use std::sync::Arc;
+#[cfg(feature = "notify")]
 use std::time::Duration;
-
+#[cfg(feature = "notify")]
 use tokio::sync::mpsc;
 
 /// How long one ntfy POST may take before it counts as failed.
+#[cfg(feature = "notify")]
 const POST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The gap before the single retry, and how many tries in total.
@@ -60,7 +75,9 @@ const POST_TIMEOUT: Duration = Duration::from_secs(10);
 /// over a link that blipped. What it deliberately does *not* try to be is a queue of
 /// record — `bd` is the record — so a second failure is an error line, not a loop
 /// that never stops trying against an endpoint nobody configured correctly.
+#[cfg(feature = "notify")]
 const POST_ATTEMPTS: u32 = 2;
+#[cfg(feature = "notify")]
 const RETRY_AFTER: Duration = Duration::from_secs(2);
 
 /// The fact worth interrupting somebody for: a ticket this harness worked, and the
@@ -79,6 +96,12 @@ impl BeadDone {
     ///
     /// Falls back to the bare id when the title is blank: `"looprs-1 — "` is worse
     /// than `"looprs-1"`.
+    ///
+    /// Gated with the transport that reads it: in a `notify`-less build nothing
+    /// formats this fact, and a `pub` method nothing calls is exactly the shape the
+    /// dead-code policy in `src/session/mod.rs` refuses to leave lying around
+    /// un-answered (looprs-00u.15). The type itself stays either way.
+    #[cfg(feature = "notify")]
     pub fn summary(&self) -> String {
         let title = self.title.trim();
         if title.is_empty() {
@@ -121,6 +144,7 @@ impl Notifier for Noop {
 /// clone, `Debug`, and safe to hold in a config that gets handed around — which is
 /// the whole point of the split: dropping the last sender is what ends the poster
 /// task, so the task's lifetime is exactly the notifier's.
+#[cfg(feature = "notify")]
 #[derive(Debug)]
 pub struct Ntfy {
     tx: mpsc::UnboundedSender<BeadDone>,
@@ -128,6 +152,7 @@ pub struct Ntfy {
     topic: String,
 }
 
+#[cfg(feature = "notify")]
 impl Ntfy {
     /// Build the queue and spawn the task that drains it to `base_url`/`topic`.
     ///
@@ -163,10 +188,12 @@ impl Ntfy {
 ///
 /// A trim rather than a URL parser because the doubled slash is the mistake this
 /// prevents, and a hand-typed `LOOPRS_NTFY_URL=https://ntfy.sh/` is full of it.
+#[cfg(feature = "notify")]
 fn ntfy_url(base: &str, topic: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), topic)
 }
 
+#[cfg(feature = "notify")]
 impl Notifier for Ntfy {
     fn notify(&self, done: BeadDone) {
         // A failed send means the poster task is gone. Named and dropped: the
@@ -188,7 +215,23 @@ impl Notifier for Ntfy {
 /// A *configured but unbuildable* notifier degrades to [`Noop`] with the failure
 /// logged rather than killing startup for the same reason: the beads loop is the
 /// feature, and it works without the doorbell.
+///
+/// In a build made **without** the `notify` feature the answer is [`Noop`] for
+/// every environment, and the line that says so names the variables it is
+/// ignoring rather than pretending they were never set. Same call site, same
+/// signature: whether the transport exists is a build-time fact, and the session
+/// layer must not have to know it.
 pub fn notifier_from_env() -> Arc<dyn Notifier> {
+    #[cfg(feature = "notify")]
+    return ntfy_notifier();
+
+    #[cfg(not(feature = "notify"))]
+    return silent_without_the_feature();
+}
+
+/// The with-`notify` half: read the pair, build the sink, or say why not.
+#[cfg(feature = "notify")]
+fn ntfy_notifier() -> Arc<dyn Notifier> {
     let cfg = ntfy_settings(env_value("LOOPRS_NTFY_URL"), env_value("LOOPRS_NTFY_TOPIC"));
     let Some((url, topic)) = cfg else {
         // `info`, not `debug`: this is a startup resolution, and the operator
@@ -215,12 +258,40 @@ pub fn notifier_from_env() -> Arc<dyn Notifier> {
     }
 }
 
+/// The without-`notify` half: nothing was built, so nothing can post.
+///
+/// `info`, and starting with the same `notifications: off` prefix the
+/// with-feature path uses, because the operator page's grep index looks for that
+/// string (`grep 'notifications: off'`) and a run that answered with some other
+/// sentence would read as "the app never checked". When the two variables *are*
+/// set the line says so explicitly: a bare "off" is indistinguishable from the
+/// unset case, and the operator would go looking for a typo in a topic that was
+/// spelled perfectly all along.
+#[cfg(not(feature = "notify"))]
+fn silent_without_the_feature() -> Arc<dyn Notifier> {
+    let asked = env_value("LOOPRS_NTFY_URL").is_some() || env_value("LOOPRS_NTFY_TOPIC").is_some();
+    if asked {
+        tracing::info!(
+            "notifications: off (this binary was built without the `notify` feature, so \
+             LOOPRS_NTFY_URL and LOOPRS_NTFY_TOPIC are ignored; build with `--features notify` \
+             to send them)"
+        );
+    } else {
+        tracing::info!(
+            "notifications: off (this binary was built without the `notify` feature; \
+             build with `--features notify` to have them)"
+        );
+    }
+    Arc::new(Noop)
+}
+
 /// The ntfy pair, or `None` unless **both** are present and non-blank.
 ///
 /// Pure, and taking the two values as arguments rather than reading the process
 /// environment itself, is the point: the rule — a half-configured notifier is *no*
 /// notifier, and whitespace is not a value — is then testable as a table instead of
 /// as a mutation of global state that every other test in the process shares.
+#[cfg(feature = "notify")]
 fn ntfy_settings(url: Option<String>, topic: Option<String>) -> Option<(String, String)> {
     let url = url.map(|v| v.trim().to_string()).unwrap_or_default();
     let topic = topic.map(|v| v.trim().to_string()).unwrap_or_default();
@@ -241,6 +312,7 @@ fn env_value(key: &str) -> Option<String> {
 
 /// One POST per completion, retried once. Split out from the sink so the queue's
 /// reader is a four-line loop and the failure ladder is readable on its own.
+#[cfg(feature = "notify")]
 async fn post(client: &reqwest::Client, url: &str, done: &BeadDone) {
     let mut last = String::from("no attempt made");
     for attempt in 1..=POST_ATTEMPTS {
@@ -264,6 +336,7 @@ async fn post(client: &reqwest::Client, url: &str, done: &BeadDone) {
 }
 
 /// The single attempt, with ntfy's own reason attached to a non-2xx.
+#[cfg(feature = "notify")]
 async fn try_post(client: &reqwest::Client, url: &str, done: &BeadDone) -> anyhow::Result<()> {
     let resp = client
         .post(url)
@@ -293,6 +366,7 @@ async fn try_post(client: &reqwest::Client, url: &str, done: &BeadDone) -> anyho
 }
 
 /// Shorten to `max` chars for a log line, on char boundaries (never mid-emoji).
+#[cfg(feature = "notify")]
 fn brief(s: &str, max: usize) -> String {
     let s = s.trim();
     if s.chars().count() <= max {
@@ -308,6 +382,7 @@ fn brief(s: &str, max: usize) -> String {
 /// outside it: an em dash, an accented letter, an emoji. Rather than fail the post,
 /// the header gets a lossy ASCII rendering. The full UTF-8 title goes in the body,
 /// which is where ntfy reads a message from anyway.
+#[cfg(feature = "notify")]
 fn ascii_header(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -324,6 +399,7 @@ fn ascii_header(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "notify")]
     #[test]
     fn a_completed_bead_is_summarised_with_its_title_and_falls_back_to_its_id() {
         let full = BeadDone {
@@ -348,6 +424,7 @@ mod tests {
     /// A half-set notifier is the misconfiguration that would otherwise produce a
     /// silent no-op — or, worse, a POST to `https://ntfy.sh/` with no topic — so
     /// it is the row this test is really about.
+    #[cfg(feature = "notify")]
     #[test]
     fn the_notifier_needs_a_url_and_a_topic_and_is_off_for_lesser_pairs() {
         let both = Some("https://ntfy.sh".to_string());
@@ -387,6 +464,7 @@ mod tests {
         // `the_default_config_carries_the_silent_sink` (session layer).
     }
 
+    #[cfg(feature = "notify")]
     #[test]
     fn the_post_target_never_doubles_the_slash_it_was_handed() {
         assert_eq!(
@@ -404,6 +482,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "notify")]
     #[test]
     fn a_long_ntfy_reason_is_shortened_without_breaking_a_multibyte_char() {
         let long = "é".repeat(400);
@@ -416,6 +495,7 @@ mod tests {
     /// The header-value rule that the wire test below exists to catch: `http`
     /// rejects anything but visible ASCII there, so a title with an em dash in it
     /// would have failed the whole request had it gone in the header unbaked.
+    #[cfg(feature = "notify")]
     #[test]
     fn only_visible_ascii_survives_a_header_value() {
         assert_eq!(ascii_header("looprs-26r"), "looprs-26r");
@@ -440,6 +520,7 @@ mod tests {
     /// write this, and the way an earlier draft did — passes every pure test and
     /// shows up on the phone as literal JSON.
     #[tokio::test]
+    #[cfg(feature = "notify")]
     #[ignore = "binds a loopback port; run with `cargo test -- --ignored`"]
     async fn the_post_puts_the_message_in_the_body_and_the_chrome_in_the_headers() {
         let (base, seen) = spawn_responder(200, "");
@@ -483,6 +564,7 @@ mod tests {
     /// Ignored for the same reason as the format test, plus it sleeps once between
     /// attempts, so it costs [`RETRY_AFTER`] of wall clock.
     #[tokio::test]
+    #[cfg(feature = "notify")]
     #[ignore = "binds a loopback port and sleeps between retries"]
     async fn a_refused_post_is_tried_a_bounded_number_of_times_and_then_stops() {
         let (base, seen) = spawn_responder(500, "topic does not exist");
@@ -522,6 +604,7 @@ mod tests {
     /// precisely that reason. The unsafe is contained by the ignore: nothing else
     /// runs concurrently with it under `cargo test -- --ignored`, and the two wire
     /// tests take their endpoint as an argument rather than from the environment.
+    #[cfg(feature = "notify")]
     #[tokio::test]
     #[ignore = "mutates the process environment"]
     async fn the_environment_switches_the_real_sink_on_and_off() {
@@ -550,8 +633,41 @@ mod tests {
         );
     }
 
-    // ------------------- the loopback responder both wire tests use -------------------
+    /// **The same link, in the build that has no transport.** Both ntfy variables
+    /// set and no `notify` feature is the one configuration where the app could
+    /// lie: the operator asked for a doorbell, the env parse succeeded, and there
+    /// is no wire to put it on. It must resolve to the silent sink and say so —
+    /// never half-build a notifier, never pretend the variables were absent.
+    /// Asserted on the value; the one-line log it prints is recorded in
+    /// `spikes/results/dependency-cost.log`.
+    ///
+    /// Ignored, and unsafe, for exactly the reason the test above is.
+    #[cfg(not(feature = "notify"))]
+    #[tokio::test]
+    #[ignore = "mutates the process environment"]
+    async fn without_the_feature_no_environment_can_ask_for_a_post() {
+        // SAFETY: `#[ignore]`d, so it runs only when the ignored set is asked for,
+        // and nothing else in that set reads these two variables.
+        unsafe {
+            std::env::set_var("LOOPRS_NTFY_URL", "https://ntfy.sh");
+            std::env::set_var("LOOPRS_NTFY_TOPIC", "looprs-off-smoke");
+        }
+        let got = format!("{:?}", notifier_from_env());
+        // SAFETY: as above; removed rather than blanked so the next reader sees the
+        // unset case.
+        unsafe {
+            std::env::remove_var("LOOPRS_NTFY_URL");
+            std::env::remove_var("LOOPRS_NTFY_TOPIC");
+        }
+        assert!(
+            got.contains("Noop"),
+            "without the `notify` feature a fully configured environment must still \
+             produce the silent sink, got {got}"
+        );
+    }
 
+    // ------------------- the loopback responder both wire tests use -------------------
+    #[cfg(feature = "notify")]
     /// Answer every request with `status` + `body`, recording each request line.
     ///
     /// `std::net`, no test-only dependency, and a plain OS thread: the responder is
@@ -603,6 +719,7 @@ mod tests {
     /// Poll a condition rather than sleep for a guessed amount of time: a working
     /// notifier returns in milliseconds, a broken one fails in five seconds rather
     /// than never.
+    #[cfg(feature = "notify")]
     async fn wait_until(ready: impl Fn() -> bool) -> bool {
         for _ in 0..250 {
             if ready() {

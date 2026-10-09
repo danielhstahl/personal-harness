@@ -20,9 +20,21 @@ multi-process, three-backend TUI without a model, a board, or a terminal.
 1. `cargo fmt --check`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
-4. `scripts/dead_audit.py --gate` — every `#[allow(dead_code)]` still covers dead
+4. `cargo clippy --all-targets --features notify -- -D warnings` **and**
+   `cargo test --features notify` — the *other* build. The shipped default carries
+   no `notify` feature (`[features]` in `Cargo.toml`); without this step the ntfy
+   half would be compiled only by whoever last touched it. The seam is designed not
+   to change shape between the two, and running both is what makes that a checked
+   claim rather than a design intention
+5. `scripts/dead_audit.py --gate` — every `#[allow(dead_code)]` still covers dead
    code
-5. `scripts/docs_check.sh` — the docs rot gate: no dead internal link, no page
+6. `scripts/dep_audit.py --gate` — every `[dependencies]` entry in `Cargo.toml` is
+   named in `src/`, or answered at its own line with a `dep-audit: <reason>`
+   comment. The counterpart of step 5 for the other half of the tree: an
+   unjustified allow in the source and an unjustified dependency in the manifest
+   are the same failure, and the blanket that used to cover the second one
+   (`unused_dependencies = "allow"`) is what this replaced
+7. `scripts/docs_check.sh` — the docs rot gate: no dead internal link, no page
    outside the site tree, every `LOOPRS_*` the code reads is in the
    [configuration reference](guide/configuration.md), no two pages state a
    different default for one knob, and the

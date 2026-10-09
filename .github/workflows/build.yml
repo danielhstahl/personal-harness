@@ -29,7 +29,14 @@ jobs:
 
       - name: Compile
         run: |
-          ./cross build --release --target ${{ matrix.target }}
+          # `--features notify` keeps the ntfy completion notice in the released
+          # binaries. The crate's default build no longer carries it: the feature's
+          # HTTP/TLS stack is 75 of 218 crates in a cold build and 45% of the
+          # binary (looprs/spikes/results/dependency-cost.log, looprs-00u.15), so
+          # a deployment that wants the doorbell asks for it by name. Without this
+          # flag a released looprs still starts and still reads LOOPRS_NTFY_*, and
+          # logs one line saying it was built without the transport.
+          ./cross build --release --features notify --target ${{ matrix.target }}
 
       - name: Release
         run: |

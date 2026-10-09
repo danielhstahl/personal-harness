@@ -171,6 +171,24 @@ Both are required because a half-configured notifier is worse than none: the app
 would either guess a topic (leaks your ticket titles to strangers) or silently do
 nothing. `grep 'notifications: off' looprs.log` tells you which you have.
 
+**There is a third off, and it is made at build time.** The transport behind these
+two knobs is the `notify` cargo feature, and it is **off by default**
+([`Cargo.toml`](../../Cargo.toml)): the HTTP client and TLS stack it pulls are half
+the cold build and 45 % of the binary, for something most runs never reach. A
+binary built without it still starts, still reads both variables, and logs one line
+naming them as ignored — it never pretends they were unset. Build one that can post
+with:
+
+```sh
+cargo build --release --features notify
+```
+
+which is what `pi-beads/Dockerfile` and the GitHub release job do, so the image
+the harness runs keeps the capability it always had. The measurement behind the
+default, both configurations, is
+[`spikes/results/dependency-cost.log`](../../spikes/results/dependency-cost.log);
+`./scripts/check.sh` gates the crate in both.
+
 ## Harness-only variables — do not tune production with these
 
 Everything below exists so a **test, spike or measurement** can drive the app. None
@@ -271,7 +289,7 @@ RUST_LOG=debug \
 
 ## How this table is kept true
 
-`./scripts/docs_check.sh` (step 5 of [`./scripts/check.sh`](../../scripts/check.sh))
+`./scripts/docs_check.sh` (step 7 of [`./scripts/check.sh`](../../scripts/check.sh))
 checks three things about this page:
 
 1. **every `LOOPRS_*` read in `src/` appears here** — an undocumented knob is a

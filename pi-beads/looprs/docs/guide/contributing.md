@@ -286,7 +286,9 @@ rung a change has to touch**:
 | "what is painted" | `TestBackend` tests in `main.rs` / components | `cargo test` |
 | "what reaches the wire" | a real-pty spike (`spikes/*_e2e.py`) with a **control run** against the previous build | `python3 spikes/status_e2e.py` |
 | memory / cost claims | `src/measure.rs` (needs `LOOPRS_MEASURE_CORPUS`), `spikes/*.py` | `cargo test -- --ignored` |
-| the whole gate | `./scripts/check.sh` — fmt, clippy `-D warnings`, tests, dead-code audit, docs gate | `./scripts/check.sh` |
+| anything behind a cargo feature | the **same** suite over that build; the seam is not allowed to change shape | `cargo test --features notify` |
+| a dependency's right to be in the manifest | `scripts/dep_audit.py` — named in `src/`, or answered at its own line | `python3 scripts/dep_audit.py --gate` |
+| the whole gate | `./scripts/check.sh` — fmt, clippy `-D warnings` and tests in **both** feature configurations, dead-code audit, dependency audit, docs gate | `./scripts/check.sh` |
 | docs only | `./scripts/docs_check.sh` | same, or on its own |
 
 Two rules about the ladder that are not obvious from the run commands:
@@ -302,10 +304,26 @@ and the policy is written where it used to be
 ([`session/mod.rs`](../../src/session/mod.rs)). `dead_audit.py --gate` asks the
 compiler, through the allow, whether the item is still dead, and a redundant allow
 fails the build. It exists because nine allows promised a consumer that landed
-somewhere else. (Say *dead-code*, because the manifest still carries a different
-blanket: `unused_dependencies = "allow"` in
-[`Cargo.toml`](../../Cargo.toml) — priced as `looprs-00u.15`, and not covered by
-`dead_audit.py`, which only reads `#[allow(dead_code)]` attributes.)
+somewhere else.
+
+**The same rule, one file over: a dependency must name its user.** The manifest used
+to carry `unused_dependencies = "allow"` — a second blanket, over the half of the
+tree `dead_audit.py` cannot see. It is gone (looprs-00u.15), and
+`scripts/dep_audit.py --gate` is what keeps it gone: every `[dependencies]` entry
+has to be named in `src/`, or answered at its own line with a `dep-audit:
+<reason>` comment for the case where the grep is wrong (a macro, a rename, anything
+that is not a `path::` expression). Two things that audit settled, both worth
+knowing before you trust one signal:
+
+* cargo's own lint is not a complete witness here. Dropping the blanket reports
+  nothing unused — correct — but a *deliberately unused* `ryu = "1"` added to the
+  same manifest also reported nothing, while the identical mistake in a
+  two-dependency crate was caught. Hence a grep of the crate's own making.
+* the feature this ticket claimed was spike-only (`crossterm`'s `osc52`) is **not**.
+  `src/services/clipboard.rs::osc52_bytes` calls crossterm's own writer to frame
+  the app's remote-session copy path, so the app and the spike ship one
+  implementation rather than two that merely agree. The premise was wrong; the
+  manifest says so where the feature is declared.
 
 ## House style
 
