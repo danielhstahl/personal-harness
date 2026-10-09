@@ -261,7 +261,7 @@ pub struct App {
     /// target keys (`a`/`o`/`s`/`t`/`?`) exist only in the armed window, so the
     /// audit for "does this shadow an existing binding" is one key, not five.
     ///
-    /// See [`CHORD_TABLE`](crate::session::view::CHORD_TABLE) for the whole
+    /// See [`CHORD_TABLE`](crate::session::view::chord_table::CHORD_TABLE) for the whole
     /// mode x key picture, and [`Self::on_key`] for the order these checks run
     /// in — which is the audit made executable.
     copy_chord: CopyChord,

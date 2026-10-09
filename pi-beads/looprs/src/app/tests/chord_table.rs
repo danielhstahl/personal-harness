@@ -1,7 +1,7 @@
 //! Keyboard copy and the chord table (looprs-pdl.13)
 //!
 //! These are the driven half of the table in
-//! [`CHORD_TABLE`](crate::session::view::CHORD_TABLE): the view test checks
+//! [`CHORD_TABLE`](crate::session::view::chord_table::CHORD_TABLE): the view test checks
 //! the table is internally consistent, these check that the keystrokes land
 //! where the table says they do. Every one of them drives the real `App` with
 //! real `KeyEvent`s and reads back real consequences — what the sink got,

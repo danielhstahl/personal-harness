@@ -13,7 +13,7 @@ Four checks that keep the site true after the day it was written:
    drifting apart is the failure this check exists for; the "one home per fact"
    rule is only worth anything if the second home is checked against the first.
 3. **Keymap coverage** — the per-mode tables in `docs/guide/keymap.md` are a
-   rendering of `CHORD_TABLE` in `src/session/view.rs`, compared row by row.
+   rendering of `CHORD_TABLE` in `src/session/view/chord_table.rs`, compared row by row.
    `--fix-keymap` re-renders them.
 4. **Measurement claims** (looprs-00u.23) — every spike check count restated in
    prose (`**149/149**`, `149 checks`) is backed by a committed capture under
@@ -342,13 +342,13 @@ def check_default_agreement() -> list[str]:
 
 
 def parse_chord_table() -> list[dict[str, str]]:
-    """The `CHORD_TABLE` rows out of `src/session/view.rs`.
+    """The `CHORD_TABLE` rows out of `src/session/view/chord_table.rs`.
 
     The file is pre-processed with Rust's own line-continuation rule (a backslash at
     end of line inside a string literal swallows the newline and the leading
     whitespace of the next line) so a multi-line `note:` parses as one string.
     """
-    path = SRC / "session" / "view.rs"
+    path = SRC / "session" / "view" / "chord_table.rs"
     raw = path.read_text(encoding="utf-8")
     raw = re.sub(r"\\\n[ \t]*", "", raw)
     start = raw.index("pub const CHORD_TABLE")
