@@ -1,0 +1,91 @@
+# resize-transient-e2e — looprs-zie
+# measured 2026-10-08, aarch64-apple-darwin (Apple Silicon), macOS
+#
+# commands:
+#   cargo build && python3 spikes/resize_transient_e2e.py
+#   LOOPRS_BIN=/tmp/looprs-prefix python3 spikes/resize_transient_e2e.py
+#
+# The pre-ticket control binary is `96e745c` (looprs-6cj), built and copied to
+# /tmp/looprs-prefix before restoring this ticket's src/.
+#
+# A 400,000-line short-line flood through the real app in a real pty, then a
+# 16-step window drag across 30..100 columns with RSS sampled every 20 ms.
+# Both builds: app alive, drag survived, RSS flat. RSS cannot resolve the
+# per-frame transient (freed memory stays resident) and the shipped 256 KiB
+# per-view transcript buffer keeps this scenario well clear of the pathological
+# sizing; see spikes/results/resize-transient.log for the in-process numbers
+# that do.
+
+=== looprs-zie · the resize transient, measured from outside ===
+bin       : target/debug/looprs
+geometry  : 40x100 -> dragged across [90, 80, 70, 60, 50, 45, 40, 55, 75, 95, 100, 65, 45, 30, 60, 80]
+fill      : 400000 short lines (many rows per byte: the dense case)
+[  1.51s] PASS  app booted
+[  1.52s] idle RSS before the flood: 21.4 MiB
+[  5.74s] PASS  app alive after the flood started
+[  5.74s] PASS  flood reached the screen
+[  5.75s] PASS  the app absorbed the flood
+[  5.75s] baseline RSS before the drag: 60.5 MiB (+39.0 over idle)
+[  6.18s]   w= 90:    60.5 ->    60.5 MiB (+  0.0 for this step)
+[  6.61s]   w= 80:    60.5 ->    60.5 MiB (+  0.0 for this step)
+[  7.05s]   w= 70:    60.9 ->    60.9 MiB (+  0.0 for this step)
+[  7.47s]   w= 60:    60.9 ->    61.0 MiB (+  0.0 for this step)
+[  7.89s]   w= 50:    61.0 ->    61.0 MiB (+  0.0 for this step)
+[  8.32s]   w= 45:    61.0 ->    61.0 MiB (+  0.0 for this step)
+[  8.75s]   w= 40:    61.0 ->    61.0 MiB (+  0.0 for this step)
+[  9.19s]   w= 55:    61.0 ->    61.0 MiB (+  0.0 for this step)
+[  9.63s]   w= 75:    61.0 ->    61.0 MiB (+  0.0 for this step)
+[ 10.04s]   w= 95:    61.0 ->    61.0 MiB (+  0.0 for this step)
+[ 10.51s]   w=100:    61.0 ->    61.0 MiB (+  0.0 for this step)
+[ 10.95s]   w= 65:    61.0 ->    61.0 MiB (+  0.0 for this step)
+[ 11.36s]   w= 45:    61.0 ->    61.0 MiB (+  0.0 for this step)
+[ 11.78s]   w= 30:    61.0 ->    61.0 MiB (+  0.0 for this step)
+[ 12.22s]   w= 60:    61.0 ->    61.0 MiB (+  0.0 for this step)
+[ 12.66s]   w= 80:    61.0 ->    61.0 MiB (+  0.0 for this step)
+
+[ 12.66s] peak RSS across the whole drag : 61.0 MiB
+[ 12.66s] growth over the pre-drag level : 0.5 MiB
+[ 12.66s] worst single width change      : 0.0 MiB
+
+[ 12.66s] PASS  app survived the drag
+[ 12.66s] PASS  growth stayed under 96 MiB
+
+all checks passed
+
+### control: LOOPRS_BIN=/tmp/looprs-prefix (pre-ticket build at 96e745c)
+
+=== looprs-zie · the resize transient, measured from outside ===
+bin       : /tmp/looprs-prefix
+geometry  : 40x100 -> dragged across [90, 80, 70, 60, 50, 45, 40, 55, 75, 95, 100, 65, 45, 30, 60, 80]
+fill      : 400000 short lines (many rows per byte: the dense case)
+[  1.51s] PASS  app booted
+[  1.52s] idle RSS before the flood: 21.5 MiB
+[  5.73s] PASS  app alive after the flood started
+[  5.73s] PASS  flood reached the screen
+[  5.75s] PASS  the app absorbed the flood
+[  5.75s] baseline RSS before the drag: 59.3 MiB (+37.8 over idle)
+[  6.18s]   w= 90:    59.3 ->    59.3 MiB (+  0.0 for this step)
+[  6.63s]   w= 80:    59.3 ->    59.3 MiB (+  0.0 for this step)
+[  7.08s]   w= 70:    59.4 ->    59.4 MiB (+  0.0 for this step)
+[  7.53s]   w= 60:    59.4 ->    60.1 MiB (+  0.8 for this step)
+[  7.95s]   w= 50:    60.1 ->    60.1 MiB (+  0.0 for this step)
+[  8.37s]   w= 45:    60.1 ->    60.1 MiB (+  0.0 for this step)
+[  8.81s]   w= 40:    60.1 ->    60.1 MiB (+  0.0 for this step)
+[  9.23s]   w= 55:    60.1 ->    60.1 MiB (+  0.0 for this step)
+[  9.65s]   w= 75:    60.1 ->    60.1 MiB (+  0.0 for this step)
+[ 10.09s]   w= 95:    60.1 ->    60.1 MiB (+  0.0 for this step)
+[ 10.53s]   w=100:    60.1 ->    60.1 MiB (+  0.0 for this step)
+[ 10.98s]   w= 65:    60.1 ->    60.1 MiB (+  0.0 for this step)
+[ 11.41s]   w= 45:    60.1 ->    60.1 MiB (+  0.0 for this step)
+[ 11.84s]   w= 30:    60.1 ->    60.1 MiB (+  0.0 for this step)
+[ 12.27s]   w= 60:    60.1 ->    60.1 MiB (+  0.0 for this step)
+[ 12.72s]   w= 80:    60.1 ->    60.1 MiB (+  0.0 for this step)
+
+[ 12.72s] peak RSS across the whole drag : 60.1 MiB
+[ 12.72s] growth over the pre-drag level : 0.8 MiB
+[ 12.72s] worst single width change      : 0.8 MiB
+
+[ 12.72s] PASS  app survived the drag
+[ 12.72s] PASS  growth stayed under 96 MiB
+
+all checks passed

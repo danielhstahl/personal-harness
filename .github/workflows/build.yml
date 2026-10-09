@@ -2,6 +2,54 @@ on:
   release:
     types: [published]
 jobs:
+
+  build_rust_binary:
+    name: release ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # release changes require contents write
+    defaults:
+      run:
+        working-directory: ./pi-beads/looprs
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - armv7-unknown-linux-gnueabihf
+          - aarch64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          curl -L https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz -o cross-x86_64-unknown-linux-gnu.tar.gz
+          tar -xvzf cross-x86_64-unknown-linux-gnu.tar.gz
+          rustup update stable
+
+      - name: Compile
+        run: |
+          # `--features notify` keeps the ntfy completion notice in the released
+          # binaries. The crate's default build no longer carries it: the feature's
+          # HTTP/TLS stack is 75 of 218 crates in a cold build and 45% of the
+          # binary (looprs/spikes/results/dependency-cost.log, looprs-00u.15), so
+          # a deployment that wants the doorbell asks for it by name. Without this
+          # flag a released looprs still starts and still reads LOOPRS_NTFY_*, and
+          # logs one line saying it was built without the transport.
+          ./cross build --release --features notify --target ${{ matrix.target }}
+
+      - name: Release
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czvf ../../../looprs-${{ matrix.target }}.tar.gz looprs
+
+      - name: upload artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} looprs-${{ matrix.target }}.tar.gz
+
+
   build_pi_beads:
     runs-on: ubuntu-latest
     permissions:
@@ -26,3 +74,28 @@ jobs:
         working-directory: pi-beads
         run: |
           docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/danielhstahl/pi-beads:${{ github.event.release.tag_name }} -f Dockerfile . --push
+
+  build_docs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: generate docs
+        working-directory: pi-beads/looprs
+        run: |
+            ./scripts/docs.sh check
+            ./scripts/docs.sh build
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "pi-beads/looprs/docs/_site"
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

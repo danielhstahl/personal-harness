@@ -1,0 +1,31 @@
+[  0.00s] --- real-terminal leg in Apple_Terminal 470.2 (TERM=xterm-256color)
+[  0.01s]     clipboard saved (26 bytes); it goes back at the end
+[  0.01s]     --- positive control on the query path: Primary Device Attributes (CSI c)
+[  1.51s] NUM   Apple_Terminal DA1 reply = 1b5b3f313b3263
+[  1.51s] PASS  Apple_Terminal: the query path is live (DA1 answered), so a silence below means non-support and not a dead wire
+[  1.51s]     --- DEC mode queries: does this emulator even have what we want?
+[  2.76s] NUM   Apple_Terminal DECRQM ?1000 (mouse_report) = None (no answer at all)
+[  2.76s] FAIL  Apple_Terminal: mode ?1000 (mouse_report) answers DECRQM at all  -- answer=no answer at all
+[  3.99s] NUM   Apple_Terminal DECRQM ?1002 (mouse_drag) = None (no answer at all)
+[  3.99s] FAIL  Apple_Terminal: mode ?1002 (mouse_drag) answers DECRQM at all  -- answer=no answer at all
+[  5.23s] NUM   Apple_Terminal DECRQM ?1003 (any_motion) = None (no answer at all)
+[  5.23s] FAIL  Apple_Terminal: mode ?1003 (any_motion) answers DECRQM at all  -- answer=no answer at all
+[  6.47s] NUM   Apple_Terminal DECRQM ?1006 (mouse_sgr) = None (no answer at all)
+[  6.47s] FAIL  Apple_Terminal: mode ?1006 (mouse_sgr) answers DECRQM at all  -- answer=no answer at all
+[  7.68s] NUM   Apple_Terminal DECRQM ?1049 (alt_screen) = None (no answer at all)
+[  7.68s] FAIL  Apple_Terminal: mode ?1049 (alt_screen) answers DECRQM at all  -- answer=no answer at all
+[  8.93s] NUM   Apple_Terminal DECRQM ?2004 (bracketed_paste) = None (no answer at all)
+[  8.93s] FAIL  Apple_Terminal: mode ?2004 (bracketed_paste) answers DECRQM at all  -- answer=no answer at all
+[  8.93s]     --- OSC 52 write ladder, each size checked against the real clipboard
+[ 14.95s] NUM   Apple_Terminal osc52 64B = nothing landed in 6.01s
+[ 14.95s] FAIL  Apple_Terminal osc52: a 64B copy reaches the clipboard  -- clipboard unchanged after 6.01s
+[ 14.95s]     --- control: the same payload under opcode 51 must NOT touch the clipboard
+[ 16.20s] PASS  Apple_Terminal: an OSC 51 write leaves the clipboard alone (so an OSC 52 pass above is not a stale clipboard)
+[ 16.20s]     --- a copy written in 64-byte chunks: does the emulator reassemble it?
+[ 21.52s] NUM   Apple_Terminal fragmented OSC 52 = landed=0B want=542B latency=5.00s
+[ 21.52s] FAIL  Apple_Terminal: a copy written in 64-byte chunks lands whole  -- 0B of 542B
+[ 21.52s]     --- OSC 52 read-back query: does this emulator answer it?
+[ 24.04s] NUM   Apple_Terminal OSC 52 read-back = answered=False bytes_back=0
+[ 24.04s] FAIL  Apple_Terminal: the OSC 52 read-back query answers at all  -- no OSC 52 reply in 0 bytes read back
+[ 24.07s]     clipboard restored (26 bytes)
+LEG_DONE rc=0

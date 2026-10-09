@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""The blank-the-screen interval, measured off the wire.
+
+**Premise changed by looprs-pdl.4; read this before the checks.** What used to
+be measured was the live *pane*'s flash: the app parked on the pane's top row,
+flushed `ESC[<row>;1H ESC[J` on its own, then composed and sent the frame that
+replaced what it had just erased. The interval between the erase reaching the pty
+and the next printable bytes reaching the pty was exactly the interval a real
+terminal had nothing there — pre-fix it was 3.1–8.8 ms on every one of 25
+erases, post-fix 0.18–0.35 ms on 13.
+
+The full-screen frame has no such step. ratatui diffs the whole screen and sends
+only the cells that changed, in one write per frame, and there is no inline pane
+to clear below a cursor. So the erase whose gap used to be the measurement is not
+supposed to appear at all, and "measured no erases, so nothing was measured" is
+no longer the failure it looked like — it is the expected result, and the check
+is written to say so.
+
+What is asserted now:
+
+* **no partial erase on the wire.** `ESC[J` / `ESC[0J` is the inline pane's
+  shape. This is the inverted control: run against the pre-pdl.4 binary
+  (`LOOPRS_BIN=/path/to/old-binary`) and it fails with the 13–25 partial erases
+  that binary needed per streamed answer.
+* **a whole-screen clear never leaves the screen blank for long.** `ESC[2J` is
+  the one thing that still blanks cells before replacing them — the full repaint
+  a resize or a child that had the screen forces. Same budget as before.
+* **the run actually streamed.** Content reached the wire, and the answer spread
+  past the ten rows the old fixed viewport allowed. Without these the two
+  property checks above could pass on a run that did nothing.
+
+Nothing here needs the binary's log, and nothing here is a screenshot: the needles
+are escape sequences and the clock on the reading side of the pty. Read *"Why the
+spike reads the wire and not the screen"* in `docs/testing.md` before changing
+them.
+
+Usage:
+
+    cargo build
+    python3 spikes/flash_e2e.py                  | tee spikes/results/flash-e2e.log
+    LOOPRS_BIN=/path/to/old-binary python3 spikes/flash_e2e.py \\
+        | tee spikes/results/flash-e2e-control.log
+
+Environment: `LOOPRS_BIN` (default `target/debug/looprs`), `FAKE_PI` (default
+`spikes/fake_pi_slow.py`), `RUN_SECONDS`, `ROWS`, `COLS`, `CPR_DELAY`.
+"""
+
+import fcntl
+import os
+import pty
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import termios
+import threading
+import time
+
+BIN = os.environ.get("LOOPRS_BIN", "target/debug/looprs")
+ROWS = int(os.environ.get("ROWS", "40"))
+COLS = int(os.environ.get("COLS", "100"))
+RUN_SECONDS = float(os.environ.get("RUN_SECONDS", "12"))
+CPR_DELAY = float(os.environ.get("CPR_DELAY", "0.0005"))
+FAKE_PI = os.environ.get("FAKE_PI", "spikes/fake_pi_slow.py")
+
+# A repaint of a full-height pane costs a few milliseconds of CPU, and the fix is
+# about where that cost sits relative to the erase: composing the new frame has to
+# happen while the old one is still on screen, so that the rows are missing for
+# the write only. 1.5 ms clears the measured 0.35 ms max by a wide margin and
+# still catches the pre-fix 8.8 ms with room to spare.
+BLANK_BUDGET_MS = 1.5
+
+# The two erase shapes, kept apart because they mean different things now. The
+# partial one (`ESC[J` / `ESC[0J`, erase below the cursor) is the inline pane's:
+# the frame took the alternate screen in looprs-pdl.4 and no longer has a pane to
+# clear, so seeing one is the regression. `ESC[2J` is the whole-screen clear, and
+# it is legitimate — the full repaint a resize or a returned full-screen child
+# forces — which is why it is measured rather than forbidden.
+WIPE = re.compile(rb"\x1b\[([02])?J")
+CUP = re.compile(rb"\x1b\[(\d+)(?:;(\d+))?H")
+# Cursor-position report, which the rebuild asks for and which has to be answered
+# or the app sits there until crossterm gives up.
+CPR = re.compile(rb"\x1b\[6n")
+CSI = re.compile(rb"\x1b\[([0-9;?]*)([A-Za-z])")
+ANSWER_MARKER = "ALPHASHEET"  # fake_pi_slow.py's first word
+
+
+def has_printable(buf):
+    """Anything in here that a terminal would put a glyph in a cell for."""
+    stripped = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", buf)
+    return any(c >= 0x20 and c != 0x7F for c in stripped)
+
+
+class Cursor:
+    """The row the app believes it is writing on — enough to answer `ESC[6n`.
+
+    Deliberately not a terminal emulator. The measurements in this file need two
+    numbers from the stream, the row an erase started at and the deepest row that
+    received printable bytes, and both are readable off the escape sequences
+    without modelling cells, attributes or scrollback.
+    """
+
+    def __init__(self, rows, cols):
+        self.row, self.col = 0, 0
+        self.rows, self.cols = rows, cols
+        self.deepest = 0
+
+    def feed(self, buf):
+        pos = 0
+        for m in CSI.finditer(buf):
+            # Any printable bytes before this sequence are text at the cursor.
+            self._text(buf[pos:m.start()])
+            params_raw = m.group(1)
+            # Private-mode sequences (`ESC[?25l`, `ESC[?1049h`, ...) carry a `?`
+            # and are not cursor movement; the app uses them for the cursor and the
+            # alternate screen, and neither moves the row we are tracking.
+            if params_raw[:1] in (b"?", b">", b"="):
+                pos = m.end()
+                continue
+            params = [int(p) for p in params_raw.split(b";") if p.isdigit()]
+            code = m.group(2)
+            if code == b"H" or code == b"f":
+                self.row = (params[0] - 1) if len(params) > 0 else 0
+                self.col = (params[1] - 1) if len(params) > 1 else 0
+            elif code == b"A":
+                self.row -= params[0] if params else 1
+            elif code == b"B":
+                self.row += params[0] if params else 1
+            elif code == b"C":
+                self.col += params[0] if params else 1
+            elif code == b"D":
+                self.col -= params[0] if params else 1
+            self._clamp()
+            pos = m.end()
+        self._text(buf[pos:])
+
+    def _text(self, buf):
+        for b in buf:
+            if b == 0x0D:  # CR
+                self.col = 0
+            elif b == 0x0A:  # LF: raw mode, so down without the CR
+                self.row += 1
+            elif b == 0x09:  # TAB
+                self.col += 4
+            elif b >= 0x20 and b != 0x7F:
+                self.col += 1
+                self.deepest = max(self.deepest, self.row)
+        self._clamp()
+
+    def _clamp(self):
+        self.row = max(0, min(self.row, self.rows - 1))
+        self.col = max(0, min(self.col, self.cols - 1))
+
+
+class Driver:
+    def __init__(self, rows, cols, pi_bin):
+        self.master, slave = pty.openpty()
+        self.rows, self.cols = rows, cols
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        env = dict(os.environ)
+        env.update(
+            TERM="xterm-256color",
+            LOOPRS_PI_BIN=pi_bin,
+            LOOPRS_BD_BIN="/bin/echo",
+            LOOPRS_SHELL_BIN="/bin/bash",
+            RUST_LOG="error",
+        )
+        self.proc = subprocess.Popen(
+            [BIN], stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True
+        )
+        os.close(slave)
+        self.cursor = Cursor(rows, cols)
+        self.chunks = []  # (arrival_time, bytes), the only record that matters
+        self.lock = threading.Lock()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        try:
+            while True:
+                data = os.read(self.master, 65536)
+                if not data:
+                    break
+                t = time.time()
+                with self.lock:
+                    self.chunks.append((t, bytes(data)))
+                    query = CPR.search(data)
+                    # The tracker is fed the erase sequences too, which is how it
+                    # knows the row the pane's top is on when asked.
+                    self.cursor.feed(data)
+                if query:
+                    row = self.cursor.row
+                    threading.Timer(CPR_DELAY, self._answer_cpr, args=(row,)).start()
+        except OSError:
+            pass
+
+    def _answer_cpr(self, row):
+        try:
+            os.write(self.master, b"\x1b[%d;1R" % (row + 1))
+        except OSError:
+            pass
+
+    def send(self, b):
+        os.write(self.master, b)
+        time.sleep(0.4)
+
+
+def measure(chunks):
+    """One record per erase: its shape, the row it started at, how long the hole was."""
+    events = []
+    for i, (t, buf) in enumerate(chunks):
+        for m in WIPE.finditer(buf):
+            # The top row is whatever cursor move most recently preceded the erase
+            # — the app parked the cursor there before clearing, and that parked
+            # row is the pane's own top.
+            top = None
+            for c in CUP.finditer(buf, 0, m.start()):
+                top = int(c.group(1)) - 1
+            if has_printable(buf[m.end():]):
+                gap = 0.0  # the content came in the same read: no visible hole
+            else:
+                gap = None
+                for t2, b2 in chunks[i + 1:]:
+                    if has_printable(b2):
+                        gap = (t2 - t) * 1000.0
+                        break
+            events.append(
+                {
+                    "chunk": i,
+                    "mode": (m.group(1) or b"").decode(),
+                    "top": top,
+                    "gap_ms": gap,
+                }
+            )
+    return events
+
+
+def main():
+    tmp = "/tmp/flash-e2e"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    pi = os.path.join(tmp, "pi")
+    shutil.copy(FAKE_PI, pi)
+    os.chmod(pi, 0o755)
+
+    print(f"BIN={BIN}  rows={ROWS} cols={COLS}")
+    if not os.path.exists(BIN):
+        print(f"no binary at {BIN} — run `cargo build` first")
+        return 2
+
+    d = Driver(ROWS, COLS, pi)
+    time.sleep(1.2)
+    d.send(b"\t")  # Bash -> Pi
+    time.sleep(0.4)
+    d.send(b"stream several paragraphs please\r")
+    time.sleep(RUN_SECONDS)
+    d.proc.terminate()
+    time.sleep(0.3)
+
+    events = measure(d.chunks)
+    partial = [e for e in events if e["mode"] != "2"]
+    cleared = [e for e in events if e["mode"] == "2"]
+    measured = [e for e in events if e["gap_ms"] is not None]
+    content_chunks = sum(1 for _, b in d.chunks if has_printable(b))
+    answer_rows = d.cursor.deepest  # deepest row the answer ever reached
+    print(
+        f"chunks={len(d.chunks)} (carrying content: {content_chunks})  "
+        f"partial erases (ESC[J / ESC[0J)={len(partial)}  "
+        f"whole-screen clears (ESC[2J)={len(cleared)}  "
+        f"answer reached row {answer_rows}"
+    )
+
+    if measured:
+        print("\nerase timeline:")
+        for e in measured:
+            flag = "" if e["gap_ms"] <= BLANK_BUDGET_MS else "   <-- OVER BUDGET"
+            print(
+                f"  chunk {e['chunk']:4d}  mode ESC[{e['mode'] or ''}J  "
+                f"top row {str(e['top']):>4}  hole {e['gap_ms']:7.2f} ms{flag}"
+            )
+        gaps = [e["gap_ms"] for e in measured]
+        s = sorted(gaps)
+        print(
+            f"\nblank window: min={s[0]:.2f}  p50={s[len(s)//2]:.2f}  "
+            f"p90={s[int(len(s)*.9)]:.2f}  max={s[-1]:.2f} ms"
+        )
+    else:
+        print("\nno erase whose replacement content had to wait: nothing to time.")
+
+    checks = []
+    # (1) The premise looprs-pdl.4 put in place of the old one. The hole this
+    # spike was written to measure was made by the inline pane's erase, and the
+    # full-screen frame has no such step: ratatui diffs the whole screen and sends
+    # the changed cells in one write per frame. So on a streamed run the wire
+    # should carry **no partial erase at all**. Inverted control: against the
+    # pre-pdl.4 binary this fails with the 13–25 partial erases per answer that
+    # binary needed, which is the whole reason the hole existed.
+    checks.append(
+        (
+            "no partial erase on the wire: the frame never clears below the cursor",
+            not partial,
+            f"{len(partial)} `ESC[J`-shaped erases — that is the inline pane's "
+            "shape and it should be gone (see spikes/results/flash-e2e-control.log)",
+        )
+    )
+    over = [e for e in cleared if e["gap_ms"] is not None and e["gap_ms"] > BLANK_BUDGET_MS]
+    checks.append(
+        (
+            f"every whole-screen clear got replacement content inside {BLANK_BUDGET_MS} ms",
+            not over,
+            f"{len(over)} of {len(cleared)} clears left the screen blank longer",
+        )
+    )
+    # A run that did nothing would pass both checks above by silence, so the run
+    # has to prove it streamed: content arriving, and the answer reaching well
+    # past the ten rows the old `const VIEWPORT_H: u16 = 10` allowed.
+    checks.append(
+        (
+            f"the stream actually ran ({content_chunks} chunks carried content)",
+            content_chunks >= 20,
+            "too little came down the wire to have measured anything",
+        )
+    )
+    checks.append(
+        (
+            f"the answer spread past the old 10-row viewport (reached row {answer_rows})",
+            answer_rows > 10,
+            f"deepest painted row {answer_rows}",
+        )
+    )
+
+    print()
+    failed = 0
+    for name, ok, detail in checks:
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}   [{detail}]")
+        failed += 0 if ok else 1
+    print(f"\n{len(checks) - failed}/{len(checks)}")
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

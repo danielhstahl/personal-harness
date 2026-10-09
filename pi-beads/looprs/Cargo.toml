@@ -5,11 +5,46 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-crossterm = { version= "0.29.0", features = ["event-stream"] }
+# `osc52` is NOT spike-only — the ticket that opened this claimed it was, and it is
+# wrong. `src/services/clipboard.rs::osc52_bytes` calls crossterm's own writer
+# (`clipboard::CopyToClipboard::to_clipboard_from`) to frame the app's OSC 52
+# transport, which is the remote-session copy path ADR-0004 R7 chose; the app and
+# the spike measure and ship the *same* implementation rather than two that happen
+# to agree. Dropping the feature fails the build with `cannot find clipboard in
+# crossterm` (verified). Its whole dependency weight is `base64 0.22.1`, whose
+# only parent in the shipped graph is `crossterm`.
+crossterm = { version = "0.29.0", features = ["event-stream", "osc52"] }
 futures = "0.3.34"
 pulldown-cmark = "0.13.4"
 ratatui = { version="0.30.2", features = ["scrolling-regions"]}
-syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] } # pure-Rust regex
+# `default-fancy` is the pure-Rust `fancy-regex` engine. It is ~3.1× slower at
+# highlighting than the C alternative (`default-onig`, oniguruma) — measured on
+# the real corpus, warmed, release: 482.6 ms vs 153.2 ms over 626 fenced blocks,
+# 87.2 µs vs 26.7 µs per line of rust, 38.2 KiB vs 18.2 KiB of allocator churn
+# per line, and 44.8 MiB of RSS after warming four languages vs 9.38 MiB. That
+# tax is paid on purpose, for one thing: `onig_sys` compiles oniguruma from C on
+# the target, which puts a **C toolchain into every build** of this tool —
+# contributor machines, `pi-beads/Dockerfile`, every cross target.
+#
+# And the stall the tax would have bought back was measured and removed a cheaper
+# way. It is not the syntax-set load (0.9 ms / 431 KiB, and never on the startup
+# path — nothing on startup highlights); it is syntect's per-language *lazy regex
+# compile*, which arrives in the frame that renders the first fence of each
+# language — cold, the largest such first block is 20.9 ms = 131% of a 16 ms
+# frame, the worst single line 13.2 ms. Warming at startup
+# (`utils::md::spawn_warm_from_env`) takes that to 2.3 ms, and the residual
+# fancy-regex cost sits off the redraw path: a whole later block is 4.8% of a
+# frame, one settling line 0.5%.
+#
+# Do **not** "make the backend configurable" by adding a feature here. The
+# alternative is priced by a copy of this tree with this one line changed,
+# (`spikes/regex_backend_cost.sh`), precisely so it stays priced without being
+# shipped — an unbuilt feature is a door that rots, which is the lesson
+# `[features] notify` below carries a paragraph for. If you are changing this
+# line because the numbers moved, ADR-0009 §3 names the four measured triggers
+# that flip the decision and the one command that re-checks all four:
+# docs/adr/0009-highlighter-warm-start-and-the-regex-backend.md
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 tokio = { version = "1", features = ["full"] }
 unicode-width = "0.2"
 tracing = "0.1"
@@ -17,3 +52,81 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 serde_json = "1.0.151"
 serde = { version = "1.0.229", features = ["derive"] }
+# ADR-0001: the Bash terminal state runs `bash -i` on a real pty. Moved from
+# dev-dependencies to dependencies when looprs-553 landed. Its transitive `nix 0.28`
+# trips a future-incompat lint inside nix's own build script; that is a dependency
+# warning, not ours (see ADR-0001 "Costs / follow-ups").
+portable-pty = "0.9.0"
+# Reached for by exactly one sink — `Ntfy` in `src/services/notification.rs` — and
+# through it a whole TLS stack. `notify` (see `[features]`) is what decides
+# whether the shipped binary carries it; the `Notifier` seam in that module is
+# shaped the same either way, so only the transport is optional.
+reqwest = { version = "0.13.5", optional = true }
+
+# `notify` is the whole out-of-band completion affordance: `reqwest`, its TLS
+# stack, and the `Ntfy` sink. The seam that everything else depends on — the
+# `Notifier` trait, the `BeadDone` fact, the silent `Noop`, `notifier_from_env`
+# and the one call site in the beads loop — compiles either way, so this feature
+# changes what the binary *carries*, not how the loop is written.
+#
+# Default **off**, decided on the numbers rather than on taste. Clean
+# `--release`, same tree, both configurations, 2026-10-09
+# (`spikes/results/dependency-cost.log`):
+#
+#   build                     crates compiled   wall    binary
+#   ------------------------  ---------------  ------  ---------------------
+#   --features notify                218        59 s   13,032,672 B (12.4 MiB)
+#   (default, no notify)             143        30 s    7,133,168 B ( 6.8 MiB)
+#
+# Half the cold build, 75 fewer crates, 45 % of the binary — for a notifier a run
+# only ever reaches if it was told to with `LOOPRS_NTFY_URL` **and**
+# `LOOPRS_NTFY_TOPIC`. For a terminal tool that is not a close call, so the slim
+# build is the default and the doorbell is the opt-in:
+# `cargo build --release --features notify`. `pi-beads/Dockerfile` and the
+# GitHub release job say that explicitly, so the artifact the harness actually runs
+# keeps exactly the capability it had before the flip.
+#
+# What off costs is a loud line, never a silent no-op: a `notify`-less binary still
+# starts, still reads both variables, and logs one `notifications: off (… built
+# without the notify feature …)` line naming them when they are set. Both
+# configurations are gated by `./scripts/check.sh`.
+[features]
+notify = ["dep:reqwest"]
+
+[dev-dependencies]
+strip-ansi-escapes = "0.2"
+# examples/spike_bash.rs (the ADR-0001 spike) uses portable-pty, which is now a
+# regular dependency, so there is nothing left to declare here. The two OSC 52
+# spikes (`spike_clipboard_cost`, `spike_mouse_probe`) need no dev entry either:
+# the `osc52` feature they measure is a *shipped* one (see the note at `crossterm`
+# above), so they read it off the normal edge like everything else in `src/`.
+
+# No `[lints.cargo]` block, and that is the point: `unused_dependencies` is left at
+# cargo's own default (`warn`) rather than blanket-allowed (looprs-00u.15). A
+# blanket lets an unused dependency sit in this file forever, which is not how the
+# rest of the tree answers a warning — see the per-item `#[allow(dead_code)]`s and
+# the "Dead code" policy in `src/session/mod.rs`.
+#
+# Verified at the drop: `cargo check` and `cargo check --all-targets` with the lint
+# at `warn` report nothing unused, and every one of the fifteen `[dependencies]` is
+# named in `src/` (that grep is `scripts/dep_audit.py`, step 6 of
+# `./scripts/check.sh`). One caveat, recorded rather than hidden: the lint is not a
+# complete witness on this crate — a deliberately unused `ryu = "1"` added to this
+# manifest produced no report while a two-dependency reproduction caught the same
+# mistake — which is why the audit does its own grep instead of trusting the one
+# signal. If a future dependency is used in a way cargo misreports, name the crate
+# and the reason at its own line; do not restore the blanket.
+
+# The warning gate is configured in the manifest, not only in the invocation, so a
+# warning cannot be walked past on the assumption that whoever ran clippy forgot
+# `-D warnings` (looprs-6ol). `clippy::all` is the standard warn set (correctness,
+# style, complexity, perf); denying it here means `cargo clippy` alone is a gate.
+#
+# The exceptions are *not* declared here. They are per-item `#[allow(dead_code)]`s
+# in the source, each carrying the reason it stays and the thing that will read it —
+# the policy is written out in the "Dead code" section of `src/session/mod.rs`,
+# and `./scripts/check.sh` is the command that keeps the list honest. The half of
+# that a lint cannot check — an allow whose promised reader landed somewhere else —
+# is what `./scripts/dead_audit.py --gate` runs, as step 5 of that script.
+[lints.clippy]
+all = { level = "deny", priority = -1 }

@@ -45,3 +45,27 @@ My typical workflow is to create an epic with high level instructions, and then 
 
 ### pi-teams
 [pi-teams](./pi-teams) uses [pi.dev](https://pi.dev) with the `@giladbarnea/pi-simple-team` extension.  While this "works", it really isn't suitable for local LLMs (unless you have multiple servers each running an LLM!) since prompt caching breaks and token throughput slows to a crawl.
+
+
+##todos
+* When I type it goes off the side of the screen.  Fix input (and possibly tool output as well, tool commands go off the screen) [fixed]
+* Note there is no terminal during beeds (which is "good" but I would like a normal bash eventually) [FIXED]
+* Pi entry shouldn't exist when Pi is going (much like beads) [FIXED]
+* src/session/view set_status seems unclear and doesn't have consistent behavior across terminal/input types (beads, pi, bash) [FIXED]
+* Where should I put a notification trigger for a bead completing?  I want it to be async and decoupled but I can't find the "trigger" in the code... [FIXED]
+* Once agent is "done done" it invokes `let _ = self.cmd_tx.try_send(UiCommand::BeadsNext);`.  I can see in the logs that it does so, but it is never received/acted on in the BeadLoop (listen_input).  So the loop stalls after completing a ticket. [FIXED]
+* I think that the shell (or not) gets rendered on next tick,  not immediately on tab.  The "state" gets registers on tab, but the rerender doesn't immediate occur (unlike typing which i believe is immediate) [correct, but intentional]
+* Dropped bytes is useless, use context input/output.  Add token/context window [Done]
+* During output part will be cutoff by top until it is "committed" to the scrollback [fixed, with status at bottom. still "jumps" slightly on scrollback]
+* Arrow keys don't navigate text [done, + shift enter]
+* put pi install npm:@piotr-oles/pi-bash-timeout in docker
+* Resize still can mess up view (especially when reducing size)
+* Consider adding a message for compaction (otherwise it might just sit there compacting with no notification to the user)
+* During agentic workflows sometimes nothing will look like its happening, but clearly something is (it starts moving again with a quick tool command going green).
+* full screen app?
+
+
+
+
+
+This repo is half-done implementing a complex agent harness that has three terminal states.  The first is a beeds state that runs a loop creating tickets and then working them.  The second is a normal pi session.  The third is a plain bash.  Can you help complete this implementation?

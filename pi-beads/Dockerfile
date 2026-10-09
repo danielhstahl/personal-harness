@@ -1,3 +1,25 @@
+FROM rust:latest
+
+# Set working directory
+WORKDIR /app
+
+# Copy manifest files first to leverage Docker cache
+COPY pi-beads/looprs/Cargo.toml ./
+COPY pi-beads/looprs/Cargo.lock ./
+# Copy actual source code
+COPY pi-beads/looprs/src ./src
+
+# Build the application.
+#
+# `--features notify` keeps the capability this artifact has always had: the ntfy
+# completion notice. The crate's default build is now without it — that half is
+# 75 of the 218 crates in a cold build and 45% of the binary (measured in
+# looprs/spikes/results/dependency-cost.log, looprs-00u.15) — so the deployment
+# that wants the doorbell says so here rather than inheriting it by accident. A
+# looprs built without it still starts and still reads LOOPRS_NTFY_*; it just logs
+# one line saying it cannot post.
+RUN cargo build --release --features notify
+
 # https://pi.dev/docs/latest/containerization
 FROM nikolaik/python-nodejs:python3.14-nodejs25-slim
 RUN apt-get update \
@@ -6,12 +28,15 @@ RUN apt-get update \
 RUN mkdir -p /app/loop
 
 # copies directory into /app/loop/src
-ADD loop/src /app/loop/src
-ADD loop/package-lock.json /app/loop/package-lock.json
-ADD loop/package.json /app/loop/package.json
-RUN cd /app/loop && npm ci
+#ADD loop/src /app/loop/src
+#ADD loop/package-lock.json /app/loop/package-lock.json
+#ADD loop/package.json /app/loop/package.json
+#RUN cd /app/loop && npm ci
 ENV NPM_CONFIG_PREFIX=/app/.npm-global
 ENV PATH=$PATH:/app/.npm-global/bin
+#
+COPY --from=0 /app/target/release/looprs /app/looprs
+#ADD loop/src /app/loop/src
 
 RUN addgroup --system appgroup && \
     adduser --system --ingroup appgroup appuser --home /home/appuser
@@ -21,7 +46,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/home/appuser/playwright
 ENV BEADS_DIR=/home/appuser/.beads
 
 # two hours timeout
-ENV LOOP_WORK_TIMEOUT_MS=7200000
+#ENV LOOP_WORK_TIMEOUT_MS=7200000
 
 # Set all of /app to root:root, read-only for appuser
 RUN chown -R root:root /app && chmod -R 755 /app
@@ -49,7 +74,7 @@ RUN git clone https://github.com/flutter/flutter.git -b ${FLUTTER_VERSION} --dep
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/home/appuser/.cargo/bin:${PATH}"
 
-# uses beads to handle work
-# RUN pi install npm:pi-workgraph
+# make sure bash times out if it waits too long
+RUN pi install npm:@piotr-oles/pi-bash-timeout
 WORKDIR /workspace
 ENTRYPOINT ["/app/entrypoint.sh"]

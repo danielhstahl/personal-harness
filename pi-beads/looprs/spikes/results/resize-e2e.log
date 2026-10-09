@@ -1,0 +1,65 @@
+[  0.00s] == group untouched: an idle drag in a pty with no controlling terminal ==
+[  1.51s] PASS  the app boots (bare)
+[  2.48s] PASS  Tab reaches Bash (bare)
+[  2.48s] PASS  …and the frame is at the starting width
+[  3.98s] PASS  untouched wide: the app was idle before the drag [bare]
+[  3.99s] PASS  untouched wide: the drag repaints [bare]
+[  3.99s]   untouched wide: first byte 7.6ms after the drag
+[  4.40s] PASS  untouched wide: the repaint reaches the new right edge [bare]
+[  4.40s] PASS  untouched wide: the input box's border lands on the new edge [bare]
+[  4.40s] PASS  untouched wide: the app is alive after the drag [bare]
+[  5.91s] PASS  untouched wide: the app settles back to silence after the repaint [bare]
+[  5.91s] PASS  untouched: nothing on the wire is a cursor query
+[  5.97s] == group attached: an idle drag with a real controlling terminal ==
+[  7.47s] PASS  the app boots (attached)
+[  8.44s] PASS  Tab reaches Bash (attached)
+[  9.94s] PASS  attached wide: the app was idle before the drag [attached]
+[  9.95s] PASS  attached wide: the drag repaints [attached]
+[  9.95s]   attached wide: first byte 7.8ms after the drag
+[ 10.36s] PASS  attached wide: the repaint reaches the new right edge [attached]
+[ 10.36s] PASS  attached wide: the input box's border lands on the new edge [attached]
+[ 10.36s] PASS  attached wide: the app is alive after the drag [attached]
+[ 11.87s] PASS  attached wide: the app settles back to silence after the repaint [attached]
+[ 11.87s] PASS  attached: nothing on the wire is a cursor query
+[ 11.92s] == group rewrap: settled prose re-wraps into the narrower window ==
+[ 11.93s] PASS  the app boots (bare)
+[ 12.54s] PASS  Tab reaches Pi
+[ 12.77s] PASS  the prose fits ONE row at 120 columns (head and tail together)
+[ 14.27s] PASS  …and it is settled content, not the live tail
+[ 14.28s] PASS  a narrowing drag repaints settled prose [bare]
+[ 14.89s] PASS  …and the head is still on screen at 60 columns
+[ 14.89s] PASS  …and the tail is NOT on the head's row: the line came back re-wrapped
+[ 14.89s] PASS  …and the tail is on a row of its own below the head
+[ 14.89s] PASS  rewrap: nothing on the wire is a cursor query
+[ 14.95s] == group drag: a burst of resizes, like a hand on the window edge ==
+[ 16.47s] PASS  the app boots (bare)
+[ 17.43s] PASS  Tab reaches Bash (bare)
+[ 18.94s] PASS  …and it is idle before the drag
+[ 19.21s] PASS  the burst paints [bare]
+[ 19.22s]   full repaints (ESC[2J) the whole run so far cost: 11
+[ 19.22s] PASS  …and the frame ends at the LAST size of the burst, not one from the middle
+[ 20.73s] PASS  drag: the app settles back to silence after the repaint [bare]
+[ 20.73s] PASS  drag: nothing on the wire is a cursor query
+[ 20.78s] == group scrolled: a drag with the transcript scrolled up ==
+[ 22.30s] PASS  the app boots (bare)
+[ 23.27s] PASS  Tab reaches Bash (bare)
+[ 23.44s] PASS  PageUp moves the view off the tail
+[ 24.95s] PASS  …and the app is idle while the user reads
+[ 24.96s] PASS  a drag repaints while the transcript is scrolled up [bare]
+[ 24.96s] PASS  …and the app is alive
+[ 25.37s] PASS  …and the repaint is at the narrow width
+[ 25.43s] PASS  …and End still reaches the tail across the resize
+[ 26.93s] PASS  scrolled: the app settles back to silence after the repaint [bare]
+[ 26.93s] PASS  scrolled: nothing on the wire is a cursor query
+[ 26.99s] == group held: a drag while a full-screen program has the screen ==
+[ 28.49s] PASS  the app boots (bare)
+[ 29.45s] PASS  Tab reaches Bash (bare)
+[ 29.51s] PASS  the full-screen program took the screen
+[ 29.51s]   window dragged while the child holds the screen
+[ 35.52s]   the child reported: 'HELDSIZE 30 120'
+[ 35.52s] PASS  the held child's OWN pty was resized to the new window
+[ 35.52s] PASS  …and the app repaints its own frame when the child hands the screen back
+[ 35.52s] PASS  …and the app is alive
+[ 37.02s] PASS  held: the app settles back to silence after the repaint [bare]
+[ 37.02s] PASS  held: nothing on the wire is a cursor query
+[ 37.09s] 53/53 checks passed  (binary: target/debug/looprs)

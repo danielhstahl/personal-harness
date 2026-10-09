@@ -1,0 +1,54 @@
+[  0.00s] 
+== S1: boot on an empty board ==
+[  0.00s]   spawned pid 80139 in a 24x90 pty
+[  1.01s] PASS  S1 the app boots
+[  1.02s] PASS  S1 the row says the loop is waiting for a human
+[  1.02s] PASS  S1 the row carries both key hints together
+[  1.02s] PASS  S1 the app took the alternate screen exactly once
+[  1.02s]   capture -> /tmp/status-e2e-empty-board.log
+[  1.13s] 
+== S2: `bd` is down ==
+[  1.13s]   spawned pid 80174 in a 24x90 pty
+[  1.35s] PASS  S2 the failure reaches the row, not only the scrollback
+[  1.35s]   capture -> /tmp/status-e2e-bd-down.log
+[  1.46s] 
+== S3: beads working, then Tab away to Pi (ADR-0002) ==
+[  1.47s]   spawned pid 80180 in a 24x90 pty
+[  1.90s] PASS  S3 the row names the bead the loop is paying for
+[  1.90s]   window resized to 24x92
+[  2.31s]   window resized to 24x90
+[  2.92s] PASS  S3 `Esc cancel` is offered while the pass runs
+[  3.03s] PASS  S3 with Pi focused, the row still says beads is working
+[  3.03s] PASS  S3 the beads pass is not relabelled as the focused mode's own work
+[  3.03s]   window resized to 24x92
+[  3.44s]   window resized to 24x90
+[  4.05s] PASS  S3 the background segment carries the bead id and its own elapsed
+[  4.05s]   capture -> /tmp/status-e2e-background.log
+[  4.16s] 
+== S4: the shell's own liveness ==
+[  4.17s]   spawned pid 80245 in a 24x90 pty
+[  5.29s] PASS  S4 the row reaches the Bash mode by Tab
+[  6.10s] PASS  S4 the row answers 'is the shell working?'
+[  6.10s]   window resized to 24x92
+[  6.51s]   window resized to 24x90
+[  7.12s] PASS  S4 …and offers the key that stops it
+[ 14.13s] PASS  S4 the row settles back to idle when the command ends
+[ 14.13s] PASS  S4 Pi was only Tabbed through, so it is not claimed as a warm child
+[ 14.13s]   capture -> /tmp/status-e2e-bash-liveness.log
+[ 14.24s] 
+== S5: a 40-column window, mid-run ==
+[ 14.24s]   spawned pid 80498 in a 24x72 pty
+[ 16.37s]   window resized to 24x74
+[ 16.78s]   window resized to 24x72
+[ 17.39s] PASS  S5 running at 72 columns (the setup)
+[ 17.39s]   window resized to 40x40
+[ 17.39s] PASS  S5 the app survives a resize to 40 columns
+[ 17.39s] PASS  S5 the row is still painted, and still the running row, at 40 columns
+[ 17.39s]   capture -> /tmp/status-e2e-narrow.log
+[ 19.48s] 
+== S6: a 40-column window with a long error ==
+[ 19.48s]   spawned pid 80670 in a 24x40 pty
+[ 19.70s] PASS  S6 the error row reaches the 40-column band without vanishing
+[ 19.70s] PASS  S6 the app is still alive at the floor width
+[ 19.70s]   capture -> /tmp/status-e2e-narrow-error.log
+[ 19.81s] 20/20 checks passed  (binary: target/debug/looprs)

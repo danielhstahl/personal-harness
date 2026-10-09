@@ -1,0 +1,24 @@
+# The docs site generator (looprs-00u.2, ADR-0008).
+#
+# Its own workspace on purpose: `cargo build` at the repo root must keep building
+# exactly one thing — the app. This package is a build tool for prose, it is run by
+# ./scripts/docs.sh, and it shares the repo's `target/` directory (set by that
+# script) so `pulldown-cmark` is compiled once for the repo rather than once per
+# package.
+#
+# No new dependencies beyond what the app already ships: ADR-0008 Q1 priced the
+# generators against each other and the deciding number was that this parser is
+# already in Cargo.lock because src/utils/md.rs renders markdown for the transcript.
+[workspace]
+
+[package]
+name = "looprs-book"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "looprs-book"
+path = "src/main.rs"
+
+[dependencies]
+pulldown-cmark = "0.13.4"

@@ -1,0 +1,61 @@
+# looprs-6cj — the unbounded Msg channel, measured from outside the app
+
+Driver: `spikes/ram_e2e.py` (`fast` producer: `while true; do echo <300 bytes>; done`,
+entered by two Tabs into Bash mode, sampled from `ps` in the parent, 25 s).
+
+Both binaries are the same source except for the fix; the "before" build is
+`target/debug/looprs` rebuilt from `HEAD` (stash / build / copy / un-stash), so
+the two runs differ only by the change under test.
+
+## before (HEAD: `app_tx` = `mpsc::unbounded_channel::<Msg>()`)
+
+    [  4.22s] PASS  fast: app alive
+    [  4.22s] PASS  fast: flood reached the screen
+    [ 29.45s] fast: RSS slope +27.25 MiB/s over 23.2s; wire 0.00 MB/s
+    [ 29.45s] FAIL  fast: RSS slope bounded  -- +27.25 MiB/s exceeds 1.0 MiB/s
+    [ 29.96s] peak RSS 844.1 MiB
+    [ 29.96s] FAIL  fast: peak RSS bounded  -- peak 844.1 MiB exceeds 180.0 MiB
+    [ 33.19s] busiest child 20.9% CPU
+    [ 34.01s] 3/5 checks passed
+
+Straight-line growth, as the ticket described it. `wire` — what the app actually
+wrote to the terminal — stays near zero the whole time, which is the point: the
+failure is invisible on the screen and only shows up in the resident set.
+
+## after (bounded, coalescing bus + credit-paced byte lane)
+
+    [  4.23s] PASS  fast: app alive
+    [  4.23s] PASS  fast: flood reached the screen
+    [ 29.55s] fast: RSS slope +0.01 MiB/s over 23.2s
+    [ 30.06s] PASS  fast: RSS slope bounded
+    [ 30.06s] peak RSS 129.9 MiB
+    [ 30.06s] PASS  fast: peak RSS bounded
+    [ 33.29s] busiest child 2.2% CPU
+    [ 34.11s] 4/4 checks passed
+
+Flat. The ~130 MiB that remains is not the queue: it is the app's baseline plus
+the scrollback store's own retained-bytes cap (`DEFAULT_RETAINED_BYTES`, 32 MiB
+of rows at `ROW_STRUCT_BYTES` each), which was already there and already capped.
+The queue itself is bounded at `bus::DEFAULT_CAP_BYTES` = 256 KiB, with the byte
+lane upstream of it holding `BYTE_LANE_DEPTH` x 8 KiB = 64 KiB and the credit
+supply `OUTPUT_BUDGET_TOKENS` = 16 reads.
+
+App CPU also halved (115-122% against 228-232%), which is what removing one
+`App::update` + selection resync per 8 KiB read buffer buys.
+
+Ctrl-C lands in ~58 ms with the flood running (the control lane is separate and
+`biased`, so it never queues behind output).
+
+## what the driver learned on the way
+
+Two traps in this measurement, both of which produced a confident wrong answer
+before they were fixed, and both recorded here because the second one is the
+reason the numbers above can be believed:
+
+1. A 1000-byte filler line did not reproduce the leak at all; 300 bytes does.
+2. The first "clean" run of the fixed binary was run against a stale binary —
+   the stash-and-rebuild dance had left `target/debug/looprs` as the *before*
+   build. It printed a flat line and passed everything, and it meant nothing.
+   `spikes/ram_e2e.py` therefore asserts that the flood actually reached the
+   rendered screen before it asserts anything about memory, and the
+   before/after pair above was re-run from explicitly separate binaries.

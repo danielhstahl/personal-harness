@@ -1,3 +1,9 @@
 pub mod bd;
+pub mod board_poller;
+pub mod clipboard;
+pub mod journal;
+pub mod logging;
+pub mod notification;
 pub mod pi;
 pub mod prompts;
+pub mod transcript_file;

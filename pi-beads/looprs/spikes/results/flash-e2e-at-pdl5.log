@@ -1,0 +1,37 @@
+BIN=target/debug/looprs  rows=40 cols=100
+chunks=577  erases=25  answer reached row 39
+
+erase timeline:
+  chunk   13  top row    6  hole    2.96 ms   <-- OVER BUDGET
+  chunk   30  top row    6  hole    5.35 ms   <-- OVER BUDGET
+  chunk   48  top row    6  hole    5.85 ms   <-- OVER BUDGET
+  chunk   65  top row    6  hole    5.92 ms   <-- OVER BUDGET
+  chunk   84  top row    6  hole    5.99 ms   <-- OVER BUDGET
+  chunk  102  top row    6  hole    6.72 ms   <-- OVER BUDGET
+  chunk  121  top row    6  hole    6.60 ms   <-- OVER BUDGET
+  chunk  140  top row    6  hole    7.24 ms   <-- OVER BUDGET
+  chunk  160  top row    6  hole    7.94 ms   <-- OVER BUDGET
+  chunk  180  top row    6  hole    7.83 ms   <-- OVER BUDGET
+  chunk  200  top row    6  hole    7.47 ms   <-- OVER BUDGET
+  chunk  220  top row    6  hole    7.17 ms   <-- OVER BUDGET
+  chunk  241  top row    6  hole    7.45 ms   <-- OVER BUDGET
+  chunk  265  top row    6  hole    7.91 ms   <-- OVER BUDGET
+  chunk  287  top row    6  hole    8.25 ms   <-- OVER BUDGET
+  chunk  312  top row    6  hole    7.35 ms   <-- OVER BUDGET
+  chunk  338  top row    6  hole    8.91 ms   <-- OVER BUDGET
+  chunk  362  top row    6  hole    8.54 ms   <-- OVER BUDGET
+  chunk  388  top row    6  hole    8.38 ms   <-- OVER BUDGET
+  chunk  416  top row    6  hole    8.62 ms   <-- OVER BUDGET
+  chunk  445  top row    6  hole    8.37 ms   <-- OVER BUDGET
+  chunk  474  top row    6  hole    8.87 ms   <-- OVER BUDGET
+  chunk  502  top row    6  hole    8.59 ms   <-- OVER BUDGET
+  chunk  531  top row    6  hole    7.83 ms   <-- OVER BUDGET
+  chunk  564  top row    6  hole    6.92 ms   <-- OVER BUDGET
+
+blank window: min=2.96  p50=7.47  p90=8.62  max=8.91 ms
+
+  FAIL  every erase got replacement content inside 1.5 ms   [25 of 25 left a hole longer than that]
+  FAIL  erases batched: 25 <= 19.5 (answer spread over ~39 rows)   [0.64 reshapes per row of answer]
+  FAIL  the worst hole is short enough not to read as a blink (<1.5 ms)   [worst 8.91 ms at chunk 338]
+
+0/3

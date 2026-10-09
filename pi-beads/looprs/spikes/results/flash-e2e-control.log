@@ -1,0 +1,37 @@
+BIN=/tmp/looprs_old  rows=40 cols=100
+chunks=595  erases=25  answer reached row 39
+
+erase timeline:
+  chunk   15  top row    6  hole    3.13 ms   <-- OVER BUDGET
+  chunk   32  top row    6  hole    7.39 ms   <-- OVER BUDGET
+  chunk   50  top row    6  hole    8.64 ms   <-- OVER BUDGET
+  chunk   69  top row    6  hole    7.00 ms   <-- OVER BUDGET
+  chunk   89  top row    6  hole    7.52 ms   <-- OVER BUDGET
+  chunk  109  top row    6  hole    6.57 ms   <-- OVER BUDGET
+  chunk  130  top row    6  hole    8.26 ms   <-- OVER BUDGET
+  chunk  151  top row None  hole    7.15 ms   <-- OVER BUDGET
+  chunk  171  top row    6  hole    7.92 ms   <-- OVER BUDGET
+  chunk  193  top row    6  hole    7.35 ms   <-- OVER BUDGET
+  chunk  214  top row    6  hole    7.97 ms   <-- OVER BUDGET
+  chunk  236  top row    6  hole    7.58 ms   <-- OVER BUDGET
+  chunk  259  top row    6  hole    7.26 ms   <-- OVER BUDGET
+  chunk  282  top row    6  hole    7.55 ms   <-- OVER BUDGET
+  chunk  306  top row    6  hole    7.99 ms   <-- OVER BUDGET
+  chunk  331  top row    6  hole    8.03 ms   <-- OVER BUDGET
+  chunk  355  top row    6  hole    7.99 ms   <-- OVER BUDGET
+  chunk  381  top row    6  hole    8.40 ms   <-- OVER BUDGET
+  chunk  407  top row    6  hole    8.03 ms   <-- OVER BUDGET
+  chunk  434  top row    6  hole    9.60 ms   <-- OVER BUDGET
+  chunk  462  top row    6  hole    8.51 ms   <-- OVER BUDGET
+  chunk  491  top row    6  hole    8.36 ms   <-- OVER BUDGET
+  chunk  520  top row    6  hole    8.92 ms   <-- OVER BUDGET
+  chunk  550  top row    6  hole    8.93 ms   <-- OVER BUDGET
+  chunk  582  top row    6  hole    6.40 ms   <-- OVER BUDGET
+
+blank window: min=3.13  p50=7.97  p90=8.92  max=9.60 ms
+
+  FAIL  every erase got replacement content inside 1.5 ms   [25 of 25 left a hole longer than that]
+  FAIL  erases batched: 25 <= 19.5 (answer spread over ~39 rows)   [0.64 reshapes per row of answer]
+  FAIL  the worst hole is short enough not to read as a blink (<1.5 ms)   [worst 9.60 ms at chunk 434]
+
+0/3

@@ -1,0 +1,25 @@
+[  1.21s] PASS  the app boots and is alive
+[  2.42s] PASS  Tab reaches the Bash mode
+[  2.49s] PASS  the tail of the transcript is on screen
+[  2.95s] PASS  …and its head has scrolled out of the band
+[  3.00s] PASS  PageUp (ESC[5~) scrolls the transcript up in a real pty
+[  3.00s] PASS  …and the tail left the screen, so this is the transcript moving
+[  3.06s] PASS  output that arrives while scrolled up raises the 'N new' affordance
+[  3.06s] PASS  …and it sits on the band's bottom row, over where the tail would be
+[  3.06s] PASS  …and the line that arrived is not shown while the view is off the tail
+[  3.06s] PASS  a band of held history is snapshotted before the second arrival
+[  5.07s] PASS  …and a second arrival moves not one row of what the user is reading
+[  5.07s] PASS  …and it is counted rather than shown
+[  5.13s] PASS  End (ESC[F) returns to the tail
+[  5.19s] PASS  back at the tail, the newest line is shown
+[  6.00s] PASS  …and a pinned arrival does not raise the 'N new' affordance
+[  8.01s]   idle resize emitted 0 bytes in 2s (0 = the app does not repaint on SIGWINCH alone; 195e3c0 measures the same)
+[  9.02s] PASS  the app is alive with the transcript scrolled up across a resize
+[  9.07s] PASS  …and it still takes keystrokes and shell output afterwards
+[  9.13s] PASS  Home (ESC[H) goes to the head of the transcript
+[  9.13s] PASS  …and the tail is not on screen from the head
+[  9.19s] PASS  End from the head is all the way back at the tail
+[  9.19s] PASS  scrolling past either end stops at the end rather than wedging
+[  9.19s] PASS  the whole run issued no ESC[6n cursor query
+[  9.30s] PASS  Ctrl-Q quits
+[  9.32s] 23/23 checks passed

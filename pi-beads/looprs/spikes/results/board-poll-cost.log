@@ -1,0 +1,61 @@
+# looprs-5o4.1 — the cost of the reads the kanban ADR chooses between
+# 2026-10-08T12:18:45Z  macOS / Apple Silicon; the 'current size' legs run against this repo's own .beads
+# BD_JSON_ENVELOPE=1 on every leg, exactly as src/services/bd.rs sets it
+
+########## run 1: 10x scratch board ##########
+bd: bd   iterations/leg: 7   scale: 10x
+
+current board (/Users/danielstahl/Documents/code/ml/personal-harness/pi-beads/looprs): 50 issues  {'in_progress': 4, 'closed': 39, 'open': 7}
+
+== current size ==
+  bd --readonly list --all --limit 0 --json  (CHOSEN) med    510 ms  (min   459 / max    623)   cpu 0.30 s real 0.49 s   peak RSS   131 MB      243 KiB
+  bd list --all --limit 0 --skip-labels --json   med    476 ms  (min   451 / max    535)   cpu 0.33 s real 0.49 s   peak RSS   136 MB      247 KiB
+  bd ready --json                       (loop read) med    387 ms  (min   333 / max    401)   cpu 0.26 s real 0.35 s   peak RSS   122 MB        2 KiB
+  bd list --limit 0 --status …  (per-status read) med    468 ms  (min   459 / max    501)   cpu 0.32 s real 0.50 s   peak RSS   134 MB       35 KiB
+  bd list --limit 0 --status …  (per-status read) med    515 ms  (min   490 / max    547)   cpu 0.28 s real 0.46 s   peak RSS   132 MB       19 KiB
+  bd list --limit 0 --status …  (per-status read) med    494 ms  (min   467 / max    503)   cpu 0.34 s real 0.50 s   peak RSS   136 MB      188 KiB
+  three per-status reads, summed                 med   1478 ms  =  2.9x the single read
+
+== payload shape (what BdList in src/services/bd.rs must parse) ==
+  bd --readonly list --all --limit 0 --json  -> object ['data', 'schema_version'], data is an ARRAY of 50
+  bd --readonly list --all --limit 0 --skip-labels --json -> object ['data', 'schema_version'], data is an OBJECT with ['issues', 'meta']
+  bd ready --json                            -> object ['data', 'schema_version'], data is an ARRAY of 1
+  (the skip-labels `data` is an OBJECT {issues, meta}; BdList's Envelope wants a Vec<Bead>, so that shape is BdError::Malformed to this codebase)
+
+== 10x board (scratch, built in a temp dir) ==
+  scratch board: 500 issues  {'in_progress': 40, 'closed': 390, 'open': 70}
+  bd --readonly list --all --limit 0 --json      med    449 ms  (min   401 / max    494)   cpu 0.31 s real 0.46 s   peak RSS   134 MB     2188 KiB
+  bd --readonly list --all --limit 0 --skip-labels --json med    445 ms  (min   429 / max    465)   cpu 0.30 s real 0.43 s   peak RSS   135 MB     2209 KiB
+  bd --readonly update big-0 --status closed -> rc=1 err="Error: operation 'update' is not allowed in read-only mode"; status afterwards: in_progress
+  10x rows cost  0.9x the current-size read (50 -> 500 rows)
+
+Done.
+
+########## run 2: 50x scratch board ##########
+bd: bd   iterations/leg: 4   scale: 50x
+
+current board (/Users/danielstahl/Documents/code/ml/personal-harness/pi-beads/looprs): 50 issues  {'in_progress': 4, 'closed': 39, 'open': 7}
+
+== current size ==
+  bd --readonly list --all --limit 0 --json  (CHOSEN) med    517 ms  (min   452 / max    532)   cpu 0.33 s real 0.47 s   peak RSS   128 MB      243 KiB
+  bd list --all --limit 0 --skip-labels --json   med    475 ms  (min   467 / max    504)   cpu 0.32 s real 0.49 s   peak RSS   135 MB      247 KiB
+  bd ready --json                       (loop read) med    406 ms  (min   380 / max    418)   cpu 0.26 s real 0.41 s   peak RSS   130 MB        2 KiB
+  bd list --limit 0 --status …  (per-status read) med    514 ms  (min   469 / max    544)   cpu 0.31 s real 0.48 s   peak RSS   133 MB       35 KiB
+  bd list --limit 0 --status …  (per-status read) med    505 ms  (min   474 / max    542)   cpu 0.34 s real 0.45 s   peak RSS   138 MB       19 KiB
+  bd list --limit 0 --status …  (per-status read) med    495 ms  (min   486 / max    537)   cpu 0.28 s real 0.41 s   peak RSS   136 MB      188 KiB
+  three per-status reads, summed                 med   1515 ms  =  2.9x the single read
+
+== payload shape (what BdList in src/services/bd.rs must parse) ==
+  bd --readonly list --all --limit 0 --json  -> object ['data', 'schema_version'], data is an ARRAY of 50
+  bd --readonly list --all --limit 0 --skip-labels --json -> object ['data', 'schema_version'], data is an OBJECT with ['issues', 'meta']
+  bd ready --json                            -> object ['data', 'schema_version'], data is an ARRAY of 1
+  (the skip-labels `data` is an OBJECT {issues, meta}; BdList's Envelope wants a Vec<Bead>, so that shape is BdError::Malformed to this codebase)
+
+== 50x board (scratch, built in a temp dir) ==
+  scratch board: 2500 issues  {'in_progress': 200, 'closed': 1950, 'open': 350}
+  bd --readonly list --all --limit 0 --json      med    672 ms  (min   654 / max    690)   cpu 0.65 s real 0.67 s   peak RSS   233 MB    10946 KiB
+  bd --readonly list --all --limit 0 --skip-labels --json med    692 ms  (min   659 / max    707)   cpu 0.59 s real 0.68 s   peak RSS   217 MB    11051 KiB
+  bd --readonly update big-0 --status closed -> rc=1 err="Error: operation 'update' is not allowed in read-only mode"; status afterwards: in_progress
+  10x rows cost  1.3x the current-size read (50 -> 2500 rows)
+
+Done.

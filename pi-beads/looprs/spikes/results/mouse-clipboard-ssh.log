@@ -1,0 +1,20 @@
+[  0.00s] --- the SSH leg: a real sshd, a Linux build of the probe, key auth
+[  0.25s]     sshd up on 127.0.0.1:2222; probe at /usr/local/bin/spike_mouse_probe (linux)
+[  0.37s]     remote shell reachable (rc=0)
+[  0.49s] NUM   ssh allocated a remote pty = yes (-tt)
+[  2.21s]     remote SUMMARY mouse=13 key=0 paste=0 resize=0 other=0 raw_bytes=0 last_t=36.640
+[  2.21s] PASS  ssh: mouse reports written here decode remotely, one event per report
+[  2.21s] PASS  ssh: the kind+button mapping survives the hop unchanged
+[  2.21s] NUM   ssh wire coordinate minus reported cell = [(1, 1)]
+[  2.21s] PASS  ssh: the coordinate mapping is still a constant -1 on both axes
+[  2.21s] NUM   inject -> last report back, over real SSH = 1.21s for 13 reports
+[  3.66s] NUM   ssh -T (no remote pty) = remote_has_pts=False bytes_arrived=21/21 events_decoded=0
+[  3.66s] PASS  ssh without a remote pty still carries every injected byte
+[  3.78s] PASS  ssh: an OSC 52 copy emitted on the remote host arrives here as one well-formed sequence
+[  3.78s] NUM   ssh osc52 wire = b64_bytes=5492 payload_bytes=4096 terminator=1b5c (whether it then lands is the emulator leg's question)
+[  3.78s]         Whether the emulator in front of the ssh client *accepts* those bytes is
+[  3.78s]         measured by the same copy issued inside a real terminal window:
+[  3.78s]         `--launch --ssh-emulator`.
+[  3.78s] === summary ===
+[  3.78s] 5/5 checks passed
+[  3.78s] 5 numbers recorded -- ssh allocated a remote pty=yes (-tt); ssh wire coordinate minus reported cell=[(1, 1)]; inject -> last report back, over real SSH=1.21s for 13 reports; ssh -T (no remote pty)=remote_has_pts=False bytes_arrived=21/21 events_decoded=0, ...

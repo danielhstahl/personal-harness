@@ -1,0 +1,11 @@
+BIN=target/debug/looprs  rows=40 cols=100
+chunks=407 (carrying content: 126)  partial erases (ESC[J / ESC[0J)=0  whole-screen clears (ESC[2J)=0  answer reached row 39
+
+no erase whose replacement content had to wait: nothing to time.
+
+  PASS  no partial erase on the wire: the frame never clears below the cursor   [0 `ESC[J`-shaped erases — that is the inline pane's shape and it should be gone (see spikes/results/flash-e2e-control.log)]
+  PASS  every whole-screen clear got replacement content inside 1.5 ms   [0 of 0 clears left the screen blank longer]
+  PASS  the stream actually ran (126 chunks carried content)   [too little came down the wire to have measured anything]
+  PASS  the answer spread past the old 10-row viewport (reached row 39)   [deepest painted row 39]
+
+4/4

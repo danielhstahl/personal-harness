@@ -1,0 +1,32 @@
+=== clipboard transport cost (median of 7 runs per size) ===
+
+--- the OSC 52 path: crossterm's own writer, buffered (no terminal in the loop)
+    this is encode + format only: base64 and the escape framing, in-process
+          128 B payload ->       181 B on the wire (1.4x)  median   0.002 ms  best   0.002 ms  worst   0.015 ms
+         4096 B payload ->      5473 B on the wire (1.3x)  median   0.025 ms  best   0.025 ms  worst   0.030 ms
+        65536 B payload ->     87393 B on the wire (1.3x)  median   0.382 ms  best   0.381 ms  worst   0.393 ms
+      1048576 B payload ->   1398113 B on the wire (1.3x)  median   6.117 ms  best   6.111 ms  worst   6.385 ms
+
+--- native helper: `pbcopy` + `pbpaste` (spawn, pipe, wait; then read back and compare)
+          128 B payload   write median   9.716 ms (best   8.793, worst  10.606)  + read-back median  10.663 ms   bytes match
+         4096 B payload   write median   8.899 ms (best   8.765, worst   9.177)  + read-back median   9.690 ms   bytes match
+        65536 B payload   write median   8.928 ms (best   8.716, worst   9.136)  + read-back median   9.819 ms   bytes match
+      1048576 B payload   write median   9.735 ms (best   9.574, worst   9.933)  + read-back median  10.580 ms   bytes match
+
+=== what N could mean: the same text in three units ===
+    cells are measured with unicode-width 0.2, the crate the renderer uses
+
+text                                 chars   cells   bytes
+Copied 1,284 characters                 23      23      23
+漢字                                       2       4       6
+日本語のコード                                  7      14      21
+👩‍👩‍👦                                    5       2      18
+é                                       2       1       3
+🇯🇵                                       2       2       8
+a	b                                      3       3       3
+Café ☕ naïve                            12      13      16
+const s: &str = "日本語";                  22      25      28
+→ ← ↑ ↓                                  7       7      15
+
+    ZWJ family 👩‍👩‍👦: per-character cell widths sum to 6, the whole family measures 2 cell(s)
+    (so a cell count of a wrapped paragraph changes when the window is resized; the text does not change. That is the whole argument about N.)

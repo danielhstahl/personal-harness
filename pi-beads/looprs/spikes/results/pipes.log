@@ -1,0 +1,130 @@
+^D=== Option A - pipes (bash -i) ===
+bash bin: /bin/bash
+NOTE[ 1506ms] harness writes raw bytes "\u{3}"
+NOTE[ 3323ms] no pty to resize (Option A has nothing to resize)
+NOTE[ 6743ms] harness writes raw bytes "iHELLO-FROM-VIM\r"
+NOTE[ 7553ms] harness writes raw bytes "\u{1b}:wq!\r"
+
+--- timeline ([ms since spawn], every line the child emitted) ---
+[     6ms] bash: no job control in this shell
+[     6ms] 
+[     6ms] The default interactive shell is now zsh.
+[     6ms] To update your account to use zsh, please run `chsh -s /bin/zsh`.
+[     6ms] For more details, please visit https://support.apple.com/kb/HT208050.
+[     7ms] <ESC>[?1034hbash-3.2$ echo "PROBE pre_interrupt"
+[     7ms] PROBE pre_interrupt
+[     7ms] bash-3.2$ sleep 6
+[  6022ms] bash-3.2$ echo "PROBE post_interrupt"
+[  6022ms] PROBE post_interrupt
+[  6023ms] bash-3.2$ [ -t 0 ] && echo "PROBE stdin=tty" || echo "PROBE stdin=piped"
+[  6023ms] PROBE stdin=piped
+[  6024ms] bash-3.2$ [ -t 1 ] && echo "PROBE stdout=tty" || echo "PROBE stdout=piped"
+[  6024ms] PROBE stdout=piped
+[  6025ms] bash-3.2$ [ -t 2 ] && echo "PROBE stderr=tty" || echo "PROBE stderr=piped"
+[  6025ms] bash-3.2$ child_tty=$(ps -o tty= -p $$ 2>/dev/nuPROBE stderr=piped
+[  6025ms] ll | tr -d ' ')
+[  6038ms] bash-3.2$ parent_tty=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' ')
+[  6047ms] bash-3.2$ echo "PROBE child_tty=${child_tty:-none} harness_tty=${parent_tty:-non e} same=$([ "$c … (+52 bytes)
+[  6048ms] PROBE child_tty=ttys003 harness_tty=ttys003 same=YES
+[  6048ms] bash-3.2$ if ( : <>/dev/tty ) 2>/dev/null; then
+[  6048ms] >   echo "PROBE dev_tty=openable=yes"
+[  6048ms] > else
+[  6049ms] >   echo "PROBE dev_tty=openable=no"
+[  6049ms] > fi
+[  6050ms] PROBE dev_tty=openable=yes
+[  6050ms] bash-3.2$ echo "PROBE cwd_before=$(pwd)"
+[  6051ms] PROBE cwd_before=/Users/danielstahl/Documents/code/ml/personal-harness/pi-beads/looprs
+[  6051ms] bash-3.2$ cd /tmp
+[  6051ms] bash-3.2$ echo "PROBE cwd_after_cd=$(pwd)"
+[  6052ms] PROBE cwd_after_cd=/tmp
+[  6052ms] bash-3.2$ export LOOPRS_SPIKE=42
+[  6052ms] bash-3.2$ echo "PROBE env_across_writes=$LOOPRS_SPIKE"
+[  6052ms] PROBE env_across_writes=42
+[  6053ms] bash-3.2$ alias ll='echo alias-works'
+[  6053ms] bash-3.2$ ll
+[  6053ms] alias-works
+[  6053ms] bash-3.2$ sleep 3 &
+[  6053ms] [1] 57639
+[  6053ms] bash-3.2$ sleep 0.5
+[  6568ms] bash-3.2$ echo "PROBE jobs_visible=$(jobs -l 2>/dev/null | wc -l | tr -d ' ')"
+[  6577ms] PROBE jobs_visible=1
+[  6577ms] bash-3.2$ for i in 1 2 3 4 5 6; do echo "PROBE o$i-stdout"; echo "PROBE e$i-stde rr" >&2; done
+[  6578ms] PROBE o1-stdout
+[  6578ms] PROBE e1-stderr
+[  6578ms] PROBE o2-stdout
+[  6578ms] PROBE e2-stderr
+[  6578ms] PROBE o3-stdout
+[  6578ms] PROBE e3-stderr
+[  6578ms] PROBE o4-stdout
+[  6578ms] PROBE e4-stderr
+[  6578ms] PROBE o5-stdout
+[  6578ms] PROBE e5-stderr
+[  6578ms] PROBE o6-stdout
+[  6578ms] PROBE e6-stderr
+[  6578ms] bash-3.2$ echo "PROBE stty_before=$(stty size 2>&1 | tr -d '\n')"
+[  6585ms] PROBE stty_before=stty: stdin isn't a terminal
+[  6586ms] bash-3.2$ echo "PROBE env_size=COLUMNS=${COLUMNS:-unset} LINES=${LINES:-unset}"
+[  6586ms] PROBE env_size=COLUMNS=80 LINES=24
+[  6587ms] bash-3.2$ echo "PROBE stty_after_resize=$(stty size 2>&1 | tr -d '\n')"
+[  6592ms] PROBE stty_after_resize=stty: stdin isn't a terminal
+[  6593ms] bash-3.2$ rm -f /tmp/.looprs_spike_vim.txt.swp /tmp/looprs_spike_vim.txt
+[  6598ms] bash-3.2$ vim -u NONE -i NONE -n -X -c 'set noswapfile' /tmp/looprs_spike_vim.tx t
+[  6615ms] Vim: Warning: Output is not to a terminal
+[  6615ms] Vim: Warning: Input is not from a terminal
+[  8634ms] <ESC>[?1049h<ESC>[>4;2m<ESC>[?1h<ESC>=<ESC>[?2004h<ESC>[1;24r<ESC>[?12h<ESC>[?12l<ESC>[22;2t<ESC … (+2406 bytes)
+[  9061ms] <ESC>[?2004l<ESC>[?1l<ESC>><ESC>[?1049l<ESC>[?25h<ESC>[>4;mbash-3.2$ echo "PROBE vim_returned=$? … (+1 bytes)
+[  9061ms] PROBE vim_returned=0
+[  9062ms] bash-3.2$ echo "PROBE vim_wrote_file=[$(cat /tmp/looprs_spike_vim.txt 2>/dev/nul l)]"
+[  9073ms] PROBE vim_wrote_file=[HELLO-FROM-VIM]
+[  9074ms] bash-3.2$ sudo -k 2>/dev/null
+[  9090ms] bash-3.2$ sudo -n true >/tmp/looprs_spike_sudo.out 2>&1
+[  9111ms] bash-3.2$ echo "PROBE sudo_n exit=$? msg=$(head -1 /tmp/looprs_spike_sudo.out)"
+[  9115ms] PROBE sudo_n exit=1 msg=sudo: a password is required
+[  9115ms] bash-3.2$ printf 'not-a-real-password\n' | sudo -S true >/tmp/looprs_spike_sudo_ s.out 2>&1
+[ 11166ms] bash-3.2$ echo "PROBE sudo_S exit=$? msg=$(head -1 /tmp/looprs_spike_sudo_s.out) "
+[ 11171ms] PROBE sudo_S exit=1 msg=Password:Sorry, try again.
+[ 11171ms] bash-3.2$ echo "PROBE done"
+
+--- PROBE results ---
+PROBE pre_interrupt
+PROBE post_interrupt
+PROBE stdin=piped
+PROBE stdout=piped
+PROBE child_tty=ttys003 harness_tty=ttys003 same=YES
+PROBE dev_tty=openable=yes
+PROBE cwd_before=/Users/danielstahl/Documents/code/ml/personal-harness/pi-beads/looprs
+PROBE cwd_after_cd=/tmp
+PROBE env_across_writes=42
+PROBE jobs_visible=1
+PROBE o1-stdout
+PROBE e1-stderr
+PROBE o2-stdout
+PROBE e2-stderr
+PROBE o3-stdout
+PROBE e3-stderr
+PROBE o4-stdout
+PROBE e4-stderr
+PROBE o5-stdout
+PROBE e5-stderr
+PROBE o6-stdout
+PROBE e6-stderr
+PROBE stty_before=stty: stdin isn't a terminal
+PROBE env_size=COLUMNS=80 LINES=24
+PROBE stty_after_resize=stty: stdin isn't a terminal
+PROBE vim_returned=0
+PROBE vim_wrote_file=[HELLO-FROM-VIM]
+PROBE sudo_n exit=1 msg=sudo: a password is required
+PROBE sudo_S exit=1 msg=Password:Sorry, try again.
+
+--- marker checks (against the raw byte stream) ---
+alt-screen entered (ESC[?1049h / ESC[?47h)           YES
+vim painted typed text on its screen                 YES
+vim 'not to a terminal' warning                      YES
+vim 'Error reading input' fatal                      no 
+bash 'no job control in this shell'                  YES
+Ctrl-C echoed as ^C by a line discipline             no 
+macOS 'default interactive shell is now zsh' noise   YES
+bash prompt seen in stream (PS1)                     YES
+colored/ANSI escapes present (count)                 YES
+Ctrl-C gap                                           6.01s after `sleep 6` => IGNORED (sleep ran to completion)
+stdout/stderr merged in program order                YES

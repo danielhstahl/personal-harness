@@ -1,0 +1,22 @@
+[  0.00s] spawned target/debug/looprs (pid None) in a 40x132 pty; fakes in /var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-cancel-e2e-z4869phx
+[  1.51s] PASS  beads: the worker pass started on its own
+[  1.53s] PASS  beads: Esc is acknowledged with the bead named, in under 1s
+[  1.54s] PASS  beads: the cancelled pass settles as a cancellation, not a completion
+[  1.54s] PASS  beads: keystroke to cancelled, in under 1s
+[  1.54s] PASS  beads: the parked loop says so and asks for an instruction
+[  2.55s] PASS  beads: cancelling did NOT start another bead (one prompt, ever)
+[  4.06s] PASS  beads: an idle Esc says nothing at all
+[  4.60s] PASS  pi: the run started
+[  5.24s] PASS  pi: Esc is acknowledged in under 1s
+[  5.24s] PASS  pi: the cancelled run reports 'cancelled'
+[  5.24s] PASS  pi: keystroke to cancelled, in under 1s
+[  6.75s] PASS  pi: an idle Esc says nothing at all
+[  8.18s] PASS  bash: Esc is acknowledged with the command named, in under 1s
+[  8.18s] PASS  bash: the command is interrupted, with the interrupt named as itself
+[  8.18s] PASS  bash: keystroke to interrupted, in under 1s
+[  8.20s] PASS  bash: the same shell answers after the interrupt
+[  9.73s] PASS  bash: an idle Esc says nothing at all
+[  9.84s] PASS  Ctrl-Q quits looprs after all that cancelling
+[ 10.38s] PASS  nothing from this run survives the quit
+[ 10.38s] 
+[ 10.38s] 19/19 checks passed
