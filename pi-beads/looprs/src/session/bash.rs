@@ -1437,6 +1437,20 @@ mod tests {
         assert_eq!(s.status(), SessionStatus::Idle, "settled back to idle");
     }
 
+    fn clean_lines(out: &str) -> Vec<String> {
+        let bytes = strip_ansi_escapes::strip(out);
+        String::from_utf8_lossy(&bytes)
+            .split('\n')
+            .map(|l| {
+                l.trim_end_matches('\r')
+                    .rsplit('\r')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            })
+            .collect()
+    }
     /// **Acceptance: cwd persists.** The whole reason for a persistent shell: a
     /// one-shot `bash -c` cannot remember a `cd`.
     #[tokio::test]
@@ -1448,22 +1462,26 @@ mod tests {
         s.send_text("pwd".into()).unwrap();
         let (out, code) = run_command(&mut rx).await;
         assert_eq!(code, Some(0));
-        let trimmed: Vec<&str> = out
-            .lines()
+        let lines = clean_lines(&out);
+        /*let trimmed: Vec<&str> = out
+            .iter()
             .map(str::trim)
             .filter(|l| l.starts_with('/') && !l.is_empty())
             .collect();
 
         for tmpline in trimmed.iter() {
             println!("This is a line: {}", tmpline);
-        }
-
+        }*/
         assert!(
+            lines.iter().any(|l| l == "/tmp" || l == "/private/tmp"),
+            "cwd did not survive the previous command: {out:?}"
+        );
+        /*assert!(
             trimmed
                 .iter()
                 .any(|l| *l == "/tmp" || *l == "/private/tmp" || l.ends_with("/tmp")),
             "cwd did not survive the previous command: {out:?}"
-        );
+        );*/
     }
 
     /// **Acceptance: `false` -> visibly exit 1.**
