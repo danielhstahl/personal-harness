@@ -364,14 +364,21 @@ What the test then interrupts is a queue entry: the `0x03` goes to an idle promp
 are typed before the command line exists, and the assertion fails against a state the test never
 set up.
 
-The two halves of the fix, both needed:
+The three halves of the fix, all needed:
 
 * **the product** — `interrupt` now handles the queued case instead of returning on "nothing
   outstanding" (ADR-0003: *why an Esc that arrives early still cancels*);
 * **the tests** — `warm_shell` runs one cheap command to completion first, so the shell is
-  ready and the next `send_text` goes straight to the child, and `in_flight` then proves the
-  write happened by waiting on the session's own `Sync` seam rather than by looking at
-  `status()` at all.
+  ready and the next `send_text` goes straight to the child, and `in_flight` then waits on
+  the session's own `Sync` seam rather than looking at `status()` at all;
+* **the tests, and this is the half that took the longest to see** — the seam proves the write,
+  and the write is not the running. Written to the master is not *read by the shell*, and
+  between those two moments the command line sits in the tty's input queue where a `0x03` can
+  take it away with the Ctrl-C flush: nothing runs, no exit marker ever comes back, and the
+  escalation reports a command that was never in the shell. So `in_flight` does not stop at
+  the seam — it waits for the command's **own word** (`looprs-started`, quoted in the command
+  as `looprs-start''ed` so the echo of the command line cannot answer for the output). See
+  the next section for the second half of "running", which is not the same thing.
 
 ### The four non-hermetic pty tests are event-driven (`looprs-00u.17`)
 
@@ -385,7 +392,8 @@ shared harness `src/session/bash/tests/mod.rs`:
 | rule | the helper | what it replaced |
 | --- | --- | --- |
 | **Wait on the observable, not on a window.** Read the stream until the event you are asserting about arrives; the timeout is there to fail, not to wait. | `until_event(rx, pred, "what")` | `collect_within(rx, 800ms, …)` + `assert!(got.contains(…))`, which is a sleep wearing an assertion's clothes: on a loaded runner the sample came up empty and the failure said *"the keystroke was not acknowledged"* about a session that had acknowledged it late |
-| **Make "the command is in flight" a fact from the queue, not a poll.** `Sync` is handled by the same task after the `Submit`, and publishes the status mirror before it acks. | `in_flight(&s, cmd)` (over `warm_shell`) | `for _ in 0..200 { if status == Running break; sleep(20ms) }` — a wait whose success condition was "the mirror flipped sometime in the next four seconds" and whose failure condition was "we ran out of samples" |
+| **Make "the command is in flight" a fact from the child, not from the write.** `Sync` proves the bytes left the session and reached the pty master; it does not prove the shell read them, and `0x03` written to a line still sitting unread in the tty input queue *flushes the line*. The command never runs, so it never reports its marker, and the escalation then says the true thing about the wrong premise — "`cmd` is still running 3s after the cancel — it may be trapping the interrupt" — about a command the shell never had. `in_flight` therefore waits for the command's own declared word, quoted inside the command so the echo cannot fake it. | `in_flight(&s, rx, cmd, CHILD_STARTED)` (over `warm_shell`) | `in_flight(&s, cmd)`, which stopped at the seam — and, before that, `for _ in 0..200 { if status == Running break; sleep(20ms) }`, a wait whose success condition was "the mirror flipped sometime in the next four seconds" and whose failure condition was "we ran out of samples" |
+| **Make the process that declares itself the process the signal is aimed at.** `echo word; sleep 30` proves nothing about the interrupt's target: the word comes from the interactive shell itself while the shell still holds the tty's foreground process group, and the `sleep` is a *later* child. A `0x03` in that window signals the shell, leaves the sleep running its full thirty seconds, and no marker arrives inside any bound the test has — which is how `esc_interrupts_a_running_command_without_killing_the_shell` failed in CI and nowhere else. The fixture is `bash -c 'echo word; exec sleep 30'`: the job prints the word and then *becomes* the sleep, so the word is the promise and the sleep is what keeps it, and `130` is the only thing that can come back. | the same `in_flight` call, with the exec-shaped command | `echo star''ted; sleep 30`, whose green runs mostly ended `exit 1` — the interrupt hitting the shell's own line, i.e. the test passing while having interrupted nothing |
 | **When the precondition lives in the child, make the child declare it.** `trap '' INT` is not installed when `send_text` returns, so an `Esc` that overtakes the builtin kills the sleep and every later assertion reads a run that never had the property under test. The test runs `trap '' INT; echo looprs-trap-set` and waits for that marker. | the trap command's own `echo` | aiming `0x03` at a shell assumed to be trapping |
 | **Search the bytes, not the events.** A pty read returns whatever had arrived; the line discipline echoes a typed command one or two characters at a time, so an escape and the word after it are not promised to the same event. | `Tape` — the output bytes joined in arrival order, with a map back to the event each byte came in | `position(|e| e.contains("painted") && e.contains('\u{1b}[?1049h'))`, whose needle was simply not whole on a busy runner, and which the shell's own prompt (`\u{1b}[?1034h`) could satisfy by accident |
 

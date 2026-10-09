@@ -56,7 +56,13 @@ async fn shutdown_leaves_no_shell_running() {
 async fn shutdown_returns_while_the_lane_is_full_and_the_reader_is_parked() {
     let (mut s, mut rx) = bash(32);
     warm_shell(&mut s, &mut rx).await;
-    in_flight(&mut s, "yes").await;
+    in_flight(
+        &mut s,
+        &mut rx,
+        "bash -c 'echo looprs-start''ed; exec yes'",
+        CHILD_STARTED,
+    )
+    .await;
     // Let the producer get far enough ahead that the reader has something
     // in hand and nowhere to put it.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -105,7 +111,13 @@ async fn shutdown_returns_while_the_lane_is_full_and_the_reader_is_parked() {
 async fn a_shell_that_ignores_the_exit_is_killed_within_the_bound() {
     let (mut s, mut rx) = bash(33);
     warm_shell(&mut s, &mut rx).await;
-    in_flight(&mut s, "sleep 30").await;
+    in_flight(
+        &mut s,
+        &mut rx,
+        "bash -c 'echo looprs-start''ed; exec sleep 30'",
+        CHILD_STARTED,
+    )
+    .await;
 
     let started = Instant::now();
     s.shutdown().unwrap();

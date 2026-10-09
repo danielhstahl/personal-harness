@@ -96,7 +96,9 @@ async fn a_command_that_never_reported_is_named_when_the_shell_dies() {
     warm_shell(&mut s, &mut rx).await;
     in_flight(
         &mut s,
-        "(sleep 1; kill -KILL $$) >/dev/null 2>&1 & sleep 30",
+        &mut rx,
+        "echo looprs-start''ed; (sleep 1; kill -KILL $$) >/dev/null 2>&1 & sleep 30",
+        CHILD_STARTED,
     )
     .await;
 

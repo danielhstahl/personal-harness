@@ -21,7 +21,35 @@ use super::*;
 async fn esc_interrupts_a_running_command_without_killing_the_shell() {
     let (mut s, mut rx) = bash(7);
     warm_shell(&mut s, &mut rx).await;
-    in_flight(&mut s, "echo star''ted; sleep 30").await;
+    // The `Esc` below is aimed at *a running command*, which is two preconditions
+    // and not one: the line has to have reached the shell ([`in_flight`]), and the
+    // thing the `0x03` will be aimed at has to be the tty's foreground job.
+    //
+    // `bash -c '…; exec sleep 30'` rather than `echo …; sleep 30` because of the
+    // second half. With the builtin `echo` first, the ready word comes from the
+    // interactive shell itself, while it is still holding the tty's foreground
+    // process group; the sleep is a *later* child, and a `0x03` in that window
+    // signals the shell and leaves the sleep alone — the sleep then runs its full
+    // thirty seconds, no marker comes back inside any bound the test has, and the
+    // session honestly reports a cancel that was never delivered. Here the word is
+    // printed by the job and the job then *becomes* the sleep (`exec`), so the
+    // process that declares itself is the process that gets the signal, and a
+    // `130` is the only thing that can come back. The declared word also puts a
+    // whole `exec` plus a bash start-up between the shell's fork and the word,
+    // which is what makes the handoff win by construction rather than by luck
+    // (the bare `( … )` subshell form prints within microseconds of the fork and
+    // does lose the handoff under load).
+    //
+    // `star''ted` is the needle's guard: the echo of the command line says
+    // `star''ted`, the run says `started`, and only the second one is evidence
+    // of anything having executed.
+    in_flight(
+        &mut s,
+        &mut rx,
+        "bash -c 'echo star''ted; exec sleep 30'",
+        "started",
+    )
+    .await;
 
     let at_esc = std::time::Instant::now();
     s.abort().unwrap();
@@ -36,9 +64,14 @@ async fn esc_interrupts_a_running_command_without_killing_the_shell() {
     // wall clock, so a loaded runner costs this test nothing and a lost
     // interrupt cannot hide inside a tolerance.
     let ran = run_logged(&mut rx).await;
+    // 130 = the sleep died of `SIGINT`; 143 covers a SIGTERM-flavoured death of
+    // the same job. `1` is deliberately **off** this list now: exit 1 is what the
+    // old fixture returned when the `0x03` landed on the shell's own command
+    // line instead of on the sleep — a green test that had interrupted nothing,
+    // which is exactly what the fixture above was changed to rule out.
     assert!(
-        ran.code == Some(130) || ran.code == Some(143) || ran.code == Some(1),
-        "sleep should have been interrupted, got {:?} (out {:?})",
+        ran.code == Some(130) || ran.code == Some(143),
+        "the sleep should have died of the interrupt, got {:?} (out {:?})",
         ran.code,
         ran.out
     );
@@ -206,7 +239,13 @@ async fn an_esc_aimed_at_a_queued_command_takes_it_out_of_the_queue() {
 async fn esc_says_cancelling_before_the_command_reports_itself_done() {
     let (mut s, mut rx) = bash(22);
     warm_shell(&mut s, &mut rx).await;
-    in_flight(&mut s, "echo star''ted; sleep 30").await;
+    in_flight(
+        &mut s,
+        &mut rx,
+        "bash -c 'echo star''ted; exec sleep 30'",
+        "started",
+    )
+    .await;
     drain(&mut rx);
 
     s.abort().unwrap();
@@ -284,7 +323,20 @@ async fn a_command_that_traps_the_interrupt_is_reported_not_silently_wedged() {
              at a shell that may not be trapping anything: {armed:?}"
     );
 
-    in_flight(&mut s, "sleep 30").await;
+    // The same readiness rule again, now applied to the *sleep* rather than to
+    // the builtin: the stall below is only the real thing if a `sleep` is
+    // actually running and actually the thing the `0x03` is aimed at. A word the
+    // shell printed before forking would not prove that; this one is printed by
+    // the job, which then `exec`s into the sleep and keeps the ignore
+    // disposition it inherited from the `trap '' INT` above. The needle is
+    // quoted in the command so the echo of the line cannot answer for the run.
+    in_flight(
+        &mut s,
+        &mut rx,
+        "bash -c 'echo looprs-a''sleep; exec sleep 30'",
+        "looprs-asleep",
+    )
+    .await;
     drain(&mut rx);
 
     let at_esc = std::time::Instant::now();

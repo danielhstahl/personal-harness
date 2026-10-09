@@ -321,9 +321,16 @@ async fn raw_keys_reach_the_child_verbatim_and_the_shell_still_survives() {
     // without guessing at which other bytes are hex-looking; `stty -echo` on
     // the way in and back out again so the run neither reads the echo as the
     // report nor leaves the tty muted for whoever inherits it.
-    in_flight(
+    //
+    // The readiness needle is the command's own quoted word, not the shell's
+    // echo: the keys below must not be typed until the command is running, or
+    // they land in the shell's own line editor instead of in the six bytes the
+    // child reports (see [`in_flight`]).
+    let started = in_flight(
             &mut s,
-            "printf 'first-line\\n'; stty -echo; printf 'GOT['; head -c 6 | od -An -tx1 | tr -d ' \\n'; stty echo; printf ']\\n'",
+            &mut rx,
+            "echo looprs-start''ed; printf 'first-line\\n'; stty -echo; printf 'GOT['; head -c 6 | od -An -tx1 | tr -d ' \\n'; stty echo; printf ']\\n'",
+            CHILD_STARTED,
         )
         .await;
 
@@ -332,12 +339,14 @@ async fn raw_keys_reach_the_child_verbatim_and_the_shell_still_survives() {
     s.send_bytes(vec![0x1b, b':', b'w', b'q', b'!', 0x0d])
         .unwrap();
     let ran = run_logged(&mut rx).await;
-    assert!(ran.out.contains("first-line"), "{:?}", ran.out);
-    let reported = between(&ran.out, "GOT[", "]").unwrap_or_else(|| {
+    // `started` holds the bytes the readiness wait took off the stream, so the
+    // run's own output is only the second half of what the child wrote.
+    let all = format!("{}{}", Tape::of(&started).text, ran.out);
+    assert!(all.contains("first-line"), "{all:?}");
+    let reported = between(&all, "GOT[", "]").unwrap_or_else(|| {
         panic!(
             "the child never reported the bytes it was handed, so they never reached \
-                 the pty: {:?}",
-            ran.out
+                 the pty: {all:?}"
         )
     });
     // The ESC came through as `0x1b` — not translated to `0x03`, not eaten —
