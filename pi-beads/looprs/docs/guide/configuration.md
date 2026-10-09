@@ -11,7 +11,7 @@ table indexes it. [`./scripts/docs_check.sh`](../../scripts/docs_check.sh) compa
 the defaults wherever two pages state them and fails on a disagreement, so the
 exception cannot rot into a contradiction.
 
-**26 `LOOPRS_*` variables are read by `src/`.** That count is not from the docs:
+**30 `LOOPRS_*` variables are read by `src/`** — 29 until `LOOPRS_WARM_HIGHLIGHT` arrived with `looprs-00u.16`. That count is not from the docs:
 `./scripts/docs_check.py --list-knobs` prints them with the `file:line` of every
 read, and the gate that keeps this page complete is a step of
 [`./scripts/check.sh`](../../scripts/check.sh).
@@ -30,7 +30,7 @@ you is that **changing a variable means restarting the app**.
 The grep index, the resolved paths and the level each diagnostic needs is
 [`./operator.md`](operator.md#3-the-log); this page owns the knobs and their
 defaults. Every resolved choice is logged once at startup — `grep -E 'logging:
-|kanban board|clipboard:|notifications' "$LOG"` prints the whole resolved set,
+|kanban board|clipboard:|notifications|highlight warm' "$LOG"` prints the whole resolved set,
 where `$LOG` is
 
 ```sh
@@ -104,6 +104,26 @@ here only so this index is complete and identical to the owner page:
 | `LOOPRS_KANBAN_POLL_MS` | `5000` | the tick; `250` ms floor, clamped up with a warning |
 | `LOOPRS_KANBAN_EVENTS` | *(unset — the change detector is **on**)* | `0` / `off` / `no` / `false`: every tick is a full board read and the journal is never touched |
 | `LOOPRS_KANBAN_RECONCILE_MS` | `30000` | how long the poller may go without a full board read, however quiet the journal |
+
+## Syntax highlighting
+
+| knob | default | values | what it changes | set at | read in |
+| --- | --- | --- | --- | --- | --- |
+| `LOOPRS_WARM_HIGHLIGHT` | *(unset — the warm-up is **on**)* | `0` / `off` / `no` / `false` turns it off | whether a detached helper thread pays syntect's one-time regex compiles at startup, instead of the first fenced code block paying them inside a frame. Left alone, the first `bash` fence of a run costs 20.9 ms — **131% of a 16 ms frame** — and the first line of it 13.2 ms. Warmed, that same corpus costs 64 ms of background CPU at startup and 2.3 ms at its worst line | startup | [`warm_enabled`](../../src/utils/md.rs), started by `main` via [`spawn_warm_from_env`](../../src/utils/md.rs) |
+
+`off` is not a tuning knob — it is the **before** half of the measurement, kept
+one environment variable away so the before/after can be retaken without
+checking out an old commit. A run without the warm-up says so:
+`grep 'highlight warm' looprs.log` prints either
+`highlight warm: load_ms=… langs=["rust:20ms", …] total_ms=64` or
+`highlight warm: off (LOOPRS_WARM_HIGHLIGHT) — the frame that renders the first
+fenced block of each language will pay the load itself`.
+
+This is the knob that decides *when* the cost lands, not how big it is: the
+26.5 MiB of compiled regex state is retained whichever path pays for it. What
+that state is, what the pure-Rust regex engine costs against the C one, and the
+four measured triggers that would flip the choice:
+[ADR-0009](../adr/0009-highlighter-warm-start-and-the-regex-backend.md).
 
 ## Clipboard and mouse
 
@@ -204,6 +224,7 @@ several of them exist only to make a test's assertion possible.
 | `LOOPRS_MEASURE_TICKETS` | `src/measure.rs` | how many corpus files to replay (default 12, oldest first) |
 | `LOOPRS_MEASURE_BUFFER` | `src/measure.rs` | `0` disables the buffer for the resize-transient measurement |
 | `LOOPRS_MEASURE_CHUNK` | `src/measure.rs` | bytes of a real answer handed to the live entry per simulated frame in the live-preview-cost measurement (default 128). A stand-in for how much arrives between two network reads; the frame cost is what the run measures, so this only sets how many frames an answer takes |
+| `LOOPRS_MEASURE_BACKEND` | `spikes/regex_backend_cost.sh` | a **label, not a switch**. A test cannot see which syntect regex engine it was compiled with — `default-fancy` / `default-onig` are compile-time — so the harness passes the name in to print in the report header. The manifest line the script prints next to it is the actual witness. Setting it to `onig` on a `fancy` build mislabels the log and changes nothing else, which is exactly why the row says what it is (looprs-00u.16) |
 | `LOOPRS_BIN` | the spike drivers | which binary a spike runs — the control-run lever, so a spike can run the same script against the pre-change build |
 | `LOOPRS_SPIKE`, `LOOPRS_SPIKE_N`, `LOOPRS_SPIKE_SCALE`, `LOOPRS_SPIKE_PROBES`, `LOOPRS_SPIKE_TRACE`, `LOOPRS_SPIKE_BASH`, `LOOPRS_SPIKE_BD` | the spike harness | spike-internal: scale, probe set, trace flag, which fake binary |
 | `LOOPRS_E2E_RAW`, `LOOPRS_E2E_TIMELINE` | e2e spike drivers | capture/debug levers in the pty drivers |

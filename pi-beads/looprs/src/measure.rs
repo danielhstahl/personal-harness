@@ -1103,3 +1103,630 @@ fn corpus_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     v.truncate(tickets.max(1));
     v
 }
+
+/// ───────────── the highlighter's one-time costs, priced (looprs-00u.16) ─────────────
+///
+/// Three numbers the tree had been gesturing at without ever naming:
+///
+/// * what `SyntaxSet::load_defaults_newlines()` + `ThemeSet::load_defaults()`
+///   cost in **ms and bytes** — the thing `session::view::RETAINED_BYTES_WORST_CASE`
+///   calls "megabytes paid once on the first highlight" without saying how many;
+/// * **where** that cost lands. The ticket's premise is that the `OnceLock` in
+///   [`crate::utils::md`] puts it into the app's startup. It does not: nothing on
+///   the startup path highlights, so the load arrives at the first *fenced code
+///   block* a session renders, which is mid-stream, minutes into a beads pass, in
+///   the middle of a frame the user is watching;
+/// * what the **`default-fancy`** choice in `Cargo.toml` (pure-Rust
+///   `fancy-regex` instead of the C `oniguruma` backend) costs at highlight time,
+///   which is a portability decision nobody had priced.
+///
+/// # The two runs
+///
+/// The lazy work is per *pattern*: syntect compiles each `Regex` on first use and
+/// caches the compiled form in the `OnceCell` inside the `Regex` held by the
+/// loaded `SyntaxSet` — per-process, outliving the `HighlightLines` that
+/// triggered it. So cold-versus-warm is not a detail of this report, it *is* the
+/// report, and a single process cannot show both: once warm, warm forever.
+///
+/// Hence two `#[ignore]`d tests, each run in its own process, each under each
+/// regex backend:
+///
+/// * [`a_cold_highlight_load_and_the_first_real_fence_measured`] — the load and
+///   the stall as the user meets them;
+/// * [`a_warmed_highlighter_moves_the_load_off_the_draw_path`] — the same
+///   corpus's fences after [`crate::utils::md::warm`] has run.
+///
+/// The harness that runs all four blocks and tees them into one capture is
+/// [`spikes/regex_backend_cost.sh`](../../spikes/regex_backend_cost.sh).
+///
+/// ```sh
+/// LOOPRS_MEASURE_CORPUS=~/.pi/agent/sessions/--Users-…-looprs-- \
+///   cargo test --release -- --ignored --nocapture --test-threads=1 \
+///   the_cold_highlight_load 2>&1 | tee spikes/results/highlight-cold-fancy.log
+/// ```
+#[test]
+#[ignore = "highlight load + first-fence cost (looprs-00u.16): LOOPRS_MEASURE_CORPUS=<pi session dir>; recorded numbers in spikes/results/highlight-load-cost.log"]
+fn a_cold_highlight_load_and_the_first_real_fence_measured() {
+    println!("=== looprs-00u.16 · the highlight load and the first real fence: COLD ===");
+    print_provenance();
+
+    // (1) The app's own door, cold. This is the number the doc comment that says
+    // "megabytes" has never said: what the first highlighted draw pays, in ms of
+    // frame time and in bytes that never come back.
+    CountingAlloc::begin();
+    let t = Instant::now();
+    let hl = crate::utils::md::highlighter();
+    let load_wall = t.elapsed();
+    let (load_live, load_total) = CountingAlloc::end();
+    let load_peak = CountingAlloc::peak();
+    // Touch the value so the load cannot be argued away as dead code.
+    let _ = hl.has_syntax("rust");
+    println!("--- the app's own load: the first `md::highlighter()` in this process");
+    println!("wall        : {:.1} ms", load_wall.as_secs_f64() * 1000.0);
+    println!(
+        "live heap   : {} retained for the life of the process (never freed; one copy, shared by every mode)",
+        kib(load_live as f64)
+    );
+    println!(
+        "peak heap   : {} passed through on the way there",
+        kib(load_peak as f64)
+    );
+    println!(
+        "churn       : {} of it came and went (the decompression buffer, the throwaway plist/bincode temporaries)",
+        kib((load_total as i64 - load_live) as f64)
+    );
+    println!();
+
+    print_load_decomposition();
+
+    // (2)+(3) The fences themselves, from the real passes: the first fence of
+    // each language is the stall, everything after it is the steady state.
+    let root = match corpus_root() {
+        Some(r) => r,
+        None => {
+            println!("--- the fences themselves: NOT MEASURED");
+            println!(
+                "    no LOOPRS_MEASURE_CORPUS. The load above is a fact about syntect's own defaults; \n\
+                 \x20    the stall and the throughput are facts about real transcripts, and this run \n\
+                 \x20    does not fall back to synthetic fences (a number measured over filler is the \n\
+                 \x20    kind of number this ticket exists to replace)."
+            );
+            let _ = CountingAlloc::end();
+            return;
+        }
+    };
+    let files = corpus_files(&root);
+    println!("corpus      : {}", root.display());
+    println!("tickets     : {} session files", files.len());
+    let fences = corpus_fences(&files);
+    print_fences(&fences, ColdState::Cold);
+    let _ = CountingAlloc::end();
+}
+
+/// The same measurement with [`crate::utils::md::warm`] run first — i.e. the
+/// shape the app has after the startup thread has had its say.
+///
+/// The point of running the *same corpus* in both shapes is that it answers the
+/// one question the fix can get wrong: whether the probe lines in
+/// [`crate::utils::md::WARM_PROBES`] actually cover the constructs the real
+/// fences contain. If they do, the corpus's first rust fence arrives in
+/// microseconds instead of hundreds of milliseconds. If they do not, the gap
+/// is still there and the warm-up bought a log line and nothing else.
+#[test]
+#[ignore = "warm-start check (looprs-00u.16): the same corpus's fences after md::warm(); LOOPRS_MEASURE_CORPUS=<pi session dir>"]
+fn a_warmed_highlighter_moves_the_load_off_the_draw_path() {
+    println!("=== looprs-00u.16 · the highlight load and the first real fence: WARM ===");
+    print_provenance();
+
+    // (1) The warm-up itself, timed and counted: this is what the startup thread
+    // eats, and it is the whole cost of the fix.
+    CountingAlloc::begin();
+    let t = Instant::now();
+    let w = crate::utils::md::warm(crate::utils::md::WARM_PROBES);
+    let warm_wall = t.elapsed();
+    let (warm_live, warm_total) = CountingAlloc::end();
+    let warm_peak = CountingAlloc::peak();
+    println!("--- md::warm(WARM_PROBES), the startup thread's whole job");
+    println!("wall        : {:.1} ms", warm_wall.as_secs_f64() * 1000.0);
+    println!(
+        "  load      : {:.1} ms  (syntax set + theme deserialisation)",
+        w.load_us as f64 / 1000.0
+    );
+    for (lang, us) in &w.langs {
+        println!(
+            "  {lang:<10}: {:>7.1} ms  (first highlighted lines of that language)",
+            *us as f64 / 1000.0
+        );
+    }
+    if !w.fell_back.is_empty() {
+        println!(
+            "  fell back : {:?}  (no such syntax in the set — bought nothing)",
+            w.fell_back
+        );
+    }
+    println!("live heap   : {}", kib(warm_live as f64));
+    println!("peak heap   : {}", kib(warm_peak as f64));
+    println!(
+        "churn       : {}",
+        kib((warm_total as i64 - warm_live) as f64)
+    );
+    // The memoisation the fix relies on: a second call is not a second load.
+    let t = Instant::now();
+    let again = crate::utils::md::warm(crate::utils::md::WARM_PROBES);
+    let second = t.elapsed();
+    println!(
+        "2nd call    : {:.3} ms, report identical to the first: {}",
+        second.as_secs_f64() * 1000.0,
+        again == w
+    );
+    println!();
+
+    // (1b) What **one more language** on the warm list would cost — the number
+    // a person editing `WARM_PROBES` needs before they add a name, measured on
+    // three languages the corpus behind this run never fences in.
+    println!(
+        "--- the price of adding a language to the warm list (none of these appear in this corpus)"
+    );
+    let extra: [(&str, &[&str]); 3] = [
+        (
+            "toml",
+            &["[package]", "name = \"looprs\"", "edition = \"2024\""],
+        ),
+        (
+            "yaml",
+            &["- name: looprs", "  features:", "    - default-fancy"],
+        ),
+        (
+            "javascript",
+            &[
+                "const a = [1, 2, 3];",
+                "function f(x) { return x + 1; }",
+                "// a comment",
+            ],
+        ),
+    ];
+    for (lang, lines) in extra {
+        let found = crate::utils::md::highlighter().has_syntax(lang);
+        CountingAlloc::begin();
+        let t = Instant::now();
+        let mut hl = crate::utils::md::highlighter().start(lang);
+        for line in lines {
+            let _ = crate::utils::md::code_line(&mut hl, line);
+        }
+        let us = t.elapsed().as_micros();
+        let (live, _) = CountingAlloc::end();
+        println!(
+            "  {lang:<12}: {:>6.1} ms of CPU \u{b7} {} retained on the Rust heap{}",
+            us as f64 / 1000.0,
+            kib(live as f64),
+            if found {
+                ""
+            } else {
+                " (no such syntax — this is plain text, and the cheap case)"
+            }
+        );
+    }
+    println!();
+
+    print_load_decomposition();
+
+    let root = match corpus_root() {
+        Some(r) => r,
+        None => {
+            println!("--- the fences themselves: NOT MEASURED (no LOOPRS_MEASURE_CORPUS)");
+            let _ = CountingAlloc::end();
+            return;
+        }
+    };
+    let files = corpus_files(&root);
+    println!("corpus      : {}", root.display());
+    println!("tickets     : {} session files", files.len());
+    let fences = corpus_fences(&files);
+    print_fences(&fences, ColdState::Warm);
+    let _ = CountingAlloc::end();
+}
+
+/// Which side of the warm-up a fence report came from. Only changes the wording:
+/// the numbers are what they are, and the whole point is that they differ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColdState {
+    Cold,
+    Warm,
+}
+
+fn print_provenance() {
+    println!(
+        "backend     : {}  (`{}`)",
+        match std::env::var("LOOPRS_MEASURE_BACKEND").ok().as_deref() {
+            Some("fancy") => "default-fancy — pure-Rust fancy-regex",
+            Some("onig") => "default-onig — C oniguruma",
+            _ => "unknown to the test; the capture header carries the manifest line",
+        },
+        std::env::var("LOOPRS_MEASURE_BACKEND")
+            .ok()
+            .unwrap_or_else(|| "?".to_string())
+    );
+    println!(
+        "profile     : {}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    println!(
+        "host        : {} {} {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::env::consts::FAMILY
+    );
+    println!();
+}
+
+/// The load split into the two halves the `OnceLock` bundles, each loaded three
+/// times in the same process.
+///
+/// Three times because the first one is not the same measurement as the second:
+/// the bundled dump has to come off the binary image, and the first pass faults
+/// those pages in. Quoting the first number as "the load" and the third as "the
+/// load" would be quoting two different things with one word, and the gap
+/// between them is the part that is the OS's rather than syntect's.
+fn print_load_decomposition() {
+    println!("--- the load, split into the two halves the OnceLock bundles");
+    timed_load("SyntaxSet::load_defaults_newlines()", || {
+        syntect::parsing::SyntaxSet::load_defaults_newlines()
+            .syntaxes()
+            .len()
+    });
+    timed_load("ThemeSet::load_defaults()", || {
+        syntect::highlighting::ThemeSet::load_defaults()
+            .themes
+            .len()
+    });
+    println!();
+}
+
+/// Load something three times in a row, counting and timing each load on its own.
+fn timed_load(name: &str, mut run: impl FnMut() -> usize) {
+    let mut cells = Vec::new();
+    let mut count = 0usize;
+    for i in 1..=3 {
+        CountingAlloc::begin();
+        let t = Instant::now();
+        count = run();
+        let wall = t.elapsed();
+        let (live, _) = CountingAlloc::end();
+        let peak = CountingAlloc::peak();
+        cells.push(format!(
+            "#{i} {:.1} ms / {} live / {} peak",
+            wall.as_secs_f64() * 1000.0,
+            kib(live as f64),
+            kib(peak as f64)
+        ));
+    }
+    println!("{name:<38}: {}", cells.join("  \u{00b7}  "));
+    println!("{:<38}  {count} loaded", "");
+}
+
+/// One fenced block lifted out of a real transcript.
+struct Fence {
+    /// The language tag exactly as the author wrote it — `""` for the untagged
+    /// majority, which takes the plain-text fallback.
+    lang: String,
+    /// ```` ``` ```` or `~~~`, kept so the closing test is the same marker that
+    /// opened the block, the way `line_render` keeps it.
+    marker: String,
+    lines: Vec<String>,
+}
+
+/// Every fenced code block in the corpus's answer/thinking text, taken through
+/// **the renderer's own fence rule** rather than a markdown library's idea of
+/// one: a line whose trimmed start is ```` ``` ```` or `~~~` opens a block, the
+/// language is the first whitespace- or comma-delimited token after the marker,
+/// and the same marker closes it (`src/components/line_render.rs::on_line`).
+///
+/// Tool results are deliberately not in here — ADR-0005 forbids re-writing
+/// shell output, so a shell's bytes never reach syntect. What this prices is the
+/// surface that actually gets highlighted: markdown fences in answers, thinking
+/// and user notes.
+fn corpus_fences(files: &[std::path::PathBuf]) -> Vec<Fence> {
+    let mut out = Vec::new();
+    for f in files {
+        for it in load_session(f).unwrap_or_default() {
+            if !matches!(it.kind, Kind::Answer | Kind::Thinking) {
+                continue;
+            }
+            let mut open: Option<(String, String, Vec<String>)> = None;
+            for raw in it.text.lines() {
+                let line = raw.trim_end_matches('\r');
+                let t = line.trim_start();
+                if let Some((marker, lang, lines)) = open.as_mut() {
+                    if t.starts_with(marker.as_str()) {
+                        out.push(Fence {
+                            lang: std::mem::take(lang),
+                            marker: std::mem::take(marker),
+                            lines: std::mem::take(lines),
+                        });
+                        open = None;
+                    } else {
+                        lines.push(line.to_string());
+                    }
+                    continue;
+                }
+                if let Some(marker) = ["```", "~~~"].into_iter().find(|m| t.starts_with(m)) {
+                    let lang = t
+                        .trim_start_matches(['`', '~'])
+                        .trim()
+                        .split([' ', ','])
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    open = Some((marker.to_string(), lang, Vec::new()));
+                }
+            }
+            if let Some((marker, lang, lines)) = open {
+                // An unterminated fence at the end of an entry still rendered:
+                // `drain_stream` closes the block when the entry does.
+                if !lines.is_empty() {
+                    out.push(Fence {
+                        lang,
+                        marker,
+                        lines,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The fence half of the report: the distribution, the stall, and the steady
+/// state, in that order.
+fn print_fences(fences: &[Fence], state: ColdState) {
+    // (a) the distribution — the evidence the WARM_PROBES list is sized from.
+    let mut by_lang: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    for f in fences {
+        let e = by_lang.entry(f.lang.clone()).or_default();
+        e.0 += 1;
+        e.1 += f.lines.len();
+    }
+    let tagged: usize = by_lang
+        .iter()
+        .filter(|(l, _)| !l.is_empty())
+        .map(|(_, (n, _))| n)
+        .sum();
+    let untagged: usize = by_lang
+        .iter()
+        .filter(|(l, _)| l.is_empty())
+        .map(|(_, (n, _))| n)
+        .sum();
+    println!("--- fence languages in the corpus");
+    let backtick = fences.iter().filter(|f| f.marker == "```").count();
+    println!(
+        "  markers     : {backtick} blocks opened with ``` \u{00b7} {} with ~~~",
+        fences.len() - backtick
+    );
+    println!(
+        "  blocks    : {} ({} with a language tag, {} tagged nothing → plain text)",
+        fences.len(),
+        tagged,
+        untagged
+    );
+    let warm: Vec<&str> = crate::utils::md::WARM_PROBES
+        .iter()
+        .map(|(l, _)| *l)
+        .collect();
+    let covered: usize = by_lang
+        .iter()
+        .filter(|(l, _)| warm.iter().any(|w| w == l))
+        .map(|(_, (n, _))| n)
+        .sum();
+    println!(
+        "            {:<12}{:>7}{:>9}{:>9}   warmed?",
+        "language", "blocks", "lines", "share"
+    );
+    let mut rows: Vec<(&String, &(usize, usize))> = by_lang.iter().collect();
+    rows.sort_by_key(|(_, v)| std::cmp::Reverse(v.0));
+    for (lang, (n, lines)) in rows {
+        let shown = if lang.is_empty() {
+            "(none)"
+        } else {
+            lang.as_str()
+        };
+        println!(
+            "            {:<12}{:>7}{:>9}{:>8.1}%   {}",
+            shown,
+            n,
+            lines,
+            100.0 * *n as f64 / (tagged.max(1) as f64),
+            if warm.iter().any(|w| w == lang) {
+                "yes"
+            } else if lang.is_empty() {
+                "n/a — plain text"
+            } else {
+                "no"
+            }
+        );
+    }
+    println!(
+        "  coverage  : WARM_PROBES covers {covered} of {} tagged blocks ({:.1}% of them)",
+        tagged,
+        100.0 * covered as f64 / (tagged.max(1) as f64)
+    );
+    println!();
+
+    // (b) the stall, and (c) the steady state.
+    //
+    // One `HighlightLines` per block, the way the renderer makes one per fence
+    // (`self.fence = Some((marker, md::highlighter().start(lang)))`), so the
+    // per-block cost includes what a fresh `HighlightLines` costs and not just
+    // what a reused one does.
+    //
+    // The unit of the stall is **the first block of a language**, not the first
+    // line of it. The lazy work is one regex at a time, and a block only
+    // compiles the patterns its own text actually reaches — so a first block
+    // that opens with a comment line (an `sh` fence starting `# --- 3. …`)
+    // looks cheap on its first line and the compile lands on line 4 of the same
+    // block. Attributing the stall to "line 1" would have hidden exactly the
+    // thing being measured, which is why the aggregation below is per block and
+    // the worst line is reported with where it was standing.
+    #[derive(Default)]
+    struct Agg {
+        blocks: usize,
+        lines: usize,
+        first_block_us: f64,
+        first_block_lines: usize,
+        later_us: f64,
+        later_lines: usize,
+        max_line_us: f64,
+        max_at: (usize, usize),
+    }
+    let mut agg: std::collections::BTreeMap<String, Agg> = Default::default();
+    let mut per_block: Vec<f64> = Vec::new();
+    let mut code_lines = 0usize;
+    let mut blocks_measured = 0usize;
+    let mut worst: (f64, String, usize, usize) = (0.0, String::new(), 0, 0);
+
+    CountingAlloc::begin();
+    let t_all = Instant::now();
+    for (bi, f) in fences.iter().enumerate() {
+        if f.lines.is_empty() {
+            continue;
+        }
+        let mut hl = crate::utils::md::highlighter().start(&f.lang);
+        let mut block_us = 0.0_f64;
+        for (li, line) in f.lines.iter().enumerate() {
+            let t = Instant::now();
+            let _ = crate::utils::md::code_line(&mut hl, line);
+            let line_us = t.elapsed().as_secs_f64() * 1e6;
+            block_us += line_us;
+            code_lines += 1;
+            let a = agg.entry(f.lang.clone()).or_default();
+            a.blocks += 1;
+            a.lines += 1;
+            if a.max_line_us < line_us {
+                a.max_line_us = line_us;
+                a.max_at = (bi, li);
+            }
+            if worst.0 < line_us {
+                worst = (line_us, f.lang.clone(), bi, li);
+            }
+        }
+        // `blocks` was already incremented per line above, so "first block of
+        // this language" is the block that made it 1.
+        let first_of_lang = {
+            let a = agg.get_mut(&f.lang).expect("just written");
+            if a.first_block_lines == 0 {
+                a.first_block_us = block_us;
+                a.first_block_lines = f.lines.len();
+                true
+            } else {
+                a.later_us += block_us;
+                a.later_lines += f.lines.len();
+                false
+            }
+        };
+        blocks_measured += 1;
+        if !first_of_lang {
+            per_block.push(block_us);
+        }
+    }
+    let all_wall = t_all.elapsed();
+    let (live_end, churn) = CountingAlloc::peek();
+
+    let what = match state {
+        ColdState::Cold => "cold — the first fence a process renders pays this",
+        ColdState::Warm => "after md::warm() — the same fences, second time round",
+    };
+    println!("--- highlighting the corpus's real fences, {what}");
+    println!("blocks      : {blocks_measured} \u{00b7} code lines: {code_lines}");
+    println!(
+        "total       : {:.1} ms of highlight for the whole corpus",
+        all_wall.as_secs_f64() * 1000.0
+    );
+    println!();
+    println!(
+        "            {:<10}{:>7}{:>7}{:>16}{:>14}{:>13}{:>18}",
+        "language", "blocks", "lines", "1st block (cold)", "steady /line", "stall ×", "worst line"
+    );
+    let mut rows: Vec<(&String, &Agg)> = agg.iter().collect();
+    rows.sort_by_key(|(_, a)| std::cmp::Reverse(a.lines));
+    for (lang, a) in rows {
+        let shown = if lang.is_empty() {
+            "(none)"
+        } else {
+            lang.as_str()
+        };
+        let steady_per_line = if a.later_lines > 0 {
+            a.later_us / a.later_lines as f64
+        } else {
+            0.0
+        };
+        let first_per_line = if a.first_block_lines > 0 {
+            a.first_block_us / a.first_block_lines as f64
+        } else {
+            0.0
+        };
+        let stall = if steady_per_line > 0.0 {
+            first_per_line / steady_per_line
+        } else {
+            0.0
+        };
+        println!(
+            "            {:<10}{:>7}{:>7}{:>11.1} ms {:>11.1} µs{:>10.1}×{:>11.1} ms @{}:{}",
+            shown,
+            a.blocks,
+            a.lines,
+            a.first_block_us / 1000.0,
+            steady_per_line,
+            stall,
+            a.max_line_us / 1000.0,
+            a.max_at.0,
+            a.max_at.1
+        );
+    }
+    println!(
+        "  slowest single highlighted line in the run: {:.1} ms ({} \u{00b7} block #{}, line {})",
+        worst.0 / 1000.0,
+        if worst.1.is_empty() {
+            "(none)"
+        } else {
+            worst.1.as_str()
+        },
+        worst.2,
+        worst.3
+    );
+    println!(
+        "bytes/line  : {:.0} B of allocator churn per highlighted line ({}) total",
+        churn as f64 / (code_lines.max(1) as f64),
+        kib(churn as f64)
+    );
+    println!(
+        "retained    : {} still live after all {blocks_measured} blocks — the compiled-regex state, held for the life of the process rather than the block's",
+        kib(live_end as f64)
+    );
+    println!();
+    println!("--- what that is against a frame");
+    let mean_block = if per_block.is_empty() {
+        0.0
+    } else {
+        per_block.iter().sum::<f64>() / per_block.len() as f64
+    };
+    println!(
+        "  a later (non-first) block averages {:.2} ms = {:.1}% of a 16 ms frame",
+        mean_block / 1000.0,
+        100.0 * mean_block / 16_000.0
+    );
+    let stalls: Vec<f64> = agg
+        .values()
+        .map(|a| a.first_block_us)
+        .filter(|v| *v > 0.0)
+        .collect();
+    println!(
+        "  the first-block stalls together are {:.1} ms of CPU; the largest alone is {:.1} ms = {:.0}% of a frame",
+        stalls.iter().sum::<f64>() / 1000.0,
+        stalls.iter().cloned().fold(0.0_f64, f64::max) / 1000.0,
+        100.0 * stalls.iter().cloned().fold(0.0_f64, f64::max) / 16_000.0
+    );
+    println!();
+}

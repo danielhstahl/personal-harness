@@ -27,3 +27,4 @@
   * [ADR-0006 — The terminal mode ledger](adr/0006-terminal-mode-ledger.md)
   * [ADR-0007 — The kanban board](adr/0007-kanban-board.md)
   * [ADR-0008 — The documentation site](adr/0008-docs-site.md)
+  * [ADR-0009 — The highlighter is warmed, and the regex engine stays pure Rust](adr/0009-highlighter-warm-start-and-the-regex-backend.md)

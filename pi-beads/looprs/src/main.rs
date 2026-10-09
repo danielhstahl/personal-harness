@@ -78,6 +78,22 @@ async fn main() -> Result<()> {
     let exit = Arc::new(Teardown::new());
     install_panic_hook(exit.clone());
 
+    // The highlighter's one-time costs, paid on a helper thread before there is
+    // a frame that could be asked to carry them (looprs-00u.16). Started here,
+    // ahead of the terminal setup and the Router, because the only place this
+    // work is cheap is a moment nobody is waiting on. Measured on the real
+    // corpus: left where `md`'s `OnceLock` puts it, the first fenced code block
+    // a session renders pays 58.4 ms of lazy regex compiles, its largest first
+    // block being 20.9 ms = 131% of a 16 ms frame, and that lands mid-stream —
+    // not at startup, but in the middle of an answer the user is reading.
+    // Warming spends 64.1 ms of background CPU to take the worst line from
+    // 13.2 ms to 2.3 ms. The 26.5 MiB of compiled state is retained whichever
+    // path it arrives by: warming changes *when* it is paid, not *whether*.
+    // `utils::md::warm` carries the numbers and the reason this is a detached
+    // thread rather than a `spawn_blocking`; ADR-0009 carries the trade-off
+    // that was decided on with them.
+    utils::md::spawn_warm_from_env();
+
     // Every way in to the terminal state lives behind this one call, and the hand-
     // back sits in front of its result. That ordering is the point: before it, an
     // early `?` out of setup returned from `main` with raw mode on and nothing

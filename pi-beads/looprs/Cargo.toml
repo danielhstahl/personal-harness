@@ -17,7 +17,34 @@ crossterm = { version = "0.29.0", features = ["event-stream", "osc52"] }
 futures = "0.3.34"
 pulldown-cmark = "0.13.4"
 ratatui = { version="0.30.2", features = ["scrolling-regions"]}
-syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] } # pure-Rust regex
+# `default-fancy` is the pure-Rust `fancy-regex` engine. It is ~3.1× slower at
+# highlighting than the C alternative (`default-onig`, oniguruma) — measured on
+# the real corpus, warmed, release: 482.6 ms vs 153.2 ms over 626 fenced blocks,
+# 87.2 µs vs 26.7 µs per line of rust, 38.2 KiB vs 18.2 KiB of allocator churn
+# per line, and 44.8 MiB of RSS after warming four languages vs 9.38 MiB. That
+# tax is paid on purpose, for one thing: `onig_sys` compiles oniguruma from C on
+# the target, which puts a **C toolchain into every build** of this tool —
+# contributor machines, `pi-beads/Dockerfile`, every cross target.
+#
+# And the stall the tax would have bought back was measured and removed a cheaper
+# way. It is not the syntax-set load (0.9 ms / 431 KiB, and never on the startup
+# path — nothing on startup highlights); it is syntect's per-language *lazy regex
+# compile*, which arrives in the frame that renders the first fence of each
+# language — cold, the largest such first block is 20.9 ms = 131% of a 16 ms
+# frame, the worst single line 13.2 ms. Warming at startup
+# (`utils::md::spawn_warm_from_env`) takes that to 2.3 ms, and the residual
+# fancy-regex cost sits off the redraw path: a whole later block is 4.8% of a
+# frame, one settling line 0.5%.
+#
+# Do **not** "make the backend configurable" by adding a feature here. The
+# alternative is priced by a copy of this tree with this one line changed,
+# (`spikes/regex_backend_cost.sh`), precisely so it stays priced without being
+# shipped — an unbuilt feature is a door that rots, which is the lesson
+# `[features] notify` below carries a paragraph for. If you are changing this
+# line because the numbers moved, ADR-0009 §3 names the four measured triggers
+# that flip the decision and the one command that re-checks all four:
+# docs/adr/0009-highlighter-warm-start-and-the-regex-backend.md
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 tokio = { version = "1", features = ["full"] }
 unicode-width = "0.2"
 tracing = "0.1"

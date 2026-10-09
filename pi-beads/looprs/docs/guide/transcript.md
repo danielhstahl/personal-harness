@@ -57,7 +57,7 @@ a print stream:
 | --- | --- | --- |
 | retained store, per mode | 32 MiB (`DEFAULT_RETAINED_BYTES`) | the rendered history per mode, with row provenance |
 | view buffer, per mode | 256 KiB (`DEFAULT_VIEW_BUFFER`) | the live tail buffer that gets flushed into entries |
-| the app's worst case | 3 modes × (32 MiB + 256 KiB) | logged at startup as `retained_ceiling_bytes`; excludes syntect's one-time syntax set |
+| the app's worst case | 3 modes × (32 MiB + 256 KiB) | logged at startup as `retained_ceiling_bytes`. It counts retained **content**, and deliberately excludes syntect's compiled regex state — 26.5 MiB of Rust heap / 44.8 MiB of RSS for the four languages the real corpus fences in, one copy, process-wide, not per-view and not growing with the session ([ADR-0009](../adr/0009-highlighter-warm-start-and-the-regex-backend.md)) |
 | the UI's byte lane | `bus::DEFAULT_CAP_BYTES` | in-flight bytes are *paced*, not stored: a producer that outruns the UI waits instead of growing the process |
 
 The last row is the one that saved this app from a real incident: the queue used to

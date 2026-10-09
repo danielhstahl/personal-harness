@@ -92,8 +92,19 @@ pub const MAX_VIEWS: usize = TerminalType::ALL.len();
 ///
 /// What it does **not** cover, all of it deliberate:
 ///
-/// * **syntect's syntax set** — megabytes paid once on the first highlight,
-///   shared process-wide, and not history;
+/// * **syntect's compiled regex state** — this line used to call it
+///   "megabytes paid once on the first highlight" without saying how many, and
+///   the number turns out to be worth knowing: warming the four languages the
+///   real corpus fences in retains **26.5 MiB of Rust heap** and takes the
+///   process to **44.8 MiB RSS** (`fancy`, release; the `md::highlighter()`
+///   load itself is 430.6 KiB). It is one copy, process-wide, paid once by the
+///   startup warm thread (`utils::md::spawn_warm_from_env`) rather than by a
+///   frame, and it is not history — it does not grow with the session, does not
+///   get evicted with the scrollback, and is not per-view. That is why it is
+///   excluded here rather than added to the total: this constant answers "how
+///   much retained **content** does the app hold", and a compiled regex table is
+///   not content. Numbers, both backends, and the reason the engine stayed pure
+///   Rust: [ADR-0009](../../docs/adr/0009-highlighter-warm-start-and-the-regex-backend.md);
 /// * **transients** — the peak a rebuild passes *through* is larger than what
 ///   it retains, and is measured separately (`spikes/results/resize-transient.log`);
 /// * **allocator slack** — freed is not the same as returned to the OS.

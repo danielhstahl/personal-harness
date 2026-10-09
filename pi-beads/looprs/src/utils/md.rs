@@ -2,6 +2,7 @@
 //! Everything returned is `Line<'static>` so it can be cached / queued freely.
 
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use crate::theme::styles::BLUE;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -21,10 +22,25 @@ pub struct Highlighter {
     theme: Theme,
 }
 
+thread_local! {
+    /// Set on the thread that ran [`highlighter`]'s one-time init, and read by
+    /// the "never touched syntect" baseline test that
+    /// [`spikes/regex_backend_cost.sh`](../../spikes/regex_backend_cost.sh)
+    /// measures its RSS against.
+    ///
+    /// Thread-local rather than a global flag on purpose: a global one would make
+    /// that assertion fail in every ordinary `cargo test` run, because some
+    /// other test in the pool highlights a fence and lights it first. What the
+    /// baseline needs to know is whether *this test's own* code path reached the
+    /// syntax set, and nothing else.
+    static INITIALISED_HIGHLIGHTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Loaded once (slow). `'static` lets `HighlightLines<'static>` live in stream state.
 pub fn highlighter() -> &'static Highlighter {
     static HL: OnceLock<Highlighter> = OnceLock::new();
     HL.get_or_init(|| {
+        INITIALISED_HIGHLIGHTER.with(|c| c.set(true));
         let mut ts = ThemeSet::load_defaults();
         Highlighter {
             ss: SyntaxSet::load_defaults_newlines(),
@@ -40,6 +56,17 @@ impl Highlighter {
             .find_syntax_by_token(lang)
             .unwrap_or_else(|| self.ss.find_syntax_plain_text());
         HighlightLines::new(syn, &self.theme)
+    }
+
+    /// Whether `lang` resolves to a real syntax rather than to the plain-text
+    /// fallback.
+    ///
+    /// The warm-up needs it to say which names it **did not** buy — a fence
+    /// tagged `foo` costs the same after `warm()` as before it, and a warm-up
+    /// that reported "warmed" for a language with no syntax in the set would be
+    /// a log line that lies about the thing it exists to make true.
+    pub fn has_syntax(&self, lang: &str) -> bool {
+        !lang.is_empty() && self.ss.find_syntax_by_token(lang).is_some()
     }
 
     fn spans(&'static self, hl: &mut HighlightLines<'static>, text: &str) -> Vec<Span<'static>> {
@@ -63,6 +90,248 @@ fn conv(s: syntect::highlighting::Style) -> Style {
         st = st.add_modifier(Modifier::ITALIC);
     }
     st
+}
+
+/// The languages the startup warm-up takes, each with the lines it highlights.
+///
+/// Both halves of this list come off the measurement rather than off a guess.
+///
+/// **The languages**: every non-empty fence language that appears in the twelve
+/// real `pi` passes the harness replays, by fence count — `rust` 506, `bash`
+/// 25, `python` 12, `sh` 6, and nothing else
+/// (`spikes/results/highlight-load-cost.log`, "fence languages in the corpus").
+/// That is 100% of the 549 tagged fence blocks, and `rust` alone is 92.2% of
+/// them, which is why the list is four names and not the 75 the default set
+/// contains: **each language added costs its own one-time compile**, measured
+/// in the same log's "price of adding a language" block — `yaml` 3.4 ms and
+/// 0.9 MiB, `javascript` 16.3 ms and 6.3 MiB — spent at startup to remove a
+/// stall in a case this corpus never produces. Add a name when the corpus
+/// shows the fence, and put that language's measured cost in the commit
+/// message.
+///
+/// The other **77** fence blocks carry no language tag at all. Those take
+/// [`Highlighter::start`]'s plain-text fallback, which has no regexes to
+/// compile — 0.6 µs/line, the cheapest thing in the measurement — so there is
+/// nothing there to warm and no reason to pretend there is.
+///
+/// **The probe lines** are lifted out of real fenced blocks from the same
+/// passes, because the lazy work is per *pattern*: the patterns a probe
+/// reaches are the only ones it warms. A `fn main() {}` probe would warm a
+/// toy's worth and leave a real answer's `async fn` + `let-else` +
+/// `tracing::info!(k = %v, "…")` constructs paying their own compile in the
+/// user's frame. The residual proves the point in the other direction: even
+/// with these probes, the corpus's first rust block still costs 2.9 ms warmed
+/// against 20.2 ms cold, because the probe does not contain every construct
+/// the corpus does. Warming is not free and the tail is not zero; both are
+/// printed on every run.
+pub const WARM_PROBES: &[(&str, &[&str])] = &[
+    (
+        "rust",
+        &[
+            "/// Spawn a pi child AND prompt it with the worker prompt.",
+            "async fn spawn_worker(&mut self) -> Result<bool> {",
+            "    let beads = bd::ready_beads(&self.cfg.bd_bin)?;",
+            "    let Some(bead) = beads.first() else { return Ok(false) };",
+            "    tracing::info!(bead = %bead.id, \"starting worker pass\");",
+            "    let res = async {",
+            "        let (pi, ev_rx) = PiRpc::spawn(&self.cfg.pi_bin, &[])?;",
+            "        pi.prompt(&worker_prompt(&bead.id)).await?;",
+            "        Ok::<(), anyhow::Error>(())",
+            "    }.await;",
+            "    self.pi_rx = Some(pi);",
+            "    Ok(true)",
+            "}",
+        ],
+    ),
+    (
+        "bash",
+        &[
+            "#!/usr/bin/env bash",
+            "LOG=/tmp/fakepi/pi.log",
+            "echo \"spawn $$ $*\" >> \"$LOG\"",
+            "while IFS= read -r line; do",
+            "  case \"$line\" in",
+            "    *'\"type\":\"prompt\"'*)",
+            "      id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')",
+            "      printf '{\"type\":\"response\",\"id\":\"%s\"}\n' \"$id\"",
+            "      ;;",
+            "  esac",
+            "done",
+        ],
+    ),
+    (
+        "python",
+        &[
+            "import os, pty, subprocess, time, sys, select",
+            "cmd = [\"./target/debug/looprs\"]",
+            "env = dict(os.environ, LOOPRS_PI_BIN=\"/tmp/looprs-smoke/pi\")",
+            "pid, fd = pty.fork()",
+            "if pid == 0:",
+            "    os.execvpe(cmd[0], cmd, env)",
+            "deadline = time.time() + 8",
+            "while time.time() < deadline:",
+            "    r, w, _ = select.select([fd], [], [], 0.2)",
+            "    if r:",
+            "        out += os.read(fd, 4096)",
+        ],
+    ),
+    (
+        "sh",
+        &[
+            "echo \"PROBE cwd_before=$(pwd)\"",
+            "cd /tmp",
+            "export LOOPRS_SPIKE=42",
+            "echo \"PROBE env_across_commands=$LOOPRS_SPIKE\"",
+            "(sleep 1 &) ; sleep 0.3; echo \"PROBE jobs=$(jobs | wc -l)\"",
+            "echo \"PROBE sudo=$(sudo -n true 2>&1 | head -1)\"",
+        ],
+    ),
+];
+
+/// What a [`warm`] call bought. The numbers are of the call that **did** the
+/// work: [`warm`] is memoised, so every later call returns the same report and
+/// does nothing, which is what makes it safe to leave in a startup path that
+/// might be entered more than once.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Warmup {
+    /// µs spent deserialising the syntax set and the theme (the work
+    /// [`highlighter`] does on its first call).
+    pub load_us: u128,
+    /// Per language, in warm order: µs of that language's **first** highlighted
+    /// line, which is where the lazy regex compiles land.
+    pub langs: Vec<(&'static str, u128)>,
+    /// Requested names with no syntax in the set — the warm-up bought nothing for
+    /// these, so the log says so instead of counting them as covered.
+    pub fell_back: Vec<&'static str>,
+}
+
+impl Warmup {
+    /// Everything the warm-up cost, in µs of CPU.
+    pub fn total_us(&self) -> u128 {
+        self.load_us + self.langs.iter().map(|(_, us)| *us).sum::<u128>()
+    }
+}
+
+/// Is the startup warm-up on? Same shape as `clipboard::copy_on_select_enabled`:
+/// a pure function of the string, so every branch is reachable from a test
+/// without a process env (the "no environment" rule in the contributor guide).
+///
+/// Default **on** — the fix is the default and the knob is the exception. What
+/// the knob is *for* is the other half of the measurement: the cold block in
+/// [`spikes/results/highlight-load-cost.log`](../../spikes/results/highlight-load-cost.log)
+/// is produced by turning this off, and a fix that cannot be turned off is a fix
+/// whose before/after cannot be re-taken without checking out an old commit.
+pub fn warm_enabled(raw: Option<String>) -> bool {
+    match raw.map(|v| v.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(v) => !(v == "0" || v == "off" || v == "no" || v == "false"),
+    }
+}
+
+/// Read `LOOPRS_WARM_HIGHLIGHT` once and start (or decline) the warm-up.
+///
+/// A detached [`std::thread`] rather than `tokio::task::spawn_blocking`, and
+/// the reason is the **exit** path rather than the start one: tokio's
+/// `BlockingPool::drop` calls `shutdown(None)`, which *joins* its worker
+/// threads, so a warm-up on the blocking pool is a warm-up that a `Ctrl-Q`
+/// taken inside the first second of the run has to wait out. A detached thread
+/// dies with the process, which is the only version of "best effort" that puts
+/// nothing on quitting. Same shape as `services::journal` and `session::bash`,
+/// both of which need a thread that outlives the async layer's moods.
+///
+/// Returns whether the thread was started, so the caller can say so; the
+/// warm-up's own report is logged by the thread when it lands.
+pub fn spawn_warm_from_env() -> bool {
+    if !warm_enabled(std::env::var("LOOPRS_WARM_HIGHLIGHT").ok()) {
+        tracing::info!(
+            "highlight warm: off (LOOPRS_WARM_HIGHLIGHT) — the frame that renders the first fenced \
+             block of each language will pay the load itself"
+        );
+        return false;
+    }
+    match std::thread::Builder::new()
+        .name("hl-warm".into())
+        .spawn(|| {
+            let w = warm(WARM_PROBES);
+            tracing::info!(
+                load_ms = w.load_us as u64 / 1000,
+                langs = ?w.langs.iter().map(|(l, us)| format!("{l}:{}ms", us / 1000)).collect::<Vec<_>>(),
+                fell_back = ?w.fell_back,
+                total_ms = w.total_us() as u64 / 1000,
+                "highlight warm: syntax set + theme + per-language regex compiles paid off the draw path"
+            );
+        }) {
+        Ok(_) => true,
+        Err(e) => {
+            // Not a startup failure. The app runs; the first fence pays what
+            // this thread would have paid, which is exactly the behaviour
+            // before the fix, reported rather than silent.
+            tracing::warn!("highlight warm: could not start the warm thread ({e}) — running without it");
+            false
+        }
+    }
+}
+
+/// Pay the highlighter's one-time costs **now** so no frame has to.
+///
+/// Two costs hide behind the first fenced code block a session renders, and
+/// neither of them has anything to do with the line that triggers it:
+///
+/// 1. **deserialising** the default syntax set and theme — cheap, and not the
+///    problem: 0.9 ms, 430.6 KiB retained, 518.9 KiB peak, +1.73 MiB of RSS,
+///    identical in both regex-backend builds because both read the same dump;
+/// 2. per-language, per-pattern **regex compilation**, which syntect does
+///    lazily on first use and caches in the `OnceCell` inside each `Regex`
+///    held by the loaded `SyntaxSet` — so it is per-process, it outlives the
+///    [`HighlightLines`] that triggered it, and one call on a background
+///    thread pays it for every frame that follows. This is the expensive one
+///    and the one that holds the megabytes.
+///
+/// #2 is what shows up to the user as a hitch. Cold, over the twelve-pass
+/// corpus: 58.4 ms of first-block stalls pooled over five languages, largest
+/// single first block 20.9 ms = **131% of a 16 ms frame**, worst single line
+/// 13.2 ms. Warmed by this function: 5.7 ms pooled, worst line 2.3 ms. None
+/// of that stall is attributable to the text being rendered when it arrives,
+/// so a fix that made the *load* faster would not have removed it — which is
+/// why this ticket is about when the work happens, not about doing less of it.
+///
+/// Call it from a thread that is not the draw path (see
+/// [`spawn_warm_from_env`] for why that thread is detached). The retained
+/// bytes do not change — 26.5 MiB of Rust heap / 44.8 MiB of RSS for the four
+/// languages the corpus fences in, for the life of the process, shared
+/// ([`crate::session::view::RETAINED_BYTES_WORST_CASE`] says why that is not
+/// counted as history) — all that moves is *when* it is paid.
+pub fn warm(probes: &[(&'static str, &'static [&'static str])]) -> Warmup {
+    static DONE: OnceLock<Warmup> = OnceLock::new();
+    DONE.get_or_init(|| {
+        let t0 = Instant::now();
+        let hl = highlighter();
+        let load_us = t0.elapsed().as_micros();
+
+        let mut langs = Vec::with_capacity(probes.len());
+        let mut fell_back = Vec::new();
+        for (lang, lines) in probes {
+            if !hl.has_syntax(lang) {
+                fell_back.push(*lang);
+                continue;
+            }
+            let t = Instant::now();
+            let mut h = hl.start(lang);
+            for line in *lines {
+                // The result is thrown away on purpose: the point is the work
+                // inside `highlight_line`, not the spans. `code_line` is the
+                // app's own door, so what this warms is what the app uses.
+                let _ = code_line(&mut h, line);
+            }
+            langs.push((*lang, t.elapsed().as_micros()));
+        }
+        Warmup {
+            load_us,
+            langs,
+            fell_back,
+        }
+    })
+    .clone()
 }
 
 /// One highlighted code line with a gutter. Call once per *completed* line.
@@ -376,6 +645,78 @@ fn trim_trailing(v: &mut [Span<'static>]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The control the RSS blocks in
+    /// [`spikes/regex_backend_cost.sh`](../../spikes/regex_backend_cost.sh) read
+    /// their baseline off: a test that paints markdown and never touches
+    /// syntect. The `assert!` is that, checked in the process that also runs the
+    /// colour assertion below — a baseline that quietly started loading the
+    /// syntax set would make every RSS delta in that log too small.
+    #[test]
+    fn markdown_with_no_fence_never_touches_the_highlighter() {
+        let _ = render_markdown("plain prose, no fence anywhere", 40);
+        assert!(
+            !INITIALISED_HIGHLIGHTER.with(|c| c.get()),
+            "the baseline block of the RSS measurement now loads syntect, which makes every RSS \
+             delta in that log too small to mean anything"
+        );
+    }
+
+    /// The knob is a table, not a story: unset and anything unrecognised leave
+    /// the warm-up **on**, and only an explicit negative turns it off.
+    #[test]
+    fn the_warm_knob_off_is_a_statement_and_not_a_typo() {
+        for off in [
+            Some("0".into()),
+            Some("off".into()),
+            Some("NO".into()),
+            Some(" false ".into()),
+        ] {
+            assert!(
+                !warm_enabled(off.clone()),
+                "{off:?} should switch the warm-up off"
+            );
+        }
+        for on in [None, Some("1".into()), Some("yes".into()), Some("".into())] {
+            assert!(
+                warm_enabled(on.clone()),
+                "{on:?} should leave the warm-up on"
+            );
+        }
+    }
+
+    /// Every language in the warm list has to be a real syntax, or the warm-up
+    /// spends a thread to buy nothing and the startup log says so in
+    /// `fell_back` — which is the failure mode this pins down rather than
+    /// discovers in a log nobody reads.
+    #[test]
+    fn every_warmed_language_is_a_real_syntax() {
+        let hl = highlighter();
+        for (lang, lines) in WARM_PROBES {
+            assert!(
+                hl.has_syntax(lang),
+                "`{lang}` is not a syntax in the default set"
+            );
+            assert!(!lines.is_empty(), "`{lang}` has nothing to highlight");
+        }
+        assert!(
+            !hl.has_syntax(""),
+            "an untagged fence should fall through to plain text, not resolve to something"
+        );
+    }
+
+    /// The memoisation the startup path relies on: calling it again returns the
+    /// same report and does not re-load the world.
+    #[test]
+    fn warming_twice_is_one_warm_up() {
+        let a = warm(WARM_PROBES);
+        let b = warm(WARM_PROBES);
+        assert_eq!(
+            a, b,
+            "a second warm() must report the work the first one did"
+        );
+        assert!(a.load_us > 0 || !a.langs.is_empty());
+    }
 
     /// Markdown's two blues are the palette's, not `Color::Blue`.
     ///
