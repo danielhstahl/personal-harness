@@ -24,8 +24,8 @@ RUN mkdir -p /app/loop
 #ADD loop/package-lock.json /app/loop/package-lock.json
 #ADD loop/package.json /app/loop/package.json
 #RUN cd /app/loop && npm ci
-#ENV NPM_CONFIG_PREFIX=/app/.npm-global
-#ENV PATH=$PATH:/app/.npm-global/bin
+ENV NPM_CONFIG_PREFIX=/app/.npm-global
+ENV PATH=$PATH:/app/.npm-global/bin
 #
 COPY --from=0 /app/target/release/looprs /app/looprs
 #ADD loop/src /app/loop/src
@@ -66,7 +66,7 @@ RUN git clone https://github.com/flutter/flutter.git -b ${FLUTTER_VERSION} --dep
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/home/appuser/.cargo/bin:${PATH}"
 
-# uses beads to handle work
-# RUN pi install npm:pi-workgraph
+# make sure bash times out if it waits too long
+RUN pi install npm:@piotr-oles/pi-bash-timeout
 WORKDIR /workspace
 ENTRYPOINT ["/app/entrypoint.sh"]

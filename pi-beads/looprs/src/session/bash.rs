@@ -1442,12 +1442,9 @@ mod tests {
     #[tokio::test]
     async fn cwd_persists_across_commands() {
         let (mut s, mut rx) = bash(3);
-        //let tmp = std::env::temp_dir();
         let target = "/tmp";
         s.send_text(format!("cd {target}")).unwrap();
         run_command(&mut rx).await;
-        //assert!(tmp.exists(), "test precondition: {target} should exist");
-
         s.send_text("pwd".into()).unwrap();
         let (out, code) = run_command(&mut rx).await;
         assert_eq!(code, Some(0));
@@ -1456,6 +1453,11 @@ mod tests {
             .map(str::trim)
             .filter(|l| l.starts_with('/') && !l.is_empty())
             .collect();
+
+        for tmpline in trimmed.iter() {
+            println!("This is a line: {}", tmpline);
+        }
+
         assert!(
             trimmed
                 .iter()
