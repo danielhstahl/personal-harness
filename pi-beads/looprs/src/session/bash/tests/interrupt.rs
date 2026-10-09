@@ -21,7 +21,7 @@ use super::*;
 async fn esc_interrupts_a_running_command_without_killing_the_shell() {
     let (mut s, mut rx) = bash(7);
     warm_shell(&mut s, &mut rx).await;
-    in_flight(&mut s, "sleep 30").await;
+    in_flight(&mut s, "echo star''ted; sleep 30").await;
 
     let at_esc = std::time::Instant::now();
     s.abort().unwrap();
@@ -206,7 +206,7 @@ async fn an_esc_aimed_at_a_queued_command_takes_it_out_of_the_queue() {
 async fn esc_says_cancelling_before_the_command_reports_itself_done() {
     let (mut s, mut rx) = bash(22);
     warm_shell(&mut s, &mut rx).await;
-    in_flight(&mut s, "sleep 30").await;
+    in_flight(&mut s, "echo star''ted; sleep 30").await;
     drain(&mut rx);
 
     s.abort().unwrap();
