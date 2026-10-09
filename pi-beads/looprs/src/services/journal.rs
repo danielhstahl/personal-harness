@@ -8,11 +8,22 @@
 //!
 //! ```text
 //! $LOOPRS_TRANSCRIPT_DIR · $XDG_DATA_HOME/looprs/transcripts · ~/.local/share/looprs/transcripts
-//!     session-20261007T040456Z-31721-beads.txt     this run, this mode
-//!     session-20261007T040456Z-31721-pi.txt        …and this one
-//!     last            -> …-beads.txt               the most recently written
-//!     last-beads      -> …-beads.txt               one per mode, for when you know
+//!     session-20261009T034008Z-84367-Beeds.txt    this run, this mode
+//!     session-20261009T034004Z-84354-Pi.txt       …and this one
+//!     last            -> …-Beeds.txt               the most recently written
+//!     last-Beeds      -> …-Beeds.txt               one per mode, for when you know
+//!     last-Pi         -> …-Pi.txt                 the other modes, same shape
+//!     last-Bash       -> …-Bash.txt               a mode that never ran has none
 //! ```
+//!
+//! The mode in those names is `TerminalType::label()` interpolated verbatim by
+//! [`session_path`]: capitalised `Beeds`, `Pi`, `Bash` — **not** the lowercase
+//! word as it reads in prose. Type what `ls` shows. Nothing in the program keeps
+//! this block honest (`session_path` accepts any string), so the test
+//! `the_header_block_names_the_files_the_writer_actually_writes` pins it to the
+//! labels instead: the cost of getting this wrong is an operator typing the
+//! documented name, getting `No such file or directory` for a file that is
+//! standing right there, and concluding the journal never ran.
 //!
 //! # This file is for reading. It is not the record.
 //!
@@ -130,10 +141,12 @@ pub const CLOSE_BUDGET: Duration = Duration::from_secs(2);
 pub trait Journal: fmt::Debug + Send + Sync + 'static {
     /// Hand over the next chunk of one mode's transcript. Never blocks.
     ///
-    /// `mode` is the label of the session that said it (`"beads"`, `"pi"`,
-    /// `"bash"`); the journal keeps one file per mode so a session's document is
-    /// never interleaved with another's, which is what makes each of them
-    /// readable end to end.
+    /// `mode` is the label of the session that said it, straight from
+    /// `TerminalType::label()` — `"Beeds"`, `"Pi"`, `"Bash"`, capitalised, and
+    /// used verbatim as the file name's mode suffix (see [`session_path`]); the
+    /// journal keeps one file per mode so a session's document is never
+    /// interleaved with another's, which is what makes each of them readable
+    /// end to end.
     fn append(&self, mode: &'static str, text: String);
 
     /// Where a trimmed scrollback should send the reader, for that mode.
@@ -369,11 +382,17 @@ fn append_to(
     Ok(())
 }
 
-/// `session-<UTC>-<pid>-<mode>.txt`.
+/// `session-<UTC>-<pid>-<Mode>.txt`.
 ///
 /// UTC and ISO-shaped so the directory sorts chronologically by `ls`, and the
 /// pid so two runs of the same mode in the same second cannot collide and eat
 /// each other's history.
+///
+/// `mode` is written into the name exactly as passed — no case folding, no
+/// lowercasing — which is why the files on disk read `Beeds` / `Pi` / `Bash`:
+/// every production caller hands over `TerminalType::label()`. A mode string is
+/// an opaque key here, so two spellings of one mode are two modes and would get
+/// two files and two `last-…` links.
 pub fn session_path(dir: &Path, mode: &str, when: SystemTime) -> PathBuf {
     let secs = when
         .duration_since(UNIX_EPOCH)
@@ -509,6 +528,7 @@ pub fn default_journal() -> Arc<dyn Journal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::TerminalType;
 
     /// A scratch directory that cannot collide with another test's, and is gone
     /// when the test is done.
@@ -592,7 +612,7 @@ mod tests {
     fn the_transcript_lands_before_the_session_ends() {
         let scratch = Scratch::new("lands");
         let j = FileJournal::new(&scratch.0);
-        j.append("beads", "the first answer\n".into());
+        j.append(TerminalType::Beeds.label(), "the first answer\n".into());
         let files = wait_for_files(&scratch.0, 1);
         assert_eq!(files.len(), 1, "one file for one mode: {files:?}");
         let body = wait_for(&scratch.0.join(&files[0]), "the first answer");
@@ -606,11 +626,11 @@ mod tests {
     fn each_entry_is_durable_as_it_finalises_not_in_one_fall() {
         let scratch = Scratch::new("per-chunk");
         let j = FileJournal::new(&scratch.0);
-        j.append("beads", "one\n".into());
+        j.append(TerminalType::Beeds.label(), "one\n".into());
         let files = wait_for_files(&scratch.0, 1);
         let path = scratch.0.join(&files[0]);
         wait_for(&path, "one");
-        j.append("beads", "two\n".into());
+        j.append(TerminalType::Beeds.label(), "two\n".into());
         let body = wait_for(&path, "two");
         assert_eq!(body, "one\ntwo\n", "in order, with no separator invented");
         j.close();
@@ -621,21 +641,25 @@ mod tests {
     /// neither readable end to end.
     #[test]
     fn one_mode_never_writes_into_another_modes_file() {
+        // The file-name suffixes, derived from the labels rather than typed out,
+        // so this greps for the names that are really written.
+        let beads_suffix = format!("-{}.txt", TerminalType::Beeds.label());
+        let pi_suffix = format!("-{}.txt", TerminalType::Pi.label());
         let scratch = Scratch::new("per-mode");
         let j = FileJournal::new(&scratch.0);
-        j.append("beads", "beads said this\n".into());
-        j.append("pi", "pi said that\n".into());
-        j.append("beads", "beads said more\n".into());
+        j.append(TerminalType::Beeds.label(), "beads said this\n".into());
+        j.append(TerminalType::Pi.label(), "pi said that\n".into());
+        j.append(TerminalType::Beeds.label(), "beads said more\n".into());
         let files = wait_for_files(&scratch.0, 2);
         assert_eq!(files.len(), 2, "one per mode: {files:?}");
         let beads: Vec<String> = files
             .iter()
-            .filter(|f| f.ends_with("-beads.txt"))
+            .filter(|f| f.ends_with(&beads_suffix))
             .map(|f| wait_for(&scratch.0.join(f), "beads said more"))
             .collect();
         let pi: Vec<String> = files
             .iter()
-            .filter(|f| f.ends_with("-pi.txt"))
+            .filter(|f| f.ends_with(&pi_suffix))
             .map(|f| wait_for(&scratch.0.join(f), "pi said that"))
             .collect();
         assert_eq!(beads.len(), 1);
@@ -650,11 +674,12 @@ mod tests {
     /// joined by forty more.
     #[test]
     fn the_last_links_point_at_something_a_user_can_type() {
+        let last_beads = format!("last-{}", TerminalType::Beeds.label());
         let scratch = Scratch::new("links");
         let j = FileJournal::new(&scratch.0);
-        j.append("beads", "hello\n".into());
+        j.append(TerminalType::Beeds.label(), "hello\n".into());
         let target = scratch.0.join(&wait_for_files(&scratch.0, 1)[0]);
-        for name in ["last", "last-beads"] {
+        for name in ["last", last_beads.as_str()] {
             let link = scratch.0.join(name);
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while std::fs::read_link(&link)
@@ -671,9 +696,9 @@ mod tests {
             );
         }
         assert_eq!(
-            j.display_path("beads"),
+            j.display_path(TerminalType::Beeds.label()),
             Some(crate::services::transcript_file::display_path(
-                &scratch.0.join("last-beads")
+                &scratch.0.join(&last_beads)
             )),
             "and the hint the marker shows is that link"
         );
@@ -686,11 +711,14 @@ mod tests {
     fn a_mode_that_never_spoke_has_no_path_to_show() {
         let scratch = Scratch::new("silent");
         let j = FileJournal::new(&scratch.0);
-        assert_eq!(j.display_path("bash"), None);
-        j.append("beads", "x\n".into());
+        assert_eq!(j.display_path(TerminalType::Bash.label()), None);
+        j.append(TerminalType::Beeds.label(), "x\n".into());
         wait_for(&scratch.0.join(&wait_for_files(&scratch.0, 1)[0]), "x");
-        assert!(j.display_path("beads").is_some());
-        assert!(j.display_path("bash").is_none(), "bash still has no file");
+        assert!(j.display_path(TerminalType::Beeds.label()).is_some());
+        assert!(
+            j.display_path(TerminalType::Bash.label()).is_none(),
+            "bash still has no file"
+        );
         j.close();
     }
 
@@ -702,7 +730,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let scratch = Scratch::new("mode");
         let j = FileJournal::new(&scratch.0);
-        j.append("beads", "secret pasted thing\n".into());
+        j.append(TerminalType::Beeds.label(), "secret pasted thing\n".into());
         let path = scratch.0.join(&wait_for_files(&scratch.0, 1)[0]);
         wait_for(&path, "secret pasted thing");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -727,7 +755,7 @@ mod tests {
         let big = "x".repeat(64 * 1024);
         let started = std::time::Instant::now();
         for _ in 0..(QUEUE_CHUNKS * 8) {
-            j.append("beads", big.clone());
+            j.append(TerminalType::Beeds.label(), big.clone());
         }
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -753,8 +781,8 @@ mod tests {
     fn close_drains_what_was_handed_over_and_nothing_else() {
         let scratch = Scratch::new("drain");
         let j = FileJournal::new(&scratch.0);
-        j.append("beads", "a\n".into());
-        j.append("beads", "b\n".into());
+        j.append(TerminalType::Beeds.label(), "a\n".into());
+        j.append(TerminalType::Beeds.label(), "b\n".into());
         j.close();
         let body = read(&scratch.0.join(&only_files(&scratch.0)[0]));
         assert_eq!(body, "a\nb\n", "both chunks made it out");
@@ -771,8 +799,8 @@ mod tests {
     #[test]
     fn the_disabled_journal_writes_nothing_and_names_nothing() {
         let j = Disabled;
-        j.append("beads", "x".into());
-        assert_eq!(j.display_path("beads"), None);
+        j.append(TerminalType::Beeds.label(), "x".into());
+        assert_eq!(j.display_path(TerminalType::Beeds.label()), None);
         assert_eq!(j.describe(), "off");
     }
 
@@ -787,22 +815,151 @@ mod tests {
     /// The file name is the sort order and the collision guard, so both are
     /// worth pinning: UTC (never local time, which would sort the directory by
     /// whatever TZ the loop happened to run under) and the pid (two runs in the
-    /// same second, one file each).
+    /// same second, one file each). The mode part is pinned to
+    /// `TerminalType::label()` verbatim — the same string the callers pass, not
+    /// a lowercase stand-in for it.
     #[test]
     fn the_file_name_is_utc_shaped_and_pid_unique() {
         let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let p = session_path(Path::new("/j"), "beads", t);
+        let p = session_path(Path::new("/j"), TerminalType::Beeds.label(), t);
         let name = p.file_name().unwrap().to_string_lossy().to_string();
         assert_eq!(
             name,
             format!(
-                "session-{}-{}-beads.txt",
+                "session-{}-{}-{}.txt",
                 civil_utc(1_700_000_000),
-                std::process::id()
+                std::process::id(),
+                TerminalType::Beeds.label()
             )
         );
         assert!(name.starts_with("session-20231114T221320Z-"), "{name}");
+        assert!(
+            name.ends_with("-Beeds.txt"),
+            "{name}: the mode is the label, capitalised, as the writer spells it"
+        );
         assert_eq!(p.parent().unwrap(), Path::new("/j"));
+    }
+
+    /// **The layout block at the top of this file is a path an operator is
+    /// told to type, so it gets checked against the writer, not against
+    /// someone's memory.**
+    ///
+    /// `session_path` interpolates the mode string verbatim, which is what
+    /// made looprs-00u.21 invisible to the code: renaming `label()` moves the
+    /// bytes on disk without touching anything that could fail a compile, and
+    /// the only thing left wrong is the prose at the top of the module — and
+    /// prose cannot fail a build. The header said `last-beads` for the entire
+    /// time the directory carried `last-Beeds`, and the operator who trusted it
+    /// got `No such file or directory` for a file that was standing right
+    /// there.
+    ///
+    /// Asserted against this file's own source — the precedent set by
+    /// `kanban.rs`, `router.rs` and `main.rs` — because the two sides of the
+    /// claim, a doc block and a `format!`, share no symbol a compiler could
+    /// check. The non-vacuity half: rewrite the block back to lowercase
+    /// `-beads.txt` and this fails on both the suffix check and the
+    /// completeness check.
+    #[test]
+    fn the_header_block_names_the_files_the_writer_actually_writes() {
+        let src = include_str!("journal.rs");
+        // The module header only: everything from the test attribute down is
+        // tests, which legitimately contain the strings grepped for here.
+        let header = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let block = header
+            .split("```text\n")
+            .nth(1)
+            .and_then(|rest| rest.split("```").next())
+            .expect("the module header has a ```text layout block");
+
+        let labels: Vec<&'static str> = TerminalType::ALL.iter().map(|m| m.label()).collect();
+
+        let mut shown_files: Vec<String> = Vec::new();
+        let mut shown_links: Vec<String> = Vec::new();
+        for token in block.split_whitespace() {
+            if let Some(stem) = token.strip_suffix(".txt") {
+                shown_files.push(stem.to_string());
+            } else if let Some(rest) = token.strip_prefix("last-") {
+                shown_links.push(rest.to_string());
+            }
+        }
+        // Non-vacuity: the block really is a listing, not a paragraph.
+        assert!(
+            shown_files.len() >= 2,
+            "the header block names at least two session files, saw {shown_files:?}"
+        );
+        assert!(
+            shown_links.len() >= labels.len(),
+            "the header block shows one `last-<mode>` link per mode, saw {shown_links:?}"
+        );
+
+        // Every documented session file is `session-<stamp>-<pid>-<Label>.txt`
+        // with the mode spelled the way the type spells it. Case-sensitive on
+        // purpose: the whole bug is a case.
+        for stem in &shown_files {
+            // The mode is the last dash-separated component. `…-Beeds.txt` in
+            // the block is an elided path, not a fourth shape, so the full
+            // four-part check only applies where the name is written out.
+            let mode = stem.rsplit('-').next().unwrap_or(stem);
+            assert!(
+                labels.contains(&mode),
+                "{stem}.txt: mode {mode:?} is not a TerminalType::label() {labels:?} — \
+                 the block must spell the mode as the writer does",
+            );
+            if stem.starts_with("session-") {
+                assert_eq!(
+                    stem.split('-').count(),
+                    4,
+                    "{stem}.txt: session-<utc>-<pid>-<mode>, nothing shorter"
+                );
+            }
+        }
+
+        // And every documented link is `last-<Label>`.
+        for mode in &shown_links {
+            assert!(
+                labels.contains(&mode.as_str()),
+                "last-{mode}: not a TerminalType::label() {labels:?}"
+            );
+        }
+
+        // Completeness: each mode the app can be in appears in the block, so a
+        // fourth TerminalType has to be written into the header before it can
+        // be left out of it.
+        for label in &labels {
+            assert!(
+                shown_files
+                    .iter()
+                    .any(|f| f.ends_with(&format!("-{label}")))
+                    || shown_links.iter().any(|l| l == label),
+                "mode {label} is undocumented in the header's layout block"
+            );
+            // The name the writer would really produce for this mode, checked
+            // against the same shape the block advertises.
+            let produced = session_path(Path::new("/j"), label, SystemTime::UNIX_EPOCH)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            assert!(
+                produced.ends_with(&format!("-{label}.txt")),
+                "session_path produced {produced} for mode {label}; the header must \
+                 document that spelling"
+            );
+            // Same name, two spellings: what the writer makes for this mode and
+            // what the block advertises must agree on the mode component.
+            let produced_mode = produced
+                .trim_end_matches(".txt")
+                .rsplit('-')
+                .next()
+                .unwrap_or_default();
+            assert!(
+                shown_files
+                    .iter()
+                    .any(|f| { f.rsplit('-').next().unwrap_or_default() == produced_mode }),
+                "no header file name carries the mode suffix {produced_mode} that \
+                 session_path produces for {label}"
+            );
+        }
     }
 
     /// The hand-rolled civil-time formatter, checked against dates whose UTC
