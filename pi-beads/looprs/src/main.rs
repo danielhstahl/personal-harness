@@ -2150,7 +2150,7 @@ mod tests {
             // poller, not about what the journal saves — and with the sweep on
             // the tick the "re-poll that costs nothing" it asserts is a re-read
             // of the same board rather than a tick that skipped reading.
-            journal: crate::services::board_poller::JournalConfig {
+            journal: crate::services::board_poller::config::JournalConfig {
                 enabled: true,
                 reconcile: Duration::from_millis(50),
             },
