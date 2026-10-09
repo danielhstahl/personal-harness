@@ -214,6 +214,13 @@ Costs / follow-ups:
   thread (or `spawn_blocking`) feeding the existing mpsc pattern. Do not block the tokio runtime.
 - **Shutdown discipline:** the pty child must die with looprs. Follow looprs-ecr: kill on drop,
   reap, close the master so the reader thread sees EOF, and make terminal-restore idempotent.
+  **Where that reap gets taken is not a free choice (looprs-2ck).** The task that owns the child
+  is the same task that drains the reader thread's byte lane, so a blocking `Child::wait` taken
+  there can hold all three at once — the task on the child, the reader on the lane, and the
+  child on the tty flush inside `exit(2)` — and nothing in the process can move again. The rule
+  is *never reap alone*: keep draining the lane while polling, bound every phase, and hand over
+  anything still alive to a detached reaper thread that owns the last blocking wait. See
+  "The shutdown hang the `--skip` used to shadow" in [testing.md](../testing.md).
 - **Terminal-state seam:** raw passthrough then repaint requires forcing ratatui's diff (see
   rule 4 above). Untested seams here are the most likely source of "screen is garbled after
   exit-ing vim" bug reports.

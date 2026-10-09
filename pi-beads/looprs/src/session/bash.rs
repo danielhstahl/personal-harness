@@ -32,11 +32,11 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicU64;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::screen::{Piece, ScreenWatch};
@@ -64,8 +64,33 @@ const MARKER_BUFFER_MAX: usize = 4096;
 /// the screen a shell is ever allowed to run. 8 × 8 KiB = 64 KiB.
 pub(crate) const BYTE_LANE_DEPTH: usize = 8;
 
-/// How long a `kill` gets to land before we stop waiting for the child.
-const KILL_WAIT: Duration = Duration::from_secs(2);
+/// How long the shell gets to leave on its own after being asked, before the
+/// kill goes in.
+const EXIT_ASK: Duration = Duration::from_secs(2);
+
+/// How long to keep pumping the byte lane after the kill, waiting for the reap.
+///
+/// A `SIGKILL`ed shell is dead already; the only thing that can keep the *wait*
+/// waiting is the tty buffer it still has to flush, and that drains at the
+/// reader thread's pace. One second of pumping covers a full pty at any speed
+/// this pipe can carry it. Past that the shell is not coming back on this
+/// task's clock, and the remaining wait moves off the task (see
+/// [`reap_off_task`]).
+const KILL_REAP: Duration = Duration::from_secs(1);
+
+/// The gap between reap polls.
+///
+/// Short enough to notice a death inside a frame, long enough not to burn a
+/// core while a shell drains a full pty buffer.
+const REAP_POLL: Duration = Duration::from_millis(5);
+
+/// How long the reaper thread polls before it stops trying to be quiet about a
+/// child that has not been reaped.
+///
+/// After this it says out loud what it is waiting for and takes the blocking
+/// `wait` — which is only acceptable because the thread taking it is detached
+/// and nothing in the process is waiting on *it*.
+const REAPER_REPORT: Duration = Duration::from_millis(500);
 
 /// The shell integration, generated at spawn time.
 ///
@@ -107,7 +132,7 @@ true
 /// queued forever.
 fn write_integration() -> Result<PathBuf> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
         "looprs-bash-integration-{}-{}.sh",
         std::process::id(),
@@ -120,14 +145,27 @@ fn write_integration() -> Result<PathBuf> {
 
 /// The live shell: the child, the two ends of its pty, and the reader thread.
 struct Shell {
-    child: Box<dyn Child + Send + Sync>,
+    /// The child, until the shutdown handoff takes it (looprs-2ck).
+    ///
+    /// An `Option` for exactly one reason: the shutdown path has to be able to
+    /// leave this struct behind holding everything *except* the thing it cannot
+    /// wait for. Once the reaper owns the child this is `None`, which is also
+    /// what stops [`Drop for Shell`] from killing a child somebody else has
+    /// promised to wait on. A `Shell` with `child == None` is not a broken
+    /// shell, it is a shell whose reap is elsewhere.
+    child: Option<Box<dyn Child + Send + Sync>>,
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty>,
     integration: PathBuf,
 }
 
 impl Shell {
-    fn spawn(cfg: &SessionConfig, size: PtySize, tx: mpsc::Sender<ByteLane>) -> Result<Self> {
+    fn spawn(
+        cfg: &SessionConfig,
+        size: PtySize,
+        tx: mpsc::Sender<ByteLane>,
+        readers_live: &Arc<AtomicUsize>,
+    ) -> Result<Self> {
         let integration = write_integration()?;
         let pty = native_pty_system();
         let pair = pty
@@ -170,13 +208,25 @@ impl Shell {
             .map_err(|e| anyhow!("could not write the pty master: {e}"))?;
 
         let budget = cfg.output_budget.clone();
+        // Counted from *before* the spawn until the thread's last instruction.
+        // The window worth measuring is "a reader thread exists that might be
+        // parked", and a thread that has been spawned but not yet entered its
+        // body is exactly that; a count taken inside the thread could read 0
+        // while a parked thread already exists.
+        let live = LiveReaders::new(readers_live);
         std::thread::Builder::new()
             .name("looprs-bash-reader".into())
-            .spawn(move || read_master(reader, tx, budget))
+            .spawn(move || {
+                // Held for the whole thread, including the unwinding exit: the
+                // guard is what makes "is a reader still parked?" answerable at
+                // shutdown instead of assumed (looprs-2ck).
+                let _live = live;
+                read_master(reader, tx, budget)
+            })
             .map_err(|e| anyhow!("could not start the pty reader thread: {e}"))?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             writer,
             master: pair.master,
             integration,
@@ -210,21 +260,22 @@ impl Shell {
         }
     }
 
-    /// Tear the shell down hard, and report how it went.
-    fn kill_and_reap(&mut self) -> ExitReason {
-        let _ = self.child.kill();
-        match self.child.wait() {
-            Ok(status) => {
-                let code = status.exit_code();
-                if status.success() || code == 0 {
-                    ExitReason::Shutdown
-                } else {
-                    ExitReason::Crashed {
-                        code: Some(code as i32),
-                    }
-                }
-            }
-            Err(_) => ExitReason::Unknown,
+    /// Poll the child without blocking it.
+    ///
+    /// `Ok(None)` covers both "still running" and "this handle gave the child
+    /// to the reaper" — every caller of this treats the two the same way,
+    /// because in both cases there is nothing here to wait on.
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        match self.child.as_mut() {
+            Some(child) => child.try_wait(),
+            None => Ok(None),
+        }
+    }
+
+    /// `SIGKILL` the child, if this handle still owns one.
+    fn kill(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
         }
     }
 }
@@ -234,7 +285,14 @@ impl Drop for Shell {
         // Whatever path gets us here — shutdown, replacement, a panic — the shell
         // goes with us. A bash that outlives looprs is the orphan looprs-ecr is
         // about, and ADR-0001's "Shutdown discipline".
-        let _ = self.child.kill();
+        //
+        // Kill only; **never wait**. A `wait` here would be a blocking reap taken
+        // from inside whatever task happened to drop the shell, which is the
+        // hang looprs-2ck is about, wearing a `Drop` as a disguise. A child
+        // killed and not waited on is a zombie for the rest of this process's
+        // life, which costs one pid and blocks nothing; a thread parked in
+        // `wait4` on the task that owns the pty costs the whole process.
+        self.kill();
         let _ = std::fs::remove_file(&self.integration);
     }
 }
@@ -245,6 +303,28 @@ enum ByteLane {
     Chunk(Vec<u8>),
     /// EOF or a read error: nothing more will ever come.
     Eof,
+}
+
+/// A guard that keeps a session's live-reader count honest.
+///
+/// Incremented by the spawner *before* the thread exists and decremented when
+/// the thread's body finishes — by return, by early exit, or by unwinding, which
+/// is the whole reason it is a `Drop` rather than two statements. That pairing
+/// is what lets the shutdown path ask "is a reader still parked?" instead of
+/// assuming one is not (looprs-2ck).
+struct LiveReaders(Arc<AtomicUsize>);
+
+impl LiveReaders {
+    fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count.clone())
+    }
+}
+
+impl Drop for LiveReaders {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// The reader thread: blocking `read` on the master, bytes into the session task.
@@ -397,6 +477,15 @@ struct BashTask {
     /// (ADR-0001 Q2). The watcher is the single source of truth: `is_held()` is
     /// the answer the whole app obeys.
     screen: ScreenWatch,
+    /// How many pty reader threads this session has that have not finished.
+    ///
+    /// Not a metric: it is the shutdown path's view of the *second* property
+    /// looprs-2ck has to hold, and it has to be counted rather than inferred
+    /// because "the reader thread ended" is a statement about a thread this
+    /// task cannot see. Respawned shells each bring their own reader, so this
+    /// counts rather than flips a flag; 0 means no reader is parked anywhere on
+    /// this session's lane.
+    readers_live: Arc<AtomicUsize>,
     /// Bytes held back only because they may be the start of a multi-byte UTF-8
     /// sequence that a read boundary split in half.
     utf8: Vec<u8>,
@@ -469,7 +558,12 @@ impl BashTask {
             return Ok(());
         }
         let respawning = self.had_shell;
-        let shell = Shell::spawn(&self.cfg, self.size, self.bytes_tx.clone())?;
+        let shell = Shell::spawn(
+            &self.cfg,
+            self.size,
+            self.bytes_tx.clone(),
+            &self.readers_live,
+        )?;
         self.shell = Some(shell);
         self.had_shell = true;
         // A new shell is an unread shell: no prompt has come from it yet.
@@ -856,7 +950,7 @@ impl BashTask {
         self.release_screen_at_command_end();
         let reason = match self.shell.as_mut() {
             None => return,
-            Some(shell) => match shell.child.try_wait() {
+            Some(shell) => match shell.try_wait() {
                 Ok(Some(status)) => {
                     if status.success() {
                         ExitReason::Shutdown
@@ -867,7 +961,7 @@ impl BashTask {
                     }
                 }
                 _ => {
-                    let _ = shell.child.kill();
+                    shell.kill();
                     ExitReason::Unknown
                 }
             },
@@ -905,7 +999,33 @@ impl BashTask {
         }
     }
 
-    fn shutdown(&mut self) {
+    /// Bring the shell down without ever being the thing that blocks on it.
+    ///
+    /// The old shape of this function was a hang that only a busy machine could
+    /// find (looprs-2ck): ask the shell to `exit`, sleep-poll `try_wait` for the
+    /// grace, then `kill()` and **block in `Child::wait`**. That block is taken
+    /// by the one task in this design that drains the pty byte lane, and the
+    /// reader thread's only way out is to land a buffer on that lane. A shell
+    /// that dies with output in flight blocks in `exit(2)` with its tty buffer
+    /// unflushed, the reader parks in `blocking_send`, this task parks in
+    /// `wait4`, and the three of them hold each other down forever — `ps` shows
+    /// the child stuck in `?Es`, *trying to exit*, and never reaped. No
+    /// tolerance fixes that, because nothing is running to be tolerant of.
+    ///
+    /// The rule that replaces it is **never reap alone**. Every wait in here
+    /// takes the byte lane with it ([`reap_while_draining`]): the reader keeps
+    /// emptying the pty, the dying child keeps flushing, and the death arrives
+    /// on a `try_wait` instead of on a parked thread. And whatever has not
+    /// arrived when the bound runs out is handed to a detached thread that owns
+    /// the last blocking wait in this file ([`reap_off_task`]), so the two
+    /// properties hold whatever the child decides to do next:
+    ///
+    /// * **this returns** — bounded by `EXIT_ASK + KILL_REAP`, with no wait of
+    ///   any kind left behind on the task; and
+    /// * **the reader thread ends** — this task finishing drops the lane's
+    ///   receiver, which is exactly the wake-up a parked `blocking_send` is
+    ///   waiting for; it returns `Err` and the read end goes with it.
+    fn shutdown(&mut self, rx: &mut mpsc::Receiver<ByteLane>) {
         // The screen debt is paid *before* the shell is sent anywhere. A program
         // that held the alternate screen and dies without saying so leaves the user
         // stranded inside it — their prompt gone, the dead program's paint still on
@@ -920,28 +1040,36 @@ impl BashTask {
         // only state in which the app tees bytes instead of transcripting them.
         self.release_screen_at_command_end();
 
-        if let Some(mut shell) = self.shell.take() {
-            // Close the write end first so a shell reading stdin sees EOF, then
-            // make sure it is actually gone.
-            let _ = shell.writer.write_all(b"\nexit\n");
-            let _ = shell.writer.flush();
-            let deadline = std::time::Instant::now() + KILL_WAIT;
-            loop {
-                match shell.child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {
-                        if std::time::Instant::now() > deadline {
-                            tracing::warn!("{}: shell would not exit; killing it", self.id);
-                            let _ = shell.kill_and_reap();
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    Err(_) => break,
-                }
-            }
+        let Some(mut shell) = self.shell.take() else {
+            return;
+        };
+
+        // Ask first, and close the write end so a shell reading stdin sees EOF:
+        // an orderly `exit` is the version of this where bash runs its own exit
+        // traps and reports its own last status.
+        let _ = shell.writer.write_all(b"\nexit\n");
+        let _ = shell.writer.flush();
+
+        // The polite reap. A shell with a foreground command that never ends
+        // (`yes`, a build, a pager) never reads that `exit`, so this bound is
+        // what turns "polite, indefinitely" into "polite for `EXIT_ASK`".
+        if reap_while_draining(self, rx, &mut shell, EXIT_ASK) {
+            return;
         }
-        // Dropping `shell` kills anything still alive and removes the rc file.
+        tracing::warn!("{}: shell would not exit; killing it", self.id);
+        shell.kill();
+
+        // The forced reap, in the same lock-step. A `SIGKILL`ed shell whose only
+        // debt is a full tty is reaped inside this bound *because* the draining
+        // is what pays it — which is precisely the debt that used to be paid by
+        // never returning.
+        if reap_while_draining(self, rx, &mut shell, KILL_REAP) {
+            return;
+        }
+
+        // Two bounds deep and still not reaped: nothing this task can do next is
+        // short, so it stops trying to be the one that finishes the job.
+        reap_off_task(self.id, shell, &self.readers_live);
     }
 }
 
@@ -1015,11 +1143,137 @@ fn drain_lane_now(task: &mut BashTask, rx: &mut mpsc::Receiver<ByteLane>) {
     }
 }
 
+/// Poll for the shell's death **with the byte lane moving the whole time**.
+///
+/// `true` means it is gone (or that this handle has nothing left to wait on);
+/// `false` means it was still there when `wait` ran out.
+///
+/// The drain is not a courtesy to the transcript. Every buffer the reader
+/// thread is holding is a buffer the dying child is still trying to write, and
+/// the only thing in this process that frees it is this task taking it. So a
+/// `try_wait` loop that does *not* drain is a loop waiting for a death its own
+/// refusal has prevented — which is the deadlock looprs-2ck was called for.
+/// Draining first on every turn is what turns it into a wait that ends.
+fn reap_while_draining(
+    task: &mut BashTask,
+    rx: &mut mpsc::Receiver<ByteLane>,
+    shell: &mut Shell,
+    wait: Duration,
+) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        drain_lane_now(task, rx);
+        match shell.try_wait() {
+            // Reaped, or too far gone to ask about again. Either way there is
+            // nothing left here worth waiting for.
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(REAP_POLL);
+    }
+}
+
+/// Hand a child that will not be reaped to a thread whose only job is waiting
+/// for it (looprs-2ck). The only place in this file allowed to call
+/// [`Child::wait`].
+///
+/// Three steps, in this order, because each one is what makes the next safe:
+///
+/// 1. **take the child out of the shell**, so `Drop for Shell` cannot kill what
+///    the reaper has just been promised.
+/// 2. **drop the shell**, closing this end of the pty, the writer, and the
+///    generated rc file. Note what that is *not*: the reader thread holds its
+///    own duplicated read end, so the tty is not destroyed by this step.
+/// 3. **start the reaper**, detached and joined by nobody.
+///
+/// Nothing in here waits for the child before returning. That is the point:
+/// once this returns the session task finishes and drops the byte lane's
+/// receiver, the reader thread's parked `blocking_send` fails, its read end
+/// goes with it — and *that* is the moment the tty is finally released and a
+/// child stuck in `exit(2)` can finish. The reaper is where that landing gets
+/// logged.
+fn reap_off_task(id: SessionId, mut shell: Shell, readers_live: &Arc<AtomicUsize>) {
+    let Some(mut child) = shell.child.take() else {
+        return;
+    };
+    let pid = child.process_id();
+    drop(shell);
+    let readers = readers_live.load(Ordering::SeqCst);
+    // Cloned *before* the move: from here the `Child` itself belongs to the
+    // reaper thread, and the only thing left to do without it is kill.
+    let mut killer = child.clone_killer();
+
+    let spawned = std::thread::Builder::new()
+        .name("looprs-bash-reaper".into())
+        .spawn(move || {
+            let started = Instant::now();
+            // Polled first, so a shell that merely has not gotten here yet is
+            // reaped without a warning rather than a verdict.
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        tracing::info!(
+                            "{id}: reaped the shell it was handed after {:?} (code {})",
+                            started.elapsed(),
+                            status.exit_code()
+                        );
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("{id}: giving up on the shell it was handed: {e}");
+                        return;
+                    }
+                }
+                if started.elapsed() >= REAPER_REPORT {
+                    break;
+                }
+                std::thread::sleep(REAP_POLL);
+            }
+            // Still here, `SIGKILL` already sent, and past the point of
+            // pretending this is quick. Say what is being waited on, and where,
+            // before taking the blocking reap: a `sample` of a process that
+            // will not quit should point at a thread named for waiting, not at a
+            // session task or a pty reader that were both made to wait for it.
+            tracing::warn!(
+                "{id}: shell {pid:?} still unreaped {:?} after SIGKILL ({readers} pty reader \
+                 thread(s) still live); waiting for it here, on the detached reaper thread, so that \
+                 no task and no reader has to",
+                REAPER_REPORT
+            );
+            let _ = child.kill();
+            match child.wait() {
+                Ok(status) => tracing::warn!(
+                    "{id}: reaped shell {pid:?} after {:?} (code {})",
+                    started.elapsed(),
+                    status.exit_code()
+                ),
+                Err(e) => tracing::warn!("{id}: shell {pid:?} never reported back: {e}"),
+            }
+        });
+
+    if spawned.is_err() {
+        // No thread and therefore no reap. Kill it so it cannot run on, and say
+        // so plainly: the residue is one unreaped pid, which is the smaller
+        // failure next to a task that waited for it.
+        tracing::warn!(
+            "{id}: could not start the reaper thread; killed the shell and left it unreaped"
+        );
+        let _ = killer.kill();
+    }
+}
+
 /// Handle onto the Bash session.
 pub struct BashSession {
     id: SessionId,
     cmd: mpsc::UnboundedSender<BashCmd>,
     status: Arc<StdMutex<SessionStatus>>,
+    /// See [`BashTask::readers_live`] — the same counter, reachable without the
+    /// task (looprs-2ck).
+    readers_live: Arc<AtomicUsize>,
 }
 
 impl BashSession {
@@ -1050,6 +1304,9 @@ impl BashSession {
         let (bytes_tx, mut bytes_rx) = mpsc::channel::<ByteLane>(BYTE_LANE_DEPTH);
         let status = Arc::new(StdMutex::new(SessionStatus::NotStarted));
         let task_status = status.clone();
+        // Shared with the task so the handle can answer "is a reader thread of
+        // mine still parked?" without owning the thread (looprs-2ck).
+        let readers_live = Arc::new(AtomicUsize::new(0));
 
         let mut task = BashTask {
             id,
@@ -1067,6 +1324,7 @@ impl BashSession {
             stall_reported: false,
             pending: Vec::new(),
             output_emitted: 0,
+            readers_live: readers_live.clone(),
             // The one place the session learns who owns the alternate screen. With
             // the app in the alternate screen, the child's own enter/leave pair is
             // cut out of the stream here rather than teed (ADR-0001 amendment 4),
@@ -1143,7 +1401,11 @@ impl BashSession {
                                 // straight to `task.shutdown()` would drop the
                                 // last thing the child said.
                                 drain_lane_now(&mut task, &mut bytes_rx);
-                                task.shutdown();
+                                // The lane goes *with* the shutdown: the reap
+                                // keeps draining it so the reader thread and
+                                // the dying child can both finish instead of
+                                // parking on each other (looprs-2ck).
+                                task.shutdown(&mut bytes_rx);
                                 *task_status.lock().unwrap() = SessionStatus::Dead;
                                 let _ = ev_tx.send(SessionEvent::Exited {
                                     reason: ExitReason::Shutdown,
@@ -1183,6 +1445,7 @@ impl BashSession {
                 id,
                 cmd: cmd_tx,
                 status,
+                readers_live,
             },
             ev_rx,
         ))
@@ -1259,6 +1522,19 @@ impl Session for BashSession {
 
     fn status(&self) -> SessionStatus {
         *self.status.lock().unwrap()
+    }
+}
+
+impl BashSession {
+    /// How many of this session's pty reader threads have not finished.
+    ///
+    /// `0` is the answer the exit path wants: it means no reader thread of ours
+    /// is parked on a byte lane that has stopped draining. Diagnostic first, and
+    /// load-bearing in `bash::tests`, where it is the only way to assert the
+    /// *reader ends* half of looprs-2ck instead of assuming it.
+    #[allow(dead_code)] // consumer: bash::tests ("the reader thread ends")
+    pub fn readers_live(&self) -> usize {
+        self.readers_live.load(Ordering::SeqCst)
     }
 }
 
@@ -2203,6 +2479,129 @@ mod tests {
         }
         assert!(down, "shutdown did not report the session gone");
         assert_eq!(s.status(), SessionStatus::Dead);
+    }
+
+    /// How long the fixed shutdown is allowed to take: `EXIT_ASK + KILL_REAP`
+    /// is 3 s of design, and this is that with the room a loaded runner needs to
+    /// spend it — a **failure bound**, never a wait the test reasons about.
+    ///
+    /// It is also the shape of the bug: the pre-looprs-2ck code did not exceed
+    /// this bound, it never came back at all, which is why the stress command
+    /// used to carry this test's name in a `--skip`.
+    const SHUTDOWN_RETURNED_WITHIN: Duration = Duration::from_secs(12);
+
+    /// Poll until this session has no live reader thread, up to `bound`.
+    ///
+    /// A poll on an atomic rather than a sleep-and-hope, because the thing being
+    /// watched is the existence of a thread this task cannot see. `readers_live`
+    /// is incremented before the thread is spawned and decremented when its
+    /// body finishes by any exit, so 0 is a fact about the thread and not a
+    /// guess from a quiet channel.
+    async fn readers_gone(s: &BashSession, bound: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            let live = s.readers_live();
+            if live == 0 || tokio::time::Instant::now() >= deadline {
+                return live;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// **Acceptance: shutdown returns while the byte lane is full and the reader
+    /// is parked on it** (looprs-2ck).
+    ///
+    /// `yes` is the worst case the exit path can be handed, for three reasons
+    /// at once, and the bug needed all three: it never reads the `exit` we send
+    /// (a foreground job owns the shell), so the polite phase always runs out;
+    /// it outruns the lane immediately, so the reader thread is parked in
+    /// `blocking_send` instead of in `read(2)`; and it leaves the pty's own
+    /// kernel buffer full of bytes nobody has taken, which is what a dying
+    /// child blocks on inside `exit(2)`.
+    ///
+    /// The old code put the session task into `wait4` there and the three of
+    /// them held each other down: task waiting on child, reader waiting on lane,
+    /// child waiting on the tty the reader had stopped emptying. What is
+    /// asserted is the ticket's two properties rather than the mechanism that
+    /// now provides them — **the session reports itself gone** (the `down` line
+    /// is emitted only after `BashTask::shutdown` returns) and **the reader
+    /// thread ends** (`readers_live` reaches 0, which needs the parked send to
+    /// fail against a dropped receiver).
+    #[tokio::test]
+    async fn shutdown_returns_while_the_lane_is_full_and_the_reader_is_parked() {
+        let (mut s, mut rx) = bash(32);
+        warm_shell(&mut s, &mut rx).await;
+        in_flight(&mut s, "yes").await;
+        // Let the producer get far enough ahead that the reader has something
+        // in hand and nowhere to put it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            s.readers_live(),
+            1,
+            "the shell we are about to shut down should have exactly one reader thread"
+        );
+
+        let started = Instant::now();
+        s.shutdown().unwrap();
+
+        let seen = until_event(&mut rx, |l| l.starts_with("down "), "the shutdown notice").await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SHUTDOWN_RETURNED_WITHIN,
+            "shutdown took {elapsed:?} to report the session gone, past the {SHUTDOWN_RETURNED_WITHIN:?} \
+             the whole reap is budgeted for: {seen:?}"
+        );
+        assert_eq!(
+            s.status(),
+            SessionStatus::Dead,
+            "the session said it was down without making itself dead"
+        );
+
+        // The second property, and the one that used to be unverifiable: a
+        // reader parked on a lane that has stopped draining is the failure, so
+        // watch the count rather than the bytes.
+        let readers = readers_gone(&s, Duration::from_secs(5)).await;
+        assert_eq!(
+            readers, 0,
+            "a reader thread is still parked on this session's byte lane after {elapsed:?}"
+        );
+    }
+
+    /// **Acceptance: a shell that will not take the `exit` gets killed, and the
+    /// kill is bounded too** (looprs-2ck).
+    ///
+    /// The quiet half of the case above: `sleep 30` fills nothing, so the only
+    /// thing that can go wrong here is the wait itself. The assertion that this
+    /// really travelled the kill path rather than exiting politely is timing in
+    /// the *only* direction load cannot bend: it took **at least** `EXIT_ASK`,
+    /// because the ask deadline is armed before the shell is even asked and
+    /// nothing can make it elapse sooner.
+    #[tokio::test]
+    async fn a_shell_that_ignores_the_exit_is_killed_within_the_bound() {
+        let (mut s, mut rx) = bash(33);
+        warm_shell(&mut s, &mut rx).await;
+        in_flight(&mut s, "sleep 30").await;
+
+        let started = Instant::now();
+        s.shutdown().unwrap();
+        let seen = until_event(&mut rx, |l| l.starts_with("down "), "the shutdown notice").await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= EXIT_ASK,
+            "this shutdown finished in {elapsed:?}, before the {EXIT_ASK:?} ask was even over, so it \
+             never reached the kill it was meant to test: {seen:?}"
+        );
+        assert!(
+            elapsed < EXIT_ASK + KILL_REAP * 4,
+            "the kill-and-reap phase outstayed its budget ({elapsed:?} total, {KILL_REAP:?} budgeted): \
+             {seen:?}"
+        );
+        assert_eq!(
+            readers_gone(&s, Duration::from_secs(5)).await,
+            0,
+            "the reader thread outlived the shell it was reading"
+        );
     }
 
     /// A shell that cannot be spawned is a reported error, not a hang: the mode

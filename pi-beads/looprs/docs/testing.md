@@ -321,11 +321,8 @@ test now asserts.
 N `yes > /dev/null` processes over the box and prints a per-round verdict:
 
 ```sh
-# 20 rounds of the full suite, 8 test threads, 12 CPU hogs. The one --skip is
-# the pre-existing shutdown hang named below — not a flake being waved away, but a
-# test that never returns under load and so reports nothing about the round.
-HOGS=12 LOG=/tmp/stress.log ./scripts/stress_test.sh "$(pwd)" 20 8 \
-    --skip=session::bash::tests::shutdown_leaves_no_shell_running
+# 20 rounds of the full suite, 8 test threads, 12 CPU hogs, nothing skipped.
+HOGS=12 LOG=/tmp/stress.log ./scripts/stress_test.sh "$(pwd)" 20 8
 ```
 
 The four run concurrently with all 850-odd other tests in every one of those
@@ -338,21 +335,74 @@ until `bash: wq!: command not found`, which is not `:wq!`. It now asks the child
 for the bytes by value (`head -c 6 | od -An -tx1`) instead of reading the echo, so
 it proves more and waits less.
 
-**What this ticket names instead of fixing.** Stressing the suite that way turned up
-a worse failure than the four it set out to remove, and it is not one of them.
-`shutdown_leaves_no_shell_running` hangs forever under the same contention on the
-**pre-ticket** code too — three of eight control rounds of the unmodified
-`session::bash` hung there, which is what makes it pre-existing rather than
-something this diff brought in. The stack says why it never comes back: the session
-task is inside `BashTask::shutdown` → `Shell::kill_and_reap` → `Child::wait`, and
-the `looprs-bash-reader` thread is parked in `blocking_send` on the bounded byte
-lane that only that task drains. A blocking `wait` taken inside the async task, with
-the lane it exists to feed left unattended behind it, is not a tolerance problem:
-no event-driven test can see past it, because the test never reaches its
-assertions. The fix is on the product side — a bounded reap, or the reader drained
-while the reap runs — and it is filed as its own ticket rather than ridden in on
-this one. The `--skip` above is that ticket's shadow: every other test in the suite,
-including all four of these, runs in those rounds.
+### The shutdown hang the `--skip` used to shadow (`looprs-2ck`)
+
+This page used to run the stress command above with
+`--skip=session::bash::tests::shutdown_leaves_no_shell_running`, and said the skip
+was "a test that never returns under load", which was true and was not the end of
+it. The skip is gone, and so is the hang it stood over.
+
+`BashTask::shutdown` used to ask the shell to `exit`, sleep-poll `try_wait` for two
+seconds, then `kill()` and **block in `Child::wait`** — from inside the async task
+that owns the pty. That task is the only thing that drains the byte lane, and the
+reader thread's only way out of a read loop is to land a buffer on it, so a shell
+dying with output in flight deadlocks three parties at once:
+
+| who | parked at | waiting on |
+| --- | --- | --- |
+| the session task | `Shell::kill_and_reap` → `Child::wait` → `__wait4` | the child |
+| `looprs-bash-reader` | `mpsc::blocking_send` → `__psynch_cvwait` | the lane only that task drains |
+| the shell itself | `exit(2)` → the tty flush | the pty buffer the reader stopped emptying |
+
+`HOGS=12` hung 4 of 8 rounds of that one test with the pre-ticket code, `ps -o stat`
+called the child `?Es` — *trying to exit* — and never reaped, and the watchdog had
+to kill the round. Nothing in that stack was a tolerance problem: no event-driven test
+can see past it, because the test never reaches its assertions. A quit during a long
+command — Ctrl-Q with `yes` still pouring, an exit while the transcript is draining —
+is a terminal the user has to go and kill by hand.
+
+The rule in `src/session/bash.rs` now is **never reap alone**:
+
+* **The reap drains while it waits.** `reap_while_draining` takes the byte lane with
+  it on every turn. That is not a courtesy to the transcript: every buffer the reader
+  is holding is a buffer the dying child is still trying to write, so a `try_wait`
+  loop that does not drain is a loop waiting for a death its own refusal caused.
+* **Every phase is bounded.** `EXIT_ASK` (2 s) asked politely, `SIGKILL`, then
+  `KILL_REAP` (1 s) of the same drained polling: 3 s of design that no child can
+  stretch, because each deadline is armed before the thing it bounds.
+* **What outlives the bounds goes off-task.** `reap_off_task` detaches the child into
+  a `looprs-bash-reaper` thread, which owns the last blocking `wait` in the file and
+  *logs what it is waiting for* — pid, how long, how many reader threads are still
+  live — instead of holding the process open quietly. A thread named for waiting is a
+  diagnosable stall; a session task in `wait4` is not.
+* **`Drop for Shell` kills and never waits.** A blocking reap taken from a `Drop` is
+  the same bug wearing a different hat, and the drop path runs from inside whatever
+  task happens to let go. The residue of kill-without-wait is one zombie pid in a
+  process that is leaving anyway; a task parked in `wait4` is the terminal.
+
+Two properties hold, and both are asserted rather than assumed: **shutdown returns**,
+and **the reader thread ends**. The second needed a number rather than a feeling, so
+reader threads are counted — `LiveReaders`, held from before the spawn until the body
+finishes by any exit including a panic, surfaced as `BashSession::readers_live()` —
+and the tests watch the count reach zero. A parked reader used to be invisible; now
+it is the thing a test fails on.
+
+| new test | the shape it drives |
+| --- | --- |
+| `shutdown_returns_while_the_lane_is_full_and_the_reader_is_parked` | `yes` — the worst case on all three axes at once: the shell never reads the `exit` we send, the lane is full so the reader is parked in `blocking_send` rather than in `read(2)`, and the kernel's pty buffer is full of what the dying child must flush. Asserts the `down` notice inside `SHUTDOWN_RETURNED_WITHIN` and `readers_live() == 0` |
+| `a_shell_that_ignores_the_exit_is_killed_within_the_bound` | `sleep 30` — the quiet half, where nothing is draining and the only thing that can go wrong is the wait itself. Asserts the shutdown took **at least** `EXIT_ASK`, a lower bound no load can bend because the deadline is armed before the ask, so the test proves it travelled the kill path instead of exiting politely by accident |
+
+**Measured both ways.** Twenty rounds at 8 threads under 12 hogs with nothing skipped
+(`looprs-2ck`): **no HANG round at all** — 18 green, 2 red, on
+`esc_interrupts_…` and `beads::…the_loop_takes_its_next_pass_…`. Twenty rounds of
+the **same tree with only `src/session/bash.rs` reverted**, carrying the old `--skip`
+so the rounds finish: also 2 red of 20, on
+`beads::…the_loop_takes_its_next_pass_…` and
+`board_poller::…a_probe_that_cannot_answer_never_reads_as_a_quiet_board`. Same rate,
+different names each time, and the shutdown test in neither failing list: those two
+(or three) are ambient contention noise in the suite, not something this change
+brought in and not this ticket's to fix. What changed is that the exit path is now one
+of the things those rounds are actually testing.
 
 ### `bd` missing / failing surfaces (looprs-037)
 
@@ -600,8 +650,8 @@ The fix has three parts, and the third is the one that keeps the check honest:
    `LOOPRS_NO_REAP=1` turns the reaper off.
 3. **Prove the check can still fail.** A check scoped to a recorded set passes exactly as
    quietly when the recording is broken as when the run is clean, so
-   `scenario_leak_is_named` makes a real leak — `SIGKILL`, the one exit no `Drop`, no
-   `kill_and_reap` and no rc-file removal covers — and requires the scoped check to name the
+   `scenario_leak_is_named` makes a real leak — `SIGKILL`, the one exit no `Drop` kill,
+   no reaper thread and no rc-file removal covers — and requires the scoped check to name the
    pid it recorded, the shell from the generated rc file and the busy child inside it, before
    reaping what it leaked. Plant the dirt with
    [`./scripts/plant_stale_debris.sh`](../scripts/plant_stale_debris.sh).
@@ -632,7 +682,7 @@ LOOPRS_BIN=/tmp/base-target/debug/looprs python3 spikes/shutdown_e2e.py \
 | `SIGHUP`, default modes | `raw`, `alt_screen`, `cursor_hidden` | same |
 | `LOOPRS_PANIC=draw` | every mode, panicked inside the frame | each mode still left exactly once, exit code 101, tty cooked |
 | full-screen child killed while it holds the screen | nothing: the frame hosts the alternate screen, so the child's `?1049h` is **cut** and replaced by the canvas (ADR-0001 amendment 4) | the child painted on the screen it was handed; one `?1049h` in the whole run (the app's own); **no debt to pay and no leave from the session**; exactly one `?1049l`, at exit; nothing after it; tty cooked |
-| `SIGKILL` over a live shell (`leak`) | a child this run spawned, deliberately orphaned — no `Drop`, no `kill_and_reap`, no rc-file removal | **the leak check fires**: the recorded shell from the generated rc file and the busy child inside it are both named by pid; the scenario then reaps its own leak and ends clean. This is the non-vacuity half — a scoped check that never fired on a real leak would be passing on an empty list |
+| `SIGKILL` over a live shell (`leak`) | a child this run spawned, deliberately orphaned — no `Drop` kill, no reaper, no rc-file removal | **the leak check fires**: the recorded shell from the generated rc file and the busy child inside it are both named by pid; the scenario then reaps its own leak and ends clean. This is the non-vacuity half — a scoped check that never fired on a real leak would be passing on an empty list |
 
 **Rewritten by `pdl.4`, not silenced.** `flash_e2e.py` used to be this file's named
 exception — 0/3, 25 reshapes against a ≤19.5 budget, worst hole ~3.6 ms — and it stayed that
