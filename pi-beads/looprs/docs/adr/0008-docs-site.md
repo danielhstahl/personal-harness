@@ -30,8 +30,8 @@ it is published.
 
 | thing | size |
 | --- | --- |
-| Markdown under `docs/` (after this epic's pages) | **7,071 lines** as first published; **7,280 lines** re-measured 2026-10-09 in the improvement sweep |
-| …including `spikes/` (which the site carries) | **7,564 lines** in that same re-measurement |
+| Markdown under `docs/` (after this epic's pages) | **7,071 lines** as first published; **7,281 lines** re-measured 2026-10-09 in the improvement sweep |
+| …including `spikes/` (which the site carries) | **7,565 lines** in that same re-measurement |
 | How either number is obtained | `find docs spikes -name '*.md' -not -path 'docs/_site/*' \| xargs wc -l \| tail -1`. Re-run it; do not re-type it. The pair originally written here was "7,071 / 7,056", which cannot both be true — the superset was 15 lines *smaller* than its own part. Corrected by the sweep (`looprs-00u.27`) |
 | Markdown before this epic | 4,558 lines (`docs/`), 5,003 with `spikes/` |
 | Distinct relative link targets outside `docs/` | `src/*.rs`, `spikes/*.py`, `spikes/results/*.log`, `examples/*.rs`, `tests/fixtures` |
