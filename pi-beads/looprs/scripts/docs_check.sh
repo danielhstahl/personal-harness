@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# The docs rot gate (looprs-00u.10 / ADR-0008) — a shell wrapper around
+# scripts/docs_check.py so the step in scripts/check.sh looks like the other steps
+# and can be run the same way.
+#
+#   ./scripts/docs_check.sh                # the gate
+#   ./scripts/docs_check.sh --fix-keymap  # regenerate docs/guide/keymap.md's tables
+#   ./scripts/docs_check.sh --list-knobs  # every LOOPRS_* the code reads, with file:line
+#
+# Runs in well under a second, needs no network and no cargo, and is a step of
+# ./scripts/check.sh. See the Python file for what the three checks are and why
+# each one is worth a gate.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "docs_check.sh: python3 is not on PATH" >&2
+    exit 127
+fi
+exec python3 "$here/docs_check.py" "$@"

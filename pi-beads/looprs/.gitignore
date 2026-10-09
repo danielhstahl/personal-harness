@@ -11,3 +11,6 @@ looprs.log
 # Python bytecode from the spike drivers (they import each other)
 __pycache__/
 .beads.gate.lock
+
+# The generated docs site (ADR-0008 Q3: built, not committed).
+docs/_site/

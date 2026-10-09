@@ -8,9 +8,16 @@
 #   3. `cargo test`          — everything green, with no network and no model calls
 #   4. `scripts/dead_audit.py --gate` — every `#[allow(dead_code)]` still covers
 #         dead code
+#   5. `scripts/docs_check.sh` — no dead link or orphan page, every `LOOPRS_*` the
+#         code reads is documented, no two defaults disagree, and the keymap tables
+#         still match `CHORD_TABLE`
 #
 # The order is deliberate: fmt and clippy are seconds-long and explain themselves, so
-# they run before the ~20s test suite rather than after it.
+# they run before the ~20s test suite rather than after it. Step 5 runs last for the
+# same reason in reverse: it is the fastest step in the gate (<1s, no cargo, no
+# network) and its failures are prose failures, which are the ones you want to see
+# after the code has stopped shouting — but it is not optional, because a docs check
+# that only runs when someone remembers is a docs check that has already rotpped.
 #
 # Step 4 is not covered by step 2. `-D warnings` stops a *new* unjustified allow
 # from being added; it says nothing about the ones already in the tree, and an
@@ -51,5 +58,8 @@ cargo test
 echo "==> dead-code allow audit"
 python3 "$(dirname "${BASH_SOURCE[0]}")/dead_audit.py" --gate
 
+echo "==> docs rot gate (links, knob coverage, keymap coverage)"
+"$(dirname "${BASH_SOURCE[0]}")/docs_check.sh"
+
 echo
-echo "gate: clean (fmt, clippy -D warnings, tests, dead-code audit)"
+echo "gate: clean (fmt, clippy -D warnings, tests, dead-code audit, docs)"

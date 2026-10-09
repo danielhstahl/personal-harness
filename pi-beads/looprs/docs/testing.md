@@ -20,6 +20,13 @@ multi-process, three-backend TUI without a model, a board, or a terminal.
 1. `cargo fmt --check`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
+4. `scripts/dead_audit.py --gate` — every `#[allow(dead_code)]` still covers dead
+   code
+5. `scripts/docs_check.sh` — the docs rot gate: no dead internal link, no page
+   outside the site tree, every `LOOPRS_*` the code reads is in the
+   [configuration reference](guide/configuration.md), no two pages state a
+   different default for one knob, and the
+   [keymap](guide/keymap.md) tables still match `CHORD_TABLE`
 
 The same gate is declared three ways, because each one catches a different kind of
 person:
@@ -29,6 +36,15 @@ person:
 | `Cargo.toml` `[lints.clippy] all = "deny"` | `cargo clippy` alone is a gate; nobody gets to "forget" `-D warnings` |
 | `scripts/check.sh` | one command that means "this branch is mergeable" |
 | `tests/warning_gate.rs` (`--ignored`) | reachable from `cargo test` without leaving the cargo mindset |
+
+The docs step is new with the docs site and follows the same shape on purpose: the
+half a prose review catches is not checkable, but a dead link, an undocumented knob
+and a drifted table all are, and a docs rule that is not checked has a half-life of
+about a month. `./scripts/docs_check.sh` runs in under a second, needs no network
+and no cargo, and its three checks are described in
+[ADR-0008](adr/0008-docs-site.md) and in
+[the contributor guide](guide/contributing.md). The generator itself is
+`./scripts/docs.sh` (`build` / `serve` / `check`).
 
 CI runs `scripts/check.sh` (`.github/workflows/looprs-gate.yml`, at the repo root,
 path-filtered to `pi-beads/looprs/**`).
@@ -394,9 +410,14 @@ trusts), and the planner (it holds no claim, so its spend lands in the window of
 the first bead that follows it rather than being zeroed away).
 
 **Dropped bytes are gone from the row.** They were ADR-0002's scrollback-integrity
-signal for the buffer cap, and that signal still exists where the loss happens: the
-view inserts a `… N bytes dropped (buffer cap) …` notice into the transcript
-itself (`session::view::tests`). The row spends the room on cost instead.
+signal for the buffer cap, and that signal still exists where the loss happens — at
+the marker row at the top of the band, which reads
+`⌄ scrollback trimmed: N earlier lines dropped` and names the journal file that kept
+what the store dropped. The view no longer inserts a `… N bytes dropped (buffer cap) …`
+*entry* into the transcript (see
+[`session/view.rs`](../src/session/view.rs), `trim_open_entry`'s doc: the entry is
+gone because the marker row says the same thing where the user can see it). The row
+spends the room on cost instead.
 
 ### A compaction says so (the compaction card)
 
