@@ -30,7 +30,12 @@
 #         run was never captured, so nothing in the repo could contradict the page),
 #         and every test name a page quotes in backticks answers to a real `fn` of
 #         that name in the tree (looprs-00u.25: a page whose point is that the test
-#         list is a specification quoted a name that could not be grepped for)
+#         list is a specification quoted a name that could not be grepped for),
+#         and every `*.py`/`*.sh` under `spikes/` has a row in `spikes/README.md`
+#         while no row points at a driver that is gone (looprs-00u.26: two pages
+#         call that file *the* index of what each spike measures, and it was
+#         missing three drivers — two of them linked from those pages by name, so
+#         the index said a cited file did not exist)
 #
 # The order is deliberate: fmt and clippy are seconds-long and explain themselves, so
 # they run before the ~20s test suite rather than after it. Step 7 runs last for the

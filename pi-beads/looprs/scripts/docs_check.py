@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The documentation rot gate (looprs-00u.10 / ADR-0008).
 
-Five checks that keep the site true after the day it was written:
+Six checks that keep the site true after the day it was written:
 
 1. **Links and orphans** — every relative link in every Markdown page resolves,
    every `#anchor` exists in the page it names, and every `.md` under `docs/` is
@@ -31,6 +31,16 @@ Five checks that keep the site true after the day it was written:
    Illustrative names that are not functions get an explicit entry in
    `ILLUSTRATIVE_TEST_NAMES` with the reason they are illustrative, and an
    entry that no longer covers a citation fails.
+6. **The spike index** (looprs-00u.26) — every `*.py` and `*.sh` under `spikes/`
+   has a row in `spikes/README.md`, and every row of that index that names a
+   path under `spikes/` points at something that exists. `spikes/README.md` is
+   cited by `docs/guide/operator.md` and `docs/guide/contributing.md` as *the*
+   index of what each spike measures; three drivers sat unindexed there while two
+   pages linked to them by name, so the index said a cited file did not exist.
+   An unindexed spike and an orphan page are the same failure arriving later,
+   which is why this check is the orphan check with the noun changed — including
+   the direction that only bites later: an index that keeps advertising a driver
+   somebody deleted is the same lie, told forward.
 
 Run from anywhere; runs in well under a second; no network, no cargo, no build.
 
@@ -38,6 +48,7 @@ Run from anywhere; runs in well under a second; no network, no cargo, no build.
     ./scripts/docs_check.py --fix-keymap    # rewrite the generated tables
     ./scripts/docs_check.py --list-knobs    # what the code reads, with file:line
     ./scripts/docs_check.py --list-captures # every committed capture and its total
+    ./scripts/docs_check.py --list-spikes   # every driver, indexed or not, with its captures
 """
 
 from __future__ import annotations
@@ -55,6 +66,7 @@ DOCS = ROOT / "docs"
 SRC = ROOT / "src"
 SPIKES = ROOT / "spikes"
 RESULTS = SPIKES / "results"
+SPIKE_INDEX = SPIKES / "README.md"
 
 # Pages outside docs/ that are part of the corpus the site carries, and whose links
 # are therefore gated. Kept short on purpose: spikes/results/*.log files are
@@ -1491,6 +1503,140 @@ def check_test_names(pages) -> tuple[list[str], int]:
     return bad, checked
 
 
+# ─────────────────── check 6: the spike index ───────────────────
+
+#: What counts as a "driver" under `spikes/`: a program you run to measure
+#: something. A fixture the drivers *use* (`fake_pi_slow.py`) counts too — it
+#: lives under `spikes/`, a reader wondering "what is this?" deserves an answer
+#: for it as much as for a measurement, and the index already carries a row for
+#: the one that exists. `--list-spikes` prints the whole set so the gate's view
+#: can be checked by hand.
+SPIKE_DRIVER_SUFFIXES = {".py", ".sh"}
+
+
+def spike_drivers() -> list[Path]:
+    """Every driver under `spikes/`, at any depth, minus the evidence and the cache.
+
+    Recursive like the orphan check it mirrors: a driver filed into
+    `spikes/subdir/` is exactly as unfindable as one at the top level, and a
+    non-recursive check would just teach people to add a directory. `results/` is
+    the committed output, not a driver, and `__pycache__` is the drivers' own
+    bytecode (`spikes/*.py` import each other).
+    """
+    if not SPIKES.is_dir():
+        return []
+    out = []
+    for path in SPIKES.rglob("*"):
+        if not path.is_file() or path.suffix not in SPIKE_DRIVER_SUFFIXES:
+            continue
+        if "results" in path.relative_to(SPIKES).parts:
+            continue
+        if "__pycache__" in path.parts or path.name.startswith((".", "_")):
+            continue
+        out.append(path)
+    return sorted(out)
+
+
+def spike_index_entries() -> list[tuple[str, int]]:
+    """`(named_path, line_no)` for the first column of every row of the index.
+
+    A **row** counts and a prose mention does not. The failure this check is
+    about is a reader who cannot find out *what measures X*; a driver name
+    inside a shell snippet in "Running it" does not answer that, and neither
+    does one in a paragraph. The table is the index, so the table is what gets
+    checked — which is also what keeps the check cheap and exact: no fuzzy
+    matching, no "did the author mention it somewhere" heuristic.
+
+    The named thing is the first backticked token in the cell, or the bare cell
+    text if there is no code span; a link in the cell (`[`x`](y)`) is unwrapped
+    first so a linked row still names the file it points at.
+    """
+    if not SPIKE_INDEX.is_file():
+        return []
+    text = SPIKE_INDEX.read_text(encoding="utf-8")
+    out: list[tuple[str, int]] = []
+    for _header, lineno, cells in md_tables(text):
+        if not cells:
+            continue
+        cell = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", cells[0])
+        codes = re.findall(r"`([^`]+)`", cell)
+        named = codes[0] if codes else cell
+        named = named.strip().strip("`*").strip()
+        if named:
+            out.append((named, lineno))
+    return out
+
+
+def check_spike_index() -> tuple[list[str], int]:
+    """Every driver under `spikes/` is indexed, and the index names no ghost.
+
+    Both halves are reported because they fail at different times and get missed
+    for different reasons. The missing row is missed on the day the driver lands
+    — or, as it happened here, three drivers and forty tickets later, because the
+    file grew from one ticket's harness into the repo-wide index while the table
+    stayed where the first ticket left it. The ghost row is found by whoever
+    follows a docs page into `spikes/README.md` looking for the measurement that
+    answers their question and is sent to a file that is not there.
+
+    The message points at the row that has to be written rather than at the
+    rule: the rule is obvious once the file is open and useless as an
+    abstraction.
+
+    Returns `(violations, drivers_checked)`.
+    """
+    drivers = spike_drivers()
+    if not SPIKE_INDEX.is_file():
+        return (
+            [
+                f"{rel(SPIKE_INDEX)}: missing — the harness has no index, and "
+                f"{len(drivers)} driver(s) under spikes/ are undocumented"
+            ],
+            len(drivers),
+        )
+
+    entries = spike_index_entries()
+    indexed: set[str] = set()
+    bad: list[str] = []
+
+    for named, lineno in entries:
+        path = named.rstrip("/")
+        if path.startswith("spikes/"):
+            target = ROOT / path
+            if not target.exists():
+                bad.append(
+                    f"{rel(SPIKE_INDEX)}:{lineno}: the index names `{path}`, which does "
+                    f"not exist — a reader following a docs page here is sent to a file "
+                    f"that isn't there"
+                )
+            if target.suffix in SPIKE_DRIVER_SUFFIXES and target.is_file():
+                indexed.add(target.name)
+            continue
+        # A bare file name in the first column still indexes the driver it names.
+        for drv in drivers:
+            if path in {drv.name, drv.stem}:
+                indexed.add(drv.name)
+
+    for drv in drivers:
+        if drv.name in indexed:
+            continue
+        bad.append(
+            f"{rel(drv)}: no row in {rel(SPIKE_INDEX)} — the declared index of the "
+            f"measurement harness is incomplete. Add a row: the ticket it answers, "
+            f"what it proves, and the committed log under "
+            f"{rel(RESULTS)}/ (or a note saying why there is no capture). An "
+            f"unindexed spike is invisible to the reader who arrives looking for "
+            f"'what measures this' — the same failure as an orphan page, "
+            f"arriving later"
+        )
+
+    # The other half of the harness's index — the Rust examples the spikes run —
+    # is deliberately not checked here. `examples/*.rs` are compiled by cargo on
+    # every gate run, so a deleted one stops the build on its own; a Python driver
+    # under `spikes/` is nothing's compile unit, which is why the index is the only
+    # thing that can notice it.
+    return bad, len(drivers)
+
+
 # ──────────────────────────────── main ────────────────────────────────
 
 
@@ -1521,6 +1667,10 @@ def main() -> int:
     ap.add_argument(
         "--list-test-names", action="store_true",
         help="print every test-shaped name the docs quote, where it resolves, and what is excused",
+    )
+    ap.add_argument(
+        "--list-spikes", action="store_true",
+        help="print every driver under spikes/, whether the index carries it, and its captures",
     )
     args = ap.parse_args()
 
@@ -1581,6 +1731,21 @@ def main() -> int:
             print(f"{leaf:62s} {where:34s} {status}")
         return 0
 
+    if args.list_spikes:
+        recs = capture_records()
+        bad, _ = check_spike_index()
+        unindexed = {line.split(":", 1)[0] for line in bad if "no row in" in line}
+        for drv in spike_drivers():
+            mine = sorted(n for n, r in recs.items() if r["spike"] == drv.name)
+            state = "NOT INDEXED" if rel(drv) in unindexed else "indexed"
+            cur = current_capture(recs, drv.name)
+            caps = ", ".join(
+                f"{n}{' <- current' if cur is not None and cur['path'].name == n else ''}"
+                for n in mine
+            )
+            print(f"{rel(drv):32s} {state:12s} {caps or 'no capture committed'}")
+        return 0
+
     pages = corpus_pages()
     violations: list[str] = []
     violations += check_links(pages)
@@ -1592,6 +1757,8 @@ def main() -> int:
     violations += measurement_violations
     name_violations, names_checked = check_test_names(pages)
     violations += name_violations
+    index_violations, drivers_checked = check_spike_index()
+    violations += index_violations
 
     if (args.fix_keymap or args.fix_wire) and not violations:
         print("docs_check: regenerated the generated tables; no other violations")
@@ -1603,8 +1770,9 @@ def main() -> int:
             print(f"  {v}")
         print()
         print("  These are docs-rot failures: a link that lands nowhere, a knob the")
-        print("  reference does not list, a page nothing links to, or a table that has")
-        print("  drifted from the code it claims to describe.")
+        print("  reference does not list, a page nothing links to, a table that has")
+        print("  drifted from the code it claims to describe, or a spike under")
+        print("  spikes/ that the harness's own index does not carry.")
         return 1
 
     if not args.quiet:
@@ -1613,7 +1781,8 @@ def main() -> int:
             f"{len(code_knobs())} knob(s), {len(parse_chord_table())} chord row(s), "
             f"{len(wire_inventory())} wire value(s), {claims_checked} measurement "
             f"claim(s) backed by spikes/results/, {names_checked} quoted test "
-            "name(s) resolved to a function in the tree)"
+            f"name(s) resolved to a function in the tree, {drivers_checked} "
+            "driver(s) under spikes/ all indexed in spikes/README.md)"
         )
     return 0
 

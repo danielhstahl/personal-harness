@@ -42,9 +42,11 @@ multi-process, three-backend TUI without a model, a board, or a terminal.
    [wire protocol](guide/wire-protocol.md) tables still match `WIRE_INVENTORY`
    and no `#[allow(dead_code)]` in `src/wire.rs` is missing the reason it
    carries, every spike check count written into prose matches a committed
-   capture in `spikes/results/` (looprs-00u.23), and every test name a page
+   capture in `spikes/results/` (looprs-00u.23), every test name a page
    quotes in backticks answers to a real `fn` of that name in the tree
-   (looprs-00u.25)
+   (looprs-00u.25), and every driver under `spikes/` has a row in
+   [`spikes/README.md`](../spikes/README.md) while no row there points at a
+   driver that is gone (looprs-00u.26)
 
 The same gate is declared three ways, because each one catches a different kind of
 person:
@@ -59,7 +61,7 @@ The docs step is new with the docs site and follows the same shape on purpose: t
 half a prose review catches is not checkable, but a dead link, an undocumented knob
 and a drifted table all are, and a docs rule that is not checked has a half-life of
 about a month. `./scripts/docs_check.sh` runs in under a second, needs no network
-and no cargo, and its five checks are described in
+and no cargo, and its six checks are described in
 [ADR-0008](adr/0008-docs-site.md) and in
 [the contributor guide](guide/contributing.md). The generator itself is
 `./scripts/docs.sh` (`build` / `serve` / `check`).
@@ -99,6 +101,25 @@ justification. The excuse list is checked in the other direction as well: an ent
 no page quotes any more fails the gate, so it cannot quietly become the dump that
 the blanket allows were. `--list-test-names` prints every citation and what happened
 to it.
+
+The sixth check is the same failure aimed at the harness itself. Two pages call
+`spikes/README.md` *the* index of what each spike measures, and it had quietly
+stopped being one: three drivers existed with no row — `spikes/ram_e2e.py`,
+`spikes/resize_transient_e2e.py` and `spikes/board_poll_cost.py` — two of them
+linked from `docs/guide/beads-loop.md` and
+[`docs/adr/0007-kanban-board.md`](adr/0007-kanban-board.md) by name, so the
+index's own readers were told a cited file did not exist. The cause is recorded in
+the file itself: it grew out of one ticket's ADR-0001 harness into the repo-wide
+index while the table stayed where the first ticket left it. So the gate now reads
+the index the way it reads `SUMMARY.md`: every `*.py` and `*.sh` under `spikes/`
+must appear as the first cell of a table row, and every row that names a path under
+`spikes/` must resolve. A name in a shell snippet in "Running it" does not count,
+because the question a reader has is not "is this file mentioned" but "what does it
+prove", and only a row answers that. The mirror half is what makes this a check and
+not a reminder: a row that outlives its driver is the lie told forward, and it is
+found by whoever follows a docs page into the index looking for the measurement
+that answers their question. `./scripts/docs_check.sh --list-spikes` prints every
+driver, whether the index carries it, and which capture of it is current.
 
 The check found two besides the one that opened the ticket, in the same commit's own
 grep: the compaction row above (`an_unknown_reason_…` for a test called

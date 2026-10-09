@@ -290,7 +290,9 @@ git worktree add --detach /tmp/looprs-ctl HEAD~20
 LOOPRS_BIN=/tmp/ctl-target/debug/looprs python3 spikes/status_e2e.py --control
 ```
 
-[spikes/README.md](../../spikes/README.md) is the index of what each spike measures.
+[spikes/README.md](../../spikes/README.md) is the index of what each spike measures
+— and the docs gate keeps it complete, so a driver that exists and is not in that
+table fails the build rather than staying unfindable.
 
 ### What to attach when you file a bug
 

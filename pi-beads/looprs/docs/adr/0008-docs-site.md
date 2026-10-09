@@ -226,7 +226,15 @@ The full `SUMMARY.md` tree as accepted, with the ticket that owns each page:
 Every entry maps to exactly one ticket in this epic or is an existing page indexed
 without being rewritten. That mapping is not just a table in this file:
 `docs_check.py`'s orphan check fails any `.md` under `docs/` that is not reachable
-from `SUMMARY.md`, so a page cannot exist outside the tree.
+from `SUMMARY.md`, so a page cannot exist outside the tree. The same rule reaches
+the harness now (`looprs-00u.26`): `spikes/README.md` is cited by
+[Files, logs and recovery](../guide/operator.md) and
+[Contributing](../guide/contributing.md) as *the* index of what each spike
+measures, and it had drifted — three drivers existed with no row while two pages
+linked to them by name. So a `*.py` or `*.sh` under `spikes/` with no row in that
+index, and an index row pointing at a driver that has been deleted, both fail the
+gate. An index that is declared authoritative and is allowed to drift is worse than
+no index, because the reader trusts it first.
 
 ## Consequences
 

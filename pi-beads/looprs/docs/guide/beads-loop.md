@@ -191,7 +191,7 @@ and no model. If you want to *see* a pass without paying for one, the drivers in
 cargo build
 python3 spikes/status_e2e.py            # the row across 6 scenarios
 python3 spikes/cancel_e2e.py            # Esc, per mode
-LOOPRS_KANBAN=1 python3 spikes/board_poll_cost.py   # what one read costs
+python3 spikes/board_poll_cost.py            # what one read of the board costs
 ```
 
 The full map of what is tested where is

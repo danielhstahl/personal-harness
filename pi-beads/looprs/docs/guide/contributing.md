@@ -322,6 +322,7 @@ rung a change has to touch**:
 | "what reaches the wire" | a real-pty spike (`spikes/*_e2e.py`) with a **control run** against the previous build | `python3 spikes/status_e2e.py` |
 | "the protocol page still says what the code does" | the generated tables vs `WIRE_INVENTORY`, plus the inventory tests that run each role through `apply_pi` | `./scripts/docs_check.py --fix-wire && cargo test wire_protocol` |
 | a spike's check count quoted in a page | the capture committed under `spikes/results/`, which the docs gate reads back against the prose | `./scripts/capture.sh <spike> <capture-name>` then `./scripts/docs_check.sh` (`--list-captures` shows every total and which capture is current) |
+| a new spike driver | a row in [`spikes/README.md`](../../spikes/README.md) — the ticket it answers, what it proves, the committed log. The index is gated in both directions: no driver without a row, no row pointing at a driver that is gone | `./scripts/docs_check.sh` (fails naming the driver); `--list-spikes` shows every driver, indexed or not, with its captures |
 | memory / cost claims | `src/measure.rs` (needs `LOOPRS_MEASURE_CORPUS`), `spikes/*.py` | `cargo test -- --ignored` |
 | anything behind a cargo feature | the **same** suite over that build; the seam is not allowed to change shape | `cargo test --features notify` |
 | a dependency's right to be in the manifest | `scripts/dep_audit.py` — named in `src/`, or answered at its own line | `python3 scripts/dep_audit.py --gate` |
