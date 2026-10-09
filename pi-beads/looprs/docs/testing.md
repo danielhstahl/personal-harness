@@ -78,20 +78,15 @@ The one warning that is not ours: `nix v0.28.0` future-incompatibility, pulled i
 [ADR-0001](adr/0001-bash-terminal-state-pty.md) rather than silenced, because the
 gate's claim is "everything except this one named thing is clean".
 
-**Known flakes, named so a green run is not mistaken for the only honest one.**
-Four of the `session::bash` tests drive a real pty and wait on real timing —
-`esc_says_cancelling_before_the_command_reports_itself_done`,
-`esc_interrupts_a_running_command_without_killing_the_shell`,
-`a_command_that_traps_the_interrupt_is_reported_not_silently_wedged` and
-`a_full_screen_program_is_handed_the_screen_and_gives_it_back`. Under the full
-suite's CPU contention they fail intermittently and pass on a re-run. Measured
-this way on the *pre*-*-scrollback binary at `195e3c0` as well as on later work
-— 2 failures in one run, 1 in the next, 0 the third, with no change in between
-— so it is the harness's tolerance, not a regression. If one fails, re-run it
-in isolation (`cargo test --bin looprs session::bash::tests::<name>`); it has
-passed in isolation every time it has been asked. Tightening the tolerance rather
-than the sleep is someone's chore: these four are the suite's only non-hermetic
-tests.
+**No test is forgiven in advance.** A gate whose failures are pre-forgiven trains
+people to ignore failures, so this page used to carry a named list of four
+`session::bash` pty tests whose red meant "re-run it in isolation, it's fine".
+That list is gone, and so is the reason for it: every wait in those tests now
+blocks on an observable — the session's own `Sync` seam, the command's exit
+marker, the byte tape — and the durations that remain are failure bounds with that
+written on them. The discipline, and how to check it under the contention that
+used to break it, is in
+[the four pty tests are event-driven](#the-four-non-hermetic-pty-tests-are-event-driven-looprs-00u17).
 
 ### Dead-code allows
 
@@ -284,20 +279,80 @@ The two halves of the fix, both needed:
 * **the product** — `interrupt` now handles the queued case instead of returning on "nothing
   outstanding" (ADR-0003: *why an Esc that arrives early still cancels*);
 * **the tests** — `warm_shell` runs one cheap command to completion first, so the shell is
-  ready and the next `send_text` goes straight to the child. `wait_running`'s doc now says out
-  loud that it cannot honour its own name on a cold shell.
+  ready and the next `send_text` goes straight to the child, and `in_flight` then proves the
+  write happened by waiting on the session's own `Sync` seam rather than by looking at
+  `status()` at all.
 
-`wait_running` on a cold shell was the shared root of
-`esc_interrupts_…`, `esc_says_cancelling_…`, `a_command_that_traps_the_interrupt_…`,
-`a_command_that_never_reported_…` and `raw_keys_reach_the_child_verbatim_…` failing on
-Actions. A separate flake of the same shape lived in the test rather than the code: the
-alt-screen test identified "the program painted" as *an event containing `painted` and an escape
-byte*, which the shell's own prompt (`\033[?1034h`) satisfies whenever the pty happens to
-coalesce the prompt with the echoed command. It now matches the escape **where the program put
-one** (`\033[?25lpainted`) and rejects the command's literal `\033[` text.
+### The four non-hermetic pty tests are event-driven (`looprs-00u.17`)
 
-Verified under load rather than hoped for: the full suite green with 8–10 `yes > /dev/null`
-hogging every core (32 s against 24 s idle, so the load was real), several runs in a row.
+Four tests drive a real pty and cannot be made hermetic without lying about the thing
+they check: `esc_interrupts_…`, `esc_says_cancelling_…`,
+`a_command_that_traps_the_interrupt_…`, `a_full_screen_program_is_handed_the_screen_…`.
+They used to fail under the full suite's CPU contention, and the honest-sounding
+answer was a list of names to re-run. Four rules replaced the list, all in
+`src/session/bash.rs`'s test module:
+
+| rule | the helper | what it replaced |
+| --- | --- | --- |
+| **Wait on the observable, not on a window.** Read the stream until the event you are asserting about arrives; the timeout is there to fail, not to wait. | `until_event(rx, pred, "what")` | `collect_within(rx, 800ms, …)` + `assert!(got.contains(…))`, which is a sleep wearing an assertion's clothes: on a loaded runner the sample came up empty and the failure said *"the keystroke was not acknowledged"* about a session that had acknowledged it late |
+| **Make "the command is in flight" a fact from the queue, not a poll.** `Sync` is handled by the same task after the `Submit`, and publishes the status mirror before it acks. | `in_flight(&s, cmd)` (over `warm_shell`) | `for _ in 0..200 { if status == Running break; sleep(20ms) }` — a wait whose success condition was "the mirror flipped sometime in the next four seconds" and whose failure condition was "we ran out of samples" |
+| **When the precondition lives in the child, make the child declare it.** `trap '' INT` is not installed when `send_text` returns, so an `Esc` that overtakes the builtin kills the sleep and every later assertion reads a run that never had the property under test. The test runs `trap '' INT; echo looprs-trap-set` and waits for that marker. | the trap command's own `echo` | aiming `0x03` at a shell assumed to be trapping |
+| **Search the bytes, not the events.** A pty read returns whatever had arrived; the line discipline echoes a typed command one or two characters at a time, so an escape and the word after it are not promised to the same event. | `Tape` — the output bytes joined in arrival order, with a map back to the event each byte came in | `position(|e| e.contains("painted") && e.contains('\u{1b}[?1049h'))`, whose needle was simply not whole on a busy runner, and which the shell's own prompt (`\u{1b}[?1034h`) could satisfy by accident |
+
+**Where the observable genuinely is time, say so and bound it.** The escalation on
+a trapped interrupt *is* a timer (`cancel::GRACE`), so the test stops pretending
+otherwise: it blocks on the report and then checks the gap between the keystroke
+and the report is **at least** the grace. That is a lower bound between two events,
+and it is sound because the deadline is armed after the keystroke is handled — no
+amount of load can make the grace elapse earlier than it started. The `collect_within(500ms)`
+it replaced could not distinguish "early" from "not yet", which is every slow case.
+
+**The remaining durations are failure bounds, labelled.** `NO_HANG` (20 s) and
+`INTERRUPTED_WITHIN` (12 s), each with a comment saying *failure bound, not a
+wait*. The one-second bar these tests used to assert on is gone deliberately: a
+wall-clock assertion under a second measures the runner's scheduler. The
+load-independent form of "the word comes before the child does" is the ordering —
+`send_sigint` puts the acknowledgement out before the reply can possibly have been
+read, because one task owns the pty and emits both ends — and that is what the
+test now asserts.
+
+**Verified under load, not hoped for.** Both halves of that claim are in
+`scripts/stress_test.sh`, which runs the whole suite at a chosen thread count with
+N `yes > /dev/null` processes over the box and prints a per-round verdict:
+
+```sh
+# 20 rounds of the full suite, 8 test threads, 12 CPU hogs. The one --skip is
+# the pre-existing shutdown hang named below — not a flake being waved away, but a
+# test that never returns under load and so reports nothing about the round.
+HOGS=12 LOG=/tmp/stress.log ./scripts/stress_test.sh "$(pwd)" 20 8 \
+    --skip=session::bash::tests::shutdown_leaves_no_shell_running
+```
+
+The four run concurrently with all 850-odd other tests in every one of those
+rounds. The run-by-run record lives in the `looprs-00u.17` ticket notes, because a
+single green run proves nothing here — which is the whole reason the ticket existed.
+One discovery from re-measuring: the *old* form of `raw_keys_reach_the_child_verbatim_…`
+was flaky in the same way and had simply been lucky — through one pty, two of three
+runs showed the echoed `^[:wq!` before the command finished and one showed nothing
+until `bash: wq!: command not found`, which is not `:wq!`. It now asks the child
+for the bytes by value (`head -c 6 | od -An -tx1`) instead of reading the echo, so
+it proves more and waits less.
+
+**What this ticket names instead of fixing.** Stressing the suite that way turned up
+a worse failure than the four it set out to remove, and it is not one of them.
+`shutdown_leaves_no_shell_running` hangs forever under the same contention on the
+**pre-ticket** code too — three of eight control rounds of the unmodified
+`session::bash` hung there, which is what makes it pre-existing rather than
+something this diff brought in. The stack says why it never comes back: the session
+task is inside `BashTask::shutdown` → `Shell::kill_and_reap` → `Child::wait`, and
+the `looprs-bash-reader` thread is parked in `blocking_send` on the bounded byte
+lane that only that task drains. A blocking `wait` taken inside the async task, with
+the lane it exists to feed left unattended behind it, is not a tolerance problem:
+no event-driven test can see past it, because the test never reaches its
+assertions. The fix is on the product side — a bounded reap, or the reader drained
+while the reap runs — and it is filed as its own ticket rather than ridden in on
+this one. The `--skip` above is that ticket's shadow: every other test in the suite,
+including all four of these, runs in those rounds.
 
 ### `bd` missing / failing surfaces (looprs-037)
 

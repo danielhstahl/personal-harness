@@ -1267,7 +1267,26 @@ mod tests {
     use super::*;
     use crate::session::TerminalType;
 
+    /// A failure bound, not a wait. Every wait in this module blocks on an event —
+    /// the seam ([`BashSession::quiesce`]), the command's own exit marker, the
+    /// byte tape — and this number exists only to turn "the event never came" into
+    /// a named failure instead of a hung test. Nothing here sleeps and hopes.
     const NO_HANG: Duration = Duration::from_secs(20);
+
+    /// Same shape as [`NO_HANG`]: an upper bound that fails the test, never a wait
+    /// the test reasons about.
+    ///
+    /// Twelve times the one-second bar `cancel::GRACE`'s own doc gives a
+    /// responsive child, and well under the `sleep 30` these tests cut short, so
+    /// "interrupted" and "ran to its own end" stay two different answers even
+    /// here. The reason this is twelve seconds and not one is the reason this
+    /// module stopped claiming sub-second things: a wall-clock assertion under a
+    /// second measures the runner's scheduler, not the product, and a loaded
+    /// eight-core box loses a `0x03`'s round trip to nothing but contention
+    /// (looprs-00u.17 — that assertion is where four of these tests flaked for a
+    /// year). The promptness claim that *is* load-independent lives in the event
+    /// order: `esc_says_cancelling_before_the_command_reports_itself_done`.
+    const INTERRUPTED_WITHIN: Duration = Duration::from_secs(12);
 
     /// The real system bash. A fake cannot prove that a pty keeps its cwd, that
     /// `0x03` interrupts, or that `PROMPT_COMMAND` fires the way the ADR says it
@@ -1417,6 +1436,135 @@ mod tests {
         );
     }
 
+    /// Read the stream until an event matches, and hand back everything read, in
+    /// order — including the one that matched.
+    ///
+    /// This is what a test that wants "the acknowledgement, then the exit line, in
+    /// that order" should be doing instead of collecting whatever shows up in the
+    /// next 800 ms and hoping the sample contained both (looprs-00u.17). A window
+    /// like that is a *sleep with assertions bolted on afterwards*: it passes when
+    /// the machine is fast and fails when it is busy, and the failure says nothing
+    /// about the code. Blocking on the event says which one it was.
+    ///
+    /// The only time in here is [`NO_HANG`], a failure bound.
+    async fn until_event<F>(
+        rx: &mut mpsc::UnboundedReceiver<SessionEvent>,
+        pred: F,
+        what: &str,
+    ) -> Vec<String>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + NO_HANG;
+        let mut seen: Vec<String> = Vec::new();
+        loop {
+            let line = match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(ev)) => describe(&ev),
+                Ok(None) => panic!("the stream closed before {what}: {seen:?}"),
+                Err(_) => panic!(
+                    "{what} never arrived within {NO_HANG:?} (failure bound, not a wait); \
+                     stream up to here: {seen:?}"
+                ),
+            };
+            let hit = pred(&line);
+            seen.push(line);
+            if hit {
+                return seen;
+            }
+        }
+    }
+
+    /// The run's output bytes glued together in arrival order, remembering which
+    /// event each byte arrived in.
+    ///
+    /// **Why a tape and not a list of events.** A pty read hands back whatever had
+    /// happened to arrive when it returned, and the session is not the only writer:
+    /// the line discipline echoes typed input a character at a time (a captured
+    /// run of the test below shows the echoed command arriving as `out p`, `out ri`,
+    /// `out n`, `out t`, `out f`…), the shell's prompt brings escapes of its own
+    /// (`\u{1b}[?1034h`), and a program's `printf` lands as one event or as four
+    /// depending on nothing but scheduling. So an assertion of the form *"which
+    /// event contains `ESC[?25lpainted`?"* is a question about read coalescing,
+    /// and it has a different answer on a loaded runner. That is not a tolerance
+    /// problem and cannot be fixed by widening a timeout: the needle was simply not
+    /// whole.
+    ///
+    /// The tape asks what the tests actually mean — *did those bytes go by, and
+    /// between which transitions?* — and answers it the same whatever the
+    /// boundaries were. The transitions (`screen true` / `screen false`, the exit
+    /// marker) are events, so ordering against them stays exact.
+    #[derive(Default, Debug)]
+    struct Tape {
+        text: String,
+        /// One entry per byte in `text`: the index of the event that carried it.
+        event_of: Vec<usize>,
+    }
+
+    impl Tape {
+        /// The output tape of a captured event list, as `describe` renders it.
+        fn of(events: &[String]) -> Self {
+            let mut tape = Tape::default();
+            for (idx, line) in events.iter().enumerate() {
+                if let Some(chunk) = line.strip_prefix("out ") {
+                    tape.push(idx, chunk);
+                }
+            }
+            tape
+        }
+
+        fn push(&mut self, event: usize, text: &str) {
+            self.text.push_str(text);
+            self.event_of.resize(self.text.len(), event);
+        }
+
+        /// The event that carried the **first** byte of `needle`, or `None` if
+        /// those bytes never went by.
+        fn event_carrying(&self, needle: &str) -> Option<usize> {
+            self.text.find(needle).map(|at| self.event_of[at])
+        }
+
+        /// Everything from the first output byte of event `from` onwards. Used to
+        /// scope a search to "after this transition went by", which is the only
+        /// way to keep a claim about the wire from being answered by the echo of
+        /// the command line that set it up.
+        fn after_event(&self, from: usize) -> &str {
+            let start = self
+                .event_of
+                .iter()
+                .position(|e| *e >= from)
+                .unwrap_or(self.text.len());
+            &self.text[start..]
+        }
+    }
+
+    /// Send a command and know it reached the child, without polling for it.
+    ///
+    /// The seam is the event: `Sync` is handled by the same task that handled the
+    /// `Submit`, ahead of it in the mailbox, and it publishes the status mirror
+    /// before acking. So when this returns, the bytes are in the pty master and
+    /// the session holds the command as outstanding — "in flight" as a fact about
+    /// the queue, not as a guess taken from a 20 ms sampling loop (which is what
+    /// `wait_running` used to be: four seconds of polling whose only failure mode
+    /// was running out of samples, and whose only success condition was the
+    /// mirror having flipped at some point in that window).
+    ///
+    /// Read the doc on [`warm_shell`] first: on a **cold** shell a submit cannot
+    /// be written at all, so it sits in the session's queue and reads as
+    /// `Running` there too. This helper asserts the command was written, which is
+    /// only true of a shell that had already printed its prompt.
+    async fn in_flight(s: &mut BashSession, cmd: &str) {
+        s.send_text(cmd.into()).unwrap();
+        assert!(
+            s.quiesce().await,
+            "the submit of `{cmd}` was never handled by the session task"
+        );
+        assert_eq!(
+            s.status(),
+            SessionStatus::Running,
+            "`{cmd}` was written to the pty and has not reported its exit"
+        );
+    }
+
     /// Cold start is lazy: nothing exists until the first command.
     #[tokio::test]
     async fn no_shell_exists_before_the_first_command() {
@@ -1463,25 +1611,10 @@ mod tests {
         let (out, code) = run_command(&mut rx).await;
         assert_eq!(code, Some(0));
         let lines = clean_lines(&out);
-        /*let trimmed: Vec<&str> = out
-            .iter()
-            .map(str::trim)
-            .filter(|l| l.starts_with('/') && !l.is_empty())
-            .collect();
-
-        for tmpline in trimmed.iter() {
-            println!("This is a line: {}", tmpline);
-        }*/
         assert!(
             lines.iter().any(|l| l == "/tmp" || l == "/private/tmp"),
             "cwd did not survive the previous command: {out:?}"
         );
-        /*assert!(
-            trimmed
-                .iter()
-                .any(|l| *l == "/tmp" || *l == "/private/tmp" || l.ends_with("/tmp")),
-            "cwd did not survive the previous command: {out:?}"
-        );*/
     }
 
     /// **Acceptance: `false` -> visibly exit 1.**
@@ -1556,36 +1689,41 @@ mod tests {
     }
 
     /// **Acceptance: Esc interrupts a long command and the shell survives.**
+    ///
+    /// Every wait in here is an event: the session's own seam for "the keystroke
+    /// has been acted on", the command's own exit line for "the interrupt
+    /// landed". The only clocks are [`NO_HANG`] and [`INTERRUPTED_WITHIN`], and
+    /// both are failure bounds.
     #[tokio::test]
     async fn esc_interrupts_a_running_command_without_killing_the_shell() {
         let (mut s, mut rx) = bash(7);
         warm_shell(&mut s, &mut rx).await;
-        s.send_text("sleep 30".into()).unwrap();
-        // Wait until the command is actually in flight.
-        for _ in 0..200 {
-            if s.status() == SessionStatus::Running {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(s.status(), SessionStatus::Running, "sleep is running");
+        in_flight(&mut s, "sleep 30").await;
 
-        let started = std::time::Instant::now();
+        let at_esc = std::time::Instant::now();
         s.abort().unwrap();
-        // Esc must be *acted on* fast; the interrupt's own exit line is the proof.
-        let _ = s.quiesce().await;
-        assert!(started.elapsed() < Duration::from_secs(1), "Esc was slow");
-        assert_eq!(s.status(), SessionStatus::Aborting);
+        // The keystroke is acted on inside the session's own mailbox, and the
+        // seam *is* that handling: waiting for it is waiting for the event, not
+        // for a clock. `Aborting` is what the state was when it completed.
+        assert!(s.quiesce().await, "the Esc was handled");
+        assert_eq!(s.status(), SessionStatus::Aborting, "the cancel is live");
 
-        let (out, code) = run_command(&mut rx).await;
+        // The interrupt's own exit line is the proof that the sleep was cut short
+        // rather than still running: block on the line instead of on a second of
+        // wall clock, so a loaded runner costs this test nothing and a lost
+        // interrupt cannot hide inside a tolerance.
+        let ran = run_logged(&mut rx).await;
         assert!(
-            code == Some(130) || code == Some(143) || code == Some(1),
-            "sleep should have been interrupted, got {code:?} (out {out:?})"
+            ran.code == Some(130) || ran.code == Some(143) || ran.code == Some(1),
+            "sleep should have been interrupted, got {:?} (out {:?})",
+            ran.code,
+            ran.out
         );
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the interrupt took {:?}; the command ran to completion instead",
-            started.elapsed()
+            at_esc.elapsed() < INTERRUPTED_WITHIN,
+            "an interrupt exit arrived {:?} after the keystroke, which is `sleep 30` winding \
+             down eventually rather than being interrupted by us (failure bound, not a wait)",
+            at_esc.elapsed()
         );
         assert_eq!(s.status(), SessionStatus::Idle, "shell is still alive");
 
@@ -1725,39 +1863,63 @@ mod tests {
     /// **Acceptance: the word comes before the child does.** A `sleep 30` stops
     /// fast but not instantly, and the user must not spend the gap wondering
     /// whether Esc reached anything. So the contract is an *ordering*: the
-    /// acknowledgement precedes the exit line, and arrives inside a second of the
-    /// keystroke whether or not the shell has finished by then.
+    /// acknowledgement precedes the exit line.
+    ///
+    /// **Read the ordering to its end; do not sample it.** This test used to
+    /// collect whatever arrived in the next 800 ms and assert the acknowledgement
+    /// was in the sample — a sleep wearing an assertion's clothes. On a loaded
+    /// runner the sample came up empty and the failure read "the keystroke was not
+    /// acknowledged" about a session that had acknowledged it late, which is a
+    /// verdict about the machine (looprs-00u.17). Blocking on the *far* end of
+    /// the ordering — the interrupted command's exit line — makes both halves
+    /// exact: the ack is there or the test says so, and nothing about how long
+    /// anything took changes the answer.
+    ///
+    /// Why the order is structural rather than probable: one task owns the pty and
+    /// emits both ends. `send_sigint` writes the `0x03` and then puts the word
+    /// out, and the reply can only be read on a later turn of that task's loop —
+    /// so a session that cancels at all says so first. That is what makes this a
+    /// test of the ordering rather than a race against it.
     #[tokio::test]
     async fn esc_says_cancelling_before_the_command_reports_itself_done() {
         let (mut s, mut rx) = bash(22);
         warm_shell(&mut s, &mut rx).await;
-        s.send_text("sleep 30".into()).unwrap();
-        wait_running(&s).await;
+        in_flight(&mut s, "sleep 30").await;
         drain(&mut rx);
 
-        let started = std::time::Instant::now();
         s.abort().unwrap();
-        // Well inside both the one-second bar and the grace, so whatever arrives
-        // here arrived because the session said it, not because the shell did.
-        let got =
-            crate::testing::collect_within(&mut rx, Duration::from_millis(800), describe).await;
+        // The far end of the ordering. Everything between the keystroke and this
+        // line is the evidence, in the order the session put it on the wire.
+        let got = until_event(
+            &mut rx,
+            |l| exit_code_of(l).is_some(),
+            "the interrupted command's exit line",
+        )
+        .await;
         let ack = got
             .iter()
-            .position(|l| l.starts_with("system: cancelling") && l.contains("sleep 30"));
+            .position(|l| l.starts_with("system: cancelling") && l.contains("sleep 30"))
+            .unwrap_or_else(|| panic!("the keystroke was not acknowledged, by name: {got:?}"));
+        let done = got
+            .iter()
+            .rposition(|l| exit_code_of(l).is_some())
+            .expect("until_event stopped on the exit line");
+        // "Cancelled" arriving before "cancelling" is the silence this row exists
+        // to remove, arriving late instead of never.
         assert!(
-            ack.is_some(),
-            "the keystroke was not acknowledged, by name: {got:?}"
+            ack < done,
+            "the command reported itself done before the cancel was acknowledged: {got:?}"
         );
-        assert!(started.elapsed() < Duration::from_secs(1), "Esc was slow");
-        // If the shell got this far inside the window, the acknowledgement still
-        // has to have come first. "Cancelled" arriving before "cancelling" is the
-        // silence this row exists to remove, arriving late instead of never.
-        if let Some(done) = got.iter().position(|l| l.contains("exit ")) {
-            assert!(
-                ack.unwrap() < done,
-                "the command reported itself done before the cancel was acknowledged: {got:?}"
-            );
-        }
+        // And the exit that followed is the same story as the acknowledgement, not
+        // an unrelated line that happened to be shaped like an exit: a cancel
+        // acknowledged and then reported as a plain `exit 130` would mean the
+        // session had already forgotten it was cancelling.
+        assert!(
+            got[ack..=done]
+                .iter()
+                .any(|l| l.contains("interrupted (exit ")),
+            "the exit that followed the acknowledgement did not say it was an interrupt: {got:?}"
+        );
     }
 
     /// **The escalation: a command that will not be interrupted.**
@@ -1767,35 +1929,61 @@ mod tests {
     /// here that is indistinguishable from a hang, which is exactly why the stall
     /// has to be a sentence rather than a spinner — and why the session must not
     /// "solve" it by killing the shell the command was running inside of.
+    ///
+    /// **The child says when it is ready to be uninterruptible.** A trap is not
+    /// installed when `send_text` returns: a `0x03` that overtakes the builtin
+    /// kills the sleep like any other, no stall ever happens, and every assertion
+    /// below is then aimed at a run that never had the property under test. So the
+    /// builtin is followed by an `echo` of the test's own marker and the test
+    /// waits for that byte — readiness declared by the child through the pty, not
+    /// assumed from a delay (looprs-00u.17: this is the ticket's "make the
+    /// observable deterministic when the observable really is time").
+    ///
+    /// **"Not before the grace" is a lower bound between two events, not a 500 ms
+    /// sample.** The stall deadline is armed *after* the keystroke is handled, so
+    /// a correct implementation cannot report early however loaded the runner is:
+    /// measure the keystroke-to-report gap and compare it with
+    /// [`cancel::GRACE`], and the only way to fail the check is to actually cry
+    /// wolf. A sample window cannot make that claim at all — it only ever shows
+    /// "not yet", which is what an early report and a merely slow one have in
+    /// common.
     #[tokio::test]
     async fn a_command_that_traps_the_interrupt_is_reported_not_silently_wedged() {
         let (mut s, mut rx) = bash(23);
         warm_shell(&mut s, &mut rx).await;
-        s.send_text("trap '' INT; sleep 30".into()).unwrap();
-        wait_running(&s).await;
 
+        s.send_text("trap '' INT; echo looprs-trap-set".into())
+            .unwrap();
+        let armed = run_logged(&mut rx).await;
+        assert_eq!(armed.code, Some(0), "the trap builtin failed: {armed:?}");
+        assert!(
+            armed.out.contains("looprs-trap-set"),
+            "the trap never reported itself installed, so the interrupt below would be aimed \
+             at a shell that may not be trapping anything: {armed:?}"
+        );
+
+        in_flight(&mut s, "sleep 30").await;
+        drain(&mut rx);
+
+        let at_esc = std::time::Instant::now();
         s.abort().unwrap();
         assert!(s.quiesce().await, "the Esc was handled");
         assert_eq!(s.status(), SessionStatus::Aborting);
 
-        // Not early: reporting a stall before the grace would cry wolf at a
-        // command that was still on its way out.
-        let early =
-            crate::testing::collect_within(&mut rx, Duration::from_millis(500), describe).await;
+        // Block on the escalation itself; where it landed in time is read off the
+        // same two events afterwards.
+        let late = until_event(
+            &mut rx,
+            |l| l.starts_with("error:") && l.contains("still running"),
+            "the stalled-interrupt report",
+        )
+        .await;
         assert!(
-            early.iter().all(|l| !l.contains("still running")),
-            "escalated before the grace was up: {early:?}"
-        );
-
-        let late =
-            crate::testing::collect_within(&mut rx, cancel::GRACE + Duration::from_secs(4), |ev| {
-                describe(ev)
-            })
-            .await;
-        assert!(
-            late.iter()
-                .any(|l| l.starts_with("error:") && l.contains("still running")),
-            "the stalled interrupt was silent: {late:?}"
+            at_esc.elapsed() >= cancel::GRACE,
+            "the escalation cried wolf: it landed {:?} after the keystroke, inside the {:?} a \
+             responsive child is still allowed to take: {late:?}",
+            at_esc.elapsed(),
+            cancel::GRACE
         );
         assert!(
             s.status().is_alive(),
@@ -1807,13 +1995,15 @@ mod tests {
         drain(&mut rx);
         s.abort().unwrap();
         assert!(s.quiesce().await, "the second Esc was handled");
-        let again =
-            crate::testing::collect_within(&mut rx, Duration::from_millis(800), describe).await;
+        let again = until_event(
+            &mut rx,
+            |l| l.contains("cancelling") && l.contains("again"),
+            "the retry acknowledgement",
+        )
+        .await;
         assert!(
-            again
-                .iter()
-                .any(|l| l.contains("cancelling") && l.contains("again")),
-            "a second Esc was swallowed by the first: {again:?}"
+            again.last().is_some_and(|l| l.contains("sleep 30")),
+            "the retry did not name the command it is cancelling again: {again:?}"
         );
     }
 
@@ -1823,34 +2013,23 @@ mod tests {
     /// `submit` cannot be written at all — the shell has not printed its prompt —
     /// so the command sits in the session's queue, `status()` reports `Running`
     /// because something is pending, and an `Esc` aimed at "the running command"
-    /// is in fact aimed at a queue entry that has not started. `wait_running`
-    /// cannot tell those two apart from the outside: both are `Running`, and that
-    /// conflation is what made these tests CI-flaky, with the window widening with
-    /// load. Running one cheap command to completion first leaves the shell ready,
-    /// so the next `send_text` goes straight to the child and the interrupt has
-    /// something to interrupt.
+    /// is in fact aimed at a queue entry that has not started. Nothing on the
+    /// outside can tell those two apart: both are `Running`, and that conflation
+    /// is what made these tests CI-flaky, with the window widening with load.
+    /// Running one cheap command to completion first leaves the shell ready, so
+    /// the next `send_text` goes straight to the child and [`in_flight`]'s claim
+    /// — *written to the pty, not parked behind readiness* — is true of it.
+    ///
+    /// This replaced a poll of `status()` every 20 ms (`wait_running`), whose
+    /// success condition was "the mirror flipped somewhere in the next eight
+    /// seconds" and whose failure condition was "we ran out of samples": a
+    /// tolerance with assertions bolted on either side of it.
     async fn warm_shell(s: &mut BashSession, rx: &mut mpsc::UnboundedReceiver<SessionEvent>) {
         s.send_text("echo looprs-warm".into()).unwrap();
         let (out, code) = run_command(rx).await;
         assert_eq!(code, Some(0), "the shell did not come up warm: {out:?}");
         assert_eq!(s.status(), SessionStatus::Idle, "warm means idle");
         drain(rx);
-    }
-
-    /// Poll until the session says the command is in flight, so an interrupt is
-    /// never aimed at a shell that has not started the command yet.
-    ///
-    /// Read the doc on [`warm_shell`]: this helper *cannot* honour that intention
-    /// on a cold shell, because a queued command and a running one are the same
-    /// `SessionStatus`. Call `warm_shell` first.
-    async fn wait_running(s: &BashSession) {
-        for _ in 0..400 {
-            if s.status() == SessionStatus::Running {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("the shell never reported the command running");
     }
 
     /// **Acceptance: `exit` -> a notice, and the next command works.**
@@ -1969,41 +2148,40 @@ mod tests {
     /// Driven by the shell's own death (a background job SIGKILLs it mid-`sleep`),
     /// not by app shutdown: that is the case the user hits, and the one the StreamEnd
     /// path exists for.
+    ///
+    /// The command is put in flight through the seam ([`in_flight`]) rather than by
+    /// polling `status()` until it reads `Running`, and the notice is waited for as
+    /// an event: the two things this test needs to be sure of are *which* message
+    /// arrived and *what it named*, neither of which a sample window can answer
+    /// (looprs-00u.17).
     #[tokio::test]
     async fn a_command_that_never_reported_is_named_when_the_shell_dies() {
         let (mut s, mut rx) = bash(16);
         warm_shell(&mut s, &mut rx).await;
-        s.send_text("(sleep 1; kill -KILL $$) >/dev/null 2>&1 & sleep 30".into())
-            .unwrap();
-        for _ in 0..200 {
-            if s.status() == SessionStatus::Running {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(s.status(), SessionStatus::Running, "sleep is in flight");
+        in_flight(
+            &mut s,
+            "(sleep 1; kill -KILL $$) >/dev/null 2>&1 & sleep 30",
+        )
+        .await;
 
-        let mut seen = Vec::new();
-        let deadline = tokio::time::Instant::now() + NO_HANG;
-        while tokio::time::Instant::now() < deadline {
-            let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await
-            else {
-                continue;
-            };
-            let line = describe(&ev);
-            seen.push(line.clone());
-            if line.contains("shell exited") {
-                assert!(
-                    line.contains("while running `"),
-                    "the unreported command was never named: {line}"
-                );
-                return;
-            }
-            if line.starts_with("down ") {
-                panic!("the session reported itself gone without a notice: {seen:?}");
-            }
-        }
-        panic!("the shell's death was silent: {seen:?}");
+        // `down` before the notice is the failure this used to guard against by
+        // hand, so it stays part of what we wait for: stop on either, then say
+        // which one it was.
+        let seen = until_event(
+            &mut rx,
+            |l| l.contains("shell exited") || l.starts_with("down "),
+            "the shell's death notice",
+        )
+        .await;
+        let notice = seen.last().expect("until_event stopped on something");
+        assert!(
+            notice.contains("shell exited"),
+            "the session reported itself gone without a notice: {seen:?}"
+        );
+        assert!(
+            notice.contains("while running `"),
+            "the unreported command was never named: {notice}"
+        );
     }
 
     /// Shutdown kills the shell: no bash left behind.
@@ -2081,35 +2259,43 @@ mod tests {
     /// terminal. The takeover and the release are still reported to the UI
     /// exactly as if the switch had happened, because the UI's question — "is
     /// something else painting right now?" — is answered the same either way.
+    ///
+    /// **Every byte check below runs on the tape ([`Tape`]), and that is the whole
+    /// of what made this test a flake.** It used to ask which *event* contained
+    /// `\u{1b}[?25lpainted`. A pty read returns whatever had arrived when it
+    /// returned — the same stream delivers this very command's echo one or two
+    /// characters at a time — so there is no promise that an escape and the bytes
+    /// after it land in the same event, and on a loaded runner they did not. The
+    /// needle was not whole, and a needle that does not exist cannot be found by
+    /// widening a tolerance. The transitions *are* events, so ordering against
+    /// them stays exact while the byte search stops depending on where the reads
+    /// happened to fall.
+    ///
+    /// The "not on the wire" check moves for the same reason and keeps its scope:
+    /// the echo of the command line is full of the literal characters `?1049`, so
+    /// only output that went by **after** the takeover can say what reached the
+    /// terminal.
     #[tokio::test]
     async fn a_full_screen_program_is_handed_the_screen_and_gives_it_back() {
         let (mut s, mut rx) = bash(21);
         s.send_text("printf '\\033[?1049h\\033[?25lpainted\\033[?1049l'".into())
             .unwrap();
         let events = until_exit(&mut rx).await;
+        let tape = Tape::of(&events);
 
         let took = events
             .iter()
             .position(|e| e == "screen true")
             .unwrap_or_else(|| panic!("the takeover was never reported: {events:?}"));
-        // The *program's* paint, and not the two other events that say "painted".
-        // The command echo carries the literal characters `\033[?1049h…` with no
-        // escape byte at all, which is the easy case. The one that used to win the
-        // race is the shell's own prompt: it arrives with a real escape of its own
-        // (`\033[?1034h`), and when the pty coalesces the prompt with the echoed
-        // command — which it does or does not depending on nothing but scheduling —
-        // that single event satisfies "contains `painted` **and** contains an
-        // escape byte" without being the program's bytes in the slightest, and the
-        // ordering assertion then fails on a machine that happened to batch the
-        // reads. So the test is for an escape **where the program put one**, and
-        // for none of the command's literal `\033` text: the paint is
-        // `\033[?25lpainted`, the echo and the prompt are not.
-        let painted = events
-            .iter()
-            .position(|e| {
-                e.starts_with("out ") && e.contains("\u{1b}[?25lpainted") && !e.contains("\\033[")
-            })
-            .unwrap_or_else(|| panic!("the paint never arrived: {events:?}"));
+        // The *program's* paint, and not the two other things in this stream that
+        // say "painted": the command's echo (the literal characters `\033[`, no
+        // escape byte anywhere) and the shell's own prompt (a real escape of its
+        // own, `\u{1b}[?1034h`, which used to satisfy "contains `painted` and
+        // contains an escape" whenever the pty batched the prompt with the echo).
+        // The needle is an escape exactly where the program put one.
+        let painted = tape
+            .event_carrying("\u{1b}[?25lpainted")
+            .unwrap_or_else(|| panic!("the program's paint never went by: {events:?}"));
         let released = events
             .iter()
             .position(|e| e == "screen false")
@@ -2122,11 +2308,9 @@ mod tests {
             painted < released,
             "the release must come after the paint it follows: {events:?}"
         );
-        // The switch itself never reached the wire: neither the enter nor the leave.
-        // Measured from the takeover onwards: everything before it is the echo of
-        // the command line, which contains the literal characters `?1049` as
-        // text and says nothing about what reached the wire.
-        let after = events[took..].join("|");
+        // The switch itself never reached the wire: neither the enter nor the
+        // leave, anywhere in the output that went by after the takeover.
+        let after = tape.after_event(took);
         assert!(
             !after.contains("?1049"),
             "the child's alt-screen bytes reached the terminal; the frame owns \
@@ -2135,10 +2319,10 @@ mod tests {
         // …and in place of the enter, the canvas the child expected: a blank
         // screen, not our previous frame showing through wherever it did not paint.
         assert!(
-            events.iter().any(|e| e.contains("\u{1b}[H\u{1b}[2J")),
+            after.contains("\u{1b}[H\u{1b}[2J"),
             "no blank canvas was handed over: {events:?}"
         );
-        assert_no_marker_bytes(&after);
+        assert_no_marker_bytes(&events[took..].join("|"));
         assert_eq!(s.status(), SessionStatus::Idle, "and the shell is fine");
     }
 
@@ -2146,30 +2330,45 @@ mod tests {
     /// goes through as written, and the leave lands before the release is
     /// reported — which is the shape that path had before the frame took the
     /// screen, kept tested so a change to the cutter cannot silently widen.
+    ///
+    /// Read on the tape ([`Tape`]) for the same reason as the hosted test, and
+    /// with a stronger reason: the check this replaces wanted **one event** to
+    /// carry the program's `\u{1b}[?1049h` *and* the `painted` that follows it
+    /// three escapes later, which is a demand about read coalescing that this path
+    /// never made any promise about.
     #[tokio::test]
     async fn a_childs_alt_screen_pair_passes_through_when_we_do_not_host_the_screen() {
         let (mut s, mut rx) = bash_not_hosting(21);
         s.send_text("printf '\\033[?1049h\\033[?25lpainted\\033[?1049l'".into())
             .unwrap();
         let events = until_exit(&mut rx).await;
+        let tape = Tape::of(&events);
 
         let took = events
             .iter()
             .position(|e| e == "screen true")
             .unwrap_or_else(|| panic!("the takeover was never reported: {events:?}"));
-        let painted = events
-            .iter()
-            .position(|e| {
-                e.starts_with("out ") && e.contains("painted") && e.contains("\u{1b}[?1049h")
-            })
-            .unwrap_or_else(|| panic!("the paint never arrived: {events:?}"));
         let released = events
             .iter()
             .position(|e| e == "screen false")
             .unwrap_or_else(|| panic!("the release was never reported: {events:?}"));
+        let after = tape.after_event(took);
+        assert!(
+            after.contains("\u{1b}[?1049h"),
+            "the enter was cut on the path that must cut nothing: {events:?}"
+        );
+        let painted = tape
+            .event_carrying("\u{1b}[?25lpainted")
+            .unwrap_or_else(|| panic!("the program's paint never went by: {events:?}"));
+        // The order that matters here: the leave bytes reach the terminal *before*
+        // the release is reported, so a terminal watching the wire is back on the
+        // main screen by the time the UI is told it may draw again.
+        let left = tape
+            .event_carrying("\u{1b}[?1049l")
+            .unwrap_or_else(|| panic!("the leave bytes never reached the terminal: {events:?}"));
         assert!(took < painted, "{events:?}");
         assert!(
-            painted < released,
+            left < released,
             "the leave bytes must reach the terminal before the release: {events:?}"
         );
         assert_no_marker_bytes(&events.join("|"));
@@ -2347,38 +2546,79 @@ mod tests {
     ///
     /// `Esc` has to arrive as one `0x1b` byte, not `0x03` and not with a newline
     /// on it: this is what lets a program in the alt screen read the keyboard.
-    /// Checked end to end on a real pty, because the line discipline's echo is the
-    /// only honest witness to what actually went down the master.
+    ///
+    /// **The witness is the child's own report of the bytes, not the line
+    /// discipline's echo.** The old form read the echo, and the echo turned out not
+    /// to be a witness at all: whether it fires depends on whether readline had
+    /// the tty in raw mode at the instant of the write, and whether `ESC :` is
+    /// echoed as `^[:` or swallowed by readline as an escape prefix. Three runs of
+    /// the old form through the same pty: two showed `^[:wq!` before the command
+    /// finished, one showed nothing until `bash: wq!: command not found` — which is
+    /// not `:wq!`, so that run failed the assertion it was supposed to be
+    /// guaranteeing (looprs-00u.17). `head -c 6 | od -An -tx1` answers the
+    /// question by value instead: exactly these bytes arrived, in this order, and
+    /// nothing else arrived with them.
+    ///
+    /// The command is put in flight through the seam ([`in_flight`]) rather than by
+    /// polling `status()` until it reads `Running`, which made "is it safe to type
+    /// at it yet?" a question with a timer for an answer.
     #[tokio::test]
     async fn raw_keys_reach_the_child_verbatim_and_the_shell_still_survives() {
         let (mut s, mut rx) = bash(24);
         warm_shell(&mut s, &mut rx).await;
-        s.send_text("printf 'first-line\\n'; sleep 1.5".into())
-            .unwrap();
-        // Wait until the command is genuinely in flight, then type a keystroke
-        // sequence: Esc, ':' , 'w', 'q', '!' and CR — the shape of `:wq!`.
-        for _ in 0..200 {
-            if s.status() == SessionStatus::Running {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(s.status(), SessionStatus::Running, "sleep is running");
+        // `GOT[` … `]` brackets the report so it can be picked out of the stream
+        // without guessing at which other bytes are hex-looking; `stty -echo` on
+        // the way in and back out again so the run neither reads the echo as the
+        // report nor leaves the tty muted for whoever inherits it.
+        in_flight(
+            &mut s,
+            "printf 'first-line\\n'; stty -echo; printf 'GOT['; head -c 6 | od -An -tx1 | tr -d ' \\n'; stty echo; printf ']\\n'",
+        )
+        .await;
 
+        // Type a keystroke sequence at the running command: Esc, ':', 'w', 'q',
+        // '!' and CR — the shape of `:wq!`.
         s.send_bytes(vec![0x1b, b':', b'w', b'q', b'!', 0x0d])
             .unwrap();
         let ran = run_logged(&mut rx).await;
-        // The bytes were echoed by the line discipline: `:wq!` appearing in the
-        // output is the witness that they went down the master verbatim, which is
-        // the only thing a session-side test can honestly see. `first-line` proves
-        // the shell was alive to be typed at.
         assert!(ran.out.contains("first-line"), "{:?}", ran.out);
+        let reported = between(&ran.out, "GOT[", "]").unwrap_or_else(|| {
+            panic!(
+                "the child never reported the bytes it was handed, so they never reached \
+                 the pty: {:?}",
+                ran.out
+            )
+        });
+        // The ESC came through as `0x1b` — not translated to `0x03`, not eaten —
+        // and the five typed bytes are the five reported bytes, in order.
         assert!(
-            ran.out.contains(":wq!"),
-            "the keystrokes did not come back echoed, so they never reached the pty: {:?}",
-            ran.out
+            reported.starts_with("1b3a777121"),
+            "the child got {reported:?}, not the ESC : w q ! we typed"
+        );
+        // Six bytes and not seven: the "nothing added" half. The sixth is the line
+        // terminator we typed — CR, which the line discipline's own ICRNL turns
+        // into NL on the way in. A `\\n` appended by the session would make seven.
+        assert_eq!(
+            reported.len(),
+            12,
+            "typed six bytes, the child reported {reported:?}: a byte added or lost"
+        );
+        assert!(
+            reported.ends_with("0a") || reported.ends_with("0d"),
+            "the terminator is not the CR we typed (possibly ICRNL-translated): {reported:?}"
         );
         assert_eq!(s.status(), SessionStatus::Idle);
+    }
+
+    /// The stretch of `hay` between the **last** `open` and the `close` after it.
+    ///
+    /// "Last" because the command that printed the marker also put the marker's
+    /// characters into the stream once before that — as the echo of the command
+    /// line — and it is the report we want, not the recital of the recipe.
+    fn between<'a>(hay: &'a str, open: &str, close: &str) -> Option<&'a str> {
+        let start = hay.rfind(open)? + open.len();
+        let end = hay[start..].find(close)?;
+        Some(&hay[start..start + end])
     }
 
     /// A held screen must not swallow the command boundary: the `exit 0` still has
