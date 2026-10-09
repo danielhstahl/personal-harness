@@ -27,7 +27,10 @@
 #         missing the reason it carries), and every spike check count written into
 #         prose matches a committed capture in `spikes/results/` (looprs-00u.23:
 #         three pages said "149 checks" while the tree printed 171, and the 171
-#         run was never captured, so nothing in the repo could contradict the page)
+#         run was never captured, so nothing in the repo could contradict the page),
+#         and every test name a page quotes in backticks answers to a real `fn` of
+#         that name in the tree (looprs-00u.25: a page whose point is that the test
+#         list is a specification quoted a name that could not be grepped for)
 #
 # The order is deliberate: fmt and clippy are seconds-long and explain themselves, so
 # they run before the ~20s test suite rather than after it. Step 7 runs last for the

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The documentation rot gate (looprs-00u.10 / ADR-0008).
 
-Four checks that keep the site true after the day it was written:
+Five checks that keep the site true after the day it was written:
 
 1. **Links and orphans** — every relative link in every Markdown page resolves,
    every `#anchor` exists in the page it names, and every `.md` under `docs/` is
@@ -22,6 +22,15 @@ Four checks that keep the site true after the day it was written:
    capture of the spike it names. A count whose run was never captured needs an
    explicit `<!-- spike-count: unverified N/M spike — why -->` marker, which is
    itself rot-checked (a marker that no longer backs anything fails).
+5. **Quoted test names** (looprs-00u.25) — a backticked `snake_case` name in a
+   page that is long enough to read as a test-name citation (four words or
+   more, the shape this repo's test names have) resolves to a real `fn <name>`
+   in the tree. A page whose whole point is "the test list is a
+   specification" is worthless when a quoted item cannot be grepped: the
+   reader assumes their grep is wrong before they assume the docs are.
+   Illustrative names that are not functions get an explicit entry in
+   `ILLUSTRATIVE_TEST_NAMES` with the reason they are illustrative, and an
+   entry that no longer covers a citation fails.
 
 Run from anywhere; runs in well under a second; no network, no cargo, no build.
 
@@ -34,6 +43,7 @@ Run from anywhere; runs in well under a second; no network, no cargo, no build.
 from __future__ import annotations
 
 import argparse
+import difflib
 import os
 import re
 import subprocess
@@ -1345,6 +1355,142 @@ def _capture_matches(rec, count, kind) -> bool:
     return rec["passed"] == int(passed) and rec["total"] == int(total)
 
 
+# ─────────────────── check 5: quoted test names ───────────────────
+
+#: How many words make a backticked `snake_case` name read as a *test-name
+#: citation*. This repo writes test names as sentences —
+#: `a_ticket_that_is_never_closed_stops_the_loop_instead_of_spinning` — and a
+#: lower-case snake identifier of four or more words is nothing else Rust has.
+#: Shorter backticks are fields, knobs and helpers (`last_good_read`,
+#: `retained_ceiling_bytes`, `blocking_send`) and are none of this check's
+#: business. The threshold is a number rather than a feel because it is the
+#: whole heuristic: at four words the tree's own pages cite no invented names,
+#: and dropping to three would flag a dozen legitimate ones.
+TEST_NAME_WORDS = 4
+
+#: A backticked name: optionally path-qualified, all lower-case after the last
+#: `::`, at least one underscore. Upper-case segments are types, and this
+#: check does not read them — resolving a moved type is a different question
+#: than resolving a renamed test, and guessing wrong costs a reader their trust
+#: in the gate.
+TEST_NAME_RE = re.compile(r"`((?:[A-Za-z_][A-Za-z0-9_]*::)*[a-z][a-z0-9_]*_[a-z0-9_]*)`")
+
+#: Citations that read as test names and are **not** functions — a name written
+#: to illustrate the naming rule, or the name of something the page is about
+#: the *absence* of. Each entry is the reason the gate is wrong about it, in
+#: the voice `wire.rs` uses for an `#[allow(dead_code)]` that needs a reason
+#: beside it. The allowlist is rot-checked in the other direction too: an
+#: entry whose citation has disappeared fails, so the list cannot quietly turn
+#: into a dump.
+ILLUSTRATIVE_TEST_NAMES = {
+    "follow_the_pane_down": (
+        "docs/adr/0004-fullscreen-tui.md names the helpers the inline-viewport "
+        "rewrite deleted; the page's point is that they are gone (it counts "
+        "them at 0 occurrences), so the citation is of a decision, not of a "
+        "function"
+    ),
+}
+
+#: Where a quoted test name is allowed to live: everything in the tree that can
+#: hold a test, plus the spike drivers, which the docs cite by function name.
+DEF_SITES = ("src", "tests", "examples", "spikes", "scripts")
+DEF_SUFFIXES = {".rs", ".py"}
+FN_DEF_RE = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([a-z_][a-z0-9_]*)", re.M
+)
+PY_DEF_RE = re.compile(r"^\s*def\s+([a-z_][a-z0-9_]*)", re.M)
+
+
+def defined_names() -> dict[str, list[str]]:
+    """Every function name the tree defines, with the places it is defined.
+
+    Rust `fn` and Python `def` only — a test is a function, and this check is
+    about the names of tests. Cached on the function because every page of the
+    site asks.
+    """
+    cached = getattr(defined_names, "_cache", None)
+    if cached is not None:
+        return cached
+    out: dict[str, list[str]] = {}
+    for base_name in DEF_SITES:
+        base = ROOT / base_name
+        if not base.exists():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file() or path.suffix not in DEF_SUFFIXES:
+                continue
+            if "__pycache__" in path.parts:
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            rx = FN_DEF_RE if path.suffix == ".rs" else PY_DEF_RE
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                for m in rx.finditer(line):
+                    out.setdefault(m.group(1), []).append(f"{rel(path)}:{lineno}")
+    defined_names._cache = out  # type: ignore[attr-defined]
+    return out
+
+
+def check_test_names(pages) -> tuple[list[str], int]:
+    """Every test-shaped name quoted in a page exists as a function in the tree.
+
+    Reports the page, the line and the unresolved name, plus the nearest name
+    that *does* exist when there is one: the commonest way this fails is a
+    test that got renamed and a page that was never told, so the nearest match
+    is usually the answer, and pointing at it turns a ten-minute grep into a
+    ten-second one.
+
+    Returns `(violations, citations_checked)`. The count is printed on a clean
+    run so "the gate checks the quoted test names" stays a number rather than
+    becoming a claim.
+    """
+    defs = defined_names()
+    bad: list[str] = []
+    checked = 0
+    cited_illustrative: set[str] = set()
+
+    for page in pages:
+        text = page.read_text(encoding="utf-8")
+        in_fence = False
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if line.lstrip().startswith("```"):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            for quoted in TEST_NAME_RE.findall(line):
+                leaf = quoted.rsplit("::", 1)[-1]
+                if leaf.count("_") + 1 < TEST_NAME_WORDS:
+                    continue
+                checked += 1
+                if leaf in defs:
+                    continue
+                if leaf in ILLUSTRATIVE_TEST_NAMES:
+                    cited_illustrative.add(leaf)
+                    continue
+                near = difflib.get_close_matches(leaf, defs, n=1, cutoff=0.62)
+                hint = ""
+                if near:
+                    hit = near[0]
+                    hint = (
+                        f" — the closest name that does exist is `{hit}` "
+                        f"({', '.join(defs[hit][:2])})"
+                    )
+                bad.append(
+                    f"{rel(page)}:{lineno}: `{quoted}` reads like a test name "
+                    f"(at least {TEST_NAME_WORDS} words) but no `fn {leaf}` exists "
+                    f"in {'/'.join(DEF_SITES)}{hint}"
+                )
+
+    for name, why in sorted(ILLUSTRATIVE_TEST_NAMES.items()):
+        if name not in cited_illustrative:
+            bad.append(
+                f"scripts/docs_check.py: ILLUSTRATIVE_TEST_NAMES excuses `{name}`, "
+                f"which no page quotes any more — drop the entry (it was excused "
+                f"as: {why})"
+            )
+    return bad, checked
+
+
 # ──────────────────────────────── main ────────────────────────────────
 
 
@@ -1372,6 +1518,10 @@ def main() -> int:
         help="print every committed spike capture, its total, and which spike it belongs to",
     )
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument(
+        "--list-test-names", action="store_true",
+        help="print every test-shaped name the docs quote, where it resolves, and what is excused",
+    )
     args = ap.parse_args()
 
     if args.list_knobs:
@@ -1404,6 +1554,33 @@ def main() -> int:
             print(f"  {r['line']:>5d}  {r['item']:34s} {r['reason']}")
         return 0
 
+    if args.list_test_names:
+        defs = defined_names()
+        rows = set()
+        for page in corpus_pages():
+            text = page.read_text(encoding="utf-8")
+            in_fence = False
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if line.lstrip().startswith("```"):
+                    in_fence = not in_fence
+                    continue
+                if in_fence:
+                    continue
+                for quoted in TEST_NAME_RE.findall(line):
+                    leaf = quoted.rsplit("::", 1)[-1]
+                    if leaf.count("_") + 1 < TEST_NAME_WORDS:
+                        continue
+                    if leaf in defs:
+                        status = ", ".join(defs[leaf])[:64]
+                    elif leaf in ILLUSTRATIVE_TEST_NAMES:
+                        status = "EXCUSED (illustrative)"
+                    else:
+                        status = "UNRESOLVED"
+                    rows.add((leaf, f"{rel(page)}:{lineno}", status))
+        for leaf, where, status in sorted(rows):
+            print(f"{leaf:62s} {where:34s} {status}")
+        return 0
+
     pages = corpus_pages()
     violations: list[str] = []
     violations += check_links(pages)
@@ -1413,6 +1590,8 @@ def main() -> int:
     violations += check_wire(fix=args.fix_wire)
     measurement_violations, claims_checked = check_measurement_claims(pages)
     violations += measurement_violations
+    name_violations, names_checked = check_test_names(pages)
+    violations += name_violations
 
     if (args.fix_keymap or args.fix_wire) and not violations:
         print("docs_check: regenerated the generated tables; no other violations")
@@ -1432,8 +1611,9 @@ def main() -> int:
         print(
             f"docs_check: clean ({len(pages)} page(s), "
             f"{len(code_knobs())} knob(s), {len(parse_chord_table())} chord row(s), "
-            f"{len(wire_inventory())} wire value(s), {claims_checked} measurement claim(s) "
-            "backed by spikes/results/)"
+            f"{len(wire_inventory())} wire value(s), {claims_checked} measurement "
+            f"claim(s) backed by spikes/results/, {names_checked} quoted test "
+            "name(s) resolved to a function in the tree)"
         )
     return 0
 

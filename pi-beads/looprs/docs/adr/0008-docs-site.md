@@ -301,3 +301,21 @@ from `SUMMARY.md`, so a page cannot exist outside the tree.
    printed 171 (`spikes/results/shutdown-e2e-00u23.log` is now committed, and the
    three pages name their captures), and before this check nothing in the repo could
    have contradicted them.
+9. **No test name quoted in backticks that no function answers to.** A test list is
+   a specification only while a reader can find the item they were pointed at, and
+   the failure this rules out is silent in both directions: the quoted name is
+   typographic, so nothing fails, and the reader who greps and finds nothing
+   suspects the grep before suspecting the page. So a backticked `snake_case` name
+   of four or more words — the shape this repo's test names have, and no other
+   shape Rust has — resolves to a real `fn <name>` in `src/`, `tests/`,
+   `examples/`, `spikes/` or `scripts/`. Names that are *deliberately* not
+   functions (a prose example of the naming rule; the name of something a page is
+   about the absence of, as ADR-0004 counts the deleted viewport helpers at zero
+   occurrences) are excused one at a time in `ILLUSTRATIVE_TEST_NAMES` with the
+   reason written beside them, and the excuse is checked both ways like the capture
+   markers above: a citation with no function and no excuse fails, and an excuse no
+   page still uses fails. Renaming a test to match a page is not a fix — the page
+   is the thing that was wrong. Added after `looprs-00u.25`, which found the class
+   by noticing one name in `docs/guide/contributing.md` was ungreppable; the gate
+   written against it found two more, one of which credited the *row* cap with a
+   test written about the **byte** cap.

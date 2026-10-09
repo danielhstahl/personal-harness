@@ -402,7 +402,11 @@ gives you something to do.
 **Names state the property.** `SwitchAway::DrainThenPark` says what it does.
 `last_good_read` says what it is. `a_ticket_that_is_never_closed_stops_the_loop_instead_of_spinning`
 is a test name that is a sentence, and that is deliberate: the test list is a
-specification, and a specification you have to read the body of is not one.
+specification, and a specification you have to read the body of is not one. The
+second half of that is that the quotation has to be *exact* — the docs gate fails a
+backticked test-shaped name that no `fn` in the tree answers to, because a
+specification you cannot grep is not a specification either. Quote the name out of
+`cargo test --list`, not out of memory.
 
 **Bad, from a review comment I have made more than once:**
 

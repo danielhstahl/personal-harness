@@ -41,8 +41,10 @@ multi-process, three-backend TUI without a model, a board, or a terminal.
    [keymap](guide/keymap.md) tables still match `CHORD_TABLE`, the
    [wire protocol](guide/wire-protocol.md) tables still match `WIRE_INVENTORY`
    and no `#[allow(dead_code)]` in `src/wire.rs` is missing the reason it
-   carries, and every spike check count written into prose matches a committed
-   capture in `spikes/results/` (looprs-00u.23)
+   carries, every spike check count written into prose matches a committed
+   capture in `spikes/results/` (looprs-00u.23), and every test name a page
+   quotes in backticks answers to a real `fn` of that name in the tree
+   (looprs-00u.25)
 
 The same gate is declared three ways, because each one catches a different kind of
 person:
@@ -57,7 +59,7 @@ The docs step is new with the docs site and follows the same shape on purpose: t
 half a prose review catches is not checkable, but a dead link, an undocumented knob
 and a drifted table all are, and a docs rule that is not checked has a half-life of
 about a month. `./scripts/docs_check.sh` runs in under a second, needs no network
-and no cargo, and its four checks are described in
+and no cargo, and its five checks are described in
 [ADR-0008](adr/0008-docs-site.md) and in
 [the contributor guide](guide/contributing.md). The generator itself is
 `./scripts/docs.sh` (`build` / `serve` / `check`).
@@ -71,6 +73,39 @@ next capture says something else. Take captures with
 [`./scripts/capture.sh`](../scripts/capture.sh), which heads the log with the UTC
 time, the tree rev and the command that produced it, and commit the fresh capture in
 the same commit that changed the count.
+
+The fifth check is the same failure one level down: a test **name** quoted in prose
+that no function answers to. This page is a specification, and a specification you
+cannot grep is not one — the ticket that opened this ran into a page that had
+dropped the word `is` out of a test name, and a reader who followed that name into
+`src/` found nothing and suspected their grep before suspecting the page. So a
+backticked `snake_case` name of four or more words has to resolve to a real
+`fn <name>` in `src/`, `tests/`, `examples/`, `spikes/` or `scripts/`, and a
+failure prints the page, the line, the name, and the nearest real name — because
+the usual cause is a renamed test with a page that was never told:
+
+```
+docs/testing.md:577: `components::compaction::tests::an_unknown_reason_leaves_no_trailing_separator`
+  reads like a test name (at least 4 words) but no `fn an_unknown_reason_leaves_no_trailing_separator`
+  exists in src/tests/examples/spikes/scripts — the closest name that does exist is
+  `no_reason_at_all_leaves_no_trailing_separator` (src/components/compaction.rs:186)
+```
+
+Names that are deliberately *not* functions — a prose example of the naming rule,
+or the name of something a page is about the absence of — are excused one at a
+time in `ILLUSTRATIVE_TEST_NAMES` with the reason beside them, in the same voice
+`src/wire.rs` uses for an `#[allow(dead_code)]` that has to carry its
+justification. The excuse list is checked in the other direction as well: an entry
+no page quotes any more fails the gate, so it cannot quietly become the dump that
+the blanket allows were. `--list-test-names` prints every citation and what happened
+to it.
+
+The check found two besides the one that opened the ticket, in the same commit's own
+grep: the compaction row above (`an_unknown_reason_…` for a test called
+`no_reason_at_all_leaves_…`), and the scrollback row that credited the *row* cap
+with a test written about the **byte** cap — not only a wrong identifier, a wrong
+unit. Both now quote what the code calls them. Renaming a test to match a page is
+the forbidden direction: the page is the thing that was wrong.
 
 CI runs `scripts/check.sh` (`.github/workflows/looprs-gate.yml`, at the repo root,
 path-filtered to `pi-beads/looprs/**`).
@@ -574,7 +609,7 @@ finished row in the scrollback, `✓ context compacted · threshold · 150.0k �
 | the card is drawn in the frame's card band, and the two endings draw differently | `main::tests::a_live_compaction_is_drawn_in_the_card_band`, `main::tests::a_cancelled_and_a_failed_compaction_are_drawn_differently` |
 | an `end` whose `start` never arrived is recorded rather than swallowed | `app::tests::token_window::a_compaction_end_with_no_open_card_is_recorded_anyway` |
 | closing the card releases everything that queued up behind it | `app::tests::token_window::closing_the_compaction_card_releases_what_came_behind_it` |
-| a missing `reason` leaves no dangling separator on the row | `components::compaction::tests::an_unknown_reason_leaves_no_trailing_separator` |
+| a missing `reason` leaves no dangling separator on the row | `components::compaction::tests::no_reason_at_all_leaves_no_trailing_separator` |
 
 **A card left open when the session dies is a bug with teeth.** A `!done` entry
 stalls the flush cursor, so a compaction — or a tool — that was still in flight
@@ -725,7 +760,7 @@ row index it happened to be at.
 
 | Layer | Where | What it pins |
 | --- | --- | --- |
-| the store | `state::scrollback::tests` | pinned by default and output follows (`pinned_is_the_default_and_new_output_follows`), one row up unpins (`scrolling_up_one_row_unpins`), off the tail it holds and counts (`unpinned_holds_its_content_and_counts_what_arrived`), the very bottom re-pins and clears the count (`reaching_the_very_bottom_re_pins_and_clears_the_count`), the top clamp (`cannot_scroll_past_the_top_of_the_content`), provenance per row (`every_row_carries_its_provenance`), the paste join (`joining_rows_follows_the_hard_soft_rule`), the cell map across CJK, combining marks and a ZWJ family (`the_cell_map_never_splits_a_cluster`, `a_combining_mark_belongs_to_its_base`), styles kept on the row and never copied (`styles_render_and_are_never_copied`), re-wrap under a pin and against a content anchor (`rewrap_keeps_a_pinned_view_pinned`, `rewrap_anchors_on_content_not_on_row_index`), a re-wrap whose anchor was trimmed away holding rather than inventing a position (`rewrap_with_lost_content_holds_rather_than_inventing_a_position`), the row cap and eviction renumbering (`the_row_cap_drops_the_oldest_and_says_so`, `eviction_drops_gone_entries_and_renumbers_the_rest`) |
+| the store | `state::scrollback::tests` | pinned by default and output follows (`pinned_is_the_default_and_new_output_follows`), one row up unpins (`scrolling_up_one_row_unpins`), off the tail it holds and counts (`unpinned_holds_its_content_and_counts_what_arrived`), the very bottom re-pins and clears the count (`reaching_the_very_bottom_re_pins_and_clears_the_count`), the top clamp (`cannot_scroll_past_the_top_of_the_content`), provenance per row (`every_row_carries_its_provenance`), the paste join (`joining_rows_follows_the_hard_soft_rule`), the cell map across CJK, combining marks and a ZWJ family (`the_cell_map_never_splits_a_cluster`, `a_combining_mark_belongs_to_its_base`), styles kept on the row and never copied (`styles_render_and_are_never_copied`), re-wrap under a pin and against a content anchor (`rewrap_keeps_a_pinned_view_pinned`, `rewrap_anchors_on_content_not_on_row_index`), a re-wrap whose anchor was trimmed away holding rather than inventing a position (`rewrap_with_lost_content_holds_rather_than_inventing_a_position`), the byte cap and eviction renumbering (`the_byte_cap_drops_oldest_entries_whole_and_says_so`, `eviction_drops_gone_entries_and_renumbers_the_rest`) |
 | the flush | `session::view::tests` | the store's width follows the flush and a re-wrap *makes* the rows rather than adding to them (`a_rewrap_makes_the_rows_again_rather_than_adding_to_them`), no row outlives the entry that can re-render it (`eviction_leaves_no_row_the_transcript_cannot_re_render`), arrivals off the tail are counted and do not move the view (`rows_that_arrive_off_the_tail_count_themselves_and_do_not_move_the_view`) |
 | the plumbing | `app::tests` | a page is the band the frame lays out, from the same function and not a second arithmetic (`a_page_is_the_band_the_frame_lays_out`), scrolling is neither a round trip nor the box's (`scrolling_is_not_a_round_trip_and_not_a_keystroke_anyones_else`), a transcript shorter than the band has nowhere to scroll to and cannot unpin (`with_nothing_above_the_band_there_is_nowhere_to_scroll`), a resize re-wraps without doubling content (`a_resize_rewraps_the_store_without_doubling_or_losing_content`) |
 | the paint | `main::tests` (ratatui `TestBackend`) | the live tail shows only while the view follows the tail (`the_live_tail_shows_only_while_the_view_follows_the_tail`), the pill appears off the tail and only then, on the band's bottom row (`the_new_rows_pill_shows_while_off_the_tail_and_only_then`), a resize keeps the resting line on the screen (`a_resize_keeps_the_line_the_user_was_looking_at_on_screen`) |

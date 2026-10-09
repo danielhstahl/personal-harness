@@ -7,6 +7,7 @@
 #   ./scripts/docs_check.sh --fix-keymap  # regenerate docs/guide/keymap.md's tables
 #   ./scripts/docs_check.sh --list-knobs  # every LOOPRS_* the code reads, with file:line
 #   ./scripts/docs_check.sh --list-captures  # every spike capture, its total, which is current
+#   ./scripts/docs_check.sh --list-test-names  # every test name the docs quote, and what resolved it
 #
 # Runs in well under a second, needs no network and no cargo, and is a step of
 # ./scripts/check.sh. See the Python file for what the checks are and why each one
