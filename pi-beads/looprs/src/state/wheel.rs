@@ -86,8 +86,11 @@
 //! count, duration, rows applied — and logs it at `debug` (see
 //! [`WheelCadence::gesture`]). A real finger does not need a code change to
 //! retune this: it needs one flick and one grep
-//! (`grep 'wheel gesture closed' looprs.log`), which is the gap pdl.2 #4b
-//! left open and the reason the accounting exists at all.
+//! (`RUST_LOG=debug`, then `grep 'wheel gesture closed' "$LOG"` — `$LOG` is the
+//! resolved log file, `${LOOPRS_LOG_DIR:-$HOME/.local/state/looprs}/looprs.log`, see
+//! `docs/guide/operator.md`), which is the gap pdl.2 #4b left open and the
+//! reason the accounting exists at all. The level matters: the default run is
+//! `info`, so a flick taken without raising it is a flick that was never recorded.
 //!
 //! # What is *not* decided here
 //!

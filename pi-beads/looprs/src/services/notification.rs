@@ -191,9 +191,13 @@ impl Notifier for Ntfy {
 pub fn notifier_from_env() -> Arc<dyn Notifier> {
     let cfg = ntfy_settings(env_value("LOOPRS_NTFY_URL"), env_value("LOOPRS_NTFY_TOPIC"));
     let Some((url, topic)) = cfg else {
-        tracing::debug!(
-            "notifications: off (set LOOPRS_NTFY_URL and LOOPRS_NTFY_TOPIC to turn on)"
-        );
+        // `info`, not `debug`: this is a startup resolution, and the operator
+        // page's grep index asks for it by name (`grep 'notifications: off'`).
+        // Every other knob's resolved-once line is already `info`; a run that
+        // quietly downgraded the *off* half of that set to `debug` made the grep
+        // answer "nothing", which reads as "the app never checked" rather than
+        // "you set neither variable" (looprs-00u.13).
+        tracing::info!("notifications: off (set LOOPRS_NTFY_URL and LOOPRS_NTFY_TOPIC to turn on)");
         return Arc::new(Noop);
     };
     match Ntfy::spawn(&url, &topic) {

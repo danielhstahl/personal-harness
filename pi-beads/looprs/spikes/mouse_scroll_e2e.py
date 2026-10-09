@@ -34,9 +34,13 @@ WHAT THIS STILL DOES NOT MEASURE, AND WHO HAS TO
     finger on this path", and a synthetic burst at a chosen cadence is a
     *cadence*, not a finger. What closes that gap is one flick's worth of
     `debug`-level logging: `WheelCadence` records every gesture's report count,
-    duration and rows applied, and `looprs.log` keeps it. One real flick, read
-    with `grep 'wheel gesture closed' looprs.log`, is the measurement; the
-    constants are then retuned against it rather than against this file.
+    duration and rows applied, and the log keeps it. One real flick, read with
+    `grep 'wheel gesture closed' "$LOG"` (where `LOG` is the resolved log file —
+    `${LOOPRS_LOG_DIR:-$HOME/.local/state/looprs}/looprs.log`, see
+    `docs/guide/operator.md`), is the measurement; the constants are then
+    retuned against it rather than against this file. That line is `debug`, and
+    the run level is `info` by default, so a flick meant to be read back has to
+    be taken under `RUST_LOG=debug`.
 
     cargo build
     python3 spikes/mouse_scroll_e2e.py | tee spikes/results/mouse-scroll-e2e.log
@@ -533,7 +537,12 @@ def group_unbound():
     """Right- and middle-click are not silently swallowed."""
     say("--- buttons other than the wheel are reported, not swallowed ---")
     tmp = tempfile.mkdtemp(prefix="looprs-mouse-scroll-")
-    d = Driver(ROWS, COLS, cwd=tmp)
+    # The log destination is a knob now (looprs-00u.13), so the spike that reads
+    # the log names it: `LOOPRS_LOG_DIR` points the app at this scratch dir, and
+    # the file read below is the file this run wrote. Before the knob existed this
+    # check looked for `looprs.log` in a cwd the binary never wrote to (it used
+    # `temp_dir()`), so it could only ever report zero hits.
+    d = Driver(ROWS, COLS, cwd=tmp, env={"LOOPRS_LOG_DIR": tmp})
     try:
         check("the app reached Bash mode", into_bash(d), d.dump())
         check("60 lines of transcript are in", fill(d), d.dump())

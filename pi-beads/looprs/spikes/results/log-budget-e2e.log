@@ -1,0 +1,168 @@
+[  0.00s] --- default settings (no RUST_LOG): 60s idle, default cap ---
+[  0.01s]   spawned pid 32043 in a 32x100 pty
+[ 60.02s]       looprs.log at 5.0s: 2411
+[ 60.02s]       looprs.log at 10.0s: 2411
+[ 60.02s]       looprs.log at 15.0s: 2411
+[ 60.02s]       looprs.log at 20.0s: 2411
+[ 60.02s]       looprs.log at 25.0s: 2411
+[ 60.02s]       looprs.log at 30.0s: 2411
+[ 60.02s]       looprs.log at 35.0s: 2411
+[ 60.02s]       looprs.log at 40.1s: 2411
+[ 60.02s]       looprs.log at 45.1s: 2411
+[ 60.02s]       looprs.log at 50.1s: 2411
+[ 60.02s]       looprs.log at 55.1s: 2411
+[ 60.02s]       looprs.log at 60.0s: 2411
+[ 60.63s] PASS  default settings (no RUST_LOG): a log in the LOOPRS_LOG_DIR it was given
+[ 60.63s] PASS  default settings (no RUST_LOG): one startup line naming path, rung, level and ceiling
+[ 60.63s]       what the startup line said: logging: /var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-idle-5tkqnapt/logs/looprs.log | via LOOPRS_LOG_DIR | level info (default; RUST_LOG=debug for a loud run) | budget 1.0 MiB per file x 5 file(s) = <= 5.0 MiB total
+[ 60.63s] PASS  default settings (no RUST_LOG): names the rung we set
+[ 60.63s] PASS  default settings (no RUST_LOG): the level it says is the level it ran at
+[ 60.63s] PASS  default settings (no RUST_LOG): points at RUST_LOG as the knob
+[ 60.63s] PASS  default settings (no RUST_LOG): the whole log dir (2880 B) is inside the ceiling it stated (5.0 MiB)
+[ 60.63s] PASS  …and no DEBUG line anywhere: the default really is info, not debug
+[ 60.63s]       default settings (no RUST_LOG): files left behind: ['looprs.log']
+[ 60.63s]       default settings (no RUST_LOG): bytes per file: {'looprs.log': 2880}
+[ 60.63s]       default settings (no RUST_LOG): total bytes: 2880
+[ 60.63s]   every line the default-level run wrote:
+[ 60.63s]     2026-10-09T06:19:16.505731Z  INFO looprs::services::logging: logging: /var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-idle-5tkqnapt/logs/looprs.log | via LOOPRS_LOG_DIR | level info (default; RUST_LOG=debug for a loud run) | budget 1.0 MiB per file x 5 file(s) = <= 5.0 MiB total
+[ 60.63s]     2026-10-09T06:19:16.506031Z  INFO looprs: bounded layers: per-mode store + transcript buffer, plus the byte lane views=3 store_bytes_per_view=33554432 transcript_bytes_per_view=262144 retained_ceiling_bytes=101449728 bus_bytes=262144
+[ 60.63s]     2026-10-09T06:19:16.506292Z  INFO looprs::services::clipboard: clipboard: native+osc52
+[ 60.63s]     2026-10-09T06:19:16.509553Z  INFO looprs::services::notification: notifications: ntfy → http://stahlserver.home:6001
+[ 60.63s]     2026-10-09T06:19:16.509591Z  INFO looprs::services::board_poller: kanban board: watching `/var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-idle-5tkqnapt/bd --readonly events tail` every 5s, reading `/var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-idle-5tkqnapt/bd --readonly list --all --limit 0 --json` on a change or every 30s (LOOPRS_KANBAN_POLL_MS / LOOPRS_KANBAN_RECONCILE_MS to retune, LOOPRS_KANBAN_EVENTS=0 to read the board every tick, LOOPRS_KANBAN=0 for none)
+[ 60.63s]     2026-10-09T06:19:16.509892Z  INFO looprs::services::transcript_file: transcript dump: file (FileSink { dir: "/var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-idle-5tkqnapt/home/.cache/looprs" })
+[ 60.63s]     2026-10-09T06:19:16.510144Z  INFO looprs::services::journal: journal: file → ~/.local/share/looprs/transcripts (read it, do not parse it: bd is the record)
+[ 60.63s]     2026-10-09T06:19:16.510164Z  INFO looprs: kanban row budget: Auto (ceiling 8 rows; no band at all below 17 rows of window with a full card wall and the tallest box)
+[ 60.63s]     2026-10-09T06:19:16.693073Z  WARN looprs::services::board_poller: board change detector unusable: events journal unreadable: `/var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-idle-5tkqnapt/bd --readonly events tail --since 0 --limit 512 --json` failed (exit 2): fake bd: unsupported verb --readonly — the band still gets a full board read every 30s, just not the moment something moves
+[ 60.63s]     2026-10-09T06:19:16.696831Z  WARN looprs::services::board_poller: board poll failed: `/var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-idle-5tkqnapt/bd --readonly list --all --limit 0 --json` failed (exit 2): fake bd: unsupported verb --readonly
+[ 60.63s]     2026-10-09T06:20:16.509360Z  INFO looprs::services::journal: journal drained and closed
+[ 60.63s]     2026-10-09T06:20:16.509492Z  INFO looprs::teardown: handing the terminal back holding=[Raw, AltScreen, CursorHidden, MouseReport, MouseDrag, MouseSgr] child_screen=None
+[ 60.63s]     2026-10-09T06:20:16.509668Z  INFO looprs::services::logging: log budget: 0 rotation(s), 2 KiB in the active file, ceiling 5.0 MiB in /var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-idle-5tkqnapt/logs
+[ 60.63s] PASS  default settings (no RUST_LOG): an idle run stays under the 1 MiB default, so nothing rotated
+[ 60.63s] --- RUST_LOG=debug: 60s idle, default cap ---
+[ 60.64s]   spawned pid 32185 in a 32x100 pty
+[120.65s]       looprs.log at 5.0s: 3017
+[120.65s]       looprs.log at 10.0s: 3597
+[120.65s]       looprs.log at 15.0s: 4177
+[120.65s]       looprs.log at 20.0s: 5073
+[120.65s]       looprs.log at 25.1s: 5917
+[120.65s]       looprs.log at 30.1s: 6497
+[120.65s]       looprs.log at 35.1s: 7077
+[120.65s]       looprs.log at 40.1s: 7657
+[120.65s]       looprs.log at 45.1s: 8237
+[120.65s]       looprs.log at 50.1s: 8817
+[120.65s]       looprs.log at 55.1s: 9397
+[120.65s]       looprs.log at 60.0s: 9397
+[121.27s] PASS  RUST_LOG=debug: a log in the LOOPRS_LOG_DIR it was given
+[121.27s] PASS  RUST_LOG=debug: one startup line naming path, rung, level and ceiling
+[121.27s]       what the startup line said: logging: /var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-idle-763vnyrp/logs/looprs.log | via LOOPRS_LOG_DIR | level debug (RUST_LOG) | budget 1.0 MiB per file x 5 file(s) = <= 5.0 MiB total
+[121.27s] PASS  RUST_LOG=debug: names the rung we set
+[121.27s] PASS  RUST_LOG=debug: the level it says is the level it ran at
+[121.27s] PASS  RUST_LOG=debug: points at RUST_LOG as the knob
+[121.27s] PASS  RUST_LOG=debug: the whole log dir (10803 B) is inside the ceiling it stated (5.0 MiB)
+[121.27s] PASS  RUST_LOG=debug: DEBUG lines present
+[121.27s]       RUST_LOG=debug: files left behind: ['looprs.log']
+[121.27s]       RUST_LOG=debug: bytes per file: {'looprs.log': 10803}
+[121.27s]       RUST_LOG=debug: total bytes: 10803
+[121.27s] PASS  RUST_LOG=debug: an idle run stays under the 1 MiB default, so nothing rotated
+[121.27s] --- the destination ladder: four runs, one rung shadowing the next ---
+[121.28s]   spawned pid 32307 in a 32x100 pty
+[125.81s] PASS  LOOPRS_LOG_DIR wins over XDG_STATE_HOME and HOME: a log at /var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-ladder-b_s_91ls/rung-zpx8uycd/knob/looprs.log
+[125.81s] PASS  LOOPRS_LOG_DIR wins over XDG_STATE_HOME and HOME: and the app named that very path
+[125.81s] PASS  LOOPRS_LOG_DIR wins over XDG_STATE_HOME and HOME: and named the rung (LOOPRS_LOG_DIR)
+[125.81s] PASS  LOOPRS_LOG_DIR wins over XDG_STATE_HOME and HOME: and nothing at the shadowed rung /var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-ladder-b_s_91ls/rung-zpx8uycd/xdgstate/looprs/looprs.log
+[125.81s] PASS  LOOPRS_LOG_DIR wins over XDG_STATE_HOME and HOME: and nothing at the shadowed rung /var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-ladder-b_s_91ls/rung-zpx8uycd/home/.local/state/looprs/looprs.log
+[125.82s]   spawned pid 32318 in a 32x100 pty
+[130.34s] PASS  XDG_STATE_HOME is next once the knob is unset: a log at /var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-ladder-b_s_91ls/rung-377krzmm/xdgstate/looprs/looprs.log
+[130.34s] PASS  XDG_STATE_HOME is next once the knob is unset: and the app named that very path
+[130.34s] PASS  XDG_STATE_HOME is next once the knob is unset: and named the rung (XDG_STATE_HOME)
+[130.34s] PASS  XDG_STATE_HOME is next once the knob is unset: and nothing at the shadowed rung /var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-ladder-b_s_91ls/rung-377krzmm/home/.local/state/looprs/looprs.log
+[130.35s]   spawned pid 32330 in a 32x100 pty
+[134.88s] PASS  $HOME/.local/state is next once XDG_STATE_HOME is unset: a log at /var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-ladder-b_s_91ls/rung-gt7kzz8s/home/.local/state/looprs/looprs.log
+[134.88s] PASS  $HOME/.local/state is next once XDG_STATE_HOME is unset: and the app named that very path
+[134.88s] PASS  $HOME/.local/state is next once XDG_STATE_HOME is unset: and named the rung ($HOME/.local/state)
+[134.88s] PASS  $HOME/.local/state is next once XDG_STATE_HOME is unset: and nothing at the shadowed rung /var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-ladder-b_s_91ls/rung-gt7kzz8s/knob/looprs.log
+[134.89s]   spawned pid 32341 in a 32x100 pty
+[139.41s] PASS  the system temp dir is the last rung: a log at /var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs.log
+[139.41s] PASS  the system temp dir is the last rung: and the app named that very path
+[139.41s] PASS  the system temp dir is the last rung: and named the rung (the system temp dir)
+[139.41s] PASS  the system temp dir is the last rung: and nothing at the shadowed rung /var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-ladder-b_s_91ls/rung-vr3p6q3m/home/.local/state/looprs/looprs.log
+[139.42s] --- forced volume, 30s: debug level, `bd` failing every poll, 16 KiB cap ---
+[139.43s]   spawned pid 32352 in a 32x100 pty
+[169.67s]       active-file size over the run: ['2.2s=8280', '4.5s=14072', '6.7s=3329', '8.9s=9121', '11.2s=14913', '13.4s=4270', '15.6s=10062', '17.9s=15854', '20.1s=5159', '22.3s=10951', '24.6s=279', '26.8s=6071', '29.0s=11863', '30.2s=14605']
+[170.29s]       files left behind: ['looprs.log', 'looprs.log.1', 'looprs.log.2', 'looprs.log.3']
+[170.29s]       bytes per file: {'looprs.log': 16012, 'looprs.log.1': 16464, 'looprs.log.2': 16487, 'looprs.log.3': 16435}
+[170.29s]       total bytes: 65398
+[170.29s] PASS  a chatty run rotated at all
+[170.29s] PASS  and produced nothing outside active + keep
+[170.29s] PASS  the active name survived every rotation
+[170.29s] PASS  no file is more than one line over the cap
+[170.29s] PASS  total stays <= (keep+1) x 2 x cap = 131072 B
+[170.29s] PASS  the run really was debug
+[170.29s] PASS  the failing board poll is in it (the stale-board grep)
+[170.29s] PASS  the synthetic flick produced a gesture line at debug
+[170.29s] --- a deliberately bad knob: loud fallback at the default level ---
+[170.30s]   spawned pid 32643 in a 32x100 pty
+[174.82s]   the warnings this run emitted:
+[174.82s]     2026-10-09T06:22:06.806569Z  WARN looprs::services::logging: logging: RUST_LOG="=debug" is not a valid filter; using info (try `debug`, `info`, or `looprs::bus=trace,looprs=warn` for one module loudly)
+[174.82s]     2026-10-09T06:22:06.806620Z  WARN looprs::services::logging: logging: LOOPRS_LOG_MAX_BYTES="lots" is not a size (invalid digit found in string); using 1.0 MiB
+[174.82s]     2026-10-09T06:22:06.806629Z  WARN looprs::services::logging: logging: LOOPRS_LOG_KEEP="many" is not a number (invalid digit found in string); using 4
+[174.82s]     2026-10-09T06:22:07.059696Z  WARN looprs::services::board_poller: board change detector unusable: events journal unreadable: `/var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-badknob-pp6_lgkd/bd --readonly events tail --since 0 --limit 512 --json` failed (exit 2): fake bd: unsupported verb --readonly — the band still gets a full board read every 30s, just not the moment something moves
+[174.82s]     2026-10-09T06:22:07.063490Z  WARN looprs::services::board_poller: board poll failed: `/var/folders/17/zpwmvyzd1bdc4lkjs6x0_r6c0000gn/T/looprs-log-badknob-pp6_lgkd/bd --readonly list --all --limit 0 --json` failed (exit 2): fake bd: unsupported verb --readonly
+[174.82s] PASS  a bad RUST_LOG did not stop the run: it still logged its startup line
+[174.82s] PASS  and it said so at WARN (visible without RUST_LOG=debug)
+[174.82s] PASS  and said the same about LOOPRS_LOG_MAX_BYTES
+[174.82s] PASS  and about LOOPRS_LOG_KEEP
+[174.82s] PASS  and ran on the defaults it fell back to
+[174.82s]       files left behind: ['looprs.log']
+[174.83s] --- the operator page's grep index, run against every run above ---
+[174.83s]   diagnostic                                default             debug               chatty              bad knob            
+[174.83s]   what is configured                        5 hit(s)            6 hit(s)            1 hit(s)            5 hit(s)            
+[174.83s]       what is configured [default] levels that produced it: ['INFO']
+[174.83s]       what is configured [debug] levels that produced it: ['DEBUG', 'INFO']
+[174.83s]       what is configured [chatty] levels that produced it: ['DEBUG']
+[174.83s]       what is configured [bad knob] levels that produced it: ['INFO']
+[174.83s]   the board is wrong / stale                1 hit(s)            12 hit(s)           100 hit(s)          1 hit(s)            
+[174.83s]       the board is wrong / stale [default] levels that produced it: ['WARN']
+[174.83s]       the board is wrong / stale [debug] levels that produced it: ['DEBUG', 'WARN']
+[174.83s]       the board is wrong / stale [chatty] levels that produced it: ['DEBUG']
+[174.83s]       the board is wrong / stale [bad knob] levels that produced it: ['WARN']
+[174.83s]   the change detector broke                 1 hit(s)            12 hit(s)           99 hit(s)           1 hit(s)            
+[174.83s]       the change detector broke [default] levels that produced it: ['WARN']
+[174.83s]       the change detector broke [debug] levels that produced it: ['DEBUG', 'WARN']
+[174.83s]       the change detector broke [chatty] levels that produced it: ['DEBUG']
+[174.83s]       the change detector broke [bad knob] levels that produced it: ['WARN']
+[174.83s]   the wheel ate my scroll                   0 hit(s)            0 hit(s)            11 hit(s)           0 hit(s)            
+[174.83s]       the wheel ate my scroll [default] levels that produced it: ['(none)']
+[174.83s]       the wheel ate my scroll [debug] levels that produced it: ['(none)']
+[174.83s]       the wheel ate my scroll [chatty] levels that produced it: ['DEBUG']
+[174.83s]       the wheel ate my scroll [bad knob] levels that produced it: ['(none)']
+[174.83s]   a knob was ignored                        0 hit(s)            0 hit(s)            0 hit(s)            1 hit(s)            
+[174.83s]       a knob was ignored [default] levels that produced it: ['(none)']
+[174.83s]       a knob was ignored [debug] levels that produced it: ['(none)']
+[174.83s]       a knob was ignored [chatty] levels that produced it: ['(none)']
+[174.83s]       a knob was ignored [bad knob] levels that produced it: ['WARN']
+[174.84s]   something refused to copy                 2 hit(s)            4 hit(s)            2 hit(s)            2 hit(s)            
+[174.84s]       something refused to copy [default] levels that produced it: ['INFO']
+[174.84s]       something refused to copy [debug] levels that produced it: ['DEBUG', 'INFO']
+[174.84s]       something refused to copy [chatty] levels that produced it: ['DEBUG']
+[174.84s]       something refused to copy [bad knob] levels that produced it: ['INFO']
+[174.84s]   the terminal did not come back            0 hit(s)            7 hit(s)            1 hit(s)            0 hit(s)            
+[174.84s]       the terminal did not come back [default] levels that produced it: ['(none)']
+[174.84s]       the terminal did not come back [debug] levels that produced it: ['DEBUG']
+[174.85s]       the terminal did not come back [chatty] levels that produced it: ['DEBUG']
+[174.85s]       the terminal did not come back [bad knob] levels that produced it: ['(none)']
+[174.85s]   where the log itself went                 4 hit(s)            4 hit(s)            2 hit(s)            10 hit(s)           
+[174.85s]       where the log itself went [default] levels that produced it: ['INFO']
+[174.85s]       where the log itself went [debug] levels that produced it: ['INFO']
+[174.85s]       where the log itself went [chatty] levels that produced it: ['INFO']
+[174.85s]       where the log itself went [bad knob] levels that produced it: ['INFO', 'WARN']
+[174.85s]   patterns the default level does not reach: ['the wheel ate my scroll', 'a knob was ignored', 'the terminal did not come back']
+[174.85s] PASS  the startup-resolution greps still hit at the default level
+[174.85s] PASS  every grep on the page is reached by some run here (none is unverifiable)
+[174.85s] --- the number the ticket asks for ---
+[174.85s]   60s idle at the default level (info): 2880 bytes
+[174.85s]   60s idle at the old default level (debug): 10803 bytes
+[174.85s]   ratio: the default run writes 3.8x less than the old default at the same length
+[174.85s]   and neither can exceed the ceiling printed in its own startup line; the
+[174.85s]   chatty run above proves the ceiling bites (rotated, bounded, active name intact)
+[174.85s] 48/48 checks passed

@@ -37,11 +37,10 @@ use components::kanban::Kanban;
 use components::selection::SelectionHighlight;
 use components::text_stream::{NewRowsPill, TranscriptBand, band_layout};
 use components::toast::ToastOverlay;
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::EnvFilter;
 
 use crate::services::board_poller;
 use crate::services::clipboard;
+use crate::services::logging;
 use crate::services::notification;
 use crate::session::router::{Router, SHUTDOWN_GRACE};
 use crate::session::{ChatState, SessionConfig, TerminalType};
@@ -50,25 +49,20 @@ use crate::state::selection::BandSnapshot;
 use crate::state::transcript::Entry;
 use crate::teardown::{Mode, Teardown, install_panic_hook, panic_injected};
 
-fn init_logging() -> anyhow::Result<WorkerGuard> {
-    let dir = std::env::temp_dir(); //current_dir().unwrap();
-    let appender = tracing_appender::rolling::never(&dir, "looprs.log");
-    let (writer, guard) = tracing_appender::non_blocking(appender);
-
-    tracing_subscriber::fmt()
-        .with_writer(writer)
-        .with_ansi(false)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
-        )
-        .init();
-
-    Ok(guard)
+fn init_logging() -> anyhow::Result<logging::LogGuard> {
+    // Everything the log will do — where it goes, how loud it is, how big it is
+    // allowed to get — is resolved in [`services::logging`] rather than here, so
+    // the ladder is a pure function with tests instead of four lines nobody could
+    // reach without editing `main` (looprs-00u.13).
+    logging::init_logging()
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _log_guard = init_logging()?; // keep alive until exit, or buffered logs are lost
+    // The log is resolved and opened before anything else runs, and the guard is
+    // held to the end of `main`: drop it early and the buffered lines are simply
+    // never written.
+    let log_guard = init_logging()?; // keep alive until exit, or buffered logs are lost
 
     // The teardown is built before anything that can switch a terminal mode on,
     // and the panic hook goes in before anything that can fail with one switched
@@ -93,6 +87,9 @@ async fn main() -> Result<()> {
     // hook already did the job, and the "exactly once" holds for the whole set of
     // callers rather than for each of them separately.
     exit.restore();
+    // Say what the log budget was actually spent on, now that the terminal is
+    // handed back and this line cannot garble a frame.
+    log_guard.report();
     // `res` is returned rather than swallowed: a run that failed is worth an exit
     // code, and the terminal is already safe by the time we get here to say so.
     res
@@ -2133,6 +2130,14 @@ mod tests {
             bin: fakes.bd_bin().to_string(),
             interval: Duration::from_millis(50),
             enabled: true,
+            // Sweep on the tick: this test is about the band following the
+            // poller, not about what the journal saves — and with the sweep on
+            // the tick the "re-poll that costs nothing" it asserts is a re-read
+            // of the same board rather than a tick that skipped reading.
+            journal: crate::services::board_poller::JournalConfig {
+                enabled: true,
+                reconcile: Duration::from_millis(50),
+            },
         });
         let mut app = app(TerminalType::Beeds, true);
         app.set_kanban_budget(viewport::KanbanBudget::Auto);

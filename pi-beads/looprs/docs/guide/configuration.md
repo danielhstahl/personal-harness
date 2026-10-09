@@ -11,7 +11,7 @@ table indexes it. [`./scripts/docs_check.sh`](../../scripts/docs_check.sh) compa
 the defaults wherever two pages state them and fails on a disagreement, so the
 exception cannot rot into a contradiction.
 
-**23 `LOOPRS_*` variables are read by `src/`.** That count is not from the docs:
+**26 `LOOPRS_*` variables are read by `src/`.** That count is not from the docs:
 `./scripts/docs_check.py --list-knobs` prints them with the `file:line` of every
 read, and the gate that keeps this page complete is a step of
 [`./scripts/check.sh`](../../scripts/check.sh).
@@ -25,10 +25,20 @@ here is re-read per frame, per command, or per keystroke. That is a design rule
 rather than a note: the App reads no environment at all, so every branch a knob
 selects is reachable from a unit test without mutating a process
 ([contributor guide](contributing.md#the-no-environment-rule)). The consequence for
-you is that **changing a variable means restarting the app**, and every resolved
-choice is logged — `grep 'kanban board' looprs.log` shows what is on, how often and
-reading which binary. Every fallback is loud, because a silently ignored knob is a
-knob you will keep turning.
+you is that **changing a variable means restarting the app**.
+
+The grep index, the resolved paths and the level each diagnostic needs is
+[`./operator.md`](operator.md#3-the-log); this page owns the knobs and their
+defaults. Every resolved choice is logged once at startup — `grep -E 'logging:
+|kanban board|clipboard:|notifications' "$LOG"` prints the whole resolved set,
+where `$LOG` is
+
+```sh
+LOG="${LOOPRS_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/looprs}/looprs.log"
+```
+
+Every fallback is loud, because a silently ignored knob is a knob you will keep
+turning.
 
 ---
 
@@ -121,15 +131,21 @@ The transport actually chosen is logged once: `grep clipboard: looprs.log` →
 | `LOOPRS_TRANSCRIPT_DUMP` | *(unset — `Ctrl-S t` **writes**)* | `off` / `0` / `no` / `false` | the `Ctrl-S t` escape hatch that writes the whole settled transcript to a file you asked for. Separate from the journal: the dump answers "give me this, now"; the journal answers "what did the loop say at 03:12" | startup | [`transcript_sink_from_env`](../../src/services/transcript_file.rs) |
 | `$XDG_DATA_HOME` | `~/.local/share` | a directory | the base for the journal directory | startup | `default_journal_dir` |
 | `$XDG_CACHE_HOME` | `~/.cache` | a directory | the base for the **dump** directory (`$XDG_CACHE_HOME/looprs`) | startup | `default_dump_dir` |
-| `RUST_LOG` | `debug` | any `EnvFilter` directive (`info`, `looprs=warn`, `looprs::bus=trace`) | the log filter. **The default is `debug`, not `warn`** — a long beads run produces a lot of lines, which is what `LOOPRS_PANIC`-scale debugging needs and what makes rotation a real question (see below) | startup | [`init_logging`](../../src/main.rs) |
+| `LOOPRS_LOG_DIR` | `~/.local/state/looprs` (via `$XDG_STATE_HOME`; the system temp dir last) | a directory | where `looprs.log` and its rotated generations go. A directory that cannot be created is a `WARN` and a fallback to the temp dir, not a startup failure | startup | [`resolve_log_dir`](../../src/services/logging.rs) |
+| `LOOPRS_LOG_MAX_BYTES` | `1 MiB` (min 16 KiB, max 256 MiB; `512K` / `2M` accepted) | a size | the active log file's cap. Past it the file is renamed `looprs.log.1`, the generations shift, and the oldest kept one is deleted. The check is before the write, so the file can be one line over and never two | startup | [`resolve_max_bytes`](../../src/services/logging.rs) |
+| `LOOPRS_LOG_KEEP` | `4` (max 32) | a count | how many rotated generations survive, **in addition to** the active file: `keep + 1` files, so the directory's ceiling is `(keep + 1) × LOOPRS_LOG_MAX_BYTES` and the startup line prints it. `0` is a real answer: one capped file, truncated in place | startup | [`resolve_keep`](../../src/services/logging.rs) |
+| `$XDG_STATE_HOME` | `~/.local/state` | a directory | the base for the log directory. `state` is the freedesktop category logs belong in, and the path is short enough to name in a toast, which `$TMPDIR` was not | startup | `resolve_log_dir` |
+| `RUST_LOG` | `info` | any `EnvFilter` directive (`debug`, `looprs=warn`, `looprs::bus=trace`) | the log filter. **The default is `info`, not `debug`** — 60 s of idle looping is 2,880 bytes at `info` against 10,803 at `debug` (measured; [operator §3](operator.md#3-the-log)). Set it to `debug` **before** reproducing something you mean to report: several rows of the diagnostic index are `debug`-only. A value that does not parse is refused loudly and the run continues at `info` | startup | [`init_logging`](../../src/services/logging.rs) |
 
 Two things this group is responsible for that are worth knowing before you set them:
 
-* **Nothing rotates anything.** The journal is one file per run per mode and the log
-  is one file per run, both growing until the run ends. `~/.local/share/looprs/` is
-  yours to clean; the path is logged at startup so you know where to point a
-  cleanup. The open ticket on making the log destination configurable and the log
-  itself bounded is `looprs-00u.13`.
+* **The log is bounded; the journal is not.** The log rotates at its cap and keeps
+  `keep + 1` files, so it cannot outgrow the number its startup line printed.
+  The journal is one file per run per mode and grows until that run ends —
+  `~/.local/share/looprs/` is yours to clean, and the path each run used is logged
+  at startup so you know where to point a cleanup. Rotating the journal would be
+  deleting transcript history, which is the one thing it exists to keep
+  ([ADR-0004 R2](../adr/0004-fullscreen-tui.md)).
 * **These files contain everything the agent saw.** Including secrets that appeared
   in tool output. They are written `0600` in a `0700` directory — mode bits are the
   protection, nothing else — and the way to turn each sink off is on this page.
@@ -226,12 +242,20 @@ window that cannot hold it gets no band rather than a stub:
 LOOPRS_KANBAN_ROWS=3 ./target/debug/looprs
 ```
 
-**Quiet logs** — the default is `debug`, which is a lot on a long run:
+**Loud logs** — the default is `info`, about 2.9 KB for a minute of idle looping.
+When you are about to debug something, raise the level *before* it happens, because
+several rows of the diagnostic index are `debug`-only and will otherwise say
+nothing about the thing you just saw:
 
 ```sh
-RUST_LOG=info ./target/debug/looprs
+RUST_LOG=debug ./target/debug/looprs
 RUST_LOG=looprs::bus=trace,looprs=warn ./target/debug/looprs   # one module, loudly
 ```
+
+`debug` costs 3.8× that at the same length and is still capped: the whole log
+directory holds at most `(LOOPRS_LOG_KEEP + 1) × LOOPRS_LOG_MAX_BYTES`, printed on
+the run's first line. Which diagnostic needs which level is in
+[Files, logs and recovery](operator.md#3-the-log).
 
 **A harness-shaped dev setup** — fakes for everything, no model, no board, and the
 transcript somewhere obvious:
