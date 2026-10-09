@@ -15,6 +15,7 @@
   * [The project README](../README.md)
 * **Contributing**
   * [Contributor guide](guide/contributing.md)
+  * [The improvement sweep](guide/improvement-sweep.md)
   * [Testing looprs](testing.md)
   * [The measurement harness](../spikes/README.md)
 * **Decision records**

@@ -93,10 +93,12 @@ skip the ambiguity.
 
 If the app is genuinely stuck and you cannot get a keystroke in, `kill -9` is safe
 for the terminal. The ledger cannot run on `SIGKILL`, so on that path the terminal
-keeps whatever modes were on — that is the one exception, it is why the panic and
-SIGTERM paths are the ones with 149 checks
-([`spikes/shutdown_e2e.py`](../../spikes/shutdown_e2e.py)), and if you hit it, your
-terminal is fixed by `reset` or by a new window.
+keeps whatever modes were on — that is the one exception, and it is why the panic
+and `SIGTERM` paths get the most attention in the exit-path spike
+([`spikes/shutdown_e2e.py`](../../spikes/shutdown_e2e.py): eight scenarios, its own
+ledger of the wire, and a check total it prints on every run rather than one a page
+restates — the captures live in [`spikes/results/`](../../spikes/results/)). If you
+hit it, your terminal is fixed by `reset` or by a new window.
 
 ## Two minutes in: the four things worth trying before anything else
 

@@ -30,8 +30,9 @@ it is published.
 
 | thing | size |
 | --- | --- |
-| Markdown under `docs/` (after this epic's pages) | **7,071 lines** |
-| …including `spikes/` (which the site carries) | 7,056 lines |
+| Markdown under `docs/` (after this epic's pages) | **7,071 lines** as first published; **7,280 lines** re-measured 2026-10-09 in the improvement sweep |
+| …including `spikes/` (which the site carries) | **7,564 lines** in that same re-measurement |
+| How either number is obtained | `find docs spikes -name '*.md' -not -path 'docs/_site/*' \| xargs wc -l \| tail -1`. Re-run it; do not re-type it. The pair originally written here was "7,071 / 7,056", which cannot both be true — the superset was 15 lines *smaller* than its own part. Corrected by the sweep (`looprs-00u.27`) |
 | Markdown before this epic | 4,558 lines (`docs/`), 5,003 with `spikes/` |
 | Distinct relative link targets outside `docs/` | `src/*.rs`, `spikes/*.py`, `spikes/results/*.log`, `examples/*.rs`, `tests/fixtures` |
 | Existing cross-links that must keep working | `../../spikes/results/…`, `../src/session/mod.rs`, `adr/0007-kanban-board.md#1-the-status--column-mapping` |
@@ -53,7 +54,7 @@ this corpus.
 | option | already on this machine? | install path | clean build | internal links | verdict |
 | --- | --- | --- | --- | --- | --- |
 | **`mdbook` (+ `mdbook-admonish`)** | **No** — `which mdbook` is empty | `brew install mdbook` or `cargo install mdbook`: needs network, pulls a fresh dependency tree, and must be re-run by every contributor and by the CI image | not measured — **not measured because the first criterion already decided it.** Installing a toolchain to discover a build time that a zero-install option does not have is the wrong experiment | survives only under mdbook's own layout rule (see Q2) | **rejected** |
-| **hand-rolled over `pulldown-cmark` 0.13.4** | **Yes** — it is in `Cargo.lock` because [`src/utils/md.rs`](../../src/utils/md.rs) renders markdown for the transcript | nothing. It is already a dependency of the app | **4.7 s cold** from an empty target dir (`--release`, `--offline`, compiling `pulldown-cmark` itself from the local registry cache); **~0.7 s warm** for all 7,071 lines into 157 files (35 pages + 122 carried files) / 3.9 MB | full control of path mapping and heading slugs (see below) | **chosen** |
+| **hand-rolled over `pulldown-cmark` 0.13.4** | **Yes** — it is in `Cargo.lock` because [`src/utils/md.rs`](../../src/utils/md.rs) renders markdown for the transcript | nothing. It is already a dependency of the app | **4.7 s cold** from an empty target dir (`--release`, `--offline`, compiling `pulldown-cmark` itself from the local registry cache); **~0.7 s warm** for the corpus as it stood at the decision — 157 files, 35 pages + 122 carried (36 + 123 since the sweep added its page) / 3.9 MB | full control of path mapping and heading slugs (see below) | **chosen** |
 | **"Markdown only on the git host"** | yes | nothing | n/a | *some*: host rendering keeps `docs/adr/*.md` links working but there is no book, no sidebar, no reading order, no per-page nav — and the outward links to `../../src/…` depend on the host's tree view | **rejected** |
 
 Two details of the chosen option are load-bearing rather than incidental, and both

@@ -131,7 +131,10 @@ The levers a test has, once the fakes are up:
 
 | call | effect |
 | --- | --- |
-| `Fakes::set_board(json)` | change what `bd ready` / `bd list` print, without restarting |
+| `Fakes::set_board(json)` | change what `bd ready` / `bd list` print, without restarting. Writes one **journal record** too, the way a real `bd` does, so the change detector sees the change (a detector test that set the board and not the journal would be asserting against a workspace no `bd` produces) |
+| `Fakes::set_board_unjournaled(json)` | move the board **without** a journal record — exactly what `bd dolt pull` / a merge does. The one way to test that a change the journal cannot see still lands, on the sweep and not before |
+| `Fakes::journal_head()` / `bump_journal(n)` / `set_journal(lines)` | read and move the journal on its own: stay quiet while the board does not change, make n changes, or hand the probe a script of records verbatim |
+| `Fakes::truncate_journal(floor, head)` / `disable_journal(true)` / `fail_journal(true)` | the three ways the probe itself goes bad: a watermark the retention has pruned (exit 1 + a typed `events_journal_truncated` refusal), a workspace with `events-journal` off (exit 0, empty, a note on stderr), and a `bd` that cannot answer at all. `fail_journal` breaks the **probe only** — the board reads stay healthy, which is what makes "a failed probe is never 'nothing changed'" a testable claim rather than a hope |
 | `Fakes::set_show(json)` | change what `bd show <id> --json` says — i.e. "did the worker close it" |
 | `Fakes::fail_bd(true)` | every subsequent `bd` exits 3, mid-pass |
 | `Fakes::refuse_claim(true)` | only `bd update … --claim` fails (exit 4); reads still work |
@@ -474,7 +477,7 @@ screen with the terminal's stale save.
 | the tee reports it | `app::tests` | `a_teed_alt_screen_is_a_screen_we_owe_the_terminal_back`, `a_screen_switch_that_was_never_teed_owes_nothing` |
 | the command boundary | `session::bash::tests` | `quitting_while_a_full_screen_program_holds_the_screen_leaves_the_alt_screen` |
 | the signals | `signals::tests` | `the_signals_install_inside_a_runtime`, `a_signal_sent_to_this_process_is_received` |
-| the real pty | `spikes/shutdown_e2e.py` | 8 scenarios, 149 checks, and a control run at 85/112 whose 27 failures are the ticket |
+| the real pty | `spikes/shutdown_e2e.py` | 8 scenarios. The count is the spike's own printed total and the captures in `spikes/results/shutdown-e2e-*.log` are the numbers to quote — the 149/149 of the `pdl.12` capture, and the 85/112 control whose 27 failures were the ticket. This cell points at logs rather than a count on purpose: the tree now prints more than 149 and no capture of that exists yet (`looprs-00u.23`) |
 
 The spike keeps its **own** ledger of the wire (`ModeTrace`) instead of reading the app's:
 "not in the alternate screen after exit" is not something the app may be asked at exit —

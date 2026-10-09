@@ -26,9 +26,16 @@ to pay for it.
 ## The frame, drawn
 
 Five bands, stacked, every frame. The order is
-[`viewport::frame_areas`](../src/viewport.rs), and the diagram is checked against
-it by the docs gate ([`./scripts/docs.sh check`](../scripts/docs.sh)), so if this
-picture is wrong the build fails.
+[`viewport::frame_areas`](../src/viewport.rs).
+
+**This picture is hand-maintained.** The docs gate
+([`./scripts/docs.sh check`](../scripts/docs.sh)) checks links, `LOOPRS_*` knob
+coverage and the keymap-vs-`CHORD_TABLE` tables — it does **not** check this
+diagram, so nothing fails if it drifts. When the band order matters, read it off
+`frame_areas`; if you change the ladder, change this picture in the same commit.
+Generating this block from `frame_areas` the way the keymap is generated from
+`CHORD_TABLE` is the only version of this that can truly be gated, and it is
+filed as `looprs-00u.22`.
 
 ```text
 ┌───────────────────────────────────────────────────────────────────────────┐

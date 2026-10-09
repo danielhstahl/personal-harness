@@ -189,8 +189,10 @@ looprs refuses that whole axis on purpose:
   terminal hand-back rather than hoping the child cleans up after itself
   ([ADR-0006](../adr/0006-terminal-mode-ledger.md)). Each of those three is the kind
   of thing that is invisible when it works and unfixable in a wrapper when it does
-  not — which is why they are ADRs and why the exit path has 149 checks in a spike
-  ([`spikes/shutdown_e2e.py`](../../spikes/shutdown_e2e.py)).
+  not — which is why they are ADRs, and why the exit path has a spike of its own
+  ([`spikes/shutdown_e2e.py`](../../spikes/shutdown_e2e.py)) whose totals live in
+  the committed captures under [`spikes/results/`](../../spikes/results/) rather
+  than in this sentence.
 
 **Pick aider/OpenHands if** you want the tool to own the edit-and-commit loop.
 **Pick looprs if** you want the terminal to be the product and the agents to stay

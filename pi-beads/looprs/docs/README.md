@@ -38,6 +38,7 @@ that states a default the reference contradicts.
 | [guide/configuration.md](guide/configuration.md) | all 23 `LOOPRS_*` variables the code reads, with defaults, values, `read in`, groups, harness-only variables, and combinations that were actually run |
 | [guide/operator.md](guide/operator.md) | where every file is written, recovery recipes, the diagnostic grep index, what to attach to a bug report, and the privacy note |
 | [guide/contributing.md](guide/contributing.md) | the module map (every file in `src/` accounted for), the end-to-end data-flow diagram, how-to recipes, the testing ladder, house style |
+| [guide/improvement-sweep.md](guide/improvement-sweep.md) | what to do with the things you notice while writing docs: the four required elements of a finding, "file it before you fix it", no drive-by refactors on a docs branch, and `scripts/sweep_check.py` |
 | [kanban.md](kanban.md) | the beads board in the frame: what the three columns show, how tall it gets and what `+N more` means, the `LOOPRS_KANBAN` / `LOOPRS_KANBAN_ROWS` / `LOOPRS_KANBAN_POLL_MS` knobs and their defaults, what `stale` means, and how to turn it off |
 | [testing.md](testing.md) | the gate (`./scripts/check.sh`), the fakes, and the scenario index — how a stateful multi-process TUI gets tested with no network, no model and no real `bd` database |
 | [../spikes/README.md](../spikes/README.md) | the measurement harness: what each spike measures and what it proved |

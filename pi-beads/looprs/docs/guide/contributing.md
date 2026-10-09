@@ -6,6 +6,9 @@ thing it covers. That only works if you can find the right file. This is the map
 Read this page if you are about to change code. Read
 [docs/testing.md](../testing.md) when you want to know how what you changed gets
 checked — this page maps the testing ladder and links there rather than restating it.
+And when reading the code turns up something that made you wince, the protocol for
+what happens next is [the improvement sweep](improvement-sweep.md): a finding gets
+a ticket with evidence before it gets a fix.
 
 ---
 
@@ -294,12 +297,15 @@ measures the thing it says. When a control run *passes* on a pre-feature binary,
 needle was firing on something else — that happened twice and both are written up in
 [docs/testing.md](../testing.md).
 
-**An `#[allow(dead_code)]` must name its reader.** The blanket allow is gone and the
-policy is written where it used to be
+**An `#[allow(dead_code)]` must name its reader.** The dead-code blanket allow is gone
+and the policy is written where it used to be
 ([`session/mod.rs`](../../src/session/mod.rs)). `dead_audit.py --gate` asks the
 compiler, through the allow, whether the item is still dead, and a redundant allow
 fails the build. It exists because nine allows promised a consumer that landed
-somewhere else.
+somewhere else. (Say *dead-code*, because the manifest still carries a different
+blanket: `unused_dependencies = "allow"` in
+[`Cargo.toml`](../../Cargo.toml) — priced as `looprs-00u.15`, and not covered by
+`dead_audit.py`, which only reads `#[allow(dead_code)]` attributes.)
 
 ## House style
 
@@ -339,7 +345,7 @@ rule in the CLI surface: `bd unavailable: command not found (LOOPRS_BD_BIN=bd)`
 gives you something to do.
 
 **Names state the property.** `SwitchAway::DrainThenPark` says what it does.
-`last_good_read` says what it is. `a_ticket_that_never_closed_stops_the_loop_instead_of_spinning`
+`last_good_read` says what it is. `a_ticket_that_is_never_closed_stops_the_loop_instead_of_spinning`
 is a test name that is a sentence, and that is deliberate: the test list is a
 specification, and a specification you have to read the body of is not one.
 
@@ -370,6 +376,10 @@ logs the retry once.
 * **the spikes** — if you are about to make a performance claim, someone has
   probably already measured a neighbour of it
   ([spikes/README.md](../../spikes/README.md))
+* **the improvement sweep** — if you found something wrong while reading and are
+  wondering whether to fix it now: no, you file it
+  ([the protocol](improvement-sweep.md), and `./scripts/sweep_check.py` to see
+  what is already on the list)
 
 **See also:** [docs/testing.md](../testing.md) ·
 [configuration reference](configuration.md) ·
