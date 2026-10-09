@@ -160,8 +160,8 @@ async fn run_logged(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> Ran {
             Ok(Some(ev)) => describe(&ev),
             Ok(None) => panic!("the bash session stream closed: {:?}", ran.notes),
             Err(_) => panic!(
-                "the shell never reported an exit. events so far: {:?}",
-                ran.notes
+                "no exit after {NO_HANG:?}\nnotes: {:?}\nout: {:?}",
+                ran.notes, ran.out
             ),
         };
         if let Some(rest) = line.strip_prefix("out ") {
