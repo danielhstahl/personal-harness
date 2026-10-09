@@ -65,7 +65,7 @@ pub const USER_FG: Color = Color::White;
 pub fn mode_color(mode: TerminalType) -> Color {
     match mode {
         TerminalType::Bash => BLUE,
-        TerminalType::Beeds => Color::DarkGray,
+        TerminalType::Beads => Color::DarkGray,
         TerminalType::Pi => Color::Yellow,
     }
 }

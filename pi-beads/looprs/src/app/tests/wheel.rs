@@ -419,7 +419,7 @@ fn the_wheel_and_the_page_keys_agree_because_they_are_one_store() {
 
 /// **All three modes, one wheel.** The handler does not know which mode it
 /// is in — it scrolls the *active view*'s store and nothing else — so a
-/// notch over the band has to move the transcript in Beeds, in Pi and in
+/// notch over the band has to move the transcript in Beads, in Pi and in
 /// Bash alike. This is the ticket's title read literally, and it is cheap to
 /// prove because there is nothing mode-specific to prove: one door, three
 /// views behind it.
@@ -455,9 +455,9 @@ fn the_wheel_scrolls_the_transcript_in_every_mode() {
 /// published snapshot instead of counting from the bottom of the screen.
 #[test]
 fn the_wheel_follows_the_band_when_the_input_box_is_gone() {
-    let (mut app, _rx) = app_with(TerminalType::Beeds);
+    let (mut app, _rx) = app_with(TerminalType::Beads);
     settle_deep(&mut app);
-    let id = SessionId::new(TerminalType::Beeds, 1);
+    let id = SessionId::new(TerminalType::Beads, 1);
     app.view_mut(id)
         .set_status(SessionStatus::Running, Instant::now());
     assert_eq!(

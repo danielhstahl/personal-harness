@@ -159,7 +159,7 @@ statement rather than a memory test.
 | `looprs-00u.18` | four 2–3.7k line modules | behaviour-preserving only: "if a split makes a bug obvious, file it as its own ticket rather than fixing it here" |
 | `looprs-00u.19` | `role: String // "user" \| "assistant" \| …` | a value set that lives in a comment cannot be documented from code, so the doc would need a second source of truth — the fix makes the enum the source |
 | `looprs-00u.20` | `docs/testing.md` promised a transcript entry the code had removed | fixed in the page (docs half), with the residual — nothing asserts the replacement marker's wording — split into `looprs-00u.20.1` |
-| `looprs-00u.21` | a header block documenting `-beads.txt` while disk carries `-Beeds.txt` | evidence is `ls -l` output in the ticket, and the reason it matters is the operator typing the documented name and getting "No such file or directory" |
+| `looprs-00u.21` | a header block documenting `-beads.txt` while disk carries `-Beads.txt` | evidence is `ls -l` output in the ticket, and the reason it matters is the operator typing the documented name and getting "No such file or directory" |
 
 `looprs-00u.22`–`looprs-00u.27` came from the second pass over the pages this epic
 itself had just published — which is the part worth copying: **read your own new docs

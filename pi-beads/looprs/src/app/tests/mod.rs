@@ -61,7 +61,7 @@ fn app_with(active: TerminalType) -> (App, mpsc::Receiver<UiCommand>) {
 }
 
 fn beads_id() -> SessionId {
-    SessionId::new(TerminalType::Beeds, 1)
+    SessionId::new(TerminalType::Beads, 1)
 }
 
 fn pi_id() -> SessionId {

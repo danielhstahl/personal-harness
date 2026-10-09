@@ -846,7 +846,7 @@ impl App {
     /// The budget the frame should lay the band out with, as displayed right now.
     ///
     /// **Gated by the displayed mode, not by "a board exists"** — the ticket's
-    /// first wiring requirement. `Beeds` on screen with a board to show is the
+    /// first wiring requirement. `Beads` on screen with a board to show is the
     /// only state that gets a non-`Off` budget; in Bash and in Pi the band is
     /// `Off`, which [`viewport::kanban_rows`] answers with `0` rows, which is
     /// "not hidden but reserved" and precisely the *zero rows* the frame is
@@ -858,7 +858,7 @@ impl App {
     /// the user reads Pi, and a band that appeared because a session existed
     /// would be chrome about something the user is not looking at.
     pub fn kanban_budget(&self) -> viewport::KanbanBudget {
-        if self.active == TerminalType::Beeds && self.board.is_some() {
+        if self.active == TerminalType::Beads && self.board.is_some() {
             self.kanban_budget
         } else {
             viewport::KanbanBudget::Off
@@ -976,7 +976,7 @@ impl App {
     /// One mode's row input, read off its view.
     ///
     /// A mode with no view at all is `NotStarted` rather than absent: "never
-    /// entered" is a state the row renders (`○ Beeds · not started`), not a hole
+    /// entered" is a state the row renders (`○ Beads · not started`), not a hole
     /// in it.
     fn sess(&self, mode: TerminalType) -> crate::components::status::Sess<'_> {
         let Some(v) = self.view(mode) else {
@@ -1710,7 +1710,7 @@ impl App {
     /// answers "does this settle mean take the next bead?": that question needs the
     /// step, the worker and the parked flag, all of which live inside
     /// [`BeadsSession`](crate::session::BeadsSession) and none of which the App can
-    /// see. It used to answer it anyway, from `session.mode == Beeds`, and that was
+    /// see. It used to answer it anyway, from `session.mode == Beads`, and that was
     /// looprs-msj — a Pi answer settling could drive the beads machine, and a beads
     /// worker settling with the box on Pi stalled the loop.
     ///

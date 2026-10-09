@@ -155,7 +155,7 @@ async fn app(exit: Arc<Teardown>) -> Result<()> {
     // with the ledger still holding everything it switched on.
     let mut signals = ExitSignals::install()?;
 
-    run(&mut frame, TerminalType::Beeds, &exit, &mut signals).await
+    run(&mut frame, TerminalType::Beads, &exit, &mut signals).await
 }
 
 async fn run(
@@ -795,7 +795,7 @@ fn view(app: &App, f: &mut Frame, preview: &[Line<'static>], input_rows: u16) {
 
     // The kanban band (epic looprs-5o4): painted into the rows the frame
     // budgeted for it, and into no others. `board_area` is empty in every mode
-    // except `Beeds` — `App::kanban_budget` gates on the *displayed* mode, the
+    // except `Beads` — `App::kanban_budget` gates on the *displayed* mode, the
     // budget turns that into zero rows, and a zero-length band is a band that
     // occupies nothing — so "there are rows here" is the gate. There is no
     // second mode check in this function, because a second check is a second
@@ -953,7 +953,7 @@ mod tests {
     /// on the row matters if there is nothing **on** the row.
     #[test]
     fn the_status_row_is_painted_into_the_band_the_layout_reserved_for_it() {
-        let app = app(TerminalType::Beeds, true);
+        let app = app(TerminalType::Beads, true);
         let viewport::FrameAreas { status, .. } = viewport::frame_areas(
             Rect::new(0, 0, 60, 12),
             0,
@@ -964,7 +964,7 @@ mod tests {
         let row = &screen[status.y as usize];
         assert_eq!(status.height, 1);
         assert!(
-            row.contains("Beeds") && row.contains("not started"),
+            row.contains("Beads") && row.contains("not started"),
             "the reserved row came back empty: {screen:?}"
         );
     }
@@ -1001,13 +1001,13 @@ mod tests {
     /// load-bearing, and a row that only paints alongside the box would be dark.
     #[test]
     fn the_status_row_is_painted_even_with_no_input_box() {
-        let mut app = app(TerminalType::Beeds, false);
+        let mut app = app(TerminalType::Beads, false);
         app.update(Msg::BeadStep {
-            session: SessionId::new(TerminalType::Beeds, 1),
+            session: SessionId::new(TerminalType::Beads, 1),
             step: BeadStep::WorkTickets,
         });
         app.update(Msg::SessionStatus {
-            session: SessionId::new(TerminalType::Beeds, 1),
+            session: SessionId::new(TerminalType::Beads, 1),
             status: SessionStatus::Running,
         });
         let viewport::FrameAreas { status, input, .. } = viewport::frame_areas(
@@ -1033,13 +1033,13 @@ mod tests {
     /// just empty — an empty band still pushes the row up.
     #[test]
     fn a_hidden_box_leaves_the_status_row_on_the_last_row_of_the_screen() {
-        let mut app = app(TerminalType::Beeds, false);
+        let mut app = app(TerminalType::Beads, false);
         app.update(Msg::BeadStep {
-            session: SessionId::new(TerminalType::Beeds, 1),
+            session: SessionId::new(TerminalType::Beads, 1),
             step: BeadStep::WorkTickets,
         });
         app.update(Msg::SessionStatus {
-            session: SessionId::new(TerminalType::Beeds, 1),
+            session: SessionId::new(TerminalType::Beads, 1),
             status: SessionStatus::Running,
         });
         let band = app.input_band(60);
@@ -1075,8 +1075,8 @@ mod tests {
     /// bottom while there is genuinely nothing under it.
     #[test]
     fn the_status_row_gives_the_rows_back_when_the_box_reopens() {
-        let mut app = app(TerminalType::Beeds, false);
-        let id = SessionId::new(TerminalType::Beeds, 1);
+        let mut app = app(TerminalType::Beads, false);
+        let id = SessionId::new(TerminalType::Beads, 1);
         app.view_mut(id)
             .set_status(SessionStatus::Running, Instant::now());
         assert_eq!(app.input_band(60), viewport::NO_INPUT_ROWS);
@@ -1644,7 +1644,7 @@ mod tests {
     /// beads mode.
     #[test]
     fn the_band_sits_directly_above_the_status_row_and_below_the_cards() {
-        let mut app = app(TerminalType::Beeds, true);
+        let mut app = app(TerminalType::Beads, true);
         app.set_kanban_budget(viewport::KanbanBudget::Auto);
         app.adopt_board(wired_board());
         let areas = areas_of(&app, WIDTH, HEIGHT);
@@ -1680,7 +1680,7 @@ mod tests {
         // The row the band sits on top of is still the status row and nothing
         // of the band leaked into it.
         assert!(
-            screen[areas.status.y as usize].contains("Beeds"),
+            screen[areas.status.y as usize].contains("Beads"),
             "the row under the band is not the status row: {screen:?}"
         );
         assert!(
@@ -1743,7 +1743,7 @@ mod tests {
     #[test]
     fn an_unchanged_poll_draws_nothing_and_a_moved_board_draws_once() {
         let t0 = Instant::now();
-        let mut app = app(TerminalType::Beeds, true);
+        let mut app = app(TerminalType::Beads, true);
         app.set_kanban_budget(viewport::KanbanBudget::Auto);
         app.adopt_board(wired_board().stamped_at(t0));
         let mut screen = Screen::new(HEIGHT);
@@ -1812,7 +1812,7 @@ mod tests {
     #[test]
     fn the_age_the_band_shows_ages_without_costing_a_repaint() {
         let t0 = Instant::now();
-        let mut app = app(TerminalType::Beeds, true);
+        let mut app = app(TerminalType::Beads, true);
         app.set_kanban_budget(viewport::KanbanBudget::Auto);
         app.adopt_board(wired_board().stamped_at(t0));
         app.dirty = false;
@@ -1849,7 +1849,7 @@ mod tests {
     /// not an empty board (looprs-037, one layer up from the widget).
     #[test]
     fn the_band_comes_up_reading_and_never_blank() {
-        let mut app = app(TerminalType::Beeds, true);
+        let mut app = app(TerminalType::Beads, true);
         app.set_kanban_budget(viewport::KanbanBudget::Auto);
         app.adopt_board(BoardSnapshot::loading());
         let areas = areas_of(&app, WIDTH, HEIGHT);
@@ -1873,11 +1873,11 @@ mod tests {
     }
 
     /// **Both directions of the mode switch**, driven by the key that causes
-    /// it: Beeds → other must take the band off in one frame with nothing left
+    /// it: Beads → other must take the band off in one frame with nothing left
     /// behind, and the way back must put it back where it was.
     #[test]
     fn tab_out_of_beads_takes_the_band_off_and_tab_back_puts_it_exactly_back() {
-        let mut app = app(TerminalType::Beeds, true);
+        let mut app = app(TerminalType::Beads, true);
         app.set_kanban_budget(viewport::KanbanBudget::Auto);
         app.adopt_board(wired_board());
         let mut screen = Screen::new(HEIGHT);
@@ -1890,7 +1890,7 @@ mod tests {
             app.update(tab());
             assert!(screen.paint(&mut app), "the mode switch asked for a frame");
             let now = screen.rows();
-            if app.active == TerminalType::Beeds {
+            if app.active == TerminalType::Beads {
                 continue;
             }
             saw_other_mode = true;
@@ -1907,7 +1907,7 @@ mod tests {
             );
         }
         assert!(saw_other_mode, "Tab never left beads mode");
-        assert_eq!(app.active, TerminalType::Beeds, "three Tabs cycle back");
+        assert_eq!(app.active, TerminalType::Beads, "three Tabs cycle back");
         assert!(
             screen.rows().concat().contains("To-do 2"),
             "the band did not come back: {:?}",
@@ -1926,7 +1926,7 @@ mod tests {
     /// overrunning the frame at any size.
     #[test]
     fn shrinking_the_window_takes_the_band_first_and_the_status_row_never_moves() {
-        let mut app = app(TerminalType::Beeds, true);
+        let mut app = app(TerminalType::Beads, true);
         app.set_kanban_budget(viewport::KanbanBudget::Auto);
         app.adopt_board(wired_board());
         assert_eq!(
@@ -1976,7 +1976,7 @@ mod tests {
         let a = areas_of(&app, 60, 6);
         assert_eq!(a.kanban.height, 0, "{a:?}");
         assert!(!small.concat().contains("To-do"), "{small:?}");
-        assert!(small[a.status.y as usize].contains("Beeds"), "{small:?}");
+        assert!(small[a.status.y as usize].contains("Beads"), "{small:?}");
     }
 
     /// **The overlays keep their own band** (§4): the "N new" pill and the copy
@@ -1984,14 +1984,14 @@ mod tests {
     /// sits below that. The layout says they cannot meet; the paint says it too.
     #[test]
     fn the_transcript_overlays_do_not_take_the_bands_rows() {
-        let mut app = app(TerminalType::Beeds, true);
+        let mut app = app(TerminalType::Beads, true);
         app.set_kanban_budget(viewport::KanbanBudget::Auto);
         app.adopt_board(wired_board());
-        settle(&mut app, SessionId::new(TerminalType::Beeds, 1), 30);
+        settle(&mut app, SessionId::new(TerminalType::Beads, 1), 30);
         let band_rows_count = app.transcript_band_rows();
         // Off the tail, so the pill is up.
         app.scroll_active(-(band_rows_count as isize));
-        app.view_mut(SessionId::new(TerminalType::Beeds, 1))
+        app.view_mut(SessionId::new(TerminalType::Beads, 1))
             .push_note(MessageKind::System, "late arrival".into());
         app.flush_active(WIDTH);
         assert!(app.new_rows() > 0, "setup: rows the user has not seen");
@@ -2022,12 +2022,12 @@ mod tests {
     /// back in the frame it asks for.
     #[test]
     fn a_band_update_while_the_screen_is_held_paints_nothing_until_it_comes_back() {
-        let mut app = app(TerminalType::Beeds, true);
+        let mut app = app(TerminalType::Beads, true);
         app.set_kanban_budget(viewport::KanbanBudget::Auto);
         app.adopt_board(wired_board());
         let mut screen = Screen::new(HEIGHT);
         assert!(screen.paint(&mut app));
-        let held_by = SessionId::new(TerminalType::Beeds, 1);
+        let held_by = SessionId::new(TerminalType::Beads, 1);
 
         app.update(Msg::ScreenHeld {
             session: held_by,
@@ -2155,7 +2155,7 @@ mod tests {
                 reconcile: Duration::from_millis(50),
             },
         });
-        let mut app = app(TerminalType::Beeds, true);
+        let mut app = app(TerminalType::Beads, true);
         app.set_kanban_budget(viewport::KanbanBudget::Auto);
         // The seed `run` installs before the first read lands.
         app.adopt_board((*handle.borrow()).clone());

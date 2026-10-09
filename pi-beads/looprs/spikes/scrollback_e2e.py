@@ -179,7 +179,7 @@ def main():
         # ── boot into Bash mode ──────────────────────────────────────────────
         time.sleep(1.2)
         check("the app boots and is alive", d.alive())
-        # Tab: Beeds -> Pi -> Bash. The mode label in the frame is the observable
+        # Tab: Beads -> Pi -> Bash. The mode label in the frame is the observable
         # (same needle bash_e2e.py uses).
         d.send(b"\t")
         time.sleep(0.4)

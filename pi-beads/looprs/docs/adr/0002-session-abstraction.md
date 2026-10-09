@@ -284,7 +284,7 @@ Costs / risks:
 * `TerminalType`/`BeadStep` moved out of `components/input.rs` and `app.rs` into the session layer.
   Re-exported where they were used, but any code outside this repo's current tree that imported them
   from the old paths needs the new import.
-* The variant is spelled `Beeds`; this ADR calls the mode "Beads". Renaming it was deliberately left
+* The variant is spelled `Beads`; this ADR calls the mode "Beads". Renaming it was deliberately left
   out to keep this ticket type-only.
 
 ## Amendments made while implementing looprs-05j (the router)
@@ -293,7 +293,7 @@ Three things this ADR did not anticipate. Each is small, but the contract above 
 contract, so they are recorded rather than slipped in.
 
 1. **`Session::advance()` was added** — the routing target for the legacy
-   `UiCommand::BeadsNext`. The Router routes it by *mode* (`Beeds`), never by the
+   `UiCommand::BeadsNext`. The Router routes it by *mode* (`Beads`), never by the
    active mode, because the settled event that triggered it named the beads session.
    It is a wart on a generic trait and it should die with looprs-msj, which moves the
    step machine inside `BeadsSession` where the decision belongs. Default is a no-op
@@ -370,7 +370,7 @@ app's; and `App` holds `HashMap<TerminalType, SessionView>` with `need_input` /
 ## Amendments made while implementing looprs-msj (provenance for loop transitions)
 
 The bug this ticket filed was Q2 being broken in one specific place: `App::on_pi`
-answered "does this settle mean *take the next bead*?" from `session.mode == Beeds`,
+answered "does this settle mean *take the next bead*?" from `session.mode == Beads`,
 and `session.mode` was standing in for a question only the beads session can answer.
 Everything below is that correction, plus three things it turned out to require.
 

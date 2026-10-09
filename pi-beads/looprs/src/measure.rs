@@ -289,7 +289,7 @@ fn kib(n: f64) -> String {
 }
 
 fn beads() -> SessionId {
-    SessionId::new(TerminalType::Beeds, 0)
+    SessionId::new(TerminalType::Beads, 0)
 }
 
 #[test]

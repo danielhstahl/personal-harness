@@ -24,7 +24,7 @@ python3 spikes/status_e2e.py       # 20 checks over 6 scenarios, ~25s
 ```
 
 The app opens in **Beads** mode
-([`run(&mut frame, TerminalType::Beeds, …)`](../../src/main.rs)). Not because Beads
+([`run(&mut frame, TerminalType::Beads, …)`](../../src/main.rs)). Not because Beads
 is the most important mode and not because you asked for it — because the beads
 loop's first pass runs during startup, so the input box opens in the right state
 instead of flickering once the first message lands. If you came for the shell,

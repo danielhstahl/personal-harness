@@ -48,7 +48,7 @@ fn bare_loop() -> (BeadsLoop, mpsc::UnboundedReceiver<SessionEvent>) {
         clipboard: Arc::new(crate::services::clipboard::Noop),
     };
     (
-        BeadsLoop::new(SessionId::new(TerminalType::Beeds, 0), tx, ctl_tx, cfg),
+        BeadsLoop::new(SessionId::new(TerminalType::Beads, 0), tx, ctl_tx, cfg),
         rx,
     )
 }

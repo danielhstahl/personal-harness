@@ -992,7 +992,7 @@ missing thing, and usually the chord that would have worked.
 
 The first spike of this kind in the repo: the app driven inside a live `tmux`
 3.7c session rather than a pty the harness owns. Fakes for `pi` and `bd` are
-mandatory, not tidiness — looprs boots into Beeds and the beads loop runs
+mandatory, not tidiness — looprs boots into Beads and the beads loop runs
 `bd update <id> --claim` before a Tab can reach it, so an unplanned
 `looprs` run moves the real board (it did, once, during this ticket; restored).
 

@@ -218,11 +218,11 @@ fn the_keyboard_table_is_mode_times_liveness() {
         (TerminalType::Pi, Running, false),
         (TerminalType::Pi, Aborting, false),
         (TerminalType::Pi, Dead, true),
-        (TerminalType::Beeds, NotStarted, true),
-        (TerminalType::Beeds, Idle, true),
-        (TerminalType::Beeds, Running, false),
-        (TerminalType::Beeds, Aborting, false),
-        (TerminalType::Beeds, Dead, true),
+        (TerminalType::Beads, NotStarted, true),
+        (TerminalType::Beads, Idle, true),
+        (TerminalType::Beads, Running, false),
+        (TerminalType::Beads, Aborting, false),
+        (TerminalType::Beads, Dead, true),
     ];
 
     assert_eq!(
@@ -243,7 +243,7 @@ fn the_keyboard_table_is_mode_times_liveness() {
 fn with_pi_and_beads_both_running_bash_is_still_there() {
     let now = Instant::now();
     let mut pi = view(TerminalType::Pi);
-    let mut beads = view(TerminalType::Beeds);
+    let mut beads = view(TerminalType::Beads);
     let mut bash = view(TerminalType::Bash);
 
     pi.set_status(SessionStatus::Running, now);

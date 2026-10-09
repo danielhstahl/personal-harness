@@ -18,7 +18,7 @@ use super::*;
 /// thing that can be left engaged after the door opens.
 #[test]
 fn the_step_is_a_label_not_a_lock() {
-    let mut beads = view(TerminalType::Beeds);
+    let mut beads = view(TerminalType::Beads);
 
     beads.set_step(BeadStep::WorkTickets);
     assert_eq!(

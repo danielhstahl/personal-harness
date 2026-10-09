@@ -202,7 +202,7 @@ def main():
     idle_rss = rss_kib(d.proc.pid)
     say(f"idle RSS before the flood: {idle_rss / 1024:.1f} MiB")
 
-    # Tab to Bash: Beeds -> Pi -> Bash.
+    # Tab to Bash: Beads -> Pi -> Bash.
     d.send(b"\t")
     time.sleep(0.4)
     d.send(b"\t")

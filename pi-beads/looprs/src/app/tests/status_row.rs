@@ -33,10 +33,10 @@ fn the_row_names_a_busy_mode_you_are_not_looking_at() {
     });
     let txt = row(&app, 100);
     assert!(txt.contains("Pi"), "{txt:?}");
-    assert!(txt.contains("bg: Beeds working"), "{txt:?}");
+    assert!(txt.contains("bg: Beads working"), "{txt:?}");
     assert!(txt.contains("looprs-guh"), "{txt:?}");
     assert!(
-        !txt.contains("warm: Beeds"),
+        !txt.contains("warm: Beads"),
         "a running mode is not a warm one: {txt:?}"
     );
 }
@@ -51,7 +51,7 @@ fn a_status_edge_lands_in_its_own_view_and_not_in_the_active_one() {
         status: SessionStatus::Running,
     });
     assert_eq!(
-        app.view(TerminalType::Beeds).unwrap().status,
+        app.view(TerminalType::Beads).unwrap().status,
         SessionStatus::Running
     );
     assert_eq!(
@@ -72,7 +72,7 @@ fn a_status_edge_lands_in_its_own_view_and_not_in_the_active_one() {
         SessionStatus::Idle
     );
     assert_eq!(
-        app.view(TerminalType::Beeds).unwrap().status,
+        app.view(TerminalType::Beads).unwrap().status,
         SessionStatus::Running,
         "and beads is still running, unchanged by the Pi edge"
     );
@@ -83,7 +83,7 @@ fn a_status_edge_lands_in_its_own_view_and_not_in_the_active_one() {
 /// actually alive.
 #[test]
 fn warm_children_are_named_only_for_modes_with_a_live_child() {
-    let (mut app, _rx) = app_with(TerminalType::Beeds);
+    let (mut app, _rx) = app_with(TerminalType::Beads);
     assert!(
         !row(&app, 100).contains("warm"),
         "nothing is alive yet: {:?}",
@@ -181,7 +181,7 @@ fn a_second_run_starts_a_new_clock() {
 /// the previous one's age or its claim.
 #[test]
 fn a_new_generation_carries_no_age_and_no_claim() {
-    let (mut app, _rx) = app_with(TerminalType::Beeds);
+    let (mut app, _rx) = app_with(TerminalType::Beads);
     let t0 = Instant::now();
     app.on_tick(t0);
     app.update(Msg::ActiveBead {
@@ -198,7 +198,7 @@ fn a_new_generation_carries_no_age_and_no_claim() {
     app.on_tick(t0 + Duration::from_secs(60));
     assert!(row(&app, 100).contains("looprs-old"));
 
-    let newer = SessionId::new(TerminalType::Beeds, 2);
+    let newer = SessionId::new(TerminalType::Beads, 2);
     app.view_mut(newer);
     let txt = row(&app, 100);
     assert!(!txt.contains("looprs-old"), "{txt:?}");
@@ -242,9 +242,9 @@ fn an_idle_app_is_not_repainted_by_the_row_and_a_busy_one_is_repainted_at_eight_
 #[test]
 fn a_fresh_app_with_no_sessions_at_all_renders_a_sane_row() {
     let (tx, _rx) = mpsc::channel::<UiCommand>(1);
-    let app = App::new(tx, InputState::new(), TerminalType::Beeds, 40, 24);
+    let app = App::new(tx, InputState::new(), TerminalType::Beads, 40, 24);
     let txt = row(&app, 40);
-    assert!(txt.contains("Beeds"), "{txt:?}");
+    assert!(txt.contains("Beads"), "{txt:?}");
     assert!(txt.contains("not started"), "{txt:?}");
     assert!(!txt.contains('{') && !txt.contains('}'), "{txt:?}");
 }
@@ -253,7 +253,7 @@ fn a_fresh_app_with_no_sessions_at_all_renders_a_sane_row() {
 /// has to stay put when the mode is switched away from and back.
 #[test]
 fn the_last_error_shows_in_its_own_mode_and_does_not_follow_the_user_around() {
-    let (mut app, _rx) = app_with(TerminalType::Beeds);
+    let (mut app, _rx) = app_with(TerminalType::Beads);
     app.update(Msg::Error {
         session: Some(beads_id()),
         text: "bd: database is locked".into(),

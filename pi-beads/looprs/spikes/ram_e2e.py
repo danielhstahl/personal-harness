@@ -179,7 +179,7 @@ def run_producer(kind, cmd, samples=1.0):
     if not d.alive():
         check(f"{kind}: app booted", False)
         return
-    # Tab twice: Beeds -> Pi -> Bash.
+    # Tab twice: Beads -> Pi -> Bash.
     d.send(b"\t")
     time.sleep(0.4)
     d.send(b"\t")

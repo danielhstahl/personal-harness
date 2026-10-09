@@ -669,21 +669,21 @@ mod tests {
         let rows: Vec<VerbRow> = vec![
             // beads: the loop's own step wins over the process word
             (
-                TerminalType::Beeds,
+                TerminalType::Beads,
                 Some(BeadStep::AwaitInput),
                 SessionStatus::Idle,
                 None,
                 "awaiting input",
             ),
             (
-                TerminalType::Beeds,
+                TerminalType::Beads,
                 Some(BeadStep::CreateTickets),
                 SessionStatus::Running,
                 None,
                 "planning",
             ),
             (
-                TerminalType::Beeds,
+                TerminalType::Beads,
                 Some(BeadStep::WorkTickets),
                 SessionStatus::Running,
                 None,
@@ -692,7 +692,7 @@ mod tests {
             // ...and a paused loop says so, because "awaiting input" after a
             // failure reads as an invitation rather than a consequence.
             (
-                TerminalType::Beeds,
+                TerminalType::Beads,
                 Some(BeadStep::AwaitInput),
                 SessionStatus::Idle,
                 Some("bd refused the claim"),
@@ -700,7 +700,7 @@ mod tests {
             ),
             // a cancel in flight is never "working"
             (
-                TerminalType::Beeds,
+                TerminalType::Beads,
                 Some(BeadStep::WorkTickets),
                 SessionStatus::Aborting,
                 None,
@@ -708,7 +708,7 @@ mod tests {
             ),
             // a stale step naming work that is not running believes the process
             (
-                TerminalType::Beeds,
+                TerminalType::Beads,
                 Some(BeadStep::WorkTickets),
                 SessionStatus::Idle,
                 None,
@@ -716,7 +716,7 @@ mod tests {
             ),
             // beads with no step yet (the first frame after boot) still answers
             (
-                TerminalType::Beeds,
+                TerminalType::Beads,
                 None,
                 SessionStatus::NotStarted,
                 None,
@@ -761,7 +761,7 @@ mod tests {
             ),
             // busy beats a step that says the human is wanted: believe the process
             (
-                TerminalType::Beeds,
+                TerminalType::Beads,
                 Some(BeadStep::AwaitInput),
                 SessionStatus::Running,
                 None,
@@ -809,8 +809,8 @@ mod tests {
     /// so in words rather than render nothing, a hole, or a format-string leak.
     #[test]
     fn an_empty_row_still_answers_which_mode_and_whether_anything_started() {
-        let (txt, w) = render(&plain(TerminalType::Beeds, SessionStatus::NotStarted), 40);
-        assert!(txt.contains("Beeds"), "{txt:?}");
+        let (txt, w) = render(&plain(TerminalType::Beads, SessionStatus::NotStarted), 40);
+        assert!(txt.contains("Beads"), "{txt:?}");
         assert!(txt.contains("not started"), "{txt:?}");
         assert!(w <= 40, "{w} > 40: {txt:?}");
         assert!(
@@ -836,7 +836,7 @@ mod tests {
         let b = bead();
         let long_err = "bd show looprs-guh failed: repository lock held by another process for 30s";
         let active = Sess {
-            mode: TerminalType::Beeds,
+            mode: TerminalType::Beads,
             status: SessionStatus::Running,
             step: Some(BeadStep::WorkTickets),
             bead: Some(&b),
@@ -889,7 +889,7 @@ mod tests {
     fn at_forty_columns_with_an_error_the_work_and_the_failure_survive() {
         let b = bead();
         let active = Sess {
-            mode: TerminalType::Beeds,
+            mode: TerminalType::Beads,
             status: SessionStatus::Running,
             step: Some(BeadStep::WorkTickets),
             bead: Some(&b),
@@ -909,7 +909,7 @@ mod tests {
         };
         let (txt, w) = render(&s, 40);
         assert!(w <= 40, "{w}: {txt:?}");
-        assert!(txt.contains("Beeds"), "which mode: {txt:?}");
+        assert!(txt.contains("Beads"), "which mode: {txt:?}");
         assert!(txt.contains("working"), "is it working: {txt:?}");
         assert!(txt.contains("looprs-guh"), "which bead: {txt:?}");
         assert!(txt.contains("✗"), "did anything fail: {txt:?}");
@@ -933,7 +933,7 @@ mod tests {
     #[test]
     fn the_widest_segment_goes_first_and_the_mode_last() {
         let b = bead();
-        let mut s = plain(TerminalType::Beeds, SessionStatus::Idle);
+        let mut s = plain(TerminalType::Beads, SessionStatus::Idle);
         s.active.bead = Some(&b);
         // Wide enough for everything, including the title.
         let (wide, _) = render(&s, 120);
@@ -957,7 +957,7 @@ mod tests {
         let b = bead();
         let mut s = plain(TerminalType::Pi, SessionStatus::Idle);
         s.background.push(Sess {
-            mode: TerminalType::Beeds,
+            mode: TerminalType::Beads,
             status: SessionStatus::Running,
             step: Some(BeadStep::WorkTickets),
             bead: Some(&b),
@@ -965,7 +965,7 @@ mod tests {
             error: None,
         });
         let (txt, _) = render(&s, 100);
-        assert!(txt.contains("bg: Beeds working"), "{txt:?}");
+        assert!(txt.contains("bg: Beads working"), "{txt:?}");
         assert!(txt.contains("looprs-guh"), "{txt:?}");
         // The active mode never lists itself as background.
         assert!(!txt.contains("bg: Pi"), "{txt:?}");
@@ -979,7 +979,7 @@ mod tests {
         let b = bead();
         let mut s = plain(TerminalType::Pi, SessionStatus::Idle);
         s.background.push(Sess {
-            mode: TerminalType::Beeds,
+            mode: TerminalType::Beads,
             status: SessionStatus::Running,
             step: Some(BeadStep::WorkTickets),
             bead: Some(&b),
@@ -988,7 +988,7 @@ mod tests {
         });
         let (txt, w) = render(&s, 40);
         assert!(w <= 40, "{w}: {txt:?}");
-        assert!(txt.contains("bg: Beeds working"), "{txt:?}");
+        assert!(txt.contains("bg: Beads working"), "{txt:?}");
         assert!(
             !txt.contains("looprs-"),
             "the detail outlived the room for it: {txt:?}"
@@ -999,13 +999,13 @@ mod tests {
     /// as a cost of the warm-child policy, so it gets said.
     #[test]
     fn warm_children_are_listed_once_and_busy_ones_are_not_double_counted() {
-        let mut s = plain(TerminalType::Beeds, SessionStatus::Idle);
+        let mut s = plain(TerminalType::Beads, SessionStatus::Idle);
         s.warm = vec![TerminalType::Pi, TerminalType::Bash];
         let (txt, _) = render(&s, 100);
         assert!(txt.contains("warm: Pi, Bash"), "{txt:?}");
 
         // A busy background mode rides its own, higher-priority entry.
-        let mut s = plain(TerminalType::Beeds, SessionStatus::Idle);
+        let mut s = plain(TerminalType::Beads, SessionStatus::Idle);
         s.background
             .push(sess(TerminalType::Pi, SessionStatus::Running));
         let (txt, _) = render(&s, 100);
@@ -1061,7 +1061,7 @@ mod tests {
     fn the_cache_detail_gives_way_before_the_in_out_pair() {
         let b = bead();
         let active = Sess {
-            mode: TerminalType::Beeds,
+            mode: TerminalType::Beads,
             status: SessionStatus::Running,
             step: Some(BeadStep::WorkTickets),
             bead: Some(&b),
@@ -1104,7 +1104,7 @@ mod tests {
         );
         // And of course the answers the row exists to give are all still there.
         assert!(
-            txt.contains("Beeds") && txt.contains("working") && txt.contains("looprs-guh"),
+            txt.contains("Beads") && txt.contains("working") && txt.contains("looprs-guh"),
             "{txt:?}"
         );
     }
@@ -1163,7 +1163,7 @@ mod peek {
                 "beads idle, nothing started",
                 Status {
                     active: Sess {
-                        mode: TerminalType::Beeds,
+                        mode: TerminalType::Beads,
                         status: SessionStatus::NotStarted,
                         step: Some(BeadStep::AwaitInput),
                         bead: None,
@@ -1180,7 +1180,7 @@ mod peek {
                 "beads working a bead, warm pi",
                 Status {
                     active: Sess {
-                        mode: TerminalType::Beeds,
+                        mode: TerminalType::Beads,
                         status: SessionStatus::Running,
                         step: Some(BeadStep::WorkTickets),
                         bead: Some(&b),
@@ -1205,7 +1205,7 @@ mod peek {
                         error: None,
                     },
                     background: vec![Sess {
-                        mode: TerminalType::Beeds,
+                        mode: TerminalType::Beads,
                         status: SessionStatus::Running,
                         step: Some(BeadStep::WorkTickets),
                         bead: Some(&b),
@@ -1229,7 +1229,7 @@ mod peek {
                         error: Some("spawn: no such file or directory"),
                     },
                     background: vec![],
-                    warm: vec![TerminalType::Pi, TerminalType::Beeds],
+                    warm: vec![TerminalType::Pi, TerminalType::Beads],
                     tokens: Tokens {
                         input: 12_900,
                         output: 3_100,
@@ -1242,7 +1242,7 @@ mod peek {
                 "beads paused after an error",
                 Status {
                     active: Sess {
-                        mode: TerminalType::Beeds,
+                        mode: TerminalType::Beads,
                         status: SessionStatus::Idle,
                         step: Some(BeadStep::AwaitInput),
                         bead: None,

@@ -56,7 +56,7 @@ fn claim(id: &str) -> Msg {
 }
 
 fn beads_tokens(app: &App) -> Tokens {
-    app.view(TerminalType::Beeds).unwrap().tokens
+    app.view(TerminalType::Beads).unwrap().tokens
 }
 
 fn pi_tokens(app: &App) -> Tokens {
@@ -89,7 +89,7 @@ fn every_assistant_message_adds_and_nothing_else_does() {
 /// release that follows it.
 #[test]
 fn the_beads_window_opens_on_a_claim_and_survives_the_release() {
-    let (mut app, _rx) = app_with(TerminalType::Beeds);
+    let (mut app, _rx) = app_with(TerminalType::Beads);
     app.update(ended(beads_id(), "assistant", Some(usage(10, 5, 20, 1))));
     assert_eq!(
         beads_tokens(&app).input,
@@ -201,7 +201,7 @@ fn the_wire_usage_record_parses_as_pi_writes_it() {
 /// window prints nothing rather than `↑0 ↓0`.
 #[test]
 fn the_row_prints_the_window_it_is_handed() {
-    let (mut app, _rx) = app_with(TerminalType::Beeds);
+    let (mut app, _rx) = app_with(TerminalType::Beads);
     let empty = app.status_line(120).to_string();
     assert!(
         !empty.contains('\u{2191}'),
@@ -223,7 +223,7 @@ fn the_row_prints_the_window_it_is_handed() {
 /// view" class: an event lands in the view that *owns* the session.
 #[test]
 fn events_land_in_the_view_that_owns_them() {
-    let (mut app, _rx) = app_with(TerminalType::Beeds);
+    let (mut app, _rx) = app_with(TerminalType::Beads);
 
     app.update(Msg::Agent {
         session: pi_id(),
@@ -244,8 +244,8 @@ fn events_land_in_the_view_that_owns_them() {
         },
     });
 
-    assert!(text_of(&app, TerminalType::Beeds).contains("beads answer"));
-    assert!(!text_of(&app, TerminalType::Beeds).contains("pi answer"));
+    assert!(text_of(&app, TerminalType::Beads).contains("beads answer"));
+    assert!(!text_of(&app, TerminalType::Beads).contains("pi answer"));
     assert!(text_of(&app, TerminalType::Pi).contains("pi answer"));
     assert!(!text_of(&app, TerminalType::Pi).contains("beads answer"));
 }
@@ -256,7 +256,7 @@ fn events_land_in_the_view_that_owns_them() {
 /// making noise.
 #[test]
 fn need_input_is_derived_from_the_active_view() {
-    let (mut app, _rx) = app_with(TerminalType::Beeds);
+    let (mut app, _rx) = app_with(TerminalType::Beads);
     assert!(app.need_input(), "no view yet => ask the human");
 
     app.update(Msg::SessionStatus {
@@ -272,7 +272,7 @@ fn need_input_is_derived_from_the_active_view() {
         "a beads pass running off-screen must not hide the Pi input box"
     );
 
-    app.active = TerminalType::Beeds;
+    app.active = TerminalType::Beads;
     assert!(
         !app.need_input(),
         "and coming back must not resurrect a box the beads run already closed"
@@ -304,7 +304,7 @@ fn bash_takes_input_while_every_agent_is_working() {
     });
 
     assert!(!app.need_input(), "Pi is mid-run");
-    app.active = TerminalType::Beeds;
+    app.active = TerminalType::Beads;
     assert!(!app.need_input(), "and so is beads");
     app.active = TerminalType::Bash;
     assert!(
@@ -334,9 +334,9 @@ fn chat_state_is_per_session() {
         ChatState::Stopped,
         "a beads tool going live must not animate the Pi view"
     );
-    assert_eq!(app.view(TerminalType::Beeds).unwrap().chat, ChatState::Tool);
+    assert_eq!(app.view(TerminalType::Beads).unwrap().chat, ChatState::Tool);
 
-    app.active = TerminalType::Beeds;
+    app.active = TerminalType::Beads;
     assert_eq!(app.chat_state(), ChatState::Tool);
 }
 
@@ -427,7 +427,7 @@ fn a_finished_compaction_reaches_the_scrollback_with_what_it_freed() {
 /// pressed Esc, `errorMessage` means the summarisation call broke.
 #[test]
 fn an_aborted_compaction_says_aborted_and_a_failed_one_says_why() {
-    let (mut app, _rx) = app_with(TerminalType::Beeds);
+    let (mut app, _rx) = app_with(TerminalType::Beads);
     app.on_pi(
         beads_id(),
         PiEvent::CompactionEnd {
@@ -575,7 +575,7 @@ fn the_compaction_wire_format_parses() {
 /// scrollback, not stall the cursor forever.
 #[test]
 fn session_down_seals_the_view_and_gives_the_input_box_back() {
-    let (mut app, _rx) = app_with(TerminalType::Beeds);
+    let (mut app, _rx) = app_with(TerminalType::Beads);
     app.update(Msg::Agent {
         session: beads_id(),
         event: PiEvent::MessageUpdate {
@@ -599,7 +599,7 @@ fn session_down_seals_the_view_and_gives_the_input_box_back() {
         lines.contains("unterminated answer"),
         "sealing on death must release the tail: {lines:?}"
     );
-    let v = app.view(TerminalType::Beeds).unwrap();
+    let v = app.view(TerminalType::Beads).unwrap();
     assert_eq!(v.status, SessionStatus::Dead);
     assert!(
         v.accepts_input(),
@@ -635,7 +635,7 @@ fn adopting_a_new_generation_seals_the_old_one() {
 /// Only the active view flushes; a hidden one keeps buffering.
 #[test]
 fn only_the_active_view_flushes() {
-    let (mut app, _rx) = app_with(TerminalType::Beeds);
+    let (mut app, _rx) = app_with(TerminalType::Beads);
     app.update(Msg::System {
         session: Some(pi_id()),
         text: "buffered while hidden".into(),
@@ -669,14 +669,14 @@ fn harness_messages_go_to_the_active_view() {
         app.view(TerminalType::Pi).unwrap().last_error.as_deref(),
         Some("could not open Bash")
     );
-    assert!(app.view(TerminalType::Beeds).is_none());
+    assert!(app.view(TerminalType::Beads).is_none());
 }
 
 /// Switching modes: the render pointer moves immediately, and the Router is
 /// the one told to do the lifecycle. The App never touches a session itself.
 #[tokio::test]
 async fn a_tab_is_addressed_to_the_router_not_to_a_session() {
-    let (mut app, mut rx) = app_with(TerminalType::Beeds);
+    let (mut app, mut rx) = app_with(TerminalType::Beads);
     let tab = crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Tab,
         crossterm::event::KeyModifiers::NONE,
@@ -686,7 +686,7 @@ async fn a_tab_is_addressed_to_the_router_not_to_a_session() {
     assert_eq!(app.active, TerminalType::Pi, "the view moved");
     match rx.recv().await.unwrap() {
         UiCommand::SwitchMode { from, to } => {
-            assert_eq!(from, TerminalType::Beeds);
+            assert_eq!(from, TerminalType::Beads);
             assert_eq!(to, TerminalType::Pi);
         }
         other => panic!("expected SwitchMode, got {other:?}"),

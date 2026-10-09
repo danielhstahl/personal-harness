@@ -506,7 +506,7 @@ of the things those rounds are actually testing.
 
 No subprocess, no fake, no channel wait — just the decision layer, enumerated.
 
-**Mode table (Bash / Beeds / Pi × Tab)**
+**Mode table (Bash / Beads / Pi × Tab)**
 
 - `session::tests::tab_walks_the_whole_mode_table_and_back_to_where_it_started` — one
   3-cycle, one-in-one-out per mode, three Tabs = one lap
@@ -562,7 +562,7 @@ LOOPRS_BIN=/tmp/ctl-target/debug/looprs python3 spikes/status_e2e.py --control \
 | --- | --- | --- |
 | S1 empty board | loop waiting on a human | `awaiting input · Tab switch · ^C quit`, and the app took the alternate screen **exactly once** (since `pdl.4`; a second `?1049h` would re-save the user's own contents as their main screen) |
 | S2 `bd` down | loop parked by a failing CLI | `paused · ✗ …` on the **row**, not only in scrollback |
-| S3 beads working, Tab away | a paid-for pass, then focus moved (ADR-0002) | `working · <bead-id>`, then `bg: Beeds working · <id> <elapsed>` with Pi focused; never `bg: Pi` |
+| S3 beads working, Tab away | a paid-for pass, then focus moved (ADR-0002) | `working · <bead-id>`, then `bg: Beads working · <id> <elapsed>` with Pi focused; never `bg: Pi` |
 | S4 shell liveness | `sleep 6` start → finish | `running · … · Esc cancel`, then `idle`; a mode merely Tabbed through is not claimed warm |
 | S5 40 columns, mid-run | resize while busy | app alive, row still painted and still the running row |
 | S6 40 columns + long error | the truncation worst case | `paused · ✗` still reaches the band |
@@ -590,7 +590,7 @@ What the spike checks instead is **row-only vocabulary in a fresh window**: word
 that exist nowhere else in the program's output (`Esc cancel`, `bg: `, `warm: `,
 `paused · ✗`). The transcript is deliberately different at exactly those points —
 it says "the loop is parked", the row says `paused`; it says "beads: working
-looprs-…", the row says `bg: Beeds working`. That is what makes the match mean
+looprs-…", the row says `bg: Beads working`. That is what makes the match mean
 the row, and it is why the control matters: run against the pre-feature binary,
 **0 of 13** row-specific checks fire. The control caught two needles of mine that
 were passing on transcript prose rather than on the row.

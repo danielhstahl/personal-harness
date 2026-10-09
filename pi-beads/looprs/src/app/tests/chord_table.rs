@@ -40,7 +40,7 @@ fn shell_out(app: &mut App, chunk: &str) {
 /// through the looprs-pdl.10 sink and with the looprs-pdl.10 toast.
 #[test]
 fn the_chord_copies_the_last_answer_through_the_same_sink_and_toast() {
-    for mode in [TerminalType::Pi, TerminalType::Beeds] {
+    for mode in [TerminalType::Pi, TerminalType::Beads] {
         let (mut app, _rx) = app_with(mode);
         let rec = recording_clipboard(&mut app);
         settle_answers(&mut app, 3);
@@ -174,7 +174,7 @@ fn a_command_that_ran_and_said_nothing_says_produced_no_output() {
 /// tool card's result, not a shell block.
 #[test]
 fn the_chord_copies_the_last_tool_card_in_the_agentic_modes() {
-    for mode in [TerminalType::Pi, TerminalType::Beeds] {
+    for mode in [TerminalType::Pi, TerminalType::Beads] {
         let (mut app, _rx) = app_with(mode);
         let rec = recording_clipboard(&mut app);
         let id = SessionId::new(mode, 1);
@@ -467,8 +467,8 @@ fn ctrl_c_never_copies_and_is_still_sigint_in_bash() {
     assert!(rec.is_empty() && sink.is_empty(), "and never a copy");
     assert!(!app.should_quit, "and never a quit in Bash either");
 
-    // Pi / Beeds: quit, as the table says, and still no copy.
-    for mode in [TerminalType::Pi, TerminalType::Beeds] {
+    // Pi / Beads: quit, as the table says, and still no copy.
+    for mode in [TerminalType::Pi, TerminalType::Beads] {
         let (mut app, _rx) = app_with(mode);
         let rec = recording_clipboard(&mut app);
         settle_answers(&mut app, 2);

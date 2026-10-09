@@ -23,10 +23,10 @@ $LOOPRS_TRANSCRIPT_DIR
   → $XDG_DATA_HOME/looprs/transcripts/
   → ~/.local/share/looprs/transcripts/          (the default)
 
-session-20261009T034008Z-84367-Beeds.txt    this run, this mode
+session-20261009T034008Z-84367-Beads.txt    this run, this mode
 session-20261009T034004Z-84354-Pi.txt       …and this one
-last          → …-Beeds.txt                 the most recently written, any mode
-last-Beeds    → …-Beeds.txt                 one per mode, for when you know
+last          → …-Beads.txt                 the most recently written, any mode
+last-Beads    → …-Beads.txt                 one per mode, for when you know
 last-Pi       → …-Pi.txt
 ```
 
@@ -35,11 +35,11 @@ Verified on a real run:
 ```console
 $ ls -l ~/.local/share/looprs/transcripts/ | head
 total 1387200
-lrwxr-xr-x  …  last        -> …/session-20261009T034008Z-84367-Beeds.txt
+lrwxr-xr-x  …  last        -> …/session-20261009T034008Z-84367-Beads.txt
 lrwxr-xr-x  …  last-Bash  -> …/session-20261009T034004Z-84354-Bash.txt
-lrwxr-xr-x  …  last-Beeds -> …/session-20261009T034008Z-84367-Beeds.txt
+lrwxr-xr-x  …  last-Beads -> …/session-20261009T034008Z-84367-Beads.txt
 lrwxr-xr-x  …  last-Pi    -> …/session-20261009T034004Z-84354-Pi.txt
--rw-------   …  session-20261007T104926Z-4473-Beeds.txt
+-rw-------   …  session-20261007T104926Z-4473-Beads.txt
 -rw-------   …  session-20261007T105039Z-4473-Pi.txt
 -rw-------   …  session-20261007T105042Z-4473-Bash.txt
 ```
@@ -47,7 +47,7 @@ lrwxr-xr-x  …  last-Pi    -> …/session-20261009T034004Z-84354-Pi.txt
 * **Modes:** files `0600`, directory `0700`. Mode bits are the whole protection.
 * **One file per run per mode that actually ran**, named so they sort
   chronologically: `session-<UTC timestamp>Z-<pid>-<Mode>.txt`.
-* **The mode name is `TerminalType::label()`** — capitalised `Beeds`, `Pi`, `Bash`.
+* **The mode name is `TerminalType::label()`** — capitalised `Beads`, `Pi`, `Bash`.
   The module header in `journal.rs` now spells it the same way, and
   `the_header_block_names_the_files_the_writer_actually_writes` fails the build if
   the header block and `session_path` ever drift apart again.
@@ -190,7 +190,7 @@ less "$(readlink ~/.local/share/looprs/transcripts/last)"
 ### "I want the beads one, not the chat one"
 
 ```sh
-less "$(readlink ~/.local/share/looprs/transcripts/last-Beeds)"
+less "$(readlink ~/.local/share/looprs/transcripts/last-Beads)"
 # and while a run is live, sorted by recency:
 ls -lt ~/.local/share/looprs/transcripts/ | head
 ```
@@ -216,7 +216,7 @@ sealed command block. `Ctrl-S t` if you need the whole thing.
 
 ### "I need to see what a dead Beads pass actually printed"
 
-The transcript of that mode, which is the `last-Beeds` file above. If the pass
+The transcript of that mode, which is the `last-Beads` file above. If the pass
 died mid-tool-card, the card gets sealed as `Aborted` on the way out rather than
 leaving an open card that stalls the flush — so the tail you read is complete even
 when the process was not

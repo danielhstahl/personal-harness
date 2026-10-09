@@ -207,7 +207,7 @@ def wait_for(d, needle, timeout=10.0, want=True):
 
 
 def into_bash(d):
-    """Tab: Beeds -> Pi -> Bash. Bash output arrives line-at-a-time."""
+    """Tab: Beads -> Pi -> Bash. Bash output arrives line-at-a-time."""
     time.sleep(1.2)
     d.send(b"\t")
     time.sleep(0.4)

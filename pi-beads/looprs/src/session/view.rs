@@ -482,7 +482,7 @@ impl SessionView {
             // The agentic modes own the keyboard for the duration of a turn —
             // including the `Aborting` window, where the turn is still unwinding
             // and is still an agentic workflow occurring.
-            TerminalType::Pi | TerminalType::Beeds => !self.status.is_busy(),
+            TerminalType::Pi | TerminalType::Beads => !self.status.is_busy(),
         }
     }
 

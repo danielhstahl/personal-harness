@@ -18,12 +18,10 @@ Three things to know before reading the tables:
    chords, because the chord budget in a terminal is the entire difficulty — see
    [the copy family](#the-copy-family-ctrl-s).
 
-**A note on the spelling, because it costs people time.** The mode is `Beeds` — one
-`d` — in the code and on the status row (`TerminalType::Beeds`,
-`label() == "Beeds"`), and **Beads** in the prose of these docs, because that is how
-the existing docs spelled it first. They are the same mode. The generated tables
-below use the variant name for the rows and the prose spelling for the headings; if
-you are grepping `src/` for a mode you can see on screen, grep for `Beeds`.
+**A note on the spelling, because it used to cost people time.** The mode is
+**Beads** everywhere: `TerminalType::Beads` in the code, `label() == "Beads"` on
+the status row, **Beads** in the prose here. The generated tables below use the
+variant name for the rows, so what a table row says is what the screen says.
 
 ---
 

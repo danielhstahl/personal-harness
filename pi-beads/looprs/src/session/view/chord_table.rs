@@ -40,7 +40,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
                chord is not what Ctrl-C becomes",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::CtrlC,
         keys: "Ctrl-C",
         state: ChordState::Plain,
@@ -67,7 +67,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "quit in every mode",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::CtrlQ,
         keys: "Ctrl-Q",
         state: ChordState::Plain,
@@ -94,7 +94,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "the copy prefix, armed",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::CtrlS,
         keys: "Ctrl-S",
         state: ChordState::Plain,
@@ -122,7 +122,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "the last answer, whole, through the looprs-pdl.10 sink and toast",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::TargetAnswer,
         keys: "Ctrl-S a",
         state: ChordState::ChordArmed,
@@ -149,7 +149,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "the agentic modes' answer to the same question: the last finished tool card",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::TargetOutput,
         keys: "Ctrl-S o",
         state: ChordState::ChordArmed,
@@ -176,7 +176,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "whatever selection is live",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::TargetSelection,
         keys: "Ctrl-S s",
         state: ChordState::ChordArmed,
@@ -203,7 +203,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "the escape hatch",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::TargetTranscript,
         keys: "Ctrl-S t",
         state: ChordState::ChordArmed,
@@ -230,7 +230,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "the family, listed in a toast",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::Help,
         keys: "Ctrl-S ?",
         state: ChordState::ChordArmed,
@@ -257,7 +257,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "undoes the prefix and nothing else",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::Esc,
         keys: "Esc",
         state: ChordState::ChordArmed,
@@ -322,7 +322,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "was a selection live? yes \u{2014} the first Esc unselects and sends nothing",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::Esc,
         keys: "Esc",
         state: ChordState::SelectionLive,
@@ -349,7 +349,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "was a selection live? no \u{2014} the cancel, and the queued text comes back to the box",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::Esc,
         keys: "Esc",
         state: ChordState::Plain,
@@ -377,7 +377,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "switch mode",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::Tab,
         keys: "Tab",
         state: ChordState::Plain,
@@ -404,7 +404,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "newline in the input box",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::ShiftTab,
         keys: "Shift-Tab",
         state: ChordState::Plain,
@@ -431,7 +431,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "a newline in the box",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::ShiftEnter,
         keys: "Shift-Enter",
         state: ChordState::Plain,
@@ -458,7 +458,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "submit",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::Enter,
         keys: "Enter",
         state: ChordState::Plain,
@@ -485,7 +485,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "one page up, unpinning the tail",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::PageUp,
         keys: "PageUp",
         state: ChordState::Plain,
@@ -512,7 +512,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "one page down; reaching the bottom re-pins",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::PageDown,
         keys: "PageDown",
         state: ChordState::Plain,
@@ -539,7 +539,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "top of the transcript",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::Home,
         keys: "Home",
         state: ChordState::Plain,
@@ -566,7 +566,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "bottom, and re-pin",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::End,
         keys: "End",
         state: ChordState::Plain,
@@ -593,7 +593,7 @@ pub const CHORD_TABLE: &[ChordRow] = &[
         note: "typing",
     },
     ChordRow {
-        mode: TerminalType::Beeds,
+        mode: TerminalType::Beads,
         key: KeySym::AnyOther,
         keys: "anything else",
         state: ChordState::Plain,

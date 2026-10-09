@@ -129,7 +129,7 @@ fn loop_with(
 ) {
     let (tx, rx) = mpsc::unbounded_channel();
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<BeadsCmd>();
-    let id = SessionId::new(TerminalType::Beeds, 0);
+    let id = SessionId::new(TerminalType::Beads, 0);
     (BeadsLoop::new(id, tx, ctl_tx, fakes_cfg(fakes)), rx, ctl_rx)
 }
 
@@ -281,7 +281,7 @@ fn beads(fakes: &Fakes, generation: u64) -> (BeadsSession, mpsc::UnboundedReceiv
     // The un-boxed constructor: the test keeps a concrete, cloneable handle and
     // the event stream the Router would otherwise pump.
     BeadsSession::build(
-        SessionId::new(TerminalType::Beeds, generation),
+        SessionId::new(TerminalType::Beads, generation),
         &fakes_cfg(fakes),
     )
     .expect("beads session must start")

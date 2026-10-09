@@ -38,7 +38,7 @@ fn flush_is_monotonic_per_view() {
 /// preview spins over dead text. `seal()` is what unblocks it.
 #[test]
 fn an_unsealed_entry_stalls_the_flusher_and_seal_clears_it() {
-    let mut v = view(TerminalType::Beeds);
+    let mut v = view(TerminalType::Beads);
     v.transcript
         .push_delta(MessageKind::Answer, "partial answer, no newline");
     assert_eq!(
@@ -106,7 +106,7 @@ fn sealing_closes_cards_left_running_so_the_transcript_keeps_flushing() {
 #[test]
 fn views_do_not_interfere() {
     let mut pi = view(TerminalType::Pi);
-    let mut beads = view(TerminalType::Beeds);
+    let mut beads = view(TerminalType::Beads);
 
     pi.transcript
         .push_delta(MessageKind::Answer, "pi says hi\n\n");

@@ -25,7 +25,7 @@ message held open) and `bd` is a bash fake this script writes.
     #   LOOPRS_BIN=/tmp/base-target/debug/looprs python3 spikes/status_e2e.py --control
 
 What a row can be measured as here, after three ways of trying it failed. The
-obvious move — grep the capture for `"Beeds · awaiting input"` — cannot work,
+obvious move — grep the capture for `"Beads · awaiting input"` — cannot work,
 because ratatui renders by **diff** and a frame rewrites only the cells that
 changed: observed directly, the frame after the board came back empty wrote `●` at
 column 1 and `awaiting input · Tab switch ·` at column 11 and nothing in between.
@@ -43,7 +43,7 @@ So the checks are **row-only words, in fresh windows**:
     and the verbs. The beads loop's transcript prose is deliberately different at
     exactly those points, which is what makes the match unambiguous: the transcript
     says "beads: … the loop is parked", the row says `paused`; the transcript
-    says "beads: working looprs-…", the row says `bg: Beeds working`. A needle
+    says "beads: working looprs-…", the row says `bg: Beads working`. A needle
     like the **mode name** is deliberately not used: an unchanged cell is not
     repainted, so the name is often simply absent from the frame that changed the
     verb next to it, and "which mode" is a claim `main.rs`'s render tests make
@@ -618,7 +618,7 @@ def scenario_background_work():
     # can be swallowed on the way in.
     for _ in range(3):
         d.send(b"\t")
-        ok, w = d.await_row(["bg: Beeds working"], timeout=5)
+        ok, w = d.await_row(["bg: Beads working"], timeout=5)
         if ok:
             break
     check("S3 with Pi focused, the row still says beads is working", ok, w)
@@ -648,7 +648,7 @@ def scenario_bash_liveness():
     d = Driver(fakes)
     time.sleep(1.0)
     for _ in range(3):
-        d.send(b"\t\t")  # Beeds -> Pi -> Bash
+        d.send(b"\t\t")  # Beads -> Pi -> Bash
         ok, w = d.await_row(["not started · warm"], timeout=4)
         if ok:
             break
@@ -681,7 +681,7 @@ def scenario_narrow():
     d = Driver(fakes, cols=72)
     time.sleep(1.0)
     for _ in range(3):
-        d.send(b"\t\t")  # Beeds -> Pi -> Bash
+        d.send(b"\t\t")  # Beads -> Pi -> Bash
         ok, w = d.await_row(["not started · warm"], timeout=4)
         if ok:
             break

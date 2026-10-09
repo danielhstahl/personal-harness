@@ -216,7 +216,7 @@ def vim_part():
     d = e.Driver()
     say(f"spawned {e.BIN} (pid {d.proc.pid}) in a {ROWS}x{COLS} pty")
     d.wait(1.2)
-    d.send(b"\t")  # Beeds -> Pi
+    d.send(b"\t")  # Beads -> Pi
     d.wait(0.3)
     d.send(b"\t")  # Pi -> Bash
     d.wait(0.5)
@@ -532,7 +532,7 @@ def _counts(drv, frm=0, to=None):
 
 
 def go_to_bash(d):
-    """Two tabs: Beeds -> Pi -> Bash, the way the ticket's session starts."""
+    """Two tabs: Beads -> Pi -> Bash, the way the ticket's session starts."""
     d.send(b"\t")
     time.sleep(0.3)
     d.send(b"\t")

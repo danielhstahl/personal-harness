@@ -242,7 +242,7 @@ def main():
     check("the app boots and is alive", d.alive())
 
     # ------------------------------------------------- Bash mode: 60 plain lines
-    d.send(b"\t")  # Beeds -> Pi
+    d.send(b"\t")  # Beads -> Pi
     time.sleep(0.3)
     d.send(b"\t")  # Pi -> Bash
     time.sleep(0.5)
@@ -263,9 +263,9 @@ def main():
     )
 
     # ------------------------------------------------- Pi mode: a slow live stream
-    d.send(b"\t")  # Bash -> Beeds
+    d.send(b"\t")  # Bash -> Beads
     time.sleep(0.3)
-    d.send(b"\t")  # Beeds -> Pi
+    d.send(b"\t")  # Beads -> Pi
     time.sleep(0.5)
     check("Tab reaches the Pi mode", "Pi" in d.text())
     d.send(b"stream me a long answer\r")

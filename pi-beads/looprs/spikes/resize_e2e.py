@@ -322,7 +322,7 @@ class Driver:
 
 
 def bash_mode(d):
-    """Tab Beeds -> Pi -> Bash: idle, a real shell, no board, no model call."""
+    """Tab Beads -> Pi -> Bash: idle, a real shell, no board, no model call."""
     d.send(b"\t")
     time.sleep(0.35)
     d.send(b"\t")
@@ -554,7 +554,7 @@ def group_rewrap():
     )
     try:
         check(f"the app boots ({d.relationship})", d.alive(), kind="app")
-        d.send(b"\t")  # Beeds -> Pi
+        d.send(b"\t")  # Beads -> Pi
         time.sleep(0.6)
         check("Tab reaches Pi", until(lambda: d.has("Pi"), timeout=4.0), "no Pi label", kind="app")
         d.send(b"wrap this answer please\r")

@@ -303,7 +303,7 @@ def main():
     d.absent("beads: an idle Esc says nothing at all", "cancelling", for_seconds=1.5, since=mark)
 
     # ------------------------------------------------------------------ Pi ----
-    d.send(b"\t")  # Beeds -> Pi
+    d.send(b"\t")  # Beads -> Pi
     time.sleep(0.5)
     d.send(b"hold the line\r")
     d.expect("pi: the run started", "hold the line")

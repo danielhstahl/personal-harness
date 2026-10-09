@@ -682,9 +682,9 @@ mod tests {
     /// session tag from a variant, this is the test that says why it is there.
     #[test]
     fn wrap_stamps_the_origin_on_every_session_message() {
-        let id = SessionId::new(TerminalType::Beeds, 3);
+        let id = SessionId::new(TerminalType::Beads, 3);
         let (tx, _rx) = crate::bus::channel(crate::bus::DEFAULT_CAP_BYTES);
-        let router = Router::new(TerminalType::Beeds, SessionConfig::default(), tx);
+        let router = Router::new(TerminalType::Beads, SessionConfig::default(), tx);
 
         // `Agent` is the variant looprs-msj is about: it must name its producer.
         let Msg::Agent { session, event } =
@@ -754,7 +754,7 @@ mod tests {
         };
         assert_eq!(s3, id);
         assert_eq!(t3, "queued");
-        assert_eq!(router.active_mode(), TerminalType::Beeds);
+        assert_eq!(router.active_mode(), TerminalType::Beads);
     }
 
     /// Exactly-one-SessionDown, including the sloppy case where the session just
@@ -809,7 +809,7 @@ mod tests {
     /// live sessions of one state cannot both be registered.
     #[test]
     fn one_slot_per_terminal_state() {
-        let (router, _rx, _b) = router_with(TerminalType::Beeds);
+        let (router, _rx, _b) = router_with(TerminalType::Beads);
         assert!(router.sessions.is_empty());
         assert_eq!(
             router.status_of(TerminalType::Pi),
@@ -825,19 +825,19 @@ mod tests {
     /// call, never in whether it dies.
     #[tokio::test]
     async fn switching_away_never_shuts_a_session_down() {
-        let (mut router, mut rx, backend) = router_with(TerminalType::Beeds);
+        let (mut router, mut rx, backend) = router_with(TerminalType::Beads);
         router.boot().await.unwrap();
         assert!(!backend.was_called("shutdown"), "boot shuts nothing");
 
         router
-            .handle(tab(TerminalType::Beeds, TerminalType::Pi))
+            .handle(tab(TerminalType::Beads, TerminalType::Pi))
             .await
             .unwrap();
 
         let log = backend.log();
         assert!(
             log.iter()
-                .any(|c| c.starts_with("set_active false") && c.contains("Beeds")),
+                .any(|c| c.starts_with("set_active false") && c.contains("Beads")),
             "the beads session was told it went off-screen: {log:?}"
         );
         assert!(
@@ -897,7 +897,7 @@ mod tests {
     /// One session per terminal type, however hard the Tab key is thrashed.
     #[tokio::test]
     async fn thrashing_the_tab_key_cannot_produce_two_sessions_of_one_mode() {
-        let (mut router, _rx, backend) = router_with(TerminalType::Beeds);
+        let (mut router, _rx, backend) = router_with(TerminalType::Beads);
         router.boot().await.unwrap();
         for _ in 0..6 {
             for to in TerminalType::ALL {
@@ -925,10 +925,10 @@ mod tests {
     /// something — is pinned in `session::beads::tests`.)
     #[tokio::test]
     async fn switching_into_a_mode_builds_no_child() {
-        let (mut router, _rx, backend) = router_with(TerminalType::Beeds);
+        let (mut router, _rx, backend) = router_with(TerminalType::Beads);
         router.boot().await.unwrap();
         router
-            .handle(tab(TerminalType::Beeds, TerminalType::Bash))
+            .handle(tab(TerminalType::Beads, TerminalType::Bash))
             .await
             .unwrap();
         router
@@ -950,19 +950,19 @@ mod tests {
     /// session for the abandoned mode is not conjured back to honor it.
     #[tokio::test]
     async fn a_submit_that_lost_the_race_with_a_switch_is_dropped_visibly() {
-        let (mut router, mut rx, backend) = router_with(TerminalType::Beeds);
+        let (mut router, mut rx, backend) = router_with(TerminalType::Beads);
         router.boot().await.unwrap();
 
         // The user Tabbed away; this submit, queued before the Tab, arrives after.
         router
-            .handle(tab(TerminalType::Beeds, TerminalType::Bash))
+            .handle(tab(TerminalType::Beads, TerminalType::Bash))
             .await
             .unwrap();
         drain(&mut rx);
 
         router
             .handle(UiCommand::Submit {
-                mode: TerminalType::Beeds,
+                mode: TerminalType::Beads,
                 text: "make tickets for X".into(),
             })
             .await
@@ -1001,7 +1001,7 @@ mod tests {
     /// Esc touches the active session only — never a fan-out to everything live.
     #[tokio::test]
     async fn cancel_reaches_the_active_session_only() {
-        let (mut router, mut rx, backend) = router_with(TerminalType::Beeds);
+        let (mut router, mut rx, backend) = router_with(TerminalType::Beads);
         router.boot().await.unwrap();
         // Put a Pi session alive too, so a fan-out would be visible.
         router.switch_to(TerminalType::Pi).await.unwrap();
@@ -1019,7 +1019,7 @@ mod tests {
         );
         assert!(
             !log.iter()
-                .any(|c| c.starts_with("abort") && c.contains("Beeds")),
+                .any(|c| c.starts_with("abort") && c.contains("Beads")),
             "the hidden beads session must not be cancelled by an Esc in Pi: {log:?}"
         );
         assert!(
@@ -1190,7 +1190,7 @@ mod tests {
     /// well as on screen. Every live session gets it, not just the visible one.
     #[tokio::test]
     async fn a_resize_reaches_every_live_session() {
-        let (mut router, _rx, backend) = router_with(TerminalType::Beeds);
+        let (mut router, _rx, backend) = router_with(TerminalType::Beads);
         router.boot().await.unwrap();
         router.ensure(TerminalType::Bash).await.unwrap();
         backend.clear_log();
@@ -1204,7 +1204,7 @@ mod tests {
             .unwrap();
 
         let log = backend.log();
-        for mode in [TerminalType::Beeds, TerminalType::Bash] {
+        for mode in [TerminalType::Beads, TerminalType::Bash] {
             let want = format!("resize {} ", mode.label());
             assert!(
                 log.iter()
@@ -1219,7 +1219,7 @@ mod tests {
     /// spawn per pixel-drag, in the one mode where a spawn costs a shell.
     #[tokio::test]
     async fn a_resize_never_spawns_anything() {
-        let (mut router, _rx, backend) = router_with(TerminalType::Beeds);
+        let (mut router, _rx, backend) = router_with(TerminalType::Beads);
         backend.clear_log();
 
         router
@@ -1244,7 +1244,7 @@ mod tests {
     /// inside a 40x132 pty.
     #[tokio::test]
     async fn a_resize_before_a_session_is_born_is_applied_to_it() {
-        let (mut router, _rx, backend) = router_with(TerminalType::Beeds);
+        let (mut router, _rx, backend) = router_with(TerminalType::Beads);
         backend.clear_log();
 
         router
@@ -1274,7 +1274,7 @@ mod tests {
     /// Quitting shuts every live session down.
     #[tokio::test]
     async fn quitting_shuts_every_live_session_down() {
-        let (mut router, _rx, backend) = router_with(TerminalType::Beeds);
+        let (mut router, _rx, backend) = router_with(TerminalType::Beads);
         router.boot().await.unwrap();
         router.switch_to(TerminalType::Pi).await.unwrap();
         router.switch_to(TerminalType::Bash).await.unwrap();
@@ -1325,7 +1325,7 @@ mod tests {
     async fn wedged_sessions_share_one_grace_period() {
         let (tx, _rx) = crate::bus::channel(crate::bus::DEFAULT_CAP_BYTES);
         let wedged = FakeBackend::new().with_silent_exit();
-        let mut router = Router::with_factory(TerminalType::Beeds, tx, wedged.factory());
+        let mut router = Router::with_factory(TerminalType::Beads, tx, wedged.factory());
         router.boot().await.unwrap();
         router.switch_to(TerminalType::Pi).await.unwrap();
         router.switch_to(TerminalType::Bash).await.unwrap();
@@ -1398,7 +1398,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>(16);
         let (app_tx, mut app_rx) = crate::bus::channel(crate::bus::DEFAULT_CAP_BYTES);
         let backend = FakeBackend::new();
-        let mut router = Router::with_factory(TerminalType::Beeds, app_tx, backend.factory());
+        let mut router = Router::with_factory(TerminalType::Beads, app_tx, backend.factory());
         router.boot().await.unwrap();
         let task = tokio::spawn(router.run(cmd_rx));
 
@@ -1408,7 +1408,7 @@ mod tests {
         // nobody is looking at.
         cmd_tx
             .send(UiCommand::Submit {
-                mode: TerminalType::Beeds,
+                mode: TerminalType::Beads,
                 text: "too late".into(),
             })
             .await
@@ -1473,13 +1473,13 @@ mod tests {
     /// view of the world is real.
     #[tokio::test]
     async fn live_modes_reports_which_sessions_have_a_live_child() {
-        let (mut router, _rx, backend) = router_with(TerminalType::Beeds);
+        let (mut router, _rx, backend) = router_with(TerminalType::Beads);
         router.boot().await.unwrap();
-        let beads = router.id_of(TerminalType::Beeds).unwrap();
-        assert_eq!(router.live_modes(), vec![TerminalType::Beeds]);
+        let beads = router.id_of(TerminalType::Beads).unwrap();
+        assert_eq!(router.live_modes(), vec![TerminalType::Beads]);
 
         backend.set_status(beads, SessionStatus::Idle);
-        assert_eq!(router.live_modes(), vec![TerminalType::Beeds]);
+        assert_eq!(router.live_modes(), vec![TerminalType::Beads]);
         backend.set_status(beads, SessionStatus::Dead);
         assert!(
             router.live_modes().is_empty(),

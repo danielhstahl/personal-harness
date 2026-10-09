@@ -462,15 +462,12 @@ def render_keymap_table(mode_filter: str, rows) -> str:
     return "\n".join(out)
 
 
-# slug → the `TerminalType` variant name in CHORD_TABLE. Note the first one: the
-# variant is `Beeds` (one `d`) — that is what `TerminalType::label()` puts on the
-# status row — while the prose in these docs spells the mode "Beads", which is how
-# the existing docs spelled it first (47 vs 7 in the pre-site corpus). The tables
-# are generated from the variant, so the mapping has to know the difference; the
-# keymap page says so out loud because a reader who does not know it will spend
-# ten minutes grepping for a mode that is on screen the whole time.
+# slug → the `TerminalType` variant name in CHORD_TABLE. The tables are generated
+# from the variant, so the mapping has to name it; the slug is the lowercase form
+# the page's section markers use. Code, status row and prose all spell the mode the
+# same way now — they used to disagree, which is what the keymap page warned about.
 KEYMAP_MARKERS = {
-    "beads": "Beeds",
+    "beads": "Beads",
     "pi": "Pi",
     "bash": "Bash",
 }

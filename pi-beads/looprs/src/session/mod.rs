@@ -55,12 +55,11 @@ pub use view::ChatState;
 /// The three terminal states. This is a *session* identity, not a widget property, so
 /// it lives here; `components::input` re-exports it for the input box that cycles it.
 ///
-/// Note the spelling: the variant is `Beeds` (as the input box labels it). This ADR
-/// prose calls the mode "Beads"; renaming the variant is deliberately out of scope so
-/// that the ADR ticket stays type-only.
+/// One spelling everywhere: the variant, the input box's label and the ADR prose
+/// all call the mode `Beads`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TerminalType {
-    Beeds,
+    Beads,
     Pi,
     Bash,
 }
@@ -71,14 +70,14 @@ impl TerminalType {
     /// The one place the order is written down. The status row (looprs-guh) walks
     /// it rather than only reporting the mode on screen — which is the point of the
     /// row: the modes you are *not* looking at are the ones that need reporting —
-    /// and the mode-table tests walk it instead of hard-coding "Beeds, Pi, Bash" in
+    /// and the mode-table tests walk it instead of hard-coding "Beads, Pi, Bash" in
     /// nine spots.
-    pub const ALL: [TerminalType; 3] = [TerminalType::Beeds, TerminalType::Pi, TerminalType::Bash];
+    pub const ALL: [TerminalType; 3] = [TerminalType::Beads, TerminalType::Pi, TerminalType::Bash];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Bash => "Bash",
-            Self::Beeds => "Beeds",
+            Self::Beads => "Beads",
             Self::Pi => "Pi",
         }
     }
@@ -87,8 +86,8 @@ impl TerminalType {
     /// can reason about the cycle too.
     pub fn next(self) -> Self {
         match self {
-            Self::Bash => Self::Beeds,
-            Self::Beeds => Self::Pi,
+            Self::Bash => Self::Beads,
+            Self::Beads => Self::Pi,
             Self::Pi => Self::Bash,
         }
     }
@@ -104,7 +103,7 @@ impl TerminalType {
             Self::Pi => SwitchAway::KeepRunning,
             // The loop self-advances. While nobody is watching it must not keep
             // starting billable passes: finish the current one, then park.
-            Self::Beeds => SwitchAway::DrainThenPark,
+            Self::Beads => SwitchAway::DrainThenPark,
         }
     }
 }
@@ -494,7 +493,7 @@ pub struct Spawned {
 pub fn spawn(mode: TerminalType, cfg: &SessionConfig, generation: u64) -> anyhow::Result<Spawned> {
     let id = SessionId::new(mode, generation);
     match mode {
-        TerminalType::Beeds => BeadsSession::start(id, cfg),
+        TerminalType::Beads => BeadsSession::start(id, cfg),
         TerminalType::Pi => PiChatSession::start(id, cfg),
         TerminalType::Bash => BashSession::start(id, cfg),
     }
@@ -682,7 +681,7 @@ mod tests {
         use SwitchAway::*;
         assert_eq!(TerminalType::Bash.switch_away_policy(), KeepRunning);
         assert_eq!(TerminalType::Pi.switch_away_policy(), KeepRunning);
-        assert_eq!(TerminalType::Beeds.switch_away_policy(), DrainThenPark);
+        assert_eq!(TerminalType::Beads.switch_away_policy(), DrainThenPark);
     }
 
     /// The input box opens on one step and no other. Asserted here, on the step
@@ -702,7 +701,7 @@ mod tests {
     }
 
     /// **The mode table, pure and with no subprocess** (looprs-6ol: "the mode
-    /// table (Bash/Beeds/Pi x Tab)").
+    /// table (Bash/Beads/Pi x Tab)").
     ///
     /// Tab is a permutation, not a suggestion. Asserted as the table itself, then
     /// as the properties the table has to have, so a change to `next()` that
@@ -712,7 +711,7 @@ mod tests {
     #[test]
     fn tab_walks_the_whole_mode_table_and_back_to_where_it_started() {
         use TerminalType::*;
-        let table = [(Bash, Beeds), (Beeds, Pi), (Pi, Bash)];
+        let table = [(Bash, Beads), (Beads, Pi), (Pi, Bash)];
 
         // Every row of the table is what `next()` actually does.
         for (from, to) in table {
@@ -772,9 +771,9 @@ mod tests {
         use TerminalType::*;
         let table = [
             // mode,   Tab goes to, what leaving it does
-            (Beeds, Pi, DrainThenPark),
+            (Beads, Pi, DrainThenPark),
             (Pi, Bash, KeepRunning),
-            (Bash, Beeds, KeepRunning),
+            (Bash, Beads, KeepRunning),
         ];
 
         assert_eq!(
@@ -796,6 +795,6 @@ mod tests {
             .into_iter()
             .filter(|m| m.switch_away_policy() == DrainThenPark)
             .collect();
-        assert_eq!(parking, vec![Beeds], "only the self-advancing mode parks");
+        assert_eq!(parking, vec![Beads], "only the self-advancing mode parks");
     }
 }

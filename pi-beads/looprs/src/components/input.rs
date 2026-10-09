@@ -75,7 +75,7 @@ impl InputState {
             text: "".to_string(),
             cursor: 0,
             want_col: None,
-            mode: TerminalType::Beeds,
+            mode: TerminalType::Beads,
         }
     }
 
@@ -619,11 +619,11 @@ mod tests {
     #[test]
     fn tab_reports_the_switch_it_made() {
         let mut s = InputState::new();
-        assert_eq!(s.mode, TerminalType::Beeds);
+        assert_eq!(s.mode, TerminalType::Beads);
         let Some(InputAction::SwitchMode { from, to }) = s.handle_key(key(KeyCode::Tab), W) else {
             panic!("Tab must produce SwitchMode");
         };
-        assert_eq!(from, TerminalType::Beeds);
+        assert_eq!(from, TerminalType::Beads);
         assert_eq!(to, TerminalType::Pi);
         assert_eq!(s.mode, TerminalType::Pi, "the box moved too");
     }
@@ -638,7 +638,7 @@ mod tests {
             panic!("Enter must produce Submit");
         };
         assert_eq!(text, "hi");
-        assert_eq!(mode, TerminalType::Beeds);
+        assert_eq!(mode, TerminalType::Beads);
     }
 
     /// Submitting takes the caret's offset with the text. A box left holding a

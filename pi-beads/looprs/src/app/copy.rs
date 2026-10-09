@@ -155,7 +155,7 @@ pub(super) struct PendingDump {
 
 /// The mode's name in file-name dress: lowercase, one word, no spaces.
 ///
-/// `TerminalType::label` is "Bash"/"Pi"/"Beeds" — for a status row. A file name
+/// `TerminalType::label` is "Bash"/"Pi"/"Beads" — for a status row. A file name
 /// wants the other case, and the mapping is written out rather than
 /// `to_lowercase()`d at the call site so a future rename of the label cannot
 /// silently change where a user's transcripts live.
@@ -163,7 +163,7 @@ fn mode_label(mode: TerminalType) -> &'static str {
     match mode {
         TerminalType::Bash => "bash",
         TerminalType::Pi => "pi",
-        TerminalType::Beeds => "beads",
+        TerminalType::Beads => "beads",
     }
 }
 

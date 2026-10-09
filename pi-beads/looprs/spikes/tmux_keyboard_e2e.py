@@ -26,7 +26,7 @@ What is measured, group by group:
   quit       `Ctrl-Q` leaves tmux's pane out of the alternate screen.
 
 `pi` and `bd` are fakes this script writes, and that is not optional. The real
-`looprs` boots into Beeds mode and the beads loop runs `bd update <id> --claim`
+`looprs` boots into Beads mode and the beads loop runs `bd update <id> --claim`
 before a Tab can reach it: a spike that spends a real claim and a model call to
 look at a keyboard binding is a spike that must not be run twice. The run counts
 the claims it made against the fake board and prints the number.

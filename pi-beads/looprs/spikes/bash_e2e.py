@@ -217,7 +217,7 @@ def main():
     say(f"spawned {BIN} (pid {d.proc.pid}) in a {ROWS}x{COLS} pty")
     d.wait(1.5)
 
-    # Tab: Beeds -> Pi -> Bash. The shell is NOT spawned yet (lazy), and the
+    # Tab: Beads -> Pi -> Bash. The shell is NOT spawned yet (lazy), and the
     # mode label in the input box is the observable.
     d.send(b"\t")
     d.wait(0.4)

@@ -237,7 +237,7 @@ async fn ctrl_c_in_bash_mode_cancels_the_shell_and_does_not_quit() {
 /// and not a regression nobody noticed.
 #[tokio::test]
 async fn ctrl_c_outside_bash_mode_still_quits_for_now() {
-    for mode in [TerminalType::Beeds, TerminalType::Pi] {
+    for mode in [TerminalType::Beads, TerminalType::Pi] {
         let (mut app, mut rx) = app_with(mode);
         app.update(Msg::Term(Event::Key(crossterm::event::KeyEvent::new(
             KeyCode::Char('c'),
@@ -273,7 +273,7 @@ fn ctrl_q_quits_in_every_mode() {
 fn bash_output_lands_in_its_own_view_verbatim() {
     let mut app = {
         let (tx, _rx) = mpsc::channel::<UiCommand>(16);
-        App::new(tx, InputState::new(), TerminalType::Beeds, 80, 24)
+        App::new(tx, InputState::new(), TerminalType::Beads, 80, 24)
     };
     let bash = SessionId::new(TerminalType::Bash, 1);
     let chunk = "first line\nsecond line, with no trailing newline";
@@ -302,7 +302,7 @@ fn bash_output_lands_in_its_own_view_verbatim() {
         "the line it did not end is live, not lost: {live:?}"
     );
     assert!(
-        app.view(TerminalType::Beeds).is_none(),
+        app.view(TerminalType::Beads).is_none(),
         "and it went nowhere near the mode the box was in"
     );
 
@@ -320,7 +320,7 @@ fn bash_output_lands_in_its_own_view_verbatim() {
 /// session that made it, and only the mode on screen gets the keystroke.
 #[test]
 fn a_pi_cancel_cannot_type_into_another_modes_box() {
-    let (mut app, _rx) = app_with(TerminalType::Beeds);
+    let (mut app, _rx) = app_with(TerminalType::Beads);
     app.update(Msg::RestoreInput {
         session: pi_id(),
         text: "queued from pi".into(),
