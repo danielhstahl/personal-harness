@@ -46,6 +46,18 @@ const NO_HANG: Duration = Duration::from_secs(20);
 /// order: `esc_says_cancelling_before_the_command_reports_itself_done`.
 const INTERRUPTED_WITHIN: Duration = Duration::from_secs(12);
 
+/// The word a command prints to declare that **the child is running it**.
+///
+/// Quote it in the command — `echo looprs-start''ed` — so the *echo* of the
+/// command line cannot answer for the output: the echo carries the quotes
+/// (`looprs-start''ed`) and is written by the shell before it has executed
+/// anything, while the run carries the word itself (`looprs-started`). Only
+/// the second one is evidence of a command that started, which is the whole
+/// reason [`in_flight`] can wait for it without waiting for a lie. The same
+/// trick `esc_interrupts_a_running_command_without_killing_the_shell` plays
+/// with `star''ted`.
+const CHILD_STARTED: &str = "looprs-started";
+
 /// The real system bash. A fake cannot prove that a pty keeps its cwd, that
 /// `0x03` interrupts, or that `PROMPT_COMMAND` fires the way the ADR says it
 /// does — those are properties of the shell and the line discipline, so the
@@ -295,22 +307,50 @@ impl Tape {
     }
 }
 
-/// Send a command and know it reached the child, without polling for it.
+/// Send a command and know the **child is running it** — not that the bytes
+/// left the session, and not on a timer.
 ///
-/// The seam is the event: `Sync` is handled by the same task that handled the
-/// `Submit`, ahead of it in the mailbox, and it publishes the status mirror
-/// before acking. So when this returns, the bytes are in the pty master and
-/// the session holds the command as outstanding — "in flight" as a fact about
-/// the queue, not as a guess taken from a 20 ms sampling loop (which is what
-/// `wait_running` used to be: four seconds of polling whose only failure mode
-/// was running out of samples, and whose only success condition was the
-/// mirror having flipped at some point in that window).
+/// The seam gets part of the way: `Sync` is handled by the same task that
+/// handled the `Submit`, ahead of it in the mailbox, and it publishes the
+/// status mirror before acking, so when it returns the line is in the pty
+/// master and the session holds the command as outstanding — "in flight" as
+/// a fact about the queue rather than a guess from a 20 ms sampling loop
+/// (which is what `wait_running` used to be).
+///
+/// **The seam stops one step short of what "running" means, and `Esc` lives in
+/// that gap.** Written to the master is not *read by the shell*: between those
+/// two moments the command line is sitting in the tty's input queue, and a
+/// `0x03` written there does not only signal the shell — the line discipline's
+/// Ctrl-C flush takes the pending line with it. The command never runs, so it
+/// never prints and never reports its exit marker, and everything downstream is
+/// then aimed at a run that does not exist. The session's own escalation says
+/// the true thing about the wrong premise — "`cmd` is still running 3s after
+/// the cancel — it may be trapping the interrupt" — about a command that was
+/// never in the shell at all, and a test that waits for that command's exit
+/// line waits out the whole of [`NO_HANG`] on a child that has nothing left to
+/// say. The window is a few scheduler ticks wide, closes itself on a quiet
+/// machine and widens with load, which is why it was CI-only.
+///
+/// So: **when the precondition lives in the child, make the child declare it**
+/// — the rule the trapped-interrupt case already writes down for `trap '' INT`.
+/// The command prints [`CHILD_STARTED`] and this waits for those bytes, which
+/// nothing in the session's own message ordering can fake, because the shell
+/// only writes it by executing the command.
 ///
 /// Read the doc on [`warm_shell`] first: on a **cold** shell a submit cannot
 /// be written at all, so it sits in the session's queue and reads as
-/// `Running` there too. This helper asserts the command was written, which is
-/// only true of a shell that had already printed its prompt.
-async fn in_flight(s: &mut BashSession, cmd: &str) {
+/// `Running` there too. This helper asserts the command reached the child and
+/// got as far as running, which is only reachable on a shell that had already
+/// printed its prompt.
+///
+/// Hands back everything the session said up to and including the declaring
+/// word, in order, for the tests that go on to assert on those bytes too.
+async fn in_flight(
+    s: &mut BashSession,
+    rx: &mut mpsc::UnboundedReceiver<SessionEvent>,
+    cmd: &str,
+    started: &str,
+) -> Vec<String> {
     s.send_text(cmd.into()).unwrap();
     assert!(
         s.quiesce().await,
@@ -321,6 +361,55 @@ async fn in_flight(s: &mut BashSession, cmd: &str) {
         SessionStatus::Running,
         "`{cmd}` was written to the pty and has not reported its exit"
     );
+    let seen = until_output(
+        rx,
+        started,
+        &format!("`{cmd}` reporting that it had started"),
+    )
+    .await;
+    assert_eq!(
+        s.status(),
+        SessionStatus::Running,
+        "`{cmd}` printed `{started}` and was gone again before the test could act on it: {seen:?}"
+    );
+    seen
+}
+
+/// Read the stream until the child's *output bytes* contain `needle`, handing
+/// back every event read up to and including the one that completed it.
+///
+/// Searched on a [`Tape`], not event by event, because the needle is promised
+/// to no single read: the same word can arrive as `out looprs-` and
+/// `out started`, and a per-event `contains` would miss it for reasons that
+/// belong to the pty rather than to anything under test.
+async fn until_output(
+    rx: &mut mpsc::UnboundedReceiver<SessionEvent>,
+    needle: &str,
+    what: &str,
+) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + NO_HANG;
+    let mut seen: Vec<String> = Vec::new();
+    let mut tape = Tape::default();
+    loop {
+        let line = match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(ev)) => describe(&ev),
+            Ok(None) => panic!("the stream closed before {what}: {seen:?}"),
+            Err(_) => panic!(
+                "{what} never arrived within {NO_HANG:?} (failure bound, not a wait); \
+                     stream up to here: {seen:?}"
+            ),
+        };
+        let hit = if let Some(chunk) = line.strip_prefix("out ") {
+            tape.push(seen.len(), chunk);
+            tape.text.contains(needle)
+        } else {
+            false
+        };
+        seen.push(line);
+        if hit {
+            return seen;
+        }
+    }
 }
 
 fn clean_lines(out: &str) -> Vec<String> {
