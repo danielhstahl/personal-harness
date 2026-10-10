@@ -2,6 +2,14 @@
 
 This is a repository with my personal configurations and docker containers for agentic coding.
 
+Example of a long-running session:
+
+![long-running](./screenshots/long-running.png)
+
+Example running in Zed's agent terminal:
+
+![in-zed](./screenshots/in-zed.png)
+
 ## Global configuration
 
 [models.json](./models.json) should go in your .pi/agents directory.  
