@@ -2,6 +2,7 @@
 set -e
 bd init --quiet --stealth --prefix "$BD_PREFIX" || echo "already initialized"
 bd config set events-journal true
+bd metrics off
 if [ -n "$GIT_USER_NAME" ]; then
     git config --global user.name "$GIT_USER_NAME"
 fi

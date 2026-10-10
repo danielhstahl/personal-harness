@@ -1,34 +1,12 @@
 on: push
 
 jobs:
-  run_pi_beads_tests:
-    name: Run tests for pi-beads
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./pi-beads/loop
-    env:
-      NODE_OPTIONS: "--max_old_space_size=4096"
-      VITEST_SEGFAULT_RETRY: "5"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24.1.0"
-      - name: install deps
-        run: |
-          npm ci
-      - name: run tests
-        run: npm run test -- --coverage .
-      - name: run typecheck
-        run: npm run typecheck
-
-  run_pi_beads_tests_rust:
+  run_looprs_tests:
     name: fmt + clippy -D warnings + cargo test
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ./pi-beads/looprs
+        working-directory: ./looprs
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +18,7 @@ jobs:
       - name: cache cargo target dir
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ./pi-beads/looprs
+          workspaces: ./looprs
 
       - name: fmt, clippy -D warnings, tests
         run: ./scripts/check.sh
@@ -54,6 +32,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: generate docs
-        working-directory: pi-beads/looprs
+        working-directory: looprs
         run: |
             ./scripts/docs.sh check

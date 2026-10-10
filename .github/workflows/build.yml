@@ -10,7 +10,7 @@ jobs:
       contents: write # release changes require contents write
     defaults:
       run:
-        working-directory: ./pi-beads/looprs
+        working-directory: ./looprs
     strategy:
       fail-fast: false
       matrix:
@@ -56,9 +56,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-    defaults:
-      run:
-        working-directory: ./pi-beads
     steps:
       - uses: actions/checkout@v4
 
@@ -75,9 +72,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: generate docker
-        working-directory: pi-beads
         run: |
-          docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/danielhstahl/pi-beads:${{ github.event.release.tag_name }} -f Dockerfile . --push
+          docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/danielhstahl/pi-beads:${{ github.event.release.tag_name }} -f docker/Dockerfile . --push
 
   build_docs:
     runs-on: ubuntu-latest
@@ -89,7 +85,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: generate docs
-        working-directory: pi-beads/looprs
+        working-directory: looprs
         run: |
             ./scripts/docs.sh check
             ./scripts/docs.sh build
@@ -99,7 +95,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: "pi-beads/looprs/docs/_site"
+          path: "looprs/docs/_site"
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4

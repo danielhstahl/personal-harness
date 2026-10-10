@@ -1,4 +1,4 @@
-Not recommended for local models for performance reasons.
+Docker image that has `node`, `python`, `beads` preinstalled.  Does not run as root.
 
 To run:
 
@@ -9,7 +9,7 @@ docker run --rm -it \
   --add-host=host.docker.internal:host-gateway \
   # optional, do this if you want to persist settings between runs
   -v $PWD/pi-agent-home:/home/appuser/.pi/agent \
-  ghcr.io/danielhstahl/pi-teams
+  ghcr.io/danielhstahl/pi-beads
 ```
 
 Build/run locally:
