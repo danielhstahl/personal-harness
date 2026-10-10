@@ -342,3 +342,138 @@ no index, because the reader trusts it first.
     under `docs/` and 7,056 *including* `spikes/` — fifteen lines of subtraction
     where there should have been an addition, in the one table a reader trusts to
     be the measurement.
+
+---
+
+## Amendment — 2026-10-10: the page's *shape* becomes a checked property (and Hugo is asked again)
+
+- **Trigger:** a report about the built site rather than the prose — *"looks good on normal
+  browsers but is squished on mobile with too much white space on the right side"*.
+- **Measured by:** [`spikes/docs_layout.py`](../../spikes/docs_layout.py), which loads every
+  built page at 360/390/768/1440 and asserts 15 things about the frame. Committed twice, same
+  driver, same tree, one side fixed:
+  [`spikes/results/docs-layout-control.log`](../../spikes/results/docs-layout-control.log)
+  (**2/15**, pre-fix worktree) against
+  [`spikes/results/docs-layout.log`](../../spikes/results/docs-layout.log) (**15/15**).
+  Re-run: `./scripts/docs.sh build && python3 spikes/docs_layout.py`. The static half — the
+  half that can be a gate — is `check_layout_css` in
+  [`scripts/docs_check.py`](../../scripts/docs_check.py), now check 8 of that gate.
+- **Amends:** **Q1** (asked again with a name attached: *Hugo*. The decision holds; one of the
+  two reasons originally given for it is withdrawn as wrong), **Q3** (the artefact could lie
+  after all, by a route the ticket did not consider), and **§What this forbids** (items
+  11–13 added). Nothing moved, so rule 1 was never exercised.
+
+### 1. What "squished on mobile" turned out to be
+
+Two independent bugs, neither of which fails a build, a linter, or a link checker, and both of
+which were invisible on the machine that wrote them:
+
+| what the report said | what the browser measured (pre-fix) | now |
+| --- | --- | --- |
+| "squished" | the article column resolved to **348px of a 390px** viewport, and 33 pages came out narrower than 80% of the screen | the article is ≥80% of the frame on every page |
+| "too much white space on the right" | `body` resolved **`348px 0px 42px`** — three tracks for a template that defines one. The header stopped 42px short of the right edge (that strip *is* the white space) and the entire page tree was crushed into the 42px beside it | one track at ≤900px on every page |
+| (not reported; found by measuring) | 25 pages scrolled wider than the phone — worst **3,323px** of document on a 360px screen, because every pipe table in the corpus had rendered as a paragraph of pipes instead of a table | 0 of 198 pages overflow at any width |
+
+**Bug one — a grid area named but not defined.** The narrow media query retiled `body` to one
+column with areas `top`/`main`, while `.sidebar` went on asking for `side`. CSS does not reject
+that: it synthesises a track for the ghost name and lays the header in one column beside it. The
+invariant now enforced (statically, as check 8) is *every `grid-area:` name in the stylesheet
+appears in every `grid-template-areas:` in it* — including the `body:has(.sidebar:empty)` rule
+for carried repository files, where the temptation is to drop `side` and hide the item instead.
+That temptation is the same loophole; the CSS names `side` and collapses the row.
+
+**Bug two — a markdown parser with no extensions on.** `Parser::new(md)` is *no* extensions, and
+a pipe table under a parser with no `ENABLE_TABLES` does not fail: it renders as text. Count of
+table rows in the corpus, re-runnable:
+
+```sh
+grep -rc '^|' docs/*.md docs/guide/*.md docs/adr/*.md README.md | awk -F: '{s+=$2} END {print s}'
+# 1024   (as measured 2026-10-10; `wc -l` on the same file list is a different question)
+```
+
+All of it reached the reader as `| … |` text. This is a *generator* bug with a docs-shaped
+shadow: the ADR's own table of what the corpus contains was one of the pages affected, and the
+ADR quoted the size of a corpus whose tables were invisible.
+
+Two more turned up while measuring, and both are amendments to *this* ADR rather than footnotes:
+
+**The artefact could lie, by a route Q3 missed.** Q3 rejected committed HTML because "committed
+HTML can be stale relative to its own Markdown, and a reader cannot tell". Uncommitted HTML in
+`docs/_site/` had the same property: the build only ever wrote, never removed, so 32 pages whose
+sources had gone stayed in the output directory looking like part of the site. `sweep_stale_pages`
+now deletes every `.html` the build did not write (first run: 32), which is what makes Q3's claim
+true rather than mostly true.
+
+**Two escape lists in one file.** `scripts/docs_check.py` generated the keymap tables through one
+Rust-string-unescape helper and the wire-protocol tables through a second one, and only the second
+knew `\u{…}`. Ten keymap rows shipped as `yes \u{2014} the first Esc unselects`, three pages
+apart from a wire table where the same em dash rendered correctly. There is one list now
+(`unescape_rust`, used by both), and the capture above fails if a `\u{…}` reaches a page.
+
+### 2. Decisions
+
+1. **`render_markdown` names its extension options** (`TABLES | STRIKETHROUGH | TASKLISTS`,
+   exceeding by `TABLES` what `src/utils/md.rs` turns on for the transcript), and
+   `render_page_markdown` **refuses to build a page whose markdown syntax survived** into the
+   prose. The contributor rule that follows is CommonMark's, not a style: a table needs a blank
+   line above it, because a table cannot start while a paragraph is still running. That rule bit
+   this ADR's own sibling — [ADR-0005](0005-shell-output-content-model.md) had a `check.sh` row
+   orphaned into the middle of a paragraph by an explanatory note inserted above the table's last
+   row — and the guard found it on the first run, which is the argument for the guard.
+2. **The build owns its output directory**: `sweep_stale_pages` removes what it did not write.
+3. **`check_layout_css` (gate check 8)**: grid areas closed at every breakpoint, a
+   `width=device-width` viewport meta in every page template, and no `position: sticky` sticking
+   at a remembered number. That last one is not pedantry: the sheet stuck the sidebar at a typed
+   `top: 45px` under a header whose box measured **21px**, so the sidebar's first strip was hidden
+   under an opaque bar and a gap no diff explains. `--topbar-h` is now one number in one place.
+4. **The page tree is folded on a phone, not squeezed onto one.** A 25-link tree above the article
+   is not navigation on a 390px screen; the fold is a CSS-only checkbox (`:checked ~ ul.nav`)
+   labelled `Contents · <this page>`, so a folded tree still says where you are. CSS only, on
+   purpose: `file://` has no script to lean on and `livereload.js` is a `serve`-only file.
+5. **One Rust-string-escape list** in the gate, shared by both generated-table renderers.
+
+### 3. Hugo, priced rather than argued
+
+The suggestion was that an existing generator would be more efficient than 1,425 lines of our
+own. Q1's criterion was never features — it was *what a contributor has to install before they can
+preview a page they just edited*. That criterion still decides it, but pricing Hugo properly
+withdraws one of Q1's reasons and confirms the other:
+
+| axis | Hugo v0.167.0, measured on this corpus | this generator |
+| --- | --- | --- |
+| install | **55 MB binary**, per contributor and per CI image | nothing: `pulldown-cmark` is already in `Cargo.lock` because the app's transcript renderer uses it |
+| time to first page | **zero pages** from content + config alone — Hugo emitted no HTML until three layout files existed; then 26 pages in **~40 ms** | one command, ~0.8 s warm, 4.7 s cold with an empty target dir |
+| heading slugs | `## 1. The status → column mapping` → `1-the-status--column-mapping`, **byte-identical to GitHub's rule including the double hyphen** | implements the same rule by hand |
+| a link from `docs/adr/x.md` to `../guide/operator.md` | emitted verbatim → points at a `.md` in a site of `.html`, dead, until you add `render_hooks = ["link"]` plus a `render-link.html` template | rewritten to resolve inside the site, at any mount prefix |
+| a link from an ADR to `../../spikes/results/x.log` or `../src/session/mod.rs` | emitted verbatim; both escape the site root and land on nothing. Making them land costs that render hook **plus** a `static/` mirror of `src/` and `spikes/` — i.e. copying the tree | `_repo/` carried **on demand**: only linked files, 159 files here, which is why a link into 2.3 MB of Rust costs one page |
+| the page's own shape | a theme, written by us either way (3 template files minimum here, 0 provided) | the stylesheet + 2 templates, one Rust file |
+
+**Decision: unchanged, for the reason Q1 gave, minus the reason that turned out to be false.** The
+GitHub-slug rule is not a Hugo gap and should not have been listed as one; the outward-link gap is
+real but closable with two template files and a mirror of the tree. What is not closable without an
+install is the install — and ADR-0008's whole argument was that the fast path stays available to
+someone with a checkout and no network. Hugo is the right answer to a different question: a docs
+corpus that grows search, i18n, versioning, and a theme designed by someone who is not the person
+editing the page. If that day comes, this table is where the ticket starts, and the honest framing
+then is "the corpus tripled and needs search", not "the generator is ours and it is 1,425 lines".
+
+### What this forbids (three more, in the same list as the others)
+
+11. **No `grid-area:` name that the active template does not define, no page template without a
+    `width=device-width` viewport meta, and no sticky offset typed as a literal number.** All
+    three are checked by `check_layout_css`, and all three fail *silently and only on a phone*,
+    which is the failure class this amendment exists for.
+12. **No gate that needs a browser.** The layout rules that can only be checked by a browser live
+    in `spikes/` and print a "cannot measure, here is why" exit code 2 when Chromium is absent —
+    never a pass. Rule 2 (no new documentation dependency) is the reason the gate stays
+    `python3` + the tree, offline.
+13. **No assumed markdown extension.** `render_markdown`'s `Options` list is the contract, and the
+    build refuses a page whose syntax survived rather than publishing it quietly. The first
+    version of that guard checked the raw HTML and missed `<p>\| Command \|` — a check must look at
+    the text a reader reads, which is what it now strips code regions and real tables out of.
+
+### What stands
+
+Q2 (nothing moved, and `docs/_site/` stays gitignored), Q3's conclusion (built, not committed) and
+its reasoning about diff noise, the ASCII diagram policy, the generated-table markers, and all ten
+original prohibitions. Rule 1 was never invoked: no file moved.

@@ -39,8 +39,8 @@ variant name for the rows, so what a table row says is what the screen says.
 | `Ctrl-S t` | ChordArmed | app | `DumpTranscriptFile` | the escape hatch |
 | `Ctrl-S ?` | ChordArmed | app | `ChordHelp` | the family, listed in a toast |
 | `Esc` | ChordArmed | app | `CancelChord` | undoes the prefix and nothing else |
-| `Esc` | SelectionLive | app | `ClearSelection` | was a selection live? yes \u{2014} the first Esc unselects and sends nothing |
-| `Esc` | Plain | session | `CancelRun` | was a selection live? no \u{2014} the cancel |
+| `Esc` | SelectionLive | app | `ClearSelection` | was a selection live? yes — the first Esc unselects and sends nothing |
+| `Esc` | Plain | session | `CancelRun` | was a selection live? no — the cancel |
 | `Tab` | Plain | app | `SwitchMode` | switch mode |
 | `Shift-Tab` | Plain | box | `Newline` | newline in the input box |
 | `Shift-Enter` | Plain | box | `Newline` | a newline in the box |
@@ -66,8 +66,8 @@ variant name for the rows, so what a table row says is what the screen says.
 | `Ctrl-S t` | ChordArmed | app | `DumpTranscriptFile` | the escape hatch |
 | `Ctrl-S ?` | ChordArmed | app | `ChordHelp` | the family, listed in a toast |
 | `Esc` | ChordArmed | app | `CancelChord` | undoes the prefix and nothing else |
-| `Esc` | SelectionLive | app | `ClearSelection` | was a selection live? yes \u{2014} the first Esc unselects and sends nothing |
-| `Esc` | Plain | session | `CancelRun` | was a selection live? no \u{2014} the cancel, and the queued text comes back to the box |
+| `Esc` | SelectionLive | app | `ClearSelection` | was a selection live? yes — the first Esc unselects and sends nothing |
+| `Esc` | Plain | session | `CancelRun` | was a selection live? no — the cancel, and the queued text comes back to the box |
 | `Tab` | Plain | app | `SwitchMode` | switch mode |
 | `Shift-Tab` | Plain | box | `Newline` | newline in the input box |
 | `Shift-Enter` | Plain | box | `Newline` | a newline in the box |
@@ -89,20 +89,20 @@ has rows the other two do not, and they are the interesting ones.
 | key | state | who owns it | effect | why |
 | --- | --- | --- | --- | --- |
 | `Ctrl-C` | Plain | shell | `SigInt` | the shell's own key: 0x03 to the pty master, the foreground group gets SIGINT, the app stays up — and it is never, in any mode, a copy |
-| `Ctrl-Q` | Plain | app | `Quit` | quit without touching the shell; this is also why Ctrl-S cannot be forwarded \u{2014} \u{2014} \u{2018} is ours |
+| `Ctrl-Q` | Plain | app | `Quit` | quit without touching the shell; this is also why Ctrl-S cannot be forwarded — — ‘ is ours |
 | `Ctrl-S` | Plain | app | `ArmChord` | the copy prefix: a prefix rather than four top-level chords, because the chord budget is the whole difficulty here |
 | `Ctrl-S a` | ChordArmed | app | `CopyAnswer` | in Bash this *refuses* (there are no answers here) and names the chord that works |
 | `Ctrl-S o` | ChordArmed | app | `CopyLastOutput` | the last sealed shell block: this command's echo, output and prompt, and nothing before it |
 | `Ctrl-S s` | ChordArmed | app | `CopySelection` | whatever selection is live; a keyboard-driven selection was *not* one of the things that landed in this ticket, and this target is ready for it |
 | `Ctrl-S t` | ChordArmed | app | `DumpTranscriptFile` | the escape hatch: the whole transcript to a timestamped file, through an injected sink like the clipboard's |
 | `Ctrl-S ?` | ChordArmed | app | `ChordHelp` | the family, listed in a toast: the chords have to be reachable from inside the app |
-| `Esc` | ChordArmed | app | `CancelChord` | undoes the prefix and nothing else \u{2014} it is deliberately not the mode's cancel |
+| `Esc` | ChordArmed | app | `CancelChord` | undoes the prefix and nothing else — it is deliberately not the mode's cancel |
 | `Ctrl-C` | ChildHolds | shell | `SigInt` | still SIGINT: a full-screen child does not take Ctrl-C away from the shell it is already in |
 | `Ctrl-Q` | ChildHolds | app | `Quit` | ours in every state; the child is killed on the way out |
 | `Ctrl-S` | ChildHolds | app | `Swallowed` | never forwarded: XOFF into a pty whose XON (Ctrl-Q) we own is a freeze the user cannot undo |
-| `anything else` | ChildHolds | child | `Forwarded` | a program that owns the screen owns the keyboard (ADR-0001 Q2) \u{2014} Esc included, so vim leaves insert mode |
-| `Esc` | SelectionLive | app | `ClearSelection` | was a selection live? yes \u{2014} the first Esc unselects and sends nothing |
-| `Esc` | Plain | session | `CancelRun` | was a selection live? no \u{2014} the Esc is the cancel the mode table already describes |
+| `anything else` | ChildHolds | child | `Forwarded` | a program that owns the screen owns the keyboard (ADR-0001 Q2) — Esc included, so vim leaves insert mode |
+| `Esc` | SelectionLive | app | `ClearSelection` | was a selection live? yes — the first Esc unselects and sends nothing |
+| `Esc` | Plain | session | `CancelRun` | was a selection live? no — the Esc is the cancel the mode table already describes |
 | `Tab` | Plain | app | `SwitchMode` | switch mode; the selection, the chord and the wheel throttle all clear with it |
 | `Shift-Tab` | Plain | box | `Newline` | newline in the input box — Shift-Enter never sends a shell command |
 | `Shift-Enter` | Plain | box | `Newline` | a newline in the box, not a submit |
@@ -110,7 +110,7 @@ has rows the other two do not, and they are the interesting ones.
 | `PageUp` | Plain | app | `ScrollUp` | one page up, unpinning the tail (looprs-pdl.8's semantics, the same store) |
 | `PageDown` | Plain | app | `ScrollDown` | one page down; reaching the bottom re-pins |
 | `Home` | Plain | app | `Top` | top of the transcript |
-| `End` | Plain | app | `Tail` | bottom, and re-pin: what the \u{201c}N new\u{201d} affordance names |
+| `End` | Plain | app | `Tail` | bottom, and re-pin: what the “N new” affordance names |
 | `anything else` | Plain | box | `Typing` | typing, to whichever mode's box is up |
 <!-- END GENERATED:keymap:bash -->
 

@@ -29,11 +29,11 @@
 //! still true is `./scripts/docs_check.sh`, not this generator: a generator that
 //! invented navigation would be a second index to keep in step with the first.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use pulldown_cmark::{html, Parser};
+use pulldown_cmark::{html, Options, Parser};
 
 /// A file larger than this is not carried into the site. Nothing in this repo is
 /// close (`spikes/results/` — every captured log, all of it — is 304 KB), so the
@@ -151,6 +151,12 @@ fn main() {
                 "  {} page(s), {} supporting file(s), {} external link(s)",
                 report.pages, report.materialized, report.external
             );
+            if report.stale > 0 {
+                println!(
+                    "  removed {} stale page(s): the site now contains only what this build wrote",
+                    report.stale
+                );
+            }
             if !report.warnings.is_empty() {
                 println!("  {} warning(s):", report.warnings.len());
                 for w in report.warnings {
@@ -170,6 +176,7 @@ struct Report {
     materialized: usize,
     external: usize,
     warnings: Vec<String>,
+    stale: usize,
 }
 
 fn run(
@@ -223,7 +230,8 @@ fn run(
             };
             let listing = rewrite_links(&ctx, &listing, &mut links, &mut external, &mut warnings)?;
             materialized.insert(target.clone(), site_rel.clone());
-            write_page(out, &site_rel, &listing, &nav_html(root, book, &nav, &site_rel), stamp)?;
+            let (nav, here) = nav_html(root, book, &nav, &site_rel);
+            write_page(out, &site_rel, &listing, &nav, &here, stamp)?;
             queue.extend(links.into_iter().map(|(_, p)| p).filter(|p| !p.as_os_str().is_empty()));
             continue;
         }
@@ -260,7 +268,7 @@ fn run(
 
         if extension(&target).as_deref() == Some("md") {
             let text = read(&target)?;
-            let body = render_markdown(&text);
+            let body = render_page_markdown(&show(root, &target), &text)?;
             let mut links: Vec<(String, PathBuf)> = Vec::new();
             let ctx = PageCtx {
                 root,
@@ -271,7 +279,8 @@ fn run(
             };
             let body = rewrite_links(&ctx, &body, &mut links, &mut external, &mut warnings)?;
             pages.insert(target.clone(), site_rel.clone());
-            write_page(out, &site_rel, &body, &nav_html(root, book, &nav, &site_rel), stamp)?;
+            let (nav, here) = nav_html(root, book, &nav, &site_rel);
+            write_page(out, &site_rel, &body, &nav, &here, stamp)?;
             queue.extend(links.into_iter().map(|(_, p)| p).filter(|p| !p.as_os_str().is_empty()));
             continue;
         }
@@ -312,12 +321,63 @@ fn run(
     }
 
     write_assets(out)?;
+
+    // A page in the site with no page behind it is a page that is lying, and it is
+    // lying in the one way this ADR says the build must not: `docs/_site` is not
+    // committed precisely so that generated output cannot disagree with its source
+    // while looking authoritative — but a file left in the output directory by an
+    // earlier build disagrees just as quietly. (It happened: the pre-table build's
+    // pages sat under `_site/_repo/` after the generator was fixed, so the site
+    // that looked rebuilt still rendered 32 pages of pipe syntax.) The build knows
+    // every path it wrote, so it deletes every `.html` it did not write.
+    let keep: BTreeSet<String> = pages.values().chain(materialized.values()).cloned().collect();
+    let stale = sweep_stale_pages(out, &keep);
+
     Ok(Report {
         pages: pages.len(),
         materialized: materialized.len(),
         external,
         warnings,
+        stale: stale.len(),
     })
+}
+
+/// Delete `.html` files the build did not write. Returns what it deleted.
+///
+/// Deliberately limited to `.html` inside the output directory: the generator owns
+/// the pages it generates and nothing else, and a sweep that deletes a stranger's
+/// file is a worse bug than the stale page it removed.
+fn sweep_stale_pages(out: &Path, keep: &BTreeSet<String>) -> Vec<String> {
+    let mut doomed = Vec::new();
+    let mut stack = vec![out.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("html") {
+                continue;
+            }
+            let rel = match path.strip_prefix(out) {
+                Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                Err(_) => continue,
+            };
+            if !keep.contains(&rel) {
+                doomed.push((path, rel));
+            }
+        }
+    }
+    let mut removed = Vec::new();
+    for (path, rel) in doomed {
+        if fs::remove_file(&path).is_ok() {
+            removed.push(rel);
+        }
+    }
+    removed.sort();
+    removed
 }
 
 // ───────────────────────────── paths ─────────────────────────────
@@ -414,7 +474,14 @@ fn page_rel(rel: &Path, under_repo_mirror: bool) -> String {
         format!("{s}.html")
     };
     if under_repo_mirror {
-        format!("_repo/{s}")
+        // A file outside the repo arrives absolute (`/Users/…` on the machine that
+        // wrote the link, `/workspace/…` in a container). `_repo/` joined to an
+        // absolute string is `_repo//workspace/…`: `Path::join` collapses the
+        // double slash when it writes and does **not** collapse it when something
+        // compares the strings, so a build that asks "which paths did I write?"
+        // answers wrong for every out-of-repo carry. Normalise at the one place the
+        // mirror name is built.
+        format!("_repo/{}", s.trim_start_matches('/'))
     } else {
         s
     }
@@ -572,8 +639,100 @@ fn collect_pages(nodes: &[Node], q: &mut VecDeque<PathBuf>) {
 
 fn render_markdown(md: &str) -> String {
     let mut out = String::new();
-    html::push_html(&mut out, Parser::new(md));
+    // The extension options are load-bearing, not decoration. `Parser::new` means
+    // *no* extensions, and a pipe table under a parser with no `ENABLE_TABLES` does
+    // not fail: it renders as a paragraph of pipes. That is what shipped, site-wide
+    // — every table row in the corpus (1,024 when this was counted; re-count with the
+    // `grep -rc '^|'` one-liner in ADR-0008's amendment) came out as literal `| … |`
+    // text, which is unreadable on a desktop and wide enough on a phone to push the
+    // page into horizontal scroll. `unrendered_tables` is the gate that stops it recurring.
+    //
+    // The set mirrors (and deliberately exceeds by TABLES) what the app's own
+    // markdown renderer turns on in `src/utils/md.rs`.
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    html::push_html(&mut out, Parser::new_ext(md, opts));
     add_heading_ids(&out)
+}
+
+/// Render a page's markdown, refusing the page if markdown syntax survived.
+///
+/// The only failure mode of a markdown renderer worth fearing is the silent one:
+/// output that is *valid HTML* and wrong prose. A table that did not render is not
+/// ugly, it is source code wearing a paragraph, and it is both invisible in a diff
+/// of the HTML (nothing is committed) and obvious to a reader too late.
+fn render_page_markdown(what: &str, md: &str) -> Result<String, String> {
+    let rendered = render_markdown(md);
+    match unrendered_tables(&rendered) {
+        empty if empty.is_empty() => Ok(rendered),
+        hits => Err(format!(
+            "{what}: markdown table syntax survived into the HTML ({} line(s), first: {}). \
+             Either `render_markdown`'s Options no longer include TABLES, or this table's \
+             header/`|---|` delimiter pair is malformed or glued to the paragraph above it \
+             (a table must start a block: one blank line before it).",
+            hits.len(),
+            hits[0]
+        )),
+    }
+}
+
+/// Prose lines of rendered HTML that are still markdown pipe-table syntax.
+///
+/// Checked on the output rather than the source because the output is the artefact
+/// the reader sees. Two exclusions make the check precise, and both were learned
+/// the hard way:
+///
+/// * **code regions** — an inline `` `grep -E 'logging: |kanban|clipboard'` `` has
+///   pipes at the start of a wrapped line in `docs/guide/configuration.md`, and a
+///   check that ignores code spans calls that a broken table. ASCII figures in
+///   fenced blocks drop out for the same reason (and their `│` is not `|` anyway).
+/// * **real tables** — the clipboard knob's table has cells that quote
+///   `` `auto` \| `native` \| `off` ``, so a *correctly rendered* row contains
+///   pipes in its text. Excluding `<table>…</table>` is what leaves a check for
+///   pipes that escaped a table rather than pipes that are inside one.
+///
+/// What survives is markdown pipe syntax sitting in prose, which has exactly two
+/// causes: extension options that no longer include `ENABLE_TABLES`, or a table
+/// with no blank line above it (CommonMark will not start a table while a paragraph
+/// is still running, and nothing about that failure is loud).
+fn unrendered_tables(rendered: &str) -> Vec<String> {
+    prose_text(rendered)
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('|') && line.matches('|').count() >= 3)
+        .map(|line| format!("`{}`", line.chars().take(60).collect::<String>()))
+        .collect()
+}
+
+/// The rendered HTML with code spans, code blocks and real tables removed, and its
+/// tags stripped: the prose a reader gets.
+fn prose_text(html: &str) -> String {
+    let mut regions = CodeRegions::new(html).ranges;
+    regions.extend(table_regions(html));
+    regions.sort();
+    let mut kept = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+    for (start, end) in &regions {
+        if *start > cursor {
+            kept.push_str(&html[cursor..*start]);
+        }
+        cursor = (*end).min(html.len()).max(cursor);
+    }
+    kept.push_str(&html[cursor..]);
+    strip_tags(&kept)
+}
+
+/// Byte ranges of the rendered HTML that are a rendered table.
+fn table_regions(html: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(i) = html[cursor..].find("<table") {
+        let start = cursor + i;
+        let Some(j) = html[start..].find("</table>") else { break };
+        let end = start + j + "</table>".len();
+        out.push((start, end));
+        cursor = end;
+    }
+    out
 }
 
 /// Add `id="..."` to every heading, using GitHub's slug rules.
@@ -946,21 +1105,36 @@ fn escape(s: &str) -> String {
 /// *that* page: the site is served from an unknown prefix, so an absolute href
 /// would pin it to one mount point. The cost is a few KB of string work per page
 /// across ~40 pages, which is not a thing worth caching.
-fn nav_html(root: &Path, book: &Path, nodes: &[Node], current: &str) -> String {
+///
+/// The second half of the return is the title of the page being rendered — the
+/// tree knows which entry it marked active, and on a phone the tree is folded
+/// until you ask, so the fold's label has to say where you are.
+fn nav_html(root: &Path, book: &Path, nodes: &[Node], current: &str) -> (String, String) {
     let mut out = String::new();
+    let mut here = String::new();
     out.push_str("<ul class=\"nav depth-0\">");
-    nav_items(&mut out, root, book, nodes, current);
+    nav_items(&mut out, root, book, nodes, current, &mut here);
     out.push_str("</ul>");
-    out
+    (out, here)
 }
 
-fn nav_items(out: &mut String, root: &Path, book: &Path, nodes: &[Node], current: &str) {
+fn nav_items(
+    out: &mut String,
+    root: &Path,
+    book: &Path,
+    nodes: &[Node],
+    current: &str,
+    here: &mut String,
+) {
     for n in nodes {
         match &n.page {
             Some(p) => {
                 let target = site_path(root, book, p);
                 let href = site_link(current, &target);
                 let active = if target == current { " class=\"active\"" } else { "" };
+                if target == current && here.is_empty() {
+                    *here = n.title.clone();
+                }
                 out.push_str(&format!(
                     "<li><a{active} href=\"{href}\">{}</a></li>",
                     escape(&n.title)
@@ -970,7 +1144,7 @@ fn nav_items(out: &mut String, root: &Path, book: &Path, nodes: &[Node], current
                 out.push_str(&format!("<li class=\"group\">{}", escape(&n.title)));
                 if !n.children.is_empty() {
                     out.push_str("<ul>");
-                    nav_items(out, root, book, &n.children, current);
+                    nav_items(out, root, book, &n.children, current, here);
                     out.push_str("</ul>");
                 }
                 out.push_str("</li>");
@@ -979,7 +1153,14 @@ fn nav_items(out: &mut String, root: &Path, book: &Path, nodes: &[Node], current
     }
 }
 
-fn write_page(out: &Path, site_rel: &str, body: &str, nav: &str, stamp: &str) -> Result<(), String> {
+fn write_page(
+    out: &Path,
+    site_rel: &str,
+    body: &str,
+    nav: &str,
+    here: &str,
+    stamp: &str,
+) -> Result<(), String> {
     let path = out.join(site_rel);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("{parent:?}: {e}"))?;
@@ -989,6 +1170,13 @@ fn write_page(out: &Path, site_rel: &str, body: &str, nav: &str, stamp: &str) ->
         ".".to_string()
     } else {
         vec![".."; depth].join("/")
+    };
+    // The fold's label: what the tree is, and — because a folded tree tells a
+    // reader nothing about where they are — the page they are on.
+    let here_html = if here.is_empty() {
+        String::new()
+    } else {
+        format!(" <span class=\"navtoggle-here\">{}</span>", escape(here))
     };
     let page = format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
@@ -1000,14 +1188,18 @@ fn write_page(out: &Path, site_rel: &str, body: &str, nav: &str, stamp: &str) ->
          <header class=\"topbar\"><a class=\"brand\" href=\"{up}/index.html\">loop<span>rs</span></a>\n\
          <span class=\"tagline\">a terminal that owns its transcript</span>\n\
          <a class=\"home\" href=\"{up}/index.html\">docs home</a></header>\n\
-         <nav class=\"sidebar\" aria-label=\"Docs\">{nav}</nav>\n\
+         <nav class=\"sidebar\" aria-label=\"Docs\">\
+         <input class=\"navtoggle\" type=\"checkbox\" id=\"nav-toggle\" aria-label=\"Show the page tree\">\
+         <label class=\"navtoggle-label\" for=\"nav-toggle\"><span>Contents</span>{here_html}</label>\
+         {nav}</nav>\n\
          <main>\n<article>\n{body}\n</article>\n\
          <footer class=\"pagefooter\">Generated by <code>./scripts/docs.sh build</code> · {stamp}</footer>\n\
          </main>\n</body>\n</html>\n",
         up = up,
         body = body,
         stamp = escape(stamp),
-        nav = nav
+        nav = nav,
+        here_html = here_html
     );
     fs::write(&path, page).map_err(|e| format!("{path:?}: {e}"))?;
     Ok(())
@@ -1061,6 +1253,13 @@ const CSS: &str = r##":root {
   --code-bg: #0b0d11;
   --border: #262b34;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  /* The two numbers the frame is measured in, each written once. --topbar-h is
+     both the header's height and the offset the sidebar sticks under; stated
+     twice they drift, and the drift is a strip of page hidden under an opaque
+     header (which is how this sheet shipped for a while: the header's box was
+     21px tall with 30px of text in it, and the sidebar stuck at a guessed 45px). */
+  --topbar-h: 50px;
+  --nav-w: 300px;
 }
 @media (prefers-color-scheme: light) {
   :root {
@@ -1074,19 +1273,34 @@ const CSS: &str = r##":root {
   }
 }
 * { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); }
 body {
   font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr);
+  grid-template-columns: var(--nav-w) minmax(0, 1fr);
   grid-template-rows: auto 1fr;
   grid-template-areas: "top top" "side main";
   min-height: 100vh;
+  min-height: 100dvh;
+}
+/* A carried repository file has no place in the tree, so its sidebar is empty and
+   the gutter beside it is a lie about width. Note the shape of the fix: the `side`
+   area is **kept** and given zero width rather than dropped from the template.
+   `check_layout_css` requires every `grid-area:` name to be named by every
+   `grid-template-areas:` in the sheet, and an exemption here — "it is fine because
+   another rule hides the item" — is the same loophole the mobile bug arrived
+   through. The rule says what it says for every template. */
+.sidebar:empty { display: none; }
+body:has(.sidebar:empty) {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "top" "side" "main";
 }
 .topbar {
   grid-area: top;
-  display: flex; align-items: baseline; gap: 14px;
-  padding: 10px 20px;
+  display: flex; align-items: center; gap: 14px;
+  height: var(--topbar-h);
+  padding: 0 20px;
   border-bottom: 1px solid var(--border);
   background: var(--panel);
   position: sticky; top: 0; z-index: 5;
@@ -1101,9 +1315,11 @@ body {
   background: var(--panel);
   padding: 14px 10px 40px 18px;
   overflow-y: auto;
+  overscroll-behavior: contain;
   position: sticky;
-  top: 45px;
-  max-height: calc(100vh - 45px);
+  top: var(--topbar-h);
+  max-height: calc(100vh - var(--topbar-h));
+  max-height: calc(100dvh - var(--topbar-h));
   font-size: 14px;
 }
 ul.nav { list-style: none; margin: 0; padding-left: 0; }
@@ -1112,8 +1328,18 @@ ul.nav li { margin: 3px 0; }
 ul.nav li.group { color: var(--dim); text-transform: uppercase; letter-spacing: .06em; font-size: 11.5px; font-weight: 700; margin-top: 14px; }
 ul.nav a { color: var(--fg); text-decoration: none; }
 ul.nav a:hover { color: var(--accent); text-decoration: underline; }
+ul.nav a.active { color: var(--accent); font-weight: 600; }
+/* The phone disclosure. On a wide screen the tree is simply open and neither of
+   these exists; on a phone the article is what you came for, so the tree starts
+   folded and the checkbox unfolds it. CSS only, on purpose: a site that works
+   from file:// has no script to lean on, and livereload.js is a `serve`-only
+   file. The input stays in the tab order (transparent, not `display: none`) so
+   the control is keyboard-operable and the label gets the focus ring. */
+.navtoggle, .navtoggle-label { display: none; }
 main { grid-area: main; padding: 26px 34px 80px; min-width: 0; }
-article { max-width: 900px; }
+article { max-width: 900px; overflow-wrap: break-word; }
+/* Anchor jumps land under a sticky header unless every target says otherwise. */
+[id] { scroll-margin-top: calc(var(--topbar-h) + 12px); }
 article h1, article h2, article h3 { line-height: 1.25; margin: 1.9em 0 .55em; }
 article h1 { font-size: 30px; margin-top: .3em; }
 article h2 { font-size: 23px; border-bottom: 1px solid var(--border); padding-bottom: .25em; }
@@ -1124,30 +1350,93 @@ article code {
   font-family: var(--mono); font-size: 87%;
   background: var(--code-bg); padding: .12em .35em; border-radius: 3px;
   border: 1px solid var(--border);
+  /* A chip is an atom, not a run of text. As plain inline boxes, a long sequence
+     of them (`LOOP_GIT_LOCK_WAIT_MS` / `LOOP_GIT_KILL_GRACE_MS` / …) laid out past
+     the column edge in Chrome, and `overflow-wrap` in three spellings plus
+     `word-break: break-all` all left the document at 379px on a 360px screen —
+     measured on the carried TypeScript predecessor's README, the page that
+     taught me this. As inline-blocks each chip moves to the next line whole, and
+     `max-width` keeps one absurdly long chip inside the column instead of letting
+     it punch out of it. */
+  display: inline-block; max-width: 100%;
+  overflow-wrap: anywhere;
 }
 article pre {
   background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;
-  padding: 12px 14px; overflow-x: auto; line-height: 1.5;
+  padding: 12px 14px; overflow-x: auto; max-width: 100%; line-height: 1.5;
 }
-article pre code { background: none; border: none; padding: 0; font-size: 13px; }
+article pre code { background: none; border: none; padding: 0; font-size: 13px; display: inline; max-width: none; overflow-wrap: normal; }
 article blockquote {
   margin: 1em 0; padding: .4em 1em; border-left: 3px solid var(--accent);
   background: rgba(122,162,247,.06); color: var(--fg);
 }
-article table { border-collapse: collapse; width: 100%; margin: 1.1em 0; font-size: 14.5px; display: block; overflow-x: auto; }
+/* `display: block` on the table is what gives a wide table somewhere to go: as an
+   inline table it has no scroll box, so a five-column reference either squeezes
+   every cell into unreadability or makes the whole document wider than the
+   screen. The cells still lay out as table cells inside it. */
+article table { border-collapse: collapse; width: 100%; max-width: 100%; margin: 1.1em 0; font-size: 14.5px; display: block; overflow-x: auto; }
 article th, article td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
 article th { background: var(--panel); font-weight: 700; }
 article tr:nth-child(even) td { background: rgba(255,255,255,.012); }
 article ul, article ol { padding-left: 22px; }
 article li { margin: .3em 0; }
+article img { max-width: 100%; height: auto; }
 .pagefooter { margin-top: 60px; color: var(--dim); font-size: 12.5px; border-top: 1px solid var(--border); padding-top: 12px; }
 .srcnote { color: var(--dim); font-size: 13px; }
 pre.source { max-height: none; }
 @media (max-width: 900px) {
-  body { grid-template-columns: 1fr; grid-template-areas: "top" "main"; }
-  .sidebar { position: static; max-height: none; border-right: none; border-bottom: 1px solid var(--border); }
-  main { padding: 18px; }
+  /* The invariant this block has to keep: every `grid-area:` name this sheet uses
+     is named by the `grid-template-areas` here as well. Name a `.sidebar` at a
+     `side` area that the narrow template does not define and the grid does not
+     complain — it grows an implicit track for the ghost area and lays the header
+     in one column beside it. That is what shipped: at 390px the body's tracks
+     measured `348px 0px 42px`, so the header stopped 42px short of the right
+     edge (a strip of bare page), the entire nav was crushed into that 42px, and
+     the article was squeezed to 348px. `./scripts/docs_check.py` now fails the
+     build when the two lists of names stop agreeing. */
+  body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "top" "side" "main";
+  }
+  .topbar { padding: 0 14px; gap: 10px; }
+  .tagline { display: none; }
+  .sidebar {
+    position: static; max-height: none; overflow: visible;
+    border-right: none; border-bottom: 1px solid var(--border);
+    padding: 0 14px 8px;
+  }
+  .navtoggle {
+    position: absolute; width: 1px; height: 1px; margin: 0;
+    opacity: 0; pointer-events: none;
+  }
+  .navtoggle-label {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+    margin: 0 -14px; padding: 13px 14px;
+    cursor: pointer; -webkit-tap-highlight-color: transparent;
+    font-size: 12px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase;
+    color: var(--dim);
+  }
+  .navtoggle-label .navtoggle-here {
+    text-transform: none; letter-spacing: 0; font-weight: 500;
+    color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .navtoggle-label::after { content: "+"; font-size: 15px; color: var(--accent); }
+  .navtoggle:checked ~ .navtoggle-label { border-bottom: 1px solid var(--border); }
+  .navtoggle:checked ~ .navtoggle-label::after { content: "\2212"; }
+  .navtoggle:focus-visible ~ .navtoggle-label { outline: 2px solid var(--accent); outline-offset: -3px; }
+  .navtoggle:not(:checked) ~ ul.nav { display: none; }
+  ul.nav { padding: 2px 0 10px; }
+  /* Real tap targets: the tree is a finger's job at this width. */
+  ul.nav li { margin: 0; }
+  ul.nav a { display: block; padding: 7px 0; }
+  ul.nav ul { padding-left: 12px; }
+  main { padding: 18px 16px 60px; }
+  article h1 { font-size: 25px; }
+  article h2 { font-size: 20px; }
+  article h3 { font-size: 17px; }
+  .pagefooter { margin-top: 44px; }
 }
 "##;
+
 
 

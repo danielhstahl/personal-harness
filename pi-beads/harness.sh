@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-TAG="v0.3.1"
+TAG="v0.3.2"
 
 # sanitize PWD into something safe for docker names, and make it unique
 # even if two dirs share a basename
