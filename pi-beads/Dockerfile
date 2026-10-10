@@ -25,16 +25,11 @@ FROM nikolaik/python-nodejs:python3.14-nodejs25-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates git ripgrep curl gcc unzip xz-utils zip libglu1-mesa libc6-dev \
     && rm -rf /var/lib/apt/lists/*
-RUN mkdir -p /app/loop
-# copies directory into /app/loop/src
-#ADD loop/src /app/loop/src
-#ADD loop/package-lock.json /app/loop/package-lock.json
-#ADD loop/package.json /app/loop/package.json
-#RUN cd /app/loop && npm ci
+RUN mkdir -p /app
 ENV NPM_CONFIG_PREFIX=/app/.npm-global
 ENV PATH=$PATH:/app/.npm-global/bin
 #
-COPY --from=0 /app/target/release/looprs /app/loop
+COPY --from=0 /app/target/release/looprs /app/looprs
 
 RUN addgroup --system appgroup && \
     adduser --system --ingroup appgroup appuser --home /home/appuser
