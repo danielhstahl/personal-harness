@@ -1,37 +1,21 @@
 #!/bin/bash
 set -e
 
-TAG="v0.2.7"
+TAG="v0.3.1"
 
 # sanitize PWD into something safe for docker names, and make it unique
 # even if two dirs share a basename
 SLUG="$(basename "$PWD")-$(echo -n "$PWD" | shasum -a 256 | cut -c1-8)"
 VOLUME="beads-data-$SLUG"
+BD_PREFIX="${BASENAME:0:2}"
 docker volume create $VOLUME  >/dev/null
-# make issue names shorter and reflect pwd
 BASENAME=$(basename "$PWD")
-# make sure .beads exists before anything else touches the volume
-#docker run --rm \
-#  -v $VOLUME:/home/appuser/.beads \
-#  --entrypoint bd \
-#  ghcr.io/danielhstahl/pi-beads:$TAG \
-#  init --quiet --stealth --prefix "${BASENAME:0:2}" || echo "already initialized"
-
-
 GIT_USER_NAME="$(git config user.name || true)"
 GIT_USER_NAME="${GIT_USER_NAME:-$USER}"
 
 GIT_USER_EMAIL="$(git config user.email || true)"
 GIT_USER_EMAIL="${GIT_USER_EMAIL:-$USER@example.com}"
 
-#-e LOOP_TOOL_TIMEOUT_MS=60000 \
-#-e LOOP_KANBAN="board" \
-#-e LOOP_MONITOR=0 \
-#-e LOOP_AUDIT=0 \
-#
-# run the actual pi harness
-# put models.json in $HOME/.pi/agent
-# Tools timeout after 10 minutes
 docker run --rm -it \
   -v "$PWD:/workspace" \
   --add-host=host.docker.internal:host-gateway \
@@ -39,7 +23,7 @@ docker run --rm -it \
   -v $VOLUME:/home/appuser/.beads \
   -e GIT_USER_NAME="$GIT_USER_NAME" \
   -e GIT_USER_EMAIL="$GIT_USER_EMAIL" \
-  -e LOOP_NTFY_URL="$NTFY_URL" \
-  -e LOOP_NTFY_TOPIC="harness" \
-
+  -e LOOPRS_NTFY_URL="$NTFY_URL" \
+  -e LOOPRS_NTFY_TOPIC="harness" \
+  -e BD_PREFIX="$BD_PREFIX" \
   ghcr.io/danielhstahl/pi-beads:$TAG
