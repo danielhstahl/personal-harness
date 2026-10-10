@@ -353,6 +353,7 @@ they can be re-captured and diffed):
 | `status_e2e.py` | **20/20** |
 | `shutdown_e2e.py` | **25/26** (`spikes/results/shutdown-e2e-at-pdl5.log`) — `exactly one closing newline after the erase` fails **identically on the pre-change control** (`HEAD` built to its own target dir: 25/26, same check). Pre-existing, unrelated to shell output; not chased here and not hidden |
 | `flash_e2e.py` | **0/3** (`spikes/results/flash-e2e-at-pdl5.log`; worst erase→content hole 8.80–9.26 ms) — the pre-change control fails the same way at **9.44 ms**. Pre-existing, same magnitude, not introduced by this ticket. Recorded rather than fixed: it is a frame-scheduling problem in the inline viewport's erase/paint split, which looprs-pdl.4 replaces wholesale |
+| `./scripts/check.sh` | clean (fmt, `clippy --all-targets -D warnings`, 410 tests) |
 
 Both pre-existing failures are committed as evidence: `spikes/results/flash-e2e-at-pdl5.log`
 and `spikes/results/shutdown-e2e-at-pdl5.log`, taken against this binary, alongside the
@@ -360,7 +361,6 @@ control runs quoted above (`HEAD` → its own target dir, `LOOPRS_BIN=… python
 Two spikes that used to pass do not pass at this revision in this environment, and neither of
 them passes without this ticket's code — that is the state, written down where the next person
 will look rather than left for them to rediscover mid-migration.
-| `./scripts/check.sh` | clean (fmt, `clippy --all-targets -D warnings`, 410 tests) |
 
 ---
 

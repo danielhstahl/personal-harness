@@ -1,0 +1,25 @@
+# docs-layout — captured 2026-10-10T12:39:42Z, tree 805e41b (dirty tree: the mobile fix on top of that commit)
+# ran: ./scripts/docs.sh clean && ./scripts/docs.sh build && python3 spikes/docs_layout.py
+# widths 360/390/768/1440, every page in docs/_site, chromium headless-shell via playwright
+[  0.12s] site /workspace/pi-beads/looprs/docs/_site
+[  0.12s] 198 page(s) × 4 width(s) = 792 frame(s)
+[  8.51s] measured 198 page(s) at 360px
+[ 16.54s] measured 198 page(s) at 390px
+[ 24.68s] measured 198 page(s) at 768px
+[ 32.97s] measured 198 page(s) at 1440px
+[ 32.97s] PASS  no page scrolls wider than the viewport, at any width — 0 page(s) overflow
+[ 32.97s] PASS  the header spans the whole frame at every width — 0 page(s) with a header short of the frame
+[ 32.97s] PASS  the narrow layout resolves exactly one column (≤900px) — 0 page(s) with a ghost track
+[ 32.97s] PASS  every page with a tree is two columns side by side (>900px) — 0 page(s) with a tree not side-by-side
+[ 32.97s] PASS  a page without a tree (a carried file) is one column, not an empty gutter — 0 carried page(s) with a ghost track or an empty gutter
+[ 32.97s] PASS  the article keeps a real measure: ≥80% of the viewport when narrow — 0 page(s) narrower than 80% of the viewport
+[ 32.97s] PASS  no page renders markdown pipe syntax as prose — 0 page(s) with unrendered table rows
+[ 32.97s] PASS  tables render as tables (the keymap page alone has three) — keymap: 7 table(s), 93 row(s)
+[ 32.97s] PASS  no Rust escape sequence reaches the reader — 0 page(s) printing a literal \u{…}
+[ 32.97s] PASS  a wide table scrolls inside the page instead of widening it — widest table scrolls to 358px, right edge 374px of 390px, document 390px
+[ 32.97s] PASS  a carried source file gets no empty sidebar gutter — Cargo.toml.html: sidebar 0px wide, main 390px of 390px
+[ 33.07s] PASS  the sidebar sticks exactly under the header, not a guessed offset — header 50px tall, sidebar sticks 0px below it
+[ 33.33s] PASS  the tree is folded on a phone and a tap opens it — folded before tap=True, open after tap=True, 25 link(s)
+[ 33.44s] PASS  the fold names the page you are on (a folded tree is no map) — label reads 'Contents Keymap and chords'
+[ 33.53s] PASS  an anchor jump lands below the sticky header, not under it — scroll-margin-top 62px vs a 50px header
+[ 33.57s] 15/15 checks passed

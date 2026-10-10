@@ -307,6 +307,12 @@ This is the expensive one, and the table is where the cost lands.
 5. A claim in an ADR with no measurement behind it is worse than no claim. Either
    measure it or write "not measured, because X" — the second is acceptable, the
    silence is not.
+6. **A Markdown table has to start a block: one blank line above its header row.**
+   CommonMark will not open a table while the paragraph above it is still running,
+   so the glued table renders as a paragraph of pipes and looks like prose you
+   skimmed past — which is how every table in this corpus shipped once. The build
+   now refuses such a page instead of publishing it (ADR-0008's amendment names the
+   ADR whose table this orphaned mid-page).
 
 ## The testing ladder (a map, not a duplicate)
 
@@ -324,6 +330,7 @@ rung a change has to touch**:
 | a spike's check count quoted in a page | the capture committed under `spikes/results/`, which the docs gate reads back against the prose | `./scripts/capture.sh <spike> <capture-name>` then `./scripts/docs_check.sh` (`--list-captures` shows every total and which capture is current) |
 | a new spike driver | a row in [`spikes/README.md`](../../spikes/README.md) — the ticket it answers, what it proves, the committed log. The index is gated in both directions: no driver without a row, no row pointing at a driver that is gone | `./scripts/docs_check.sh` (fails naming the driver); `--list-spikes` shows every driver, indexed or not, with its captures |
 | a **size** quoted in a page (lines, bytes, counts) | the command that printed it, and — where one row claims to include another — the docs gate's arithmetic check: the inclusive row cannot be smaller than the row it includes, and a stated difference must equal the subtraction | `./scripts/docs_check.py --list-corpus` (prints each count beside its command), then `./scripts/docs_check.sh` (fails the row, naming both numbers) |
+| the **shape of a page** — that a table rendered as a table, that a phone gets one column, that a header spans the screen it is read on | the docs build refuses a page whose markdown syntax survived, `check_layout_css` closes the grid and the viewport meta statically, and `spikes/docs_layout.py` measures the frame in a real browser. Both halves exist because the failure this closed was invisible on the laptop that caused it; the static half is the gate, the browser half is a spike, and the reason is ADR-0008's no-install rule | `./scripts/docs_check.sh` (no install, offline); `python3 spikes/docs_layout.py` after `./scripts/docs.sh build` (needs playwright + a Chromium, exits 2 with instructions if either is missing) |
 | memory / cost claims | `src/measure.rs` (needs `LOOPRS_MEASURE_CORPUS`), `spikes/*.py` | `cargo test -- --ignored` |
 | anything behind a cargo feature | the **same** suite over that build; the seam is not allowed to change shape | `cargo test --features notify` |
 | a dependency's right to be in the manifest | `scripts/dep_audit.py` — named in `src/`, or answered at its own line | `python3 scripts/dep_audit.py --gate` |

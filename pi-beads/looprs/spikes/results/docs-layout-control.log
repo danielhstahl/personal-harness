@@ -1,0 +1,25 @@
+# docs-layout-control — captured 2026-10-10T12:39:42Z, tree 805e41b
+# ran: git worktree add /tmp/before HEAD; (cd /tmp/before/pi-beads/looprs && ./scripts/docs.sh build); python3 spikes/docs_layout.py --site /tmp/before/pi-beads/looprs/docs/_site
+# the PRE-FIX site: same driver, same checks, nothing else changed
+[  0.12s] site /tmp/before/pi-beads/looprs/docs/_site
+[  0.12s] 195 page(s) × 4 width(s) = 780 frame(s)
+[  8.36s] measured 195 page(s) at 360px
+[ 16.15s] measured 195 page(s) at 390px
+[ 24.10s] measured 195 page(s) at 768px
+[ 32.41s] measured 195 page(s) at 1440px
+[ 32.41s] FAIL  no page scrolls wider than the viewport, at any width — 25 page(s) overflow: 360px _repo/spikes/README.html=3323px, 360px _repo/spikes/results/terminal-matrix.html=463px, 360px adr/0001-bash-terminal-state-pty.html=487px
+[ 32.41s] FAIL  the header spans the whole frame at every width — 601 page(s) with a header short of the frame (e.g. 360px: frame 360px, header ends 318px)
+[ 32.41s] FAIL  the narrow layout resolves exactly one column (≤900px) — 585 page(s) with a ghost track (e.g. 318px 0px 42px)
+[ 32.41s] FAIL  every page with a tree is two columns side by side (>900px) — 16 page(s) with a tree not side-by-side
+[ 32.41s] PASS  a page without a tree (a carried file) is one column, not an empty gutter — 0 carried page(s) with a ghost track or an empty gutter
+[ 32.41s] FAIL  the article keeps a real measure: ≥80% of the viewport when narrow — 33 page(s) narrower than 80% of the viewport (e.g. 360px → article 282px)
+[ 32.41s] FAIL  no page renders markdown pipe syntax as prose — 136 page(s) with unrendered table rows (e.g. README.html: P | page | about |)
+[ 32.41s] FAIL  tables render as tables (the keymap page alone has three) — keymap: 0 table(s), 0 row(s)
+[ 32.41s] PASS  no Rust escape sequence reaches the reader — 0 page(s) printing a literal \u{…}
+[ 32.41s] FAIL  a wide table scrolls inside the page instead of widening it — widest table scrolls to 0px, right edge 0px of 390px, document 756px
+[ 32.41s] FAIL  a carried source file gets no empty sidebar gutter — Cargo.toml.html: sidebar 28px wide, main 362px of 390px
+[ 32.52s] FAIL  the sidebar sticks exactly under the header, not a guessed offset — header 21px tall, sidebar sticks 24px below it
+[ 32.62s] FAIL  the tree is folded on a phone and a tap opens it — no fold control in the page at all
+[ 32.74s] FAIL  the fold names the page you are on (a folded tree is no map) — label reads ''
+[ 32.83s] FAIL  an anchor jump lands below the sticky header, not under it — scroll-margin-top 0px vs a 21px header
+[ 32.88s] 2/15 checks passed
