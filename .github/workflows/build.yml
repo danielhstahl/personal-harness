@@ -52,9 +52,13 @@ jobs:
 
   build_pi_beads:
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
       packages: write
+    defaults:
+      run:
+        working-directory: ./pi-beads
     steps:
       - uses: actions/checkout@v4
 

@@ -4,10 +4,10 @@ FROM rust:latest
 WORKDIR /app
 
 # Copy manifest files first to leverage Docker cache
-COPY pi-beads/looprs/Cargo.toml ./
-COPY pi-beads/looprs/Cargo.lock ./
+COPY looprs/Cargo.toml ./
+COPY looprs/Cargo.lock ./
 # Copy actual source code
-COPY pi-beads/looprs/src ./src
+COPY looprs/src ./src
 
 # Build the application.
 #
@@ -26,7 +26,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates git ripgrep curl gcc unzip xz-utils zip libglu1-mesa libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /app/loop
-
 # copies directory into /app/loop/src
 #ADD loop/src /app/loop/src
 #ADD loop/package-lock.json /app/loop/package-lock.json
@@ -35,8 +34,7 @@ RUN mkdir -p /app/loop
 ENV NPM_CONFIG_PREFIX=/app/.npm-global
 ENV PATH=$PATH:/app/.npm-global/bin
 #
-COPY --from=0 /app/target/release/looprs /app/looprs
-#ADD loop/src /app/loop/src
+COPY --from=0 /app/target/release/looprs /app/loop
 
 RUN addgroup --system appgroup && \
     adduser --system --ingroup appgroup appuser --home /home/appuser
