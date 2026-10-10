@@ -44,7 +44,7 @@ ENV BEADS_DIR=/home/appuser/.beads
 # Set all of /app to root:root, read-only for appuser
 RUN chown -R root:root /app && chmod -R 755 /app
 RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
-COPY entrypoint.sh /app/entrypoint.sh
+COPY docker/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 # install beads
