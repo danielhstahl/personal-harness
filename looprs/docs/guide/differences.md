@@ -29,56 +29,6 @@ The two axes that do most of the work are the first and the last. Owning the
 transcript is what makes a dozen other features possible, and "one binary" is what
 made doing it in the terminal worthwhile.
 
----
-
-## `pi-beads/loop` — the TypeScript predecessor, in this same repository
-
-This is the closest neighbour and the most interesting comparison, because it is
-the same author, the same ADR culture, the same beads board, the same `pi` backend —
-and a nearly opposite set of choices. Both ADR sets are worth reading; neither is a
-paraphrase of the other.
-
-**The loop's shape** ([`loop/README.md`](../../../loop/README.md),
-[`loop/docs/ADR-001-transport-and-rendering.md`](../../../loop/docs/ADR-001-transport-and-rendering.md)):
-it is a *single-purpose* application. It checks the board, idles for human input,
-splits the input into beads, works the top ready issue in a **fresh session with no
-conversational context carried over**, commits, records a handoff, closes, restarts.
-Durability lives in beads + git; a loop that leaked context between beads
-"accumulates garbage until it is unusable."
-
-**Transport.** The loop uses the in-process TypeScript SDK — `createAgentSession()`
-— and becomes "a fourth mode rather than a subprocess of one". looprs does the
-opposite: `pi` is a **child process** spoken to over `pi --mode rpc`, and the whole
-app is built on the assumption that every backend is a subprocess that can die
-([ADR-0002](../adr/0002-session-abstraction.md)). That buys crash isolation (a dead
-`pi` is a status-row state, not a crash in the UI's own address space) and costs
-in-process shared state, which looprs replaces with a wire vocabulary
-([`wire.rs`](../../src/wire.rs)) and a bounded byte lane ([`bus.rs`](../../src/bus.rs)).
-
-**Rendering.** The loop's constraint is *"the output must look like `pi`"*, and it
-meets it by rendering pi's own components (`AssistantMessageComponent`,
-`ToolExecutionComponent`, the live `Theme`) on `pi-tui`, so highlighting is
-inherited rather than reimplemented. looprs abandons that goal: its renderer is its
-own frame ([`viewport.rs`](../../src/viewport.rs)), and it is not trying to look like
-`pi` any more than a browser is trying to look like `curl`. That is the single
-biggest fork in the road. What looprs got for it: the kanban band, the status row
-that reports the two modes you are not looking at, the bounded store, selection
-that survives a re-wrap. What it gave up: pi's exact visual language, and the free
-ride on every rendering improvement upstream makes.
-
-**Modes.** The loop has one mode and one idle surface (`src/idle.ts`: "pi's own TUI
-input, clean exits, raw text back … single-shot by contract"). looprs has three
-persistent ones. The loop's idle surface answers once and is torn down; looprs's
-Bash mode is a shell that has been alive the whole time and still has the `cd` you
-typed an hour ago.
-
-**Pick the loop if** you want a *worker*: headless-ish, one job per iteration, no
-context carry-over, out of the way, driven by a board. That is a genuinely
-different product and it is already written.
-**Pick looprs if** you want a *terminal*: three live things in one window, the
-shell included, with the transcript, the scrollback and the clipboard behaving
-identically across all of them — and the ability to sit and read what came out.
-
 ## A plain agent CLI (`pi`, Claude Code, Codex CLI)
 
 One agent, one conversation, the terminal emulator's scrollback as the transcript,

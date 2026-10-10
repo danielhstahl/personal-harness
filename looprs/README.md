@@ -57,7 +57,7 @@ bottom of that page.
 | I want to… | go |
 | --- | --- |
 | **know what it is** | [docs/index.md](docs/index.md) |
-| **know how it differs** from a plain agent CLI, tmux, an IDE agent, `aider`, or its own TypeScript predecessor in [`../loop`](../loop) | [docs/guide/differences.md](docs/guide/differences.md) |
+| **know how it differs** from a plain agent CLI, tmux, an IDE agent, or `aider` | [docs/guide/differences.md](docs/guide/differences.md) |
 | **use it well** — first session, driving the beads loop, living with a transcript | [first session](docs/guide/first-session.md) · [the loop](docs/guide/beads-loop.md) · [the transcript](docs/guide/transcript.md) |
 | **the keys** | [docs/guide/keymap.md](docs/guide/keymap.md) — generated from `CHORD_TABLE`, per mode, with a printable cheat sheet |
 | **the wire** — every role, event and reason that crosses the session boundary, and who reads each one | [docs/guide/wire-protocol.md](docs/guide/wire-protocol.md) — generated from `WIRE_INVENTORY` |

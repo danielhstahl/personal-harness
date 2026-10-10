@@ -1,8 +1,8 @@
-## Personal Harness
+# Personal Harness + Loop
 
 This is a repository with my personal configurations and docker containers for agentic coding.
 
-### Global configuration
+## Global configuration
 
 [models.json](./models.json) should go in your .pi/agents directory.  
 
@@ -23,13 +23,12 @@ or
 "api":  "anthropic-messages",
 ```
 
-Note that this harness does not work well if the following two conditions are both met:
-* `litellm` is used to proxy
-* `litellm`'s backend uses `hosted_vllm/<model>`
-There appears to be a bug that causes tool calls to not consistently be parsed, resulting in premature halting of `pi.dev`.  
+## Custom Looprs
+[looprs](./looprs) is a TUI app that enables my preferred coding workflow. This uses [pi.dev](https://pi.dev) with [beads](https://beads.gascity.com/) to create an organized, long-running, and resilient agent.  I use local LLMs so all agent calls need to be sequential for performance, and this combination fits the bill perfectly.  
 
-### pi-beads
-[pi-beads](./pi-beads) contains my currently preferred harness.  This uses [pi.dev](https://pi.dev) with [beads](https://beads.gascity.com/) to create an organized, long-running, and resilient agent.  I use local LLMs so all agent calls need to be sequential for performance, and this combination fits the bill perfectly.  I have a custom orchestrator that follows this state machine:
+[Full docs](https://danielhstahl.github.io/personal-harness/index.html).
+
+The agent follows this state machine:
 
 * State 0: Harness starts.  Go to State 1.
 * State 1: Start new session (no persisted context).  Checks for any `beads` in "ready" state.  If yes, go to State 4.  Else, State 2. 
@@ -38,10 +37,15 @@ There appears to be a bug that causes tool calls to not consistently be parsed, 
 * State 4: Start new session (no persisted context).  Select top "ready" `bead` and "claim" it.  Work `bead`.  Go to State 5.
 * State 5: "Close" `bead`.  Commit work.  Use `bd remember` to store anything that future agents may need.  Go to State 1.
 
-#### Previous approach
-The Agent can create new tickets and pick them up later to work.  If the Agent fails for any reason, it will pick right back up from the last state of the beads Kanban board.  Instructions for pi-beads are in [AGENTS.md](./pi-beads/AGENTS.md) which should go in your .pi/agents directory.
+## Docker image
+[docker](./docker) contains the docker file that wraps this agent, and is strongly recommended for isolation.  Use it with the [harness.sh](./docker/harness.sh) shell script or stand-alone with 
 
-My typical workflow is to create an epic with high level instructions, and then ask `pi` to split into separate tickets.  [AGENTS.md](./pi-beads/AGENTS.md) tells `pi` to only create new issues as `low` and `oneshot`, which prevents it from trying to "hand off" to a human or another agent persona (which is clunky and non-automated).
-
-### pi-teams
-[pi-teams](./pi-teams) uses [pi.dev](https://pi.dev) with the `@giladbarnea/pi-simple-team` extension.  While this "works", it really isn't suitable for local LLMs (unless you have multiple servers each running an LLM!) since prompt caching breaks and token throughput slows to a crawl.
+```sh
+docker run --rm -it \
+  -v "$PWD:/workspace" \
+  --add-host=host.docker.internal:host-gateway \
+  -v $HOME/.pi/agent:/home/appuser/.pi/agent \
+  -e GIT_USER_NAME="$GIT_USER_NAME" \
+  -e GIT_USER_EMAIL="$GIT_USER_EMAIL" \
+  ghcr.io/danielhstahl/pi-beads:$TAG
+```
