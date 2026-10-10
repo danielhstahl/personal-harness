@@ -22,6 +22,14 @@ jobs:
 
       - name: fmt, clippy -D warnings, tests
         run: ./scripts/check.sh
+        
+  run_docker_build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - name: build docker
+        run: |
+          docker -t test -f docker/Dockerfile .
 
   check_docs:
     runs-on: ubuntu-latest
