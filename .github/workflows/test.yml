@@ -29,7 +29,7 @@ jobs:
     steps:
       - name: build docker
         run: |
-          docker -t test -f docker/Dockerfile .
+          docker build -t test -f docker/Dockerfile .
 
   check_docs:
     runs-on: ubuntu-latest
