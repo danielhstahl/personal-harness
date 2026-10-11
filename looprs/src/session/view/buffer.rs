@@ -155,11 +155,10 @@ impl SessionView {
     ///
     /// Lossy on purpose — that is what a cap is — so the two things it must get
     /// right are: say what was lost, and do not corrupt the render cursor. It
-    /// says what was loss by telling the store, which puts it on the marker row
-    /// the user will scroll to; it keeps the cursor honest by reseating the
-    /// flusher to the entry that the eviction moved into the slot it was
-    /// reading, because its per-entry state (scan/block/fence) belongs to
-    /// whatever entry it was last on.
+    /// says what was lost by telling the store, which puts it on the marker row
+    /// the user will scroll to; it keeps the cursor honest by moving the flusher's
+    /// read cursor down by exactly what the eviction took off the front, so the
+    /// entry it was in the middle of reading keeps its place in the text.
     ///
     /// It used to also insert a `… N bytes dropped (buffer cap) …` entry into
     /// the transcript itself. That is gone: the marker row says the same thing
@@ -174,7 +173,6 @@ impl SessionView {
         if self.limit == 0 || buffered <= self.limit {
             return;
         }
-        let first = self.flusher.consumed();
         let mut dropped = 0usize;
         let mut removed = 0usize;
         let mut lines = 0usize;
@@ -216,8 +214,13 @@ impl SessionView {
             // The skipped prefix followed the list down; it never grows here.
             self.source_skipped = skipped;
             self.dropped += dropped;
-            // The eviction shifted the transcript; the render cursor follows it.
-            self.flusher.reseat(first.saturating_sub(removed));
+            // The eviction shifted the transcript; the render cursor follows it
+            // down `removed` places — and follows it *only* that far. The entry it
+            // was reading keeps its read position, because eviction took other
+            // entries and left that entry's bytes alone; rewinding it is what made
+            // a long pass print the same streaming paragraphs two, three, four
+            // times (looprs-sch).
+            self.flusher.shift_front(removed);
             // …and so does the journal cursor, for the same reason: it addresses the
             // same list by index. It never points *below* zero (`saturating_sub`),
             // and if it had not caught up to the eviction it means the journal is

@@ -1,17 +1,21 @@
 //! The beads machine: [`BeadsLoop`] and the values it passes around.
 //!
 //! This is the pass boundary. Everything that decides *what the loop does next*
-//! — whether a bead is claimable, whether the planner's plan landed, whether
-//! the worker's pass closed the ticket it was bought for — is a method on this
-//! type, and every one of them returns a value (`Pick`, `PlanCheck`,
-//! `PassOutcome`) rather than mutating toward a conclusion, so the caller in
-//! [`task`](super::task) decides what the answer costs.
+//! — whether a bead is claimable, whether a ticket a dead session left
+//! `in_progress` has to be finished first, whether the planner's plan landed,
+//! whether the worker's pass closed the ticket it was bought for — is a method on
+//! this type, and every one of them returns a value (`Pick`, `Recovery`,
+//! `PlanCheck`, `PassOutcome`) rather than mutating toward a conclusion, so the
+//! caller in [`task`](super::task) decides what the answer costs.
 //!
 //! The loop is a backend, not UI state: it reports [`SessionEvent`] and never
 //! reaches into the App (ADR-0002 Q1).
 
 use super::guards::StepCause;
-use super::notes::{MAX_SKIPPED_LISTED, already_worked_note, worker_prompt};
+use super::notes::{
+    Arrival, MAX_SKIPPED_LISTED, already_worked_note, held_elsewhere_note,
+    resume_already_worked_note, resume_note, worker_prompt,
+};
 
 use super::BeadsCmd;
 
@@ -22,7 +26,9 @@ use std::sync::Mutex as StdMutex;
 use anyhow::{Result, anyhow};
 use tokio::sync::mpsc;
 
-use crate::services::bd::{Bead, BeadStatus, claim_with, list_status_with, ready_with, show_with};
+use crate::services::bd::{
+    Bead, BeadStatus, claim_with, in_progress_with, list_status_with, ready_with, show_with,
+};
 use crate::services::notification::BeadDone;
 use crate::services::pi::PiRpc;
 use crate::services::prompts::{PLANNER, generate_prompt};
@@ -173,6 +179,23 @@ pub(super) enum WorkerPass {
     Working,
 }
 
+/// What the resume check decided, before any new work was considered (looprs-hjo).
+///
+/// Three answers, because three things can be true of the set `bd ready` cannot
+/// show, and the loop's next action differs in each: take it, ignore it, or refuse
+/// it.
+pub(super) enum Recovery {
+    /// This ticket was already `in_progress`, this loop holds it now, and a worker
+    /// is owed for it.
+    Resumed(ActiveBead),
+    /// Nothing to resume: no ticket in progress, or every one of them belongs to a
+    /// worker `bd` will not release it from — each of those said out loud.
+    Nothing,
+    /// The in-progress ticket is one *this* loop already worked and did not close:
+    /// the re-work guard answers before a second pass is bought.
+    Refused(Bead),
+}
+
 impl BeadsLoop {
     /// Builds the loop without touching any process: it starts parked in
     /// `AwaitInput`. Work only begins when [`BeadsLoop::next`] is called, so a
@@ -247,7 +270,8 @@ impl BeadsLoop {
         self.pi_rx.as_ref().map(|w| w.serial)
     }
 
-    /// Tear down the current session, then work the next ready bead or park.
+    /// Tear down the current session, then resume what is in progress or work the
+    /// next ready bead, or park.
     ///
     /// Infallible by design: a failing `bd`, a `pi` that will not start, or a prompt
     /// that never gets answered is reported to the transcript and the loop parks in
@@ -270,25 +294,51 @@ impl BeadsLoop {
         }
     }
 
-    /// Claim the next bead, then buy the worker for it — in that order.
+    /// Resume what is already started, else claim the next bead, then buy the
+    /// worker for it — in that order.
     ///
-    /// The claim comes first because everything after it is paid for: the pass is
-    /// only worth reporting, verifying and guarding once the harness actually holds
-    /// the ticket. Spawn-first would mean a refused claim still cost a whole `pi`
-    /// session, and one pointed at a bead we do not own answers to whoever prompts
-    /// it rather than to us (looprs-w7q).
+    /// Two questions get answered here, in this order, and the second one only gets
+    /// asked when the first says there is nothing in front of it:
     ///
-    /// Also the only place a worker is both spawned *and* prompted, so callers
-    /// never see a pi child that is alive but has been given nothing to do.
+    /// 1. **Is there a ticket a dead session left behind?** `bd ready` excludes
+    ///    `in_progress` work, so a ticket whose worker died is not merely unclaimed
+    ///    — it is *invisible*, and a loop that reads only `ready` takes the next
+    ///    ticket and abandons that one (looprs-hjo). [`recover_in_progress`] is what
+    ///    makes the unfinished one outrank the untouched ones.
+    /// 2. **Otherwise, what is ready?** [`pick_bead`], with its skip/refuse rules.
+    ///
+    /// The claim comes before the spawn in both branches because everything after a
+    /// claim is paid for: the pass is only worth reporting, verifying and guarding
+    /// once the harness actually holds the ticket. Spawn-first would mean a refused
+    /// claim still cost a whole `pi` session, and one pointed at a bead we do not
+    /// own answers to whoever prompts it rather than to us (looprs-w7q).
+    ///
+    /// Also the only place a worker is both spawned *and* prompted, so callers never
+    /// see a pi child that is alive but has been given nothing to do.
     async fn work_next_bead(&mut self) -> Result<WorkerPass> {
+        match self.recover_in_progress().await? {
+            Recovery::Resumed(claim) => return self.buy_worker(&claim, Arrival::Resumed).await,
+            Recovery::Refused(bead) => return Err(anyhow!(resume_already_worked_note(&bead))),
+            Recovery::Nothing => {}
+        }
+
         let beads = ready_with(&self.cfg.bd_bin).await?;
         let bead = match self.pick_bead(&beads) {
             Pick::Nothing => return Ok(WorkerPass::Idle),
             Pick::AlreadyWorked(bead) => return Err(anyhow!(already_worked_note(&bead))),
             Pick::Work(bead) => bead,
         };
-        tracing::info!(bead = %bead.id(), "claiming a worker pass");
+        let claim = self.take_claim(&bead).await?;
+        self.buy_worker(&claim, Arrival::Fresh).await
+    }
 
+    /// Take the claim on a fresh bead and record it, before anything is bought.
+    ///
+    /// Split out of [`Self::work_next_bead`] so that the resume path and the ready
+    /// path cannot drift apart on the one thing that matters: a claim the board
+    /// granted is recorded in both registers or the pass is not counted as worked.
+    async fn take_claim(&mut self, bead: &Bead) -> Result<ActiveBead> {
+        tracing::info!(bead = %bead.id(), "claiming a worker pass");
         let claim = ActiveBead {
             id: bead.id().to_string(),
             title: bead.title().to_string(),
@@ -296,22 +346,94 @@ impl BeadsLoop {
         claim_with(&self.cfg.bd_bin, &claim.id)
             .await
             .map_err(|e| anyhow!("could not claim {} before buying a worker: {e}", claim.id))?;
+        self.record_claim(claim.clone());
+        Ok(claim)
+    }
 
-        // Two records of one claim, both taken before anything is prompted:
-        // `worked` is the guard that outlives the pass, `claim` is the live one the
-        // UI and the post-settle check read. Recording the claim *before* the spawn
-        // is what covers the pass that never reaches a settle at all — a spawn that
-        // fails, a prompt that is refused, a worker that is killed mid-run. Each of
-        // those leaves the ticket claimed on the board, and `bd ready` hands it
-        // back, so the guard has to already know about it.
+    /// Write a granted claim into both registers.
+    ///
+    /// Two records of one claim, both taken before anything is prompted: `worked` is
+    /// the guard that outlives the pass, `claim` is the live one the UI and the
+    /// post-settle check read. Recording the claim *before* the spawn is what covers
+    /// the pass that never reaches a settle at all — a spawn that fails, a prompt
+    /// that is refused, a worker that is killed mid-run, and (looprs-hjo) the
+    /// resumed pass whose ticket is *already* claimed on the board. Each of those
+    /// leaves the ticket claimed, and the next read hands it back, so the guard has
+    /// to already know about it.
+    fn record_claim(&mut self, claim: ActiveBead) {
         self.worked.insert(claim.id.clone());
-        self.set_claim(Some(claim.clone()));
+        self.set_claim(Some(claim));
+    }
 
+    /// Find the ticket a dead session left behind, and take it (looprs-hjo).
+    ///
+    /// This is the fix for "a crashed session abandons its ticket". `bd ready`
+    /// excludes `in_progress` work — that is what *in progress* means — so the
+    /// abandoned ticket never appears in the ready list, and the next pass silently
+    /// took whatever was on top of that list instead. Three rules, one per thing that
+    /// could otherwise go wrong:
+    ///
+    /// * **The re-work guard applies here too.** An in-progress ticket *this* loop
+    ///   already spent a pass on is refused with the guard's own sentence, not
+    ///   resumed: an `Esc`, a dead worker or a settle that closed nothing all leave
+    ///   the ticket in exactly this state, and re-buying it is still a human call.
+    /// * **`bd` is the arbiter of whose ticket it is.** A claim it *refuses* means
+    ///   another worker holds it — a human in another terminal, a second loop — so
+    ///   this loop walks past it, out loud, and takes fresh work. A claim it cannot
+    ///   answer at all is not a refusal and does not get walked past: that is a board
+    ///   outage, and the two must not read alike.
+    /// * **A resumed pass is an ordinary pass.** Same claim, same `worked` entry, same
+    ///   `ActiveBead` published, same post-settle check. Only the prompt differs, and
+    ///   only by telling the worker some of the work may already exist.
+    ///
+    /// A `bd reclaim`-style reaper is deliberately *not* used here: it reverts every
+    /// stale lease on the replica, including another actor's live-looking work, and
+    /// this loop only has a claim on continuing its own.
+    async fn recover_in_progress(&mut self) -> Result<Recovery> {
+        let unfinished = in_progress_with(&self.cfg.bd_bin).await.map_err(|e| {
+            anyhow!("could not read which tickets are in progress before taking new work: {e}")
+        })?;
+        for bead in unfinished {
+            if self.worked.contains(bead.id()) {
+                return Ok(Recovery::Refused(bead));
+            }
+            match claim_with(&self.cfg.bd_bin, bead.id()).await {
+                Ok(()) => {
+                    tracing::info!(bead = %bead.id(), "resuming a ticket left in progress");
+                    let claim = ActiveBead {
+                        id: bead.id().to_string(),
+                        title: bead.title().to_string(),
+                    };
+                    self.record_claim(claim.clone());
+                    self.report_system(resume_note(&bead));
+                    return Ok(Recovery::Resumed(claim));
+                }
+                // `bd` answered "no", so the ticket is somebody else's live claim.
+                // It is left alone — and the reason is said, because a resumable
+                // ticket that silently stops being resumable reads as a lost ticket.
+                Err(e) if e.is_refusal() => {
+                    self.report_system(held_elsewhere_note(&bead, &e.to_string()));
+                }
+                // No answer at all. That is not "not ours", it is "unknown", and
+                // unknown never buys a pass on something else.
+                Err(e) => {
+                    return Err(anyhow!(
+                        "could not read the board to resume {}: {e}",
+                        bead.id()
+                    ));
+                }
+            }
+        }
+        Ok(Recovery::Nothing)
+    }
+
+    /// Buy the worker a claim was taken for: spawn it, prompt it, publish the pass.
+    async fn buy_worker(&mut self, claim: &ActiveBead, arrival: Arrival) -> Result<WorkerPass> {
         // The session is built against locals: if any step below fails, `worker`
         // drops here and kill_on_drop reaps it, so a failed pass cannot leave an
         // orphan behind.
         let worker = self.spawn_worker(&[])?;
-        let disposition = worker.rpc.prompt(&worker_prompt(&claim)).await?;
+        let disposition = worker.rpc.prompt(&worker_prompt(claim, arrival)).await?;
         if disposition == "handled" {
             // pi took the prompt but started no run, so no `agent_settled` will ever
             // arrive to advance the loop. Do not hold an idle session open.

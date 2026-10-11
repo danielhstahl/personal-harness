@@ -286,6 +286,29 @@ The scenarios the chore (looprs-6ol) listed, each with the tests that carry it.
 - `session::beads::tests::claim::the_worker_is_told_its_ticket_not_invited_to_go_shopping`
 - pure: `session::beads::tests::tables::the_claim_guard_skips_refuses_and_works_in_that_order_pure`
 
+### Crash recovery — finishing what a dead session left (looprs-hjo)
+
+`bd ready` excludes `in_progress` work, so a ticket abandoned by a crashed session is
+invisible to the ready list. The loop reads `bd list --status in_progress` first, and
+these are what pin that ordering and its four edges:
+
+- `session::beads::tests::resume::a_ticket_left_in_progress_is_resumed_before_new_work`
+- `session::beads::tests::resume::a_ticket_another_worker_holds_is_left_alone_and_named`
+- `session::beads::tests::resume::a_ticket_this_loop_already_paid_for_is_not_resumed`
+- `session::beads::tests::resume::an_unreadable_board_is_not_read_as_nothing_to_resume`
+- `session::beads::tests::resume::a_resumed_ticket_still_has_to_close`
+- `session::beads::tests::resume::a_resumed_ticket_that_closes_hands_the_board_on`
+- reads: `services::bd::tests::in_progress_work_is_read_back_though_ready_cannot_see_it`,
+  `services::bd::tests::only_an_answer_of_no_is_a_refusal`
+- wording: `session::beads::tests::notes_tests::the_resume_note_names_the_ticket_and_says_why_it_is_first`
+
+Two fake-`bd` levers carry the parts that need a board behaving differently, not just
+reading differently: `Fakes::set_show` answers `bd show <id> --json` with a status the
+ready list contradicts (a ticket still `in_progress` after its worker settled), and
+`Fakes::refuse_claim_for(id)` refuses the claim for **one** ticket while every other
+claim keeps working — the shape a live foreign claim has, which is not the same thing
+as `Fakes::refuse_claim` failing every claim, and must not be tested as if it were.
+
 ### Out-of-band notification (the completion edge)
 
 Turn it on with `LOOPRS_NTFY_URL` + `LOOPRS_NTFY_TOPIC`; with either missing the

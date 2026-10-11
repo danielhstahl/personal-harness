@@ -87,6 +87,30 @@
 //! the mode is *not* an acknowledgement — a Tab back means "let me look", not
 //! "spend on that one again".
 //!
+//! ## Who picks up what a dead session left behind (looprs-hjo)
+//!
+//! **Unfinished work outranks new work.** `bd ready` excludes `in_progress` tickets
+//! — that is what *in progress* means — so a ticket whose session crashed, was
+//! killed, or was cancelled is not merely unclaimed, it is *invisible*: the next
+//! session read a ready list that did not contain it, took whatever was on top of
+//! that list, and left the half-finished ticket on the board until a human wandered
+//! into it. That was the bug, and it happened on every crash.
+//!
+//! So [`BeadsLoop::work_next_bead`] asks the board what is in progress *before* it
+//! asks what is ready, and works that. Three things fall out of doing it there
+//! rather than somewhere friendlier:
+//!
+//! * the re-work guard still answers — a ticket *this* loop already paid a pass on is
+//!   refused with the guard's sentence, not quietly resumed after a Tab back into the
+//!   mode;
+//! * `bd` stays the arbiter of whose ticket it is: a claim it *refuses* is a live
+//!   claim elsewhere (a human in another terminal, a second loop), so that ticket is
+//!   walked past and said out loud, while a board that cannot answer at all stops the
+//!   pass instead of being read as "nothing to resume";
+//! * a resumed pass is an ordinary pass — same claim, same `worked` entry, same
+//!   published `ActiveBead`, same post-settle check. Only its prompt differs, and only
+//!   by telling the worker that some of the work may already be on disk.
+//!
 //! ## What is where (looprs-00u.18)
 //!
 //! This was one 3,709-line file with six responsibilities in it. What is left

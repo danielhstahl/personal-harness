@@ -12,6 +12,19 @@ use crate::services::bd::{Bead, BeadStatus};
 use crate::services::prompts::{WORKER, generate_prompt};
 use crate::session::ActiveBead;
 
+/// How the ticket reached the worker being prompted (looprs-hjo).
+///
+/// Two ways a ticket arrives, and the worker needs to know which: a fresh ticket is
+/// worked from nothing, an in-progress one may already be half done — by the session
+/// that was killed, crashed or cancelled while holding it. A worker told neither
+/// redoes the part that already shipped, or worse, throws it away.
+pub(super) enum Arrival {
+    /// Ready work, and this pass is the first pass on it.
+    Fresh,
+    /// The board already had it `in_progress` when this loop claimed it.
+    Resumed,
+}
+
 /// The worker prompt: the standing instructions, plus the one ticket this worker
 /// owns and the fact that the harness has already claimed it.
 ///
@@ -21,17 +34,80 @@ use crate::session::ActiveBead;
 /// loop reports, guards and verifies. Hence `bd ready` is gone from the worker's
 /// command list in `prompts::WORKER`: a prompt that advertises it invites the
 /// agent to shop.
-pub(super) fn worker_prompt(claim: &ActiveBead) -> String {
-    generate_prompt(
-        WORKER,
-        &format!(
-            "Your assigned ticket: {id} — {title}\n\n\
-             The harness has already run `bd update {id} --claim`, so this ticket is yours. \
-             Work it and close it when the work is done. Do not look for other work and do not \
-             pick a different ticket: {id} is the one being reported, guarded and paid for.\n",
-            id = claim.id,
-            title = claim.title,
-        ),
+///
+/// A resumed ticket adds one paragraph — [`resumed_note_for_worker`] — and nothing
+/// else changes. That is deliberate: a resumed pass is not a lesser pass, and it
+/// gets the same claim, the same guard and the same close-check as a fresh one.
+pub(super) fn worker_prompt(claim: &ActiveBead, arrival: Arrival) -> String {
+    let mut instructions = format!(
+        "Your assigned ticket: {id} — {title}\n\n\
+         The harness has already run `bd update {id} --claim`, so this ticket is yours. \
+         Work it and close it when the work is done. Do not look for other work and do not \
+         pick a different ticket: {id} is the one being reported, guarded and paid for.\n",
+        id = claim.id,
+        title = claim.title,
+    );
+    if let Arrival::Resumed = arrival {
+        instructions.push_str(&resumed_note_for_worker(&claim.id));
+    }
+    generate_prompt(WORKER, &instructions)
+}
+
+/// The paragraph a worker gets when the ticket handed to it was already
+/// `in_progress` (looprs-hjo).
+///
+/// Written as an order to *look before writing*, because "continue" is ambiguous
+/// about a half-finished state: the work may be committed, staged, unstaged, or only
+/// ever have existed in the previous session's head.
+fn resumed_note_for_worker(id: &str) -> String {
+    format!(
+        "\nThis ticket was ALREADY `in_progress` on the board when this harness claimed it: a \
+         previous session — most likely one that crashed, was killed or was cancelled partway \
+         through — was working it. Do not assume nothing has been done. Before writing \
+         anything, find out what state it is in: `bd show {id}` for the ticket and any notes \
+         an earlier session left on it, `git status` and `git diff` for uncommitted work, and \
+         `git log` for work that is already committed. Then continue from there: do not start \
+         over, and do not redo what is already done.\n"
+    )
+}
+
+/// "This ticket was mid-flight when I got here, and it outranks new work."
+///
+/// Said out loud because the silent version is the confusing half of the bug: a loop
+/// that quietly works a ticket nobody remembers asking for reads exactly like a loop
+/// that picked the wrong ticket.
+pub(super) fn resume_note(bead: &Bead) -> String {
+    format!(
+        "beads: resuming {} — `bd` already holds it `in_progress`, so a session before this one claimed it and never closed it. `bd ready` cannot show an in-progress ticket, so finishing what is already started comes before taking anything new.",
+        bead.id()
+    )
+}
+
+/// `bd` would not hand an in-progress ticket over: another worker holds it.
+///
+/// The skip is a sentence rather than a silence for the same reason every other skip
+/// here is: a ticket that quietly leaves the running looks like a ticket that was
+/// worked. This one was not, and only a human can say whose it is.
+pub(super) fn held_elsewhere_note(bead: &Bead, reason: &str) -> String {
+    format!(
+        "beads: {} is `in_progress`, but `bd` would not hand it over ({}). Another worker holds that ticket, so this loop leaves it alone and takes fresh work instead.",
+        bead.id(),
+        clip(reason, 200)
+    )
+}
+
+/// The re-work guard answering at the resume boundary (looprs-hjo).
+///
+/// The same rule as [`already_worked_note`], in the words this boundary has: nothing
+/// was `bd ready`-offered, because `ready` cannot see this ticket at all. It is
+/// still marked in progress from a pass *this* loop already paid for, and paying for
+/// it a second time is still not the loop's decision.
+pub(super) fn resume_already_worked_note(bead: &Bead) -> String {
+    format!(
+        "`bd` still holds {} `in_progress` from a pass this loop already paid for, and says it is `{}`, not closed. It will not be resumed a second time by itself: `bd close {}`, or type a new instruction to continue.",
+        bead.id(),
+        bead.status(),
+        bead.id()
     )
 }
 
@@ -120,7 +196,7 @@ pub(super) fn nothing_held_note() -> &'static str {
     "beads: a worker settled while this loop held no claimed ticket, so there is nothing to verify. The loop is stopped; type a new instruction to continue."
 }
 
-/// The guard speaking for itself, at the pass boundary: `bd ready` offered a ticket
+/// The guard speaking for itself, at the ready boundary: `bd ready` offered a ticket
 /// this loop already burned a pass on, and it is still open. A refusal has to say
 /// what it refused *and* what would unblock it, or the human reads the stop as a
 /// crash.

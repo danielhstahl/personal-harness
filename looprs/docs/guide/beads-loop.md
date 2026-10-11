@@ -4,9 +4,10 @@
 [Your first session](first-session.md) · Next:
 [Living with a transcript](transcript.md).*
 
-This is the page about the mode that costs money. It covers what a pass is, what the
-board is showing you while one runs, what `Tab` and `Esc` do mid-pass, how to tell
-finished from wedged, and the one thing you cannot do by accident.
+This is the page about the mode that costs money. It covers what a pass is, what
+happens to a ticket when a session dies halfway through one, what the board is
+showing you while one runs, what `Tab` and `Esc` do mid-pass, how to tell finished
+from wedged, and the one thing you cannot do by accident.
 
 The kanban band itself — the column mapping, what `⊘` and `?` mean, staleness, the
 row budget, `+N more` — is documented once, in
@@ -56,6 +57,50 @@ beads machine. Read
 set when `bd update … --claim` succeeded and cleared when the pass ends — exactly
 the window in which the loop is accountable for that ticket. The row shows its id
 and title because a number you cannot read as a sentence is not a status.
+
+## When a session dies mid-ticket
+
+A worker that crashes, gets `kill`ed, runs out of money or is cancelled by `Esc`
+leaves its ticket `in_progress` and its claim held. That is the state a restart has
+to read correctly, and the trap is that `bd ready` **cannot show it** — `ready`
+excludes in-progress work, so the abandoned ticket is not merely unclaimed, it is
+invisible, and a loop that reads only `ready` takes the next ticket and never looks
+back.
+
+So the first thing a pass does is ask the board what is *in progress*, and finish
+that before touching anything new:
+
+```text
+pass boundary
+   │  bd list --status in_progress   (what `bd ready` cannot show)
+   ├─ resumable → claim it → worker told "look before you write"
+   ├─ someone else holds it → said out loud, walked past
+   ├─ this loop already paid for it → refused, same guard as a re-offered ticket
+   ▼  nothing in progress
+   bd ready → the rest of the machine as above
+```
+
+What that means for you, in practice:
+
+* **A restart continues the interrupted ticket.** The transcript says
+  `resuming <id>` rather than starting something new, and the worker is told to read
+  `bd show <id>`, `git status`/`git diff` and the recent log before writing, so the
+  part the last session already shipped is not redone.
+* **A live claim is not up for grabs.** `bd` itself decides: a claim it refuses means
+  somebody else holds that ticket, and the loop leaves it alone, names it, and takes
+  fresh work. It does not run `bd reclaim` over the board — reverting other actors'
+  leases is a supervisor's call, not a worker's.
+* **`Esc` still means "do not spend on that one again".** An aborted or half-finished
+  pass leaves the ticket `in_progress`, and re-entering the mode does not resume it:
+  the re-work guard answers with the same refusal it uses for a re-offered ticket,
+  plus `bd close <id>` / type-an-instruction as its two ways out.
+* **A resumed pass is an ordinary pass.** Claimed, guarded, published to the status
+  row and checked against the board afterwards like any other, so a resumed ticket
+  that never closes stops the loop instead of becoming a second way to spin.
+
+The tests are listed in [docs/testing.md](../testing.md) under "Crash recovery";
+the rule lives in
+[`BeadsLoop::recover_in_progress`](../../src/session/beads/machine.rs).
 
 ## Reading the band while a pass runs
 

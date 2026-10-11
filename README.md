@@ -42,7 +42,7 @@ The agent follows this state machine:
 * State 1: Start new session (no persisted context).  Checks for any `beads` in "ready" state.  If yes, go to State 4.  Else, State 2. 
 * State 2: Wait for input from human.  On input, go to State 3.
 * State 3: Take human input and translate this into one or more `beads`.  Use a `split` tool.  Go to State 1.
-* State 4: Start new session (no persisted context).  Select top "ready" `bead` and "claim" it.  Work `bead`.  Go to State 5.
+* State 4: Start new session (no persisted context).  If a previous session left a `bead` "in progress", claim and continue that one first (`bd ready` cannot show an in-progress bead, so this is checked separately).  Otherwise select the top "ready" `bead` and "claim" it.  Work `bead`.  Go to State 5.
 * State 5: "Close" `bead`.  Commit work.  Use `bd remember` to store anything that future agents may need.  Go to State 1.
 
 ## Docker image
@@ -57,3 +57,7 @@ docker run --rm -it \
   -e GIT_USER_EMAIL="$GIT_USER_EMAIL" \
   ghcr.io/danielhstahl/pi-beads:$TAG
 ```
+
+
+Bug list:
+* (none open)
