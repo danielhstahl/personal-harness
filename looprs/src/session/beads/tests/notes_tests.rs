@@ -4,10 +4,11 @@
 //! what it did not print, the empty-plan note quotes the planner, and the
 //! unverifiable note never says the board is empty.
 
-use crate::services::bd::Bead;
+use crate::services::bd::{Bead, BeadStatus};
 
 use crate::session::beads::notes::{
-    MAX_PLAN_LISTED, clip, no_plan_note, plan_note, unverifiable_note,
+    MAX_PLAN_LISTED, clip, held_elsewhere_note, no_plan_note, plan_note,
+    resume_already_worked_note, resume_note, unverifiable_note,
 };
 
 use super::*;
@@ -64,4 +65,64 @@ fn clipping_a_long_quote_never_cuts_a_multibyte_char() {
     assert_eq!(clipped.chars().count(), 11, "10 kept + the ellipsis");
     assert!(std::str::from_utf8(clipped.as_bytes()).is_ok());
     assert_eq!(clip("short", 100), "short");
+}
+
+/// The resume sentence has to say three things in one line: which ticket, that it
+/// was already in progress, and that it goes first. "Resuming" without the ticket id
+/// is a status nobody can act on, and a resume that reads like a retry makes the
+/// loop look like it had forgotten what it was doing.
+#[test]
+fn the_resume_note_names_the_ticket_and_says_why_it_is_first() {
+    let note = resume_note(&bead_status(
+        "looprs-mid",
+        "half of it is done",
+        BeadStatus::InProgress,
+    ));
+    assert!(note.contains("resuming"), "{note}");
+    assert!(note.contains("looprs-mid"), "{note}");
+    assert!(note.contains("in_progress"), "{note}");
+    assert!(
+        note.contains("bd ready"),
+        "why ready could not show it: {note}"
+    );
+    assert!(
+        !note.contains("retry") && !note.contains("again"),
+        "a resume is not a retry: {note}"
+    );
+}
+
+/// The skip note quotes `bd` because "somebody else has it" is a claim about the
+/// board, and the board's own words are the evidence. And it must not read like a
+/// failure: a live foreign claim is the system working.
+#[test]
+fn the_held_elsewhere_note_quotes_bd_and_calls_it_nothing_worse_than_it_is() {
+    let note = held_elsewhere_note(
+        &bead_status("looprs-mid", "taken", BeadStatus::InProgress),
+        "issue already claimed by danielstahl",
+    );
+    assert!(note.contains("looprs-mid"), "{note}");
+    assert!(
+        note.contains("already claimed by danielstahl"),
+        "`bd`'s own reason, not a paraphrase: {note}"
+    );
+    assert!(note.contains("leaves it alone"), "{note}");
+    assert!(!note.contains("failed"), "{note}");
+    let long = held_elsewhere_note(&bead("looprs-mid", "taken"), &"x".repeat(500));
+    assert!(long.chars().count() < 400, "the reason is clipped: {long}");
+}
+
+/// The guard at the resume boundary carries the same two exits as the one at the
+/// ready boundary — close it, or speak — because a stop with no way out is just a
+/// hang with a nicer message.
+#[test]
+fn the_resume_guard_note_names_both_ways_out() {
+    let note = resume_already_worked_note(&bead_status(
+        "looprs-mid",
+        "paid for already",
+        BeadStatus::InProgress,
+    ));
+    assert!(note.contains("looprs-mid"), "{note}");
+    assert!(note.contains("not closed"), "{note}");
+    assert!(note.contains("bd close looprs-mid"), "{note}");
+    assert!(note.contains("new instruction"), "{note}");
 }

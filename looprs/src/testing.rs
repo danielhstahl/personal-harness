@@ -627,6 +627,18 @@ impl Fakes {
         }
     }
 
+    /// Make `bd` refuse the claim for **one ticket**, and only that one.
+    ///
+    /// The lever [`Self::refuse_claim`] cannot express, and the loop needs: a bead
+    /// another worker holds is refused while every other claim keeps working, which
+    /// is the exact shape of a live foreign claim on an `in_progress` ticket
+    /// (looprs-hjo). Failing *every* claim instead cannot tell "this ticket is not
+    /// ours" from "there is no board", and the loop's answers to those two are
+    /// opposites — walk past it, versus stop.
+    pub fn refuse_claim_for(&self, id: &str) {
+        std::fs::write(self.dir.join("refuse_claim"), format!("{id}\n")).unwrap();
+    }
+
     /// What `bd show <id> --json` answers: a single bead object, or `[]`.
     ///
     /// This is the fake's lever for "the worker settled but never closed the bead",

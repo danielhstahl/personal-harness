@@ -13,7 +13,9 @@
 # table that picks the read/show/write/events answers):
 #   LOG              -> the shared bd.log this fake appends to
 #   FAIL_MARK        -> existence of this file makes every call exit 3
-#   REFUSE_MARK      -> existence of this file makes every `update` exit 4
+#   REFUSE_MARK      -> existence of this file makes every `update` exit 4; its
+#                       first line, if it names a ticket id, limits the refusal to
+#                       that one ticket
 #   READ_CMD         -> the command run for `ready` / `list` (usually `cat <board>`)
 #   SHOW_CMD         -> the command run for `show` (usually `cat <show>`, sometimes `[]`)
 #   WRITE_CMD        -> the command run for `update` / `create` / `close`
@@ -110,11 +112,24 @@ journal_tail() {
 }
 # A refused claim is its own failure mode, distinct from "bd is down": reads still
 # work, only `--claim` says no. Exit 4 so the two are not confusable.
+#
+# The mark's *contents* choose its scope. Empty (or the word `all`) refuses every
+# claim, which is how this lever started. A ticket id refuses only that ticket's
+# claim, which is the shape a real refusal has: one bead says "already claimed by
+# somebody else" while every other claim still succeeds (looprs-hjo needs that
+# distinction, because a loop that treats "not ours" and "bd is broken" alike either
+# stops on a human's ticket or walks past a dead board).
 case "$verb" in
   update)
     if [ -e "{{REFUSE_MARK}}" ]; then
-      echo "fake bd: cannot claim: already claimed by another owner" >&2
-      exit 4
+      refuse_all=yes
+      only="$(head -n 1 "{{REFUSE_MARK}}" 2>/dev/null | tr -d '[:space:]')"
+      [ -z "$only" ] && only=all
+      [ "$only" = all ] || case " $* " in *" $only "*) ;; *) refuse_all=no ;; esac
+      if [ "$refuse_all" = yes ]; then
+        echo "fake bd: cannot claim: already claimed by another owner" >&2
+        exit 4
+      fi
     fi
     ;;
 esac

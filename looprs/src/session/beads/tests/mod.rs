@@ -9,6 +9,8 @@
 //!   (looprs-k7v);
 //! * [`claim`](claim) — the harness claims the ticket it is paying for, and
 //!   cannot re-work one it did not close (looprs-w7q);
+//! * [`resume`](resume) — a ticket left `in_progress` by a dead session is worked
+//!   before anything new is picked up (looprs-hjo);
 //! * [`announce`](announce) — the one `notify` call, and the five other ways a
 //!   pass can end without it;
 //! * [`notes_tests`](notes_tests) — the wording, pinned without a subprocess;
@@ -32,6 +34,7 @@ mod drive;
 mod handle;
 mod notes_tests;
 mod planner;
+mod resume;
 mod startup;
 mod tables;
 
@@ -98,6 +101,23 @@ const BLOCKED_THEN_READY: &str = r#"{
   "data": [
     {"id": "looprs-26r", "title": "waiting on somebody else", "status": "blocked", "issue_type": "bug"},
     {"id": "looprs-99", "title": "the next ticket", "status": "open", "issue_type": "task"}
+  ],
+  "schema_version": 1
+}"#;
+
+/// A board as it stands the moment a session dies mid-ticket: the ticket it held is
+/// still `in_progress`, and there is untouched ready work on the board too.
+///
+/// The order is the point, and it is deliberate. Real `bd ready` excludes
+/// `in_progress` work, so the abandoned ticket is *second* here in the only list
+/// shape a loop could get it from: a loop that resumes nothing takes `looprs-99`
+/// first and never sees `looprs-mid` at all. The fake answers every list verb with
+/// this same file, which is stricter than the real CLI — the loop has to find the
+/// in-progress row itself, not be handed it.
+const CRASH_LEFT_ONE_IN_PROGRESS: &str = r#"{
+  "data": [
+    {"id": "looprs-99", "title": "the next ticket", "status": "open", "issue_type": "task"},
+    {"id": "looprs-mid", "title": "the ticket that was mid-flight", "status": "in_progress", "issue_type": "task"}
   ],
   "schema_version": 1
 }"#;

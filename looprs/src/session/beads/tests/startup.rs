@@ -133,6 +133,10 @@ async fn a_pi_that_dies_during_startup_is_reported() {
     assert!(l.pi_rx.is_none());
 }
 
+/// A `bd` that cannot answer at all is reported, not swallowed. Since looprs-hjo the
+/// first read of a pass is the in-progress one, so that is where the failure surfaces
+/// from — which is the point: a board nobody can read stops the pass whatever was
+/// asked of it, and never reads as "nothing to do".
 #[tokio::test]
 async fn a_failing_bd_is_reported_and_parks() {
     let fakes = Fakes::new("bad-bd", PiFake::Started, BdFake::Fails, EMPTY_BOARD);
@@ -141,10 +145,7 @@ async fn a_failing_bd_is_reported_and_parks() {
     assert!(timeout(NO_HANG, l.next()).await.is_ok());
 
     let msgs = drain(&mut rx);
-    assert!(
-        has_error(&msgs),
-        "`bd ready` failure should surface: {msgs:?}"
-    );
+    assert!(has_error(&msgs), "`bd` failing should surface: {msgs:?}");
     assert_eq!(fakes.pi_spawns(), 0, "no worker without a board read");
     assert!(l.is_awaiting_input());
 }

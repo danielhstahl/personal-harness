@@ -62,6 +62,23 @@ pub enum BdError {
     Timeout { bin: String, args: String },
 }
 
+impl BdError {
+    /// Did `bd` **answer** this call and say no, as opposed to failing to answer it
+    /// at all?
+    ///
+    /// The line the resume check (looprs-hjo) has to draw. A `--claim` that exits
+    /// non-zero is `bd` refusing *that ticket* — "issue already claimed by X" —
+    /// which is information about a bead and means "walk past it and take the next
+    /// one". A missing binary, a timeout or an unparsable payload are not answers
+    /// about a bead at all; they mean the board is unreadable, and the loop must
+    /// stop rather than choose one of the two readings. Conflating them would let a
+    /// foreign live claim look like an outage, and an outage look like somebody
+    /// else's ticket.
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
+}
+
 impl std::fmt::Display for BdError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -663,6 +680,29 @@ pub async fn list_status_with(bin: &str, status: &str) -> Result<Vec<Bead>, BdEr
     beads(bin, &["list", "--status", status, "--limit", "0", "--json"]).await
 }
 
+/// `bd list --status in_progress --json --limit 0` — the tickets somebody is
+/// holding, which is precisely the set `bd ready` cannot show.
+///
+/// `bd ready` excludes `in_progress` work; that is what *in progress* means, and it
+/// is documented in the CLI's own help. So a ticket whose worker died is not merely
+/// unclaimed, it is **invisible**: the next session reads a ready list that does not
+/// contain it, takes whatever is on top of that list, and the half-finished ticket
+/// sits on the board until a human notices (looprs-hjo). This read is what makes
+/// the abandoned ticket visible again, and it is the only one that can.
+///
+/// Each row's own `status` is re-checked rather than trusted from the command line,
+/// for the same reason every other read here re-checks what it got: a claim on a
+/// ticket this loop cannot itself point at and say "that one is in progress" would
+/// be a claim on a guess — and on a `bd` whose filters changed, it would be a guess
+/// about a *closed* ticket.
+pub async fn in_progress_with(bin: &str) -> Result<Vec<Bead>, BdError> {
+    let rows = list_status_with(bin, BeadStatus::InProgress.as_str()).await?;
+    Ok(rows
+        .into_iter()
+        .filter(|b| b.status() == BeadStatus::InProgress)
+        .collect())
+}
+
 /// `bd show <id> --json` — one bead by id, `Ok(None)` if bd knows nothing of it.
 ///
 /// The read of truth for the post-settle check in looprs-w7q: "the worker
@@ -945,6 +985,74 @@ mod tests {
             line.contains("--limit 0"),
             "a paginated diff read is a silent lie about a big board: {line}"
         );
+    }
+
+    /// **The read `bd ready` cannot do.** `ready` excludes `in_progress` work, so a
+    /// ticket abandoned by a dead worker is invisible to it — which is the whole
+    /// looprs-hjo bug. This read must find that ticket, and must not find any other.
+    ///
+    /// The fake answers every list verb with the whole board, so this also pins the
+    /// client-side status check: six of these seven rows are *not* in progress and
+    /// must not come back as if they were.
+    #[tokio::test]
+    async fn in_progress_work_is_read_back_though_ready_cannot_see_it() {
+        let fakes = Fakes::new(
+            "bd-in-progress",
+            crate::testing::PiFake::Started,
+            BdFake::Ok,
+            crate::testing::BOARD_VARIETY,
+        );
+        let held = in_progress_with(fakes.bd_bin()).await.unwrap();
+        assert_eq!(
+            held.len(),
+            1,
+            "exactly one of the seven rows is in progress: {held:?}"
+        );
+        assert_eq!(held[0].id(), "looprs-prog-1");
+        let lines = fakes.bd_log();
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("list --status in_progress"))
+            .unwrap_or_else(|| panic!("expected `bd list --status in_progress …`: {lines:?}"));
+        assert!(
+            line.contains("--limit 0"),
+            "a paginated read hides a ticket: {line}"
+        );
+    }
+
+    /// The distinction the resume check is built on: `bd` answering "no" about one
+    /// ticket is not `bd` being unable to answer at all, and the loop's two answers
+    /// to them (walk past / stop) are opposites.
+    #[test]
+    fn only_an_answer_of_no_is_a_refusal() {
+        let refused = BdError::Failed {
+            bin: "bd".to_string(),
+            args: "update looprs-1 --claim".to_string(),
+            code: Some(1),
+            stderr: "issue already claimed by danielstahl".to_string(),
+        };
+        assert!(refused.is_refusal(), "bd said no: {refused}");
+        for not_an_answer in [
+            BdError::Unavailable {
+                bin: "bd".to_string(),
+                reason: "No such file or directory".to_string(),
+            },
+            BdError::Timeout {
+                bin: "bd".to_string(),
+                args: "update looprs-1 --claim".to_string(),
+            },
+            BdError::Malformed {
+                bin: "bd".to_string(),
+                args: "update looprs-1 --claim".to_string(),
+                reason: "not json".to_string(),
+                raw: String::new(),
+            },
+        ] {
+            assert!(
+                !not_an_answer.is_refusal(),
+                "no answer is not a refusal: {not_an_answer}"
+            );
+        }
     }
 
     /// The post-settle read: the board's answer, not the worker's.
