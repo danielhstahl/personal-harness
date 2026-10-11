@@ -60,4 +60,4 @@ docker run --rm -it \
 
 
 Bug list:
-* occasionally duplicates output on the screen (3 times, in one case)
+* (none open)

@@ -229,7 +229,15 @@ impl Flusher {
     /// (scan/block/fence) is only meaningful for the entry `first` was reading, so
     /// pointing it somewhere else without resetting would make `drain_stream` slice
     /// the wrong text — the worst kind of bug, because it only shows up as garbled
-    /// scrollback long after the cause. Used by the per-view buffer cap.
+    /// scrollback long after the cause. Used by the rewrap, which reseats *back*
+    /// over entries the store already has because it is about to throw every row
+    /// it holds away and rebuild them at the new width.
+    ///
+    /// The buffer cap's eviction is **not** that: it moves entry numbers, not the
+    /// entry under the cursor, and it must not rewind the read of an entry whose
+    /// rows the store still holds — see [`Self::shift_front`], which is what the
+    /// cap calls now and which resets the per-entry state only in the one case
+    /// where the reset is honest.
     pub fn reseat(&mut self, first: usize) {
         self.first = first;
         self.cur = Cursor::default();
@@ -258,6 +266,54 @@ impl Flusher {
     #[allow(dead_code)] // measurement seam: `view::tests` asserts this never runs past the text the entry still has after a cut
     pub fn emitted(&self) -> usize {
         self.cur.scan
+    }
+
+    /// The transcript lost `removed` entries off the **front**: follow the cursor
+    /// down by that many, and keep the per-entry progress if the entry being read
+    /// is still there.
+    ///
+    /// This is the operation the buffer cap's eviction needs, and it is *not*
+    /// [`Self::reseat`]. Eviction moves entry **numbers**; it does not touch the
+    /// bytes of the entry the flusher is standing in. So when that entry survives
+    /// (`removed <= first`, i.e. everything evicted was already fully rendered)
+    /// the read position inside it — `scan`, the open block, an open fence's
+    /// highlighter state — is still exactly right, and the only thing that moved
+    /// is which entry number it belongs to.
+    ///
+    /// Dropping that progress is the duplicated-output bug (looprs-sch): a reseat
+    /// rewinds the read to the head of the entry being streamed, so the next
+    /// drain re-renders every block the store already holds and pushes the
+    /// copies onto the scrollback right under the text the user is reading. One
+    /// trim per repeat, which is why the same paragraph can arrive two, three or
+    /// four times in one long pass, and why it is the *currently streaming*
+    /// entry — a long thinking block, then the answer that follows it — that
+    /// gets repeated, while the finished entries ahead of it are untouched.
+    ///
+    /// When the cursor's own entry *was* evicted there is nothing to keep, and
+    /// nothing left to duplicate either: [`Scrollback::entries_evicted`] drops
+    /// every row whose entry is gone, so the store no longer has the rows the
+    /// cursor was counting. The cursor starts fresh on the new front entry —
+    /// which is an entry this flusher never touched, because `first` is the first
+    /// entry with anything unrendered and everything past it is untouched.
+    ///
+    /// [`Scrollback::entries_evicted`]: crate::state::scrollback::Scrollback::entries_evicted
+    pub fn shift_front(&mut self, removed: usize) {
+        if removed == 0 {
+            return;
+        }
+        if removed <= self.first {
+            self.first -= removed;
+        } else {
+            self.first = 0;
+            self.cur = Cursor::default();
+        }
+        // The cached rows were rendered under the old entry number, and the
+        // entry index is part of the cache key. Whether they were also rendered
+        // against these same bytes is not the question worth asking here: this
+        // is the second trim-invalidation site, and a cache that has to be
+        // reasoned about at each of them is a cache that will be reasoned about
+        // wrongly. Same call `reseat` and `cut_front` make, for the same reason.
+        self.tail.borrow_mut().take();
     }
 
     /// Lower the read cursor by `n` bytes because the front of the entry being
@@ -775,6 +831,98 @@ mod tests {
             f.tail_cache_stats(),
             (0, 2),
             "but the reseat dropped the cache rather than being checked against it"
+        );
+    }
+
+    /// **An eviction of older entries moves the entry number, not the read place.**
+    ///
+    /// The renderer's own half of looprs-sch, with the transcript eviction and the
+    /// cursor shift done together the way `SessionView::enforce_buffer` does them:
+    /// the store holds the first block of the entry being streamed, the cap eats
+    /// the entries that came *before* it, and the read must pick up exactly where
+    /// it left off — the entry is index 0 now instead of index 2, and the bytes it
+    /// indexes never moved.
+    #[test]
+    fn shifting_the_front_down_keeps_the_place_in_the_entry_being_read() {
+        let mut t = Transcript::default();
+        let mut f = Flusher::new();
+        for i in 0..2 {
+            t.push_done(MessageKind::System, format!("finished entry {i}"));
+        }
+        let _ = f.drain_rows(&t, 60);
+        assert_eq!(f.consumed(), 2, "both are written");
+
+        t.push_delta(
+            MessageKind::Answer,
+            "the block the store already has\n\nthe block still streaming in",
+        );
+        let rows = f.drain_rows(&t, 60);
+        assert_eq!(
+            text_of(&rows.iter().map(|r| r.line.clone()).collect::<Vec<_>>()),
+            "the block the store already has\n",
+            "the closed block went out, the open one stayed live"
+        );
+        assert_eq!(
+            f.consumed(),
+            2,
+            "and the cursor still stands on the open entry"
+        );
+        let scanned = f.emitted();
+        assert!(scanned > 0, "with the closed block behind it");
+
+        // The cap takes the two finished entries off the front, and the cursor
+        // follows them down.
+        let _ = t.evict_front();
+        let _ = t.evict_front();
+        f.shift_front(2);
+        assert_eq!(f.consumed(), 0, "the open entry is the front entry now");
+        assert_eq!(f.emitted(), scanned, "and the read did not move");
+
+        let after = f.drain_rows(&t, 60);
+        assert!(
+            after.is_empty(),
+            "nothing the store already had comes back: {after:?}"
+        );
+        assert!(
+            !f.preview(&t, 60).is_empty(),
+            "and the live tail is still there — the shift must not have eaten it"
+        );
+        assert_eq!(
+            text_of(&f.preview(&t, 60)),
+            "the block still streaming in",
+            "which is the only thing the preview was ever meant to show"
+        );
+    }
+
+    /// …and when the eviction takes the entry the cursor stood in, there is no
+    /// place left to keep: the store dropped those rows too, so the read starts
+    /// again on the new front entry — the one entry it had never touched.
+    #[test]
+    fn shifting_past_the_entry_under_the_cursor_restarts_it_at_the_front() {
+        let mut t = Transcript::default();
+        let mut f = Flusher::new();
+        // The flusher stalls on the open card, so the answer behind it is entirely
+        // unrendered and the card is the entry the eviction reaches.
+        t.push_done(MessageKind::System, "finished".into());
+        t.start_tool("t1".into(), "read".into(), "x".into());
+        t.push_delta(MessageKind::Answer, "first block\n\nopen block");
+        let _ = f.drain_rows(&t, 60);
+        assert_eq!((f.consumed(), f.emitted()), (1, 0), "stalled at the card");
+
+        let _ = t.evict_front();
+        let _ = t.evict_front();
+        f.shift_front(2);
+        assert_eq!(f.consumed(), 0, "the entry it stood in is gone");
+        assert_eq!(f.emitted(), 0, "and its read position went with it");
+
+        // The new front entry is the answer, unrendered: rendering it from its
+        // head is the one honest thing left, and it is not a repeat.
+        t.finish_last();
+        let rows = f.drain_rows(&t, 60);
+        let text = text_of(&rows.iter().map(|r| r.line.clone()).collect::<Vec<_>>());
+        assert!(
+            text.contains("first block") && text.contains("open block"),
+            "the entry behind the eviction is still rendered: {rows:?}"
         );
     }
 

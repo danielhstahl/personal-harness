@@ -308,6 +308,24 @@ contract, so they are recorded rather than slipped in.
    `drain_stream` slices the wrong text. The cap reserves room for its own notice
    (`NOTICE_BUDGET`), otherwise the view lands at `limit + notice` and the cap is a
    rounding error with an apology attached.
+   *(Amended by looprs-sch, because "any cursor move must reset" was the wrong
+   rule, and following it was the duplicated-output bug. The eviction takes
+   entries off the **front**; the entry the flusher is standing in keeps its
+   bytes, so only its *number* moves. `Flusher::shift_front()` now moves the
+   index and keeps `scan`/`block`/`fence` whenever everything evicted was already
+   rendered, and resets only when the eviction took the cursor's own entry —
+   whose rows the store drops in the same breath, so there is nothing left to
+   repeat. Resetting in the common case rewound the read to the head of the entry
+   being streamed, and the next drain re-rendered blocks the store already held:
+   one extra copy of the running prose per trim, which is how a long pass printed
+   the same paragraphs two, three, four times. It was sporadic because it needed
+   a pass over its transcript cap (256 KiB per view) with a multi-paragraph entry
+   streaming at the moment the cap bit — a long thinking block, or the answer that
+   follows it. `reseat()` stays right for the rewrap, which rewinds on purpose
+   because it is about to throw every row away and rebuild them at the new width.
+   Pinned by
+   `trimming_older_entries_does_not_re_print_the_streaming_entry` and
+   `a_mixed_capped_pass_says_each_line_once`.)*
 3. **`SessionFactory` is injected.** The lifecycle rules — park, resume, one per
    mode, "a replaced generation has no route to the UI" — are worth testing, and
    testing them through three half-built child processes would test the fakes rather

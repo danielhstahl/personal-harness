@@ -410,3 +410,179 @@ fn the_cap_stops_exactly_where_the_counter_says_it_should() {
         v.dropped_bytes()
     );
 }
+
+/// **Trimming older entries must not re-print the entry that is still streaming.**
+///
+/// This is the shape a long agentic pass is actually made of: a transcript full of
+/// finished entries (the notes, the tool results) and one open prose entry being
+/// streamed on screen, its earlier paragraphs closed and already in the store.
+/// Every paragraph the model writes takes the transcript over its cap, and every
+/// trim takes `removed` entries off the front — which moves entry *numbers*, not
+/// the bytes of the entry the flusher is standing in.
+///
+/// Getting that wrong is the duplicated-output bug (looprs-sch): the trim threw
+/// the whole per-entry render cursor away along with the numbers, rewinding the
+/// read to the head of the streaming entry, so the next drain re-rendered every
+/// block the store already had and pushed the copies onto the scrollback under
+/// the text the user was reading. One repeat per trim, which is how the same
+/// paragraph arrives two, three or four times — sporadically, and only in a pass
+/// long enough to be over its cap, and only for the entry streaming at the time:
+/// a long thinking block, then the answer that follows it.
+#[test]
+fn trimming_older_entries_does_not_re_print_the_streaming_entry() {
+    const CAP: usize = 512;
+    let mut v = SessionView::with_buffer(SessionId::new(TerminalType::Pi, 0), CAP);
+
+    // Finished entries ahead of the stream, big enough between them that the cap
+    // keeps having something to take for the whole answer.
+    for i in 0..12 {
+        v.push_note(
+            MessageKind::User,
+            format!("note {i:02} is about forty bytes of finished entry"),
+        );
+    }
+    flush_new(&mut v, 80);
+
+    for i in 0..8 {
+        v.push_delta(
+            MessageKind::Answer,
+            &format!("paragraph {i:02} of the answer is a whole row of prose.\n\n"),
+        );
+        flush_new(&mut v, 80);
+        assert!(
+            v.transcript.byte_len() <= CAP,
+            "the cap was biting at paragraph {i:02}, which is the point \
+             ({} bytes against {CAP})",
+            v.transcript.byte_len()
+        );
+
+        let store = store_text(&v);
+        for j in 0..=i {
+            let needle = format!("paragraph {j:02}");
+            let hits = store.matches(&needle).count();
+            assert_eq!(
+                hits, 1,
+                "`{needle}` reached the store {hits} times after paragraph {i:02}: \
+                 a trim rewound the read of the streaming entry\n{store}"
+            );
+        }
+    }
+    assert!(
+        v.dropped_bytes() > 0,
+        "the cap had to bite for any of the above to mean anything"
+    );
+}
+
+/// **A whole mixed pass, capped the whole way: no line reaches the store twice.**
+///
+/// The one-door invariant, driven through the shape a beads pass really has —
+/// tool cards opening and closing between stretches of prose, the cap biting the
+/// entire time — rather than through one trim. Both ways the render cursor can be
+/// moved by an eviction are on display here: the entry it stands in survives
+/// (the common case, and the one that printed the answer three times), and the
+/// entry it stands in is itself an evicted one (an open card the cap ate), where
+/// restarting the read on the new front entry is the correct move.
+#[test]
+fn a_mixed_capped_pass_says_each_line_once() {
+    const CAP: usize = 512;
+    let mut v = SessionView::with_buffer(SessionId::new(TerminalType::Pi, 0), CAP);
+
+    let mut seen: Vec<String> = Vec::new();
+    for i in 0..60 {
+        let id = format!("t{i}");
+        v.start_tool(id.clone(), "read".into(), format!("src/file_{i}.rs"));
+        v.push_delta(
+            MessageKind::Answer,
+            &format!("prose {i:02} is one row of the running answer\n\n"),
+        );
+        v.finish_tool(
+            id,
+            format!(
+                "result {i:02} {}",
+                "padded out to bytes that matter".repeat(2)
+            ),
+            false,
+        );
+        seen.extend(flush_new(&mut v, 80));
+        assert!(
+            v.transcript.byte_len() <= CAP,
+            "the cap was biting at step {i}: {} bytes against {CAP}",
+            v.transcript.byte_len()
+        );
+    }
+
+    assert!(v.dropped_bytes() > 0, "and it had plenty to drop");
+    assert!(
+        !seen.is_empty(),
+        "and the flush had something to say throughout"
+    );
+
+    // Read off the store, which is what the band draws: a row the store holds
+    // twice is a row the user sees twice. Content the cap ate earlier is not in
+    // the store at all, so this counts "not twice", not "exactly once".
+    let store = store_text(&v);
+    for i in 0..60 {
+        for needle in [format!("prose {i:02}"), format!("result {i:02}")] {
+            let hits = store.matches(&needle).count();
+            assert!(
+                hits <= 1,
+                "`{needle}` is in the store {hits} times: a trim re-rendered \
+                 content the store already had\n{store}"
+            );
+        }
+    }
+}
+
+/// **The switch from thinking to answer, with the cap biting: the reasoning that
+/// is already on the screen must not come back.**
+///
+/// The ticket's own report was that the repeat showed up "when it switches from
+/// showing the thinking to showing an actual output", and this is the shape that
+/// report describes. A long thinking block is on screen with its earlier blocks
+/// already in the store; the first answer delta closes the thinking entry *and*
+/// trips the cap in the same breath; the trim then rewound the read to the head
+/// of the entry that had just been sealed — so the next flush, the first one that
+/// could render a finished entry, said the whole reasoning again. Under the old
+/// cursor rule the transition was not a coincidence: sealing the entry is what
+/// makes its re-render possible.
+#[test]
+fn a_switch_from_thinking_to_answer_does_not_re_print_the_thinking() {
+    const CAP: usize = 512;
+    let mut v = SessionView::with_buffer(SessionId::new(TerminalType::Pi, 0), CAP);
+    for i in 0..12 {
+        v.push_note(
+            MessageKind::User,
+            format!("note {i:02} is about forty bytes of finished entry"),
+        );
+    }
+    flush_new(&mut v, 80);
+
+    for i in 0..3 {
+        v.push_delta(
+            MessageKind::Thinking,
+            &format!("thought {i:02} is one block of the running reasoning\n\n"),
+        );
+        flush_new(&mut v, 80);
+    }
+
+    // The switch: a different kind closes the thinking entry and opens the answer,
+    // and the write that did it is the one the cap reads.
+    for i in 0..4 {
+        v.push_delta(
+            MessageKind::Answer,
+            &format!("answer {i:02} is one block of the actual output\n\n"),
+        );
+        flush_new(&mut v, 80);
+    }
+
+    let store = store_text(&v);
+    let said = |kind: &str, i: usize| store.matches(&format!("{kind} {i:02}")).count();
+    for i in 0..3 {
+        assert!(
+            said("thought", i) <= 1,
+            "`thought {i:02}` is in the store {} time(s): the switch re-printed \
+             reasoning the store already had\n{store}",
+            said("thought", i)
+        );
+    }
+}
