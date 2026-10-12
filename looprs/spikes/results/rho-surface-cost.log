@@ -1,5 +1,6 @@
 # rho-surface-cost — captured 2026-10-12T12:54:35Z, tree 2775b8c (dirty tree: uncommitted changes on top of that commit)
 # ran: bash -c python3 -u spikes/rho_surface_cost.py | tee /tmp/rho_run5.log
+# provenance: this capture prices casonadams/rho (rho, rho-engine, rho-harness-core 0.12.0) — the library ADR-0010 §3 was FILED against, which is not the library the ADR was asked about (matthewyjiang/rho, whose embeddable crate is rho-sdk); retained as filed and cited by ADR-0010 §3 as filed, and re-runnable with LOOPRS_SPIKE_RHO_ID=casonadams.
 workspace-eqn rho surface/price measurement — host Linux 7.0.14-linuxkit, 8 cpus
 crate under assessment: rho 0.12.0 (casonadams/rho)
 Read before quoting a number: cold builds and one machine. The ADR cites

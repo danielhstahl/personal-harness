@@ -448,8 +448,14 @@ python3 spikes/pi_rpc_boundary_cost.py            | tee spikes/results/pi-rpc-bo
 # what looprs' own parser charges for the JSONL
 LOOPRS_MEASURE_CORPUS=~/.pi/agent/sessions/--Users-…-looprs-- \
   cargo run -q --release --example spike_rpc_serde_cost | tee spikes/results/rpc-serde-cost.log
-# the alternative: cold build of a consumer of rho, its supply chain, and one embedded turn (~6 min)
-python3 spikes/rho_surface_cost.py                | tee spikes/results/rho-surface-cost.log
+# the alternative: cold build of a consumer of the library named by the id, its
+# supply chain, and one embedded turn (~6 min). workspace-8jk.1 made the identity
+# a parameter: `--list` prints the targets, and the header of the capture names
+# the owner/repo and every crate@version the run measured. matthewyjiang/rho
+# (rho-sdk) is the library this ADR is about; casonadams/rho is what §3 as filed
+# priced, and is retained at results/rho-surface-cost.log.
+LOOPRS_SPIKE_RHO_ID=matthewyjiang python3 spikes/rho_surface_cost.py \
+  | tee spikes/results/matthewyjiang-surface-cost.log
 # the control arm: typed bd tools, bash+bd vs typed, on the real model
 python3 spikes/bd_tools_cost.py                   | tee spikes/results/bd-tools-cost.log
 ```
