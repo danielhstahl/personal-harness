@@ -28,16 +28,32 @@ multi-process, three-backend TUI without a model, a board, or a terminal.
    claim rather than a design intention
 5. `scripts/dead_audit.py --gate` — every `#[allow(dead_code)]` still covers dead
    code
-6. `scripts/dep_audit.py --gate` — every `[dependencies]` entry in `Cargo.toml` is
-   named in `src/`, or answered at its own line with a `dep-audit: <reason>`
-   comment. The counterpart of step 5 for the other half of the tree: an
-   unjustified allow in the source and an unjustified dependency in the manifest
-   are the same failure, and the blanket that used to cover the second one
-   (`unused_dependencies = "allow"`) is what this replaced. The same step also
-   enforces the one dependency question a decision has already answered: none of
-   `rho`, `rho-engine`, `rho-harness-core` may appear in `Cargo.toml` **or
-   `Cargo.lock`** ([ADR-0010](adr/0010-pi-rpc-child-vs-embedded-rho-engine.md)), so
-   the engine decision is a failing build rather than a page nobody re-reads
+6. `scripts/dep_audit.py --gate`, then `scripts/dep_audit.py --self-test` — every
+   `[dependencies]` entry in `Cargo.toml` is named in `src/`, or answered at its own
+   line with a `dep-audit: <reason>` comment. The counterpart of step 5 for the
+   other half of the tree: an unjustified allow in the source and an unjustified
+   dependency in the manifest are the same failure, and the blanket that used to
+   cover the second one (`unused_dependencies = "allow"`) is what this replaced.
+   The same step enforces the one dependency question a decision has already
+   answered: no crate from **either** `rho` family may appear in `Cargo.toml` **or
+   `Cargo.lock`** — casonadams/rho (`rho`, `rho-engine`, `rho-harness-core`) or
+   matthewyjiang/rho (`rho-sdk`, `rho-providers`, `rho-coding-agent`,
+   `rho-agent-tools`, `rho-tui-pty`), direct, renamed, optional, feature-gated or
+   pulled in transitively ([ADR-0010, decision 3](adr/0010-pi-rpc-child-vs-embedded-rho-engine.md#decision)).
+   The engine decision is therefore a failing build rather than a page nobody
+   re-reads; the reasoning and every number behind it live in that ADR and are not
+   restated here, per its own "What this forbids" 7. Two things the check states
+   rather than assumes: the ban is **project-shaped** — matched on those exact crate
+   names, never on a `rho-` prefix, so an unrelated third party's `rho-core` or
+   `rho-tools` is allowed, and the report says so out loud instead of leaving the
+   silence to be read as a verdict — and the ban has its own test.
+   `--self-test` copies the audit into scratch trees, one per banned name per
+   dependency form plus the benign near-misses, and asserts each **reason string**
+   (`matched matthewyjiang/rho family, ADR-0010 decision 3`) rather than just the
+   exit code. It exists because the deny-list carried the crate set of the wrong
+   `rho` for a whole epic: `rho-sdk = "5"` passed a gate whose only job was to fail
+   it, while printing the clause that forbids it (workspace-8jk.2). A check whose
+   failure looks like a pass needs a test on the reason, not the verdict
 7. `scripts/docs_check.sh` — the docs rot gate: no dead internal link, no page
    outside the site tree, every `LOOPRS_*` the code reads is in the
    [configuration reference](guide/configuration.md), no two pages state a

@@ -20,9 +20,17 @@
 #         counterpart of step 4 for the other half of the tree, and the reason the
 #         `unused_dependencies = "allow"` blanket could be deleted rather than
 #         argued about. It also enforces the one dependency question ADR-0010 has
-#         already decided — no `rho` in `Cargo.toml` *or* `Cargo.lock`, optional or
-#         transitive — so an engine decision lives in the gate and not only in a
-#         page nobody re-reads.
+#         already decided — no crate from either `rho` family (casonadams/rho:
+#         `rho`, `rho-engine`, `rho-harness-core`; matthewyjiang/rho: `rho-sdk`,
+#         `rho-providers`, `rho-coding-agent`, `rho-agent-tools`, `rho-tui-pty`) in
+#         `Cargo.toml` *or* `Cargo.lock`, optional, renamed or transitive — so an
+#         engine decision lives in the gate and not only in a page nobody re-reads.
+#         The list is family-shaped and name-exact, never a `rho-*` prefix, so an
+#         unrelated crate that happens to start with `rho` is not swept in. Then
+#         `--self-test` runs the ban against scratch trees — every banned name in
+#         every dependency form, plus the benign near-misses — because a deny-list
+#         that names the wrong library fails open while printing the ADR clause
+#         (workspace-8jk.2: `rho-sdk = "5"` passed the gate that existed to ban it).
 #   7. `scripts/docs_check.sh` — no dead link or orphan page, every `LOOPRS_*` the
 #         code reads is documented, no two defaults disagree, the keymap tables
 #         still match `CHORD_TABLE`, the wire protocol page still matches
@@ -99,9 +107,12 @@ python3 "$(dirname "${BASH_SOURCE[0]}")/dead_audit.py" --gate
 echo "==> dependency-surface audit"
 python3 "$(dirname "${BASH_SOURCE[0]}")/dep_audit.py" --gate
 
+echo "==> ADR-0010 ban self-test (every banned crate, every dependency form, in scratch trees)"
+python3 "$(dirname "${BASH_SOURCE[0]}")/dep_audit.py" --self-test
+
 echo "==> docs rot gate (links, knob coverage, keymap coverage, wire protocol coverage, measurement claims)"
 "$(dirname "${BASH_SOURCE[0]}")/docs_check.sh"
 
 echo
 echo "gate: clean (fmt, clippy -D warnings in both feature configurations, tests in both,"
-echo "        dead-code audit, dependency audit, docs)"
+echo "        dead-code audit, dependency audit and its ADR-0010 ban self-test, docs)"

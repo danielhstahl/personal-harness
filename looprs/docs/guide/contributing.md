@@ -333,7 +333,7 @@ rung a change has to touch**:
 | the **shape of a page** — that a table rendered as a table, that a phone gets one column, that a header spans the screen it is read on | the docs build refuses a page whose markdown syntax survived, `check_layout_css` closes the grid and the viewport meta statically, and `spikes/docs_layout.py` measures the frame in a real browser. Both halves exist because the failure this closed was invisible on the laptop that caused it; the static half is the gate, the browser half is a spike, and the reason is ADR-0008's no-install rule | `./scripts/docs_check.sh` (no install, offline); `python3 spikes/docs_layout.py` after `./scripts/docs.sh build` (needs playwright + a Chromium, exits 2 with instructions if either is missing) |
 | memory / cost claims | `src/measure.rs` (needs `LOOPRS_MEASURE_CORPUS`), `spikes/*.py` | `cargo test -- --ignored` |
 | anything behind a cargo feature | the **same** suite over that build; the seam is not allowed to change shape | `cargo test --features notify` |
-| a dependency's right to be in the manifest | `scripts/dep_audit.py` — named in `src/`, or answered at its own line; and never a crate a decision already kept out (`rho`, per ADR-0010) | `python3 scripts/dep_audit.py --gate` |
+| a dependency's right to be in the manifest | `scripts/dep_audit.py` — named in `src/`, or answered at its own line; and never a crate from either `rho` family ADR-0010 keeps out (casonadams/rho or matthewyjiang/rho) | `python3 scripts/dep_audit.py --gate` (and `--self-test` for the ban's own regression test) |
 | the whole gate | `./scripts/check.sh` — fmt, clippy `-D warnings` and tests in **both** feature configurations, dead-code audit, dependency audit, docs gate | `./scripts/check.sh` |
 | docs only | `./scripts/docs_check.sh` | same, or on its own |
 
@@ -377,11 +377,24 @@ decided that the agent engine stays a `pi --mode rpc` child and that `rho` does 
 enter the tree — not directly, not optionally, not behind a feature flag, and the
 phase-2 epic that would have built the abstraction was closed unworked rather than
 worked. That is the only dependency question in this repo with a decision behind it
-rather than a convention, so the audit answers it too: `rho`, `rho-engine` and
-`rho-harness-core` may appear in neither `Cargo.toml` nor `Cargo.lock`, renamed or
-optional or pulled in transitively, and the gate fails naming the ADR section that
-reopens the question and the evidence it would need. Prose in a decision record is
-re-litigated by the next person with a benchmark; a red gate is not.
+rather than a convention, so the audit answers it too. Two unrelated projects publish
+a `rho`, so the deny-list is a set of **families**, each carrying the clause that bans
+it: casonadams/rho's `rho`, `rho-engine`, `rho-harness-core`, and matthewyjiang/rho's
+`rho-sdk`, `rho-providers`, `rho-coding-agent`, `rho-agent-tools`, `rho-tui-pty`. None
+of them may appear in `Cargo.toml` or in `Cargo.lock`, renamed or optional or
+feature-gated or pulled in transitively, and a failure names the family it matched and
+the clause behind it (`matched matthewyjiang/rho family, ADR-0010 decision 3`) rather
+than just a word. Matching is per family and **name-exact**, never a `rho-` prefix: a
+crate from a third project that merely starts with `rho` is not banned, and the report
+prints that judgement when it sees one, because silence here reads as approval. The
+first version of this list carried only the casonadams crate set — the library ADR-0010
+§3 got *filed* against, not the one its decision was requested against — so a
+`rho-sdk = "5"` passed the gate that existed to fail it while quoting the clause that
+forbids it (workspace-8jk.2). That is why the ban is tested and not merely written:
+`python3 scripts/dep_audit.py --self-test` runs every banned name through every
+dependency form in scratch trees, asserts the reason string and not just the verdict,
+and checks that a benign `rho`-prefixed crate stays green. Prose in a decision record
+is re-litigated by the next person with a benchmark; a red gate is not.
 
 ## House style
 

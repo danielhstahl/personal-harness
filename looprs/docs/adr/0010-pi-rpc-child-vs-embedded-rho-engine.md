@@ -334,10 +334,20 @@ the tempting half-measures are worth naming, because they are the ones that rot:
 | shipping the typed `bd` tool surface | **the exception: already shipped**, by decision 2 above (`extensions/bd_tools.ts`), which is the proof that this ticket never needed an engine at all |
 
 The decision now has a check behind it, not only prose. `scripts/dep_audit.py --gate`
-— a step of `scripts/check.sh`, and therefore of CI — fails if `rho`, `rho-engine` or
-`rho-harness-core` appears in `Cargo.toml` **or in `Cargo.lock`**, direct, renamed,
-optional or transitive. A rule that lives only in a decision record is re-litigated by
-the next person with a benchmark; one that fails a gate is not.
+— a step of `scripts/check.sh`, and therefore of CI — fails if a crate from either
+`rho` family appears in `Cargo.toml` **or in `Cargo.lock`**, direct, renamed, optional,
+feature-gated or transitive: casonadams/rho's `rho`, `rho-engine`, `rho-harness-core`
+(the set §3 above was filed against) **and** matthewyjiang/rho's `rho-sdk`,
+`rho-providers`, `rho-coding-agent`, `rho-agent-tools`, `rho-tui-pty` (the library this
+decision was requested against). The gate's list is name-exact per family rather than a
+`rho-*` prefix, so an unrelated third party's crate of that shape is not caught; the
+check prints which rule it applied. Note that the enforcement list was corrected first:
+`--gate` carried only the casonadams set until workspace-8jk.2, which is why a
+`rho-sdk` dependency passed it; the record's own identity and §3 attribution are
+amended by workspace-8jk.8. A rule that lives only in a decision record is re-litigated
+by the next person with a benchmark; one that fails a gate is not — provided the gate
+names the right crate, which is what `dep_audit.py --self-test` now checks on every run
+of this step.
 
 Re-opening this work costs more than a wish: a §4 trigger named in the ticket, a fresh
 capture beside it, an amendment to this ADR, and then `bd show workspace-bt8.1` …
