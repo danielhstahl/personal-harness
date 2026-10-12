@@ -106,7 +106,8 @@ Env / args:
                             rho-coding-agent 2.x), so one shared scalar cannot
                             describe them.
   LOOPRS_RHO_TARGET         reuse this target dir instead of a cold one (the
-                            cold release build is ~4 min on 8 cores; say so in
+                            cold release build is ~4 min on 8 cores for the
+                            consumer and ~7 for all three builds; say so in
                             the capture if you reuse one)
   KEEP_TARGET=1             do not delete the scratch crate on exit
   LOOPRS_SPIKE_CAPTURE_NOTE one provenance line printed under the header — what a
