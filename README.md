@@ -57,7 +57,3 @@ docker run --rm -it \
   -e GIT_USER_EMAIL="$GIT_USER_EMAIL" \
   ghcr.io/danielhstahl/pi-beads:$TAG
 ```
-
-
-Bug list:
-* (none open)
