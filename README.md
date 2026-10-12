@@ -57,3 +57,16 @@ docker run --rm -it \
   -e GIT_USER_EMAIL="$GIT_USER_EMAIL" \
   ghcr.io/danielhstahl/pi-beads:$TAG
 ```
+
+### Quitting
+
+The container runs until its PID 1 — looprs — exits, so the container stops
+exactly when looprs stops. **Use `Ctrl-Q` to leave**: it quits in every mode,
+Bash included, and it kills the `pi`/`bd` children on the way out.
+
+`Ctrl-C` is not the way out. In the Bash view (and while a full-screen child like
+`vim`/`less` holds the screen) `Ctrl-C` belongs to that shell — it cancels the
+foreground command and looprs keeps running, which means the container keeps
+running too. From another terminal you can always ask the same orderly exit of the
+container directly: `docker stop <name>` sends `SIGTERM`, and looprs answers it
+with the same teardown `Ctrl-Q` takes.
