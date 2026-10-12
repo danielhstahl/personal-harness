@@ -7,9 +7,9 @@ TAG="v0.4.2"
 # even if two dirs share a basename
 SLUG="$(basename "$PWD")-$(echo -n "$PWD" | shasum -a 256 | cut -c1-8)"
 VOLUME="beads-data-$SLUG"
-BD_PREFIX="${BASENAME:0:2}"
-docker volume create $VOLUME  >/dev/null
 BASENAME=$(basename "$PWD")
+BD_PREFIX="${BASENAME:0:4}"
+docker volume create $VOLUME  >/dev/null
 GIT_USER_NAME="$(git config user.name || true)"
 GIT_USER_NAME="${GIT_USER_NAME:-$USER}"
 
