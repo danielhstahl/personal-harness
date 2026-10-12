@@ -32,10 +32,19 @@ from a cold build:
      in rows of `src/wire.rs`.
   4. **EMBED** — the claim tested rather than argued: build the scratch program so
      it drives **one tool-using turn in process** and print what the host process
-     sees: engine/session build time, turn time, RSS, tool list, the settle
-     signal, and the event kinds it was handed. The program is part of the
+     sees: engine/session build time, first-token and turn time, RSS (level and
+     the kernel's high-water mark), the tool list, and the event kinds the host
+     was handed. For `matthewyjiang` the arms are the rows of ADR-0010's
+     inventory list, each run rather than read out of a README: the two
+     endpoint arms (unattended allow-process policy versus the SDK's own
+     defaults), the scripted fake-provider seam, tool gating (policy vs approval
+     handler vs pre-tool hook vs per-request `ToolVisibility`), the end-of-run
+     signal under provider death / a dropped Run / a host that stops reading,
+     steering and the `clear_queue` analogue, the blast wall (a tool's child on
+     cancel, drop, SIGKILL and panic) and persistence. The program is part of the
      target, because two libraries that share a name do not share an API. No
-     model endpoint → that arm prints `not measured`.
+     model endpoint → the endpoint arms print `not measured`; the scripted arms
+     are labelled so they cannot be read as a substitute.
 
     LOOPRS_SPIKE_RHO_ID=matthewyjiang python3 spikes/rho_surface_cost.py \
         | tee spikes/results/matthewyjiang-surface-cost.log
@@ -83,6 +92,9 @@ Env / args:
                             (default: http://llm.home:8080/v1; unset host with
                             LOOPRS_SPIKE_NO_MODEL=1 to skip the leg)
   LOOPRS_SPIKE_MODEL        model id for the EMBED leg
+  LOOPRS_SPIKE_ARM_TIMEOUT  wall-clock cap per EMBED arm, seconds (default 300).
+                            An arm that hangs is a result, not a hang: the cap is
+                            printed with the arm's rc and the raw tail.
 """
 
 import glob
@@ -148,10 +160,28 @@ TARGETS = {
             'reqwest = { version = "0.12", default-features = false, '
             'features = ["json", "rustls-tls"] }',
         ],
+        # The embed program holds runs open on purpose (cancellation, steering, the
+        # backpressure wedge), which needs tokio's timer and a process handle for
+        # the kill_on_drop and SIGKILL probes. The default feature set below is
+        # what a program that only completes one turn needs.
+        "embed_tokio_features": ["rt-multi-thread", "macros", "time", "process", "sync"],
         "arms": [
-            ("openai-compatible endpoint, rho-sdk's default gating", {}, True),
-            ("scripted provider — the fake-engine seam, no endpoint involved",
+            ("endpoint, unattended: allow-process policy, nobody to approve",
+             {"RHO_SPIKE_ARM": "endpoint-headless"}, True),
+            ("endpoint, SDK default gating: DenyAllPolicy + DenyApprovals",
+             {"RHO_SPIKE_ARM": "endpoint-default"}, True),
+            ("scripted provider — the fake-provider seam, no endpoint involved",
              {"RHO_SPIKE_ARM": "scripted"}, False),
+            ("tool gating: policy, approval handler, pre-tool hook, per-request visibility",
+             {"RHO_SPIKE_ARM": "gate"}, False),
+            ("end-of-run signal: completion, provider death, dropped Run, unread stream",
+             {"RHO_SPIKE_ARM": "settle"}, False),
+            ("steering, clear_queue analogue, and the host-input round trip",
+             {"RHO_SPIKE_ARM": "steering"}, False),
+            ("cancellation and the blast wall: tool children on cancel, drop, SIGKILL, panic",
+             {"RHO_SPIKE_ARM": "blast"}, False),
+            ("persistence: what is written, in what format, and the opt-out",
+             {"RHO_SPIKE_ARM": "persist"}, False),
         ],
         "capture": "spikes/results/matthewyjiang-surface-cost.log",
         "identity_note": "the library ADR-0010 was requested against",
@@ -289,8 +319,12 @@ def embed_manifest(target, versions):
     deps = []
     for name in target["library_crates"]:
         deps.append(f'{name} = "{versions[name][0]}"')
+    features = ", ".join(
+        f'"{f}"' for f in target.get("embed_tokio_features")
+        or ["rt-multi-thread", "macros"]
+    )
     deps += [
-        'tokio = { version = "1", features = ["rt-multi-thread", "macros"] }',
+        f'tokio = {{ version = "1", features = [{features}] }}',
         'serde_json = "1"',
     ]
     deps += list(target.get("embed_extra_deps") or [])
@@ -349,8 +383,17 @@ def leg_price(target, versions, scratch):
             print(out[-2500:])
             return None
     else:
-        sh(f"cargo build --release --target-dir {tdir}", cwd=crate)
+        rc2, out2 = sh(f"cargo build --release --target-dir {tdir}", cwd=crate)
         print("rho leg:       reused target dir; compile timing skipped rather than reported as cold")
+        if rc2 != 0:
+            # A reused target dir already holds a binary built from some *older*
+            # copy of the embed program. Running that and printing its numbers
+            # under this run's header is the failure mode this guards.
+            print("not measured: the reused target dir will not build the current embed")
+            print("program, and the binary already in it was built from a different one —")
+            print("so no EMBED arm runs against a stale artifact. Compiler output —")
+            print(out2[-1500:])
+            return None
     pkgs = cargo_tree(crate)
     binpath = os.path.join(tdir, "release", "rho-embed-spike")
     size = os.path.getsize(binpath) if os.path.exists(binpath) else 0
@@ -551,6 +594,22 @@ def leg_surface(target, versions, scratch):
 
 
 # ──────────────────────────────── leg 4: embed ────────────────────────────────
+def run_capped(cmd, env, cap):
+    """Run one arm with a wall-clock cap. An arm that hangs is a finding about the
+    engine (an in-process run waiting on your own handler has nothing to kill it),
+    so the cap is reported, not swallowed."""
+    started = time.perf_counter()
+    try:
+        p = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True,
+                           text=True, env=env, timeout=cap)
+        return p.returncode, (p.stdout or "") + (p.stderr or ""), time.perf_counter() - started
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or b"") + (e.stderr or b"")
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        return 124, out + f"\nkilled at the {cap:.0f}s arm cap\n", time.perf_counter() - started
+
+
 def leg_embed(target, versions, price):
     print("\n== 4. EMBED — drive one tool-using turn with the library linked into the process ==")
     if not price:
@@ -563,30 +622,44 @@ def leg_embed(target, versions, price):
     code = sh(f"curl -s -m 10 -o /dev/null -w '%{{http_code}}' {BASE_URL}/models")[1].strip()
     endpoint_ok = code == "200" and not os.environ.get("LOOPRS_SPIKE_NO_MODEL")
     if os.environ.get("LOOPRS_SPIKE_NO_MODEL"):
-        print("not measured: model endpoint leg skipped (LOOPRS_SPIKE_NO_MODEL set)")
+        print("endpoint arms: skipped (LOOPRS_SPIKE_NO_MODEL set) — the scripted arms below")
+        print("are labelled results, not a substitute for the endpoint arm.")
     elif code != "200":
-        print(f"not measured: model endpoint {BASE_URL} answered {code!r}")
+        print(f"endpoint arms: not measured — model endpoint {BASE_URL} answered {code!r}. No")
+        print("scripted answer is substituted for them; see the labelled arms below.")
+    else:
+        print(f"endpoint:        {BASE_URL} answered {code}, model {MODEL}")
+    cap = float(os.environ.get("LOOPRS_SPIKE_ARM_TIMEOUT", 300))
+    print(f"arm cap:         {cap:.0f}s each (LOOPRS_SPIKE_ARM_TIMEOUT)")
     home = tempfile.mkdtemp(prefix="rho-home-")
     library = target["library_crates"][0]
     env = dict(os.environ, RHO_HOME=home, RHO_SPIKE_KEY="spike",
                RHO_SPIKE_BASE_URL=BASE_URL, RHO_SPIKE_MODEL=MODEL,
                RHO_SPIKE_CRATE_VERSION=versions[library][0] or "")
     for label, extra, needs_endpoint in target["arms"]:
-        if needs_endpoint and not endpoint_ok:
-            print(f"\n-- {label}\n   not measured (no model endpoint; see the reason above)")
-            continue
         print(f"\n-- {label}")
+        if needs_endpoint and not endpoint_ok:
+            print("   not measured (no model endpoint; see the reason above)")
+            continue
         if not needs_endpoint:
-            print("   labelled arm: this one does not touch a model endpoint and is not")
-            print("   evidence about the model — it is the fake-provider seam, reported")
-            print("   separately so it can never be read as the endpoint arm passing.")
-        rc, out = sh(binary, env={**env, **extra})
+            print("   labelled arm: no model endpoint involved. It exercises the runtime,")
+            print("   the in-process tool round trip and the event stream, and says nothing")
+            print("   about the model — reported separately so it can never be read as the")
+            print("   endpoint arm passing.")
+        rc, out, secs = run_capped(binary, {**env, **extra}, cap)
+        printed = 0
         for line in out.splitlines():
-            if line.startswith(("turn.", "event", "events.", "tools.", "ms.", "rss_",
-                                "config.", "auth.", "engine.", "arm.", "crate.")):
+            # The programs print `key<TAB>value`, with indented note lines; anything
+            # else is the library's own stderr (a panic message, a tokio warning)
+            # and belongs to the arm that provoked it, not to the capture.
+            if "\t" in line:
                 print(f"   {line}")
-        if rc != 0:
-            print(f"   rc={rc}: {out.strip()[-300:]}")
+                printed += 1
+        print(f"   (rc={rc}, {secs:.1f}s, {printed} lines)")
+        if rc != 0 or printed == 0:
+            print("   raw tail of that arm's output:")
+            for line in out.strip().splitlines()[-25:]:
+                print(f"   | {line[:200]}")
     shutil.rmtree(home, ignore_errors=True)
     print("\nWhat this leg is for: it is the *decision-relevant* half. Everything the")
     print("loop needs from a child over stdio has to be re-expressed as this library's")
