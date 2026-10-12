@@ -1,14 +1,48 @@
 # ADR-0010: The engine stays a child — keep `pi --mode rpc`, take the typed `bd` tools, and leave both `rho` libraries where they are
 
+> **Identity correction — read this before any number below (amendment 0010-B).**
+>
+> **§3's table and decision 3's blocker were measured against `casonadams/rho`** — the crates `rho`,
+> `rho-engine` and `rho-harness-core`, which is also what
+> [crates.io/crates/rho](https://crates.io/crates/rho) serves. **The library this assessment was
+> requested against is `matthewyjiang/rho`** — the crates `rho-sdk` (what a library consumer links),
+> `rho-providers` and `rho-coding-agent`. They are unrelated projects with a colliding name, written
+> against different APIs, and a third unrelated pair — `rho-core` / `rho-tools`, published by
+> `pyrex41/rho` — is on crates.io too and appears in this record only as the near-miss the gate
+> deliberately does not ban. A bare word was used where an identity was required, and the numbers of
+> one library were filed as the price of the other.
+>
+> Amendment **[0010-A](#amendment-0010-a--which-rho-workspace-8jk7)** put a name in every sentence
+> that carries a claim. Amendment **[0010-B](#amendment-0010-b--the-re-measurement-workspace-8jk8)**
+> re-measured the substance: [§3-B](#3-b-the-same-rows-measured-against-matthewyjiangrhos-rho-sdk)
+> prices `rho-sdk` on §3's own rows, [decision 3](#decision) is restated on the justification the
+> re-measurement actually supports, and trigger 3 below now points at definitions instead of at
+> numbers. **The verdict is unchanged — neither library enters the tree — and the justification is
+> not.** The re-measured candidate is *cheaper to link than looprs itself*, so the supply-chain-weight
+> half of §3 does not survive being pointed at the right library; what carries the ban is the
+> maintenance record, scored against written definitions rather than quoted from a paragraph.
+>
+> The `casonadams/rho` capture is **retained and labelled**, not deleted. It is what was measured,
+> about the library it names, and it still reproduces.
+
 - **ID:** workspace-eqn
 - **Status:** Accepted — 2026-10-12
-- **Amended:** 2026-10-12 by [workspace-8jk.7](#amendment-0010-a--which-rho-workspace-8jk7) — naming
-  only. Every mention of `rho` in this record that carries a claim now says *which* library it
-  carries it about. No number, verdict or prohibition changed. The durable process fix that came
-  out of the mis-identification — dependency assessments name `owner/repo` plus the artifact, and
-  captures self-identify what they measured — is
-  [contributing → assessing a third-party dependency](../guide/contributing.md#assessing-a-third-party-dependency)
-  (workspace-8jk.10).
+- **Amended:** twice on 2026-10-12, in place, with the accepted date above untouched because the
+  decision was made then and both amendments say what changed against it:
+  * **0010-A** — [workspace-8jk.7](#amendment-0010-a--which-rho-workspace-8jk7), **naming only**.
+    Every mention of `rho` in this record that carries a claim now says *which* library it carries it
+    about. No number, verdict or prohibition changed. The durable process fix that came out of the
+    mis-identification — dependency assessments name `owner/repo` plus the artifact, and captures
+    self-identify what they measured — is
+    [contributing → assessing a third-party dependency](../guide/contributing.md#assessing-a-third-party-dependency)
+    (workspace-8jk.10).
+  * **0010-B** — [workspace-8jk.8](#amendment-0010-b--the-re-measurement-workspace-8jk8),
+    **substance**. §3's rows and decision 3's blocker re-derived against the library they were meant
+    to price, the six-row inventory re-scored row by row against it, decision 3 restated (the licence
+    objection survives in a different shape, the dependency-weight objection does not survive at all),
+    and trigger 3 rewritten to name definitions rather than to print a `Today:` line. This amendment
+    **does not fire a trigger and does not re-open the decision**; it corrects the record's citations
+    and the evidence the ban rests on.
 - **Epic:** workspace-eqn (Assessment: keep `pi --mode rpc` child, or embed the rho Rust SDK as
   looprs' engine — the epic's own wording, and the SDK it meant is `matthewyjiang/rho`'s `rho-sdk`)
 - **Subjects (pinned, because this record is the page that got them confused):** three unrelated
@@ -16,8 +50,8 @@
   * **`matthewyjiang/rho`** — crates `rho-sdk` (the embeddable runtime a library consumer links),
     `rho-providers`, `rho-coding-agent` (the CLI), `rho-agent-tools`, `rho-tui-pty`. **The library
     this assessment was *requested* against**, and therefore what "the candidate" means below
-    **except where a section pins a different one** — §3 prices `casonadams/rho`, and says so at
-    its own heading.
+    **except where a section pins a different one** — §3 as filed prices `casonadams/rho`, and says so
+    at its own heading; §3-B is `rho-sdk`'s own run.
   * **`casonadams/rho`** — crates `rho`, `rho-engine`, `rho-harness-core`. **The library §3 was
     *filed* against and measured**, and the one
     [crates.io/crates/rho](https://crates.io/crates/rho) serves.
@@ -41,12 +75,26 @@
   [`spikes/results/matthewyjiang-surface-cost.log`](../../spikes/results/matthewyjiang-surface-cost.log)
   for `matthewyjiang/rho` / `rho-sdk` (the library this decision is about),
   [`spikes/bd_tools_cost.py`](../../spikes/bd_tools_cost.py)
-  → [`spikes/results/bd-tools-cost.log`](../../spikes/results/bd-tools-cost.log)
-- **Reproduced by:** the one command at the bottom. Every number below is from
+  → [`spikes/results/bd-tools-cost.log`](../../spikes/results/bd-tools-cost.log);
+  added by 0010-B:
+  [`spikes/rho_inventory_rescore.py`](../../spikes/rho_inventory_rescore.py)
+  → [`spikes/results/matthewyjiang-inventory-rescore.log`](../../spikes/results/matthewyjiang-inventory-rescore.log)
+  for the six-row inventory re-scored against `rho-sdk`,
+  [`spikes/dependency_maintenance_metrics.py`](../../spikes/dependency_maintenance_metrics.py)
+  → [`spikes/results/dependency-maintenance-metrics.log`](../../spikes/results/dependency-maintenance-metrics.log)
+  for trigger 3's four definitions scored against **both** libraries,
+  [`spikes/rho_footprint_cost.py`](../../spikes/rho_footprint_cost.py)
+  → [`spikes/results/matthewyjiang-footprint-cost.log`](../../spikes/results/matthewyjiang-footprint-cost.log)
+  for the embedded startup/memory shape and the N-concurrent extrapolation trigger 4 left unpriced
+- **Reproduced by:** the commands at the bottom. Every number below is from
   those captures, on one Linux box (8 cpus), against the local
   `llama.cpp`/`halogen-qwen3.8-flash-next` endpoint and the real beads corpus
   (87 passes of this project's own session files). Rule 4 of ADR-0009 applies
-  here without amendment: do not retype these numbers anywhere else.
+  here without amendment: do not retype these numbers anywhere else. The corpus
+  is a live directory, not a frozen fixture: workspace-8jk.11 re-derived the pass
+  denominator from it at a later hour and got a larger pass count and a smaller
+  median, and that capture quotes its figure *beside* this one rather than
+  smoothing the two into a number neither run took.
 
 ---
 
@@ -123,7 +171,7 @@ number. The client is ~250 lines in `src/services/pi.rs` plus the typed envelope
 | Dependency | How much |
 | --- | --- |
 | RPC commands looprs sends | **4 of the 33 pi documents** — `prompt`, `steer`, `clear_queue`, `abort` |
-| Wire spellings behaviour is keyed on | **40**, enumerated by `WIRE_INVENTORY` in `src/wire.rs` (`agent_start`, `agent_settled`, `message_update`, `tool_execution_start`, … plus the role and stop-reason sets) |
+| Wire spellings behaviour is keyed on | **51 `WIRE_INVENTORY` rows — 46 concrete spellings plus 5 catch-alls** — in `src/wire.rs` (`agent_start`, `agent_settled`, `message_update`, `tool_execution_start`, … plus the role and stop-reason sets). **Corrected by 0010-B:** the first version of this row said **40**, which is not a count of the table but what `rho_surface_cost.py`'s `wire: "([a-z_]+)"` scrape could see — it cannot read a camelCase spelling or the catch-all marker, so it silently dropped `bashExecution`, `branchSummary`, `compactionSummary`, `toolResult` (four roles, three with a reader), `toolUse`, and the row that records looprs' forward-compatibility policy. Of the 51 rows, 25 have a named reader and 26 are declared-but-unread — the difference between a behaviour port and a documentation row. Recounted by [`rho_inventory_rescore.py`](../../spikes/rho_inventory_rescore.py) leg 1 |
 | Protocol semantics | `data.disposition` (`"handled"` ⇒ no run and no settle ever arrives), `agent_settled` as the *only* end-of-pass signal, `success: false` as a refusal rather than an error, correlation by client-assigned `id` |
 | Process semantics | stdin-EOF-as-shutdown (ADR-0002 Q1), `kill_on_drop` so a failed pass cannot orphan a child, stderr never wired to the user's terminal, `--tools read,bash` gating for the planner |
 | Test seam | `LOOPRS_PI_BIN` and the fakes in `tests/fixtures/` — every process-level test, plus the beads e2e spikes, runs against a fake child and costs no model call |
@@ -134,10 +182,33 @@ differently (below), has no equivalent of the third's `disposition`, and makes t
 fifth seam meaningless — an in-process engine has no binary to point a fake at, so
 each fake becomes a Rust trait impl compiled into the test binary, and the
 `--tools`/argv-level behaviours those fakes prove stop existing as things to prove.
-(`rho-sdk` answers the first two differently again, and the fifth row the same way;
-the row-by-row re-scoring is the capture indexed as the
-[`matthewyjiang` inventory rescore](../../spikes/results/matthewyjiang-inventory-rescore.log),
-and reading that row against this table is workspace-8jk.8's job, not this page's.)
+
+#### The re-scored inventory: what `rho-sdk` answers, row by row
+
+The list above is engine-agnostic — it describes pi and looprs, and it is the checklist every
+candidate gets scored against. What was missing was the *scoring*: the version of this table filed
+`casonadams/rho`'s answers against rows 1 and 2 and stopped. It is now scored row by row against
+`matthewyjiang/rho`'s `rho-sdk` by
+[`spikes/rho_inventory_rescore.py`](../../spikes/rho_inventory_rescore.py), whose
+decision is
+[`spikes/results/matthewyjiang-inventory-rescore.log`](../../spikes/results/matthewyjiang-inventory-rescore.log);
+the verdict words below are that capture's leg-5 gap table, one row per row, and every `rho-sdk`
+identifier it names is grepped out of the published artifact by the same run, so a verdict that ages
+into a falsehood fails the run instead of ageing quietly.
+
+| inventory row | `rho-sdk`'s verdict | first-order cost | the shape of it |
+| --- | --- | --- | --- |
+| RPC commands | different-but-expressible | a shim, plus one redesign | `prompt`→`Session::start`, `steer`→`Run::steer`, `abort`→`Run::cancel` map cleanly; `clear_queue` changes **kind**, not spelling — there is no queue to empty, only per-id steering retraction with a lost-race outcome, so the Esc path is redesigned rather than renamed |
+| Wire spellings | different-but-expressible for most, no answer for a minority | redesign | Most rows are a renamed or narrowed `RunEvent` arm reachable with a shim; what has no answer is what pi gets from being a *process* or a typed union with a serde escape hatch — the unknown-value catch-alls, the message/step and block boundary rows, and the `length` stop reason, which `rho-sdk`'s model layer has no field for at all |
+| Protocol semantics | 3 of 4 different-but-expressible, one of them **better**, 1 no answer | redesign | `disposition` disappears because a busy session is a typed refusal instead — the one row where the alternative is the better design. The no-answer half is the settle signal this loop advances on: terminal events arrive **while someone is still reading**, and answer nothing when it stops reading |
+| Process semantics | 1 trivial, 2 design changes, 1 impossible | redesign, and one item not expressible | `kill_on_drop` is the impossible one: a tool's children survive cancel, survive `drop(run)`, and survive a `SIGKILL` of the host, and a host-provided tool is outside every SDK gate. stderr-never-to-the-terminal becomes a panic hook plus an ADR-0006 decision. Per-pass `--tools` gating exists as per-request tool visibility, installed as shared mutable state on a long-lived runtime instead of argv |
+| Test seam | different-but-expressible for the run half, no answer for the process half | shim for new arms, redesign for the process-level ones | Its scripted provider is a *better* scripted arm than the shell fake — deterministic, no model call, records what it advertised. What it cannot prove is every process fact the fake proves, and the code the fake exists to test (framing, correlation, drain) does not exist on this side, so the seam loses its **subject**, not just its coverage |
+| Corpus coupling | no answer | redesign — the largest row, and the hidden cost of the whole comparison | Persistence is opt-**in** and host-implemented: a snapshot value plus a store trait with one in-memory implementation, and nothing written to disk. So the corpus does not get a new format, it gets no format, and looprs becomes the author of one — or every corpus-justified constant gets re-baselined against captures of a corpus that does not exist yet |
+
+Read together, the six rows say the thing §3's price rows could not: the candidate is cheap to
+*link* and expensive to *become*. The row counts, the test-surface counts and the named API per row are
+in the capture, and this page does not retype them (forbids 7).
+
 
 ---
 
@@ -224,15 +295,17 @@ next to the loop.
 
 ### 3. `casonadams/rho`, priced as a dependency (`rho-surface-cost.log`)
 
-> **Which library this table prices — pinned by workspace-8jk.7.** Every number in this table is
-> **`casonadams/rho`** at 0.12.0 — crates `rho` + `rho-engine` + `rho-harness-core` — because that
-> is the crate set the ticket was *filed* against, and it is **not** the library this decision was
-> requested against. `matthewyjiang/rho`'s own four-leg run is
+> **Which library this table prices — pinned by workspace-8jk.7, re-measured by 0010-B.** Every
+> number in this table is **`casonadams/rho`** at 0.12.0 — crates `rho` + `rho-engine` +
+> `rho-harness-core` — because that is the crate set the ticket was *filed* against, and it is **not**
+> the library this decision was requested against. `matthewyjiang/rho`'s own four-leg run is
 > [`spikes/results/matthewyjiang-surface-cost.log`](../../spikes/results/matthewyjiang-surface-cost.log),
-> indexed beside this one in [spikes/README.md](../../spikes/README.md). Re-deriving these rows
-> against `rho-sdk` is workspace-8jk.8's amendment; until it lands, **no row below may be quoted as
-> `rho-sdk`'s price**, and no row below may be quoted as "`rho`'s price" without saying which of the
-> two libraries it is a price for.
+> indexed beside this one in [spikes/README.md](../../spikes/README.md), and its rows are read out in
+> [§3-B](#3-b-the-same-rows-measured-against-matthewyjiangrhos-rho-sdk) below. That re-derivation has
+> now landed, so this table is retained for what it is: **`casonadams/rho`'s measurement**, still the
+> answer to "what would *that* library cost", and still forbidden as a citation for `rho-sdk`. No row
+> here may be quoted as `rho-sdk`'s price, and no row here may be quoted as "`rho`'s price" without
+> saying which of the two libraries it is a price for.
 
 | | `casonadams/rho` consumer (scratch crate, cold `--release`) | looprs today, same machine, same method |
 | --- | --- | --- |
@@ -244,7 +317,7 @@ next to the loop.
 | licence | **no licence file in any of the three published crates**, and GitHub's licence detector sees `NONE`, though `Cargo.toml` says `MIT OR Apache-2.0` | — |
 | maintenance | 33 releases since 2026-09-02, 480 downloads, repo created 2026-08-19, 7 stars, 1 subscriber, and **823 of 865 commits (95.1%) by one human** — bus factor 1 | — |
 | pins | one exact pin, `merman = "=0.8.0-alpha.6"` (an alpha, exact) | — |
-| event vocabulary overlap with looprs' 40 wire spellings | **3 of 40** (`turn_start`, `turn_end`, `error`), out of 53 variants `casonadams/rho`'s protocol can name | — |
+| event vocabulary overlap with looprs' wire spellings | **3 shared spellings** (`turn_start`, `turn_end`, `error`), out of 53 variants `casonadams/rho`'s protocol can name. *Corrected by 0010-B:* this row's denominator was the scraper's, not the table's — see the inventory row above for what that means | — |
 
 And the part of the proposal that was actually at issue — can it be embedded, and
 what does the host get — was **done, not argued**: the spike builds a program that
@@ -288,13 +361,97 @@ this section, are findings about **`casonadams/rho`'s** API, which is not the AP
   visibility — the same answer in shape, a different surface, and the reason the
   gating row had to be re-run rather than re-quoted).
 
-The overlap row is the cost that the ticket did not price: of the **40** wire
-spellings `src/wire.rs` keys behaviour on, `casonadams/rho`'s protocol can name **3**. Not the
+The overlap row is the cost that the ticket did not price: of the wire spellings `src/wire.rs` keys
+behaviour on, `casonadams/rho`'s protocol can name **3** — and against the right library the string
+intersection is **0**, which is a worse-looking number for the same uninformative measurement: it
+compares spellings, and the cost is in meanings (see the
+[re-scored inventory](#the-re-scored-inventory-what-rho-sdk-answers-row-by-row)). Not the
 spelling — the meaning. Every row of `WIRE_INVENTORY`, the generated
 `docs/guide/wire-protocol.md`, `app::apply_pi`, the token window, and the tests that
 make each row state what the harness does with the value get re-derived by hand.
 Against a saving of 308 ms per pass, that is the wrong trade even before the
 maintainer question is asked.
+
+### 3-B. The same rows, measured against `matthewyjiang/rho`'s `rho-sdk`
+
+Every row §3 filed, re-measured against the library this decision is about, by
+[`spikes/rho_surface_cost.py`](../../spikes/rho_surface_cost.py) pointed at
+`matthewyjiang` — four legs, one machine, three cold `--release` builds and eight EMBED arms, each of
+them `rc=0`, in
+[`spikes/results/matthewyjiang-surface-cost.log`](../../spikes/results/matthewyjiang-surface-cost.log)
+and indexed beside §3 in [spikes/README.md](../../spikes/README.md). **This table deliberately
+carries no numbers**: forbids 7 applies to an amendment before it applies to anyone else, so each row
+says what the claim turns out to be and names the leg it comes from. The rows do not agree with §3's,
+and they do not agree in §3's *direction*:
+
+| §3's row | what `rho-sdk`'s own run measures | leg |
+| --- | --- | --- |
+| cold build, crates compiled | **cheaper than looprs' own cold build**, in crates compiled and in wall seconds — same method, same box, own target dir | 1 |
+| packages in the shipped graph | **fewer than looprs ships today**, and fewer again against the `--features notify` build `docker/` and the release job actually produce. Resolved **per crate**, so a closure that contains the CLI's TUI can never be quoted as the library's price; and note that the run's own consumer graph also carries the spike program's deps, so the library-only figure is the smaller one | 1 |
+| packages it would add that looprs does not ship | single-digit against the shipped (notify) build — i.e. the overlap with what looprs already links is nearly the whole graph | 1 |
+| artifact size | **smaller than looprs' own binary** under one profile on both sides, and about half the shipped artifact. Recorded because the first version of this leg compared a *stripped* scratch binary against an *unstripped* looprs one, and flattering the candidate by accident is the same defect as flattering it by mistake | 1 |
+| source a consumer links | the library crate on its own, which is a small part of the all-crates total the raw listing prints — and its `unsafe` count is bench code: the library carries `#![forbid(unsafe_code)]` in its own `src`, so the word in the artifact is not a word in what gets compiled | 3 |
+| **licence** | **the same gap, in a nicer repo.** The repo has a root `LICENSE`, GitHub's detector reads MIT and the manifest says MIT — and the published artifact of the crate a consumer links ships no licence file, nor does `rho-providers`'; the one artifact in the workspace that does ship a `LICENSE` is the CLI bin crate, and a sibling crate's file does not arrive inside another crate's artifact. Declaration, not grant, with better manners | 3, and trigger 3's licence row |
+| maintenance | a bigger and busier project than §3 filed — more releases, more downloads, more stars, a repo roughly twice as old — and still **one human** carrying it, on either denominator, with the second-named human a long way below the bar. Both denominators, the URLs and the earliest date a row can move are the scorer's business, not this page's | [trigger 3's memo](0010-trigger-3-dependency-maintenance-metrics.md) |
+| exact pins | the library crate declares **no** `=` pins and no optional dependencies at all; the three exact pins in that workspace belong to the CLI crate a library consumer does not link. Upstream's `[profile.release]` size tuning is a property of their workspace root — cargo ignores a dependency's profile — so it travels with none of it | 3 |
+| event vocabulary overlap | **0** shared spellings — and 0 measures spelling, not meaning. Scored by meaning, row by row, most rows are reachable through `RunEvent` with a shim and the expensive ones are exactly the rows pi gets from being a *process*: see the inventory table above | 3 + the rescore |
+
+The EMBED leg was rewritten to run `rho-sdk`'s API rather than describe it
+([`spikes/embed_programs/matthewyjiang-rho-sdk.main.rs`](../../spikes/embed_programs/matthewyjiang-rho-sdk.main.rs)),
+one arm per row of the inventory list, and it came back with four findings that §3's two do not
+describe — all of them about what a host has to *build*, none about what it has to pay:
+
+* **A settle event exists, and the library disclaims delivering it.** `Completed`, `Failed` and
+  `Cancelled` are real, published, prose-documented events and they arrive on the host's stream in
+  every arm that was still reading. They do not arrive when nobody is reading: a dropped `Run` produced
+  no terminal event in any trial, a panic inside a tool closed the stream with none, and a host that
+  stops draining wedges the run against the bounded event channel while the session still reports
+  `Running`. A live approval handler nobody answers holds a run open with no timeout at all. That is
+  not "no settle signal" — it is a *best-effort* one, which is a different objection and a weaker
+  library, and looprs' loop advance is precisely the consumer that needs the guarantee.
+  The five sub-tests that separate "a name exists" from "a loop can be keyed on it" are
+  [trigger 3's memo](0010-trigger-3-dependency-maintenance-metrics.md), and the
+  [footprint capture](../../spikes/results/matthewyjiang-footprint-cost.log) adds the sixth thing §3
+  never thought to ask: even when the terminal event *does* arrive, a host that advances its next
+  pass on the event gets a typed "session busy" refusal some fraction of the time, while a host that
+  drains the stream to its end is refused in none of its trials. pi's loop has to wait for the stream
+  to close for a different reason; this one has to wait for the same reason, and did not know it.
+* **Gating exists, and a host-provided tool stands outside it.** Policy, approval handler, pre-tool
+  hook and per-request visibility are four real gates and all four hang off the same `authorize`
+  call — which a tool the host supplies never makes, and the SDK says so in its own source. That is
+  the shape of every tool looprs would register. The SDK's defaults fail closed (an unattended host
+  gets a denial, not a hang), which is the right default and the opposite of looprs' argv-shaped,
+  per-pass, per-child allowlist.
+* **The blast wall has to be built by hand, and one item of it cannot be built.** A tool's child
+  process survives cancel, survives `drop(run)`, and survives a `SIGKILL` of the host process —
+  reparented to init — where the same child spawned with `kill_on_drop` is reaped. A panic inside a
+  tool is contained by the runtime's own task so the host lives, but the panic text goes to this
+  process' stderr, which in looprs is the user's terminal, mid-frame: the ADR-0006 hazard the process
+  boundary was also buying against, arrived at from the other side.
+* **Nothing is written to disk, which is a cost and not a saving.** Persistence is a snapshot value
+  plus a host-implemented store trait with one in-memory implementation: nothing to opt out of, so
+  nothing for the corpus to measure, which is inventory row 6 above.
+
+One caveat is load-bearing and belongs in the record: **`rho-sdk` ships no model client at all.** Its
+dependencies are serde, serde_json, thiserror, tokio, tracing, url and uuid, and its only shipped
+provider is a test double; the model clients live in `rho-providers`. So "embed `rho`" is a crate
+*composition*, not a dependency line, and the embedded rows in the footprint capture measure a runtime
+plus a provider this spike wrote — deliberately left inside the numbers rather than subtracted out —
+with no transport or token accounting from either candidate's shipped code.
+
+**What it costs to run, in the shape looprs would actually use** — the case §3 left unpriced and
+trigger 4 named — is
+[`spikes/rho_footprint_cost.py`](../../spikes/rho_footprint_cost.py) →
+[`spikes/results/matthewyjiang-footprint-cost.log`](../../spikes/results/matthewyjiang-footprint-cost.log):
+the memory case for embedding is **real, and bigger than §3's one-line MiB comparison suggested**, once
+every row is written as *host plus added* instead of one process' resident set against another's; boot
+is smaller than the child's by two orders of magnitude, and both sit at or below a hundredth of one
+percent of a median pass, so **trigger 1's latency leg stays dead on the right library's numbers
+too**; N concurrent passes do not multiply memory the way N children do, and the ceiling the
+extrapolation reaches is a wall the child shape hits and the embedded shape does not approach. Where it
+is **not** free is history: a long pass grows in place, and a per-pass child that dies at the end of the
+pass pays none of that. Rows, both RSS instruments reconciled, and the extrapolation's ceiling are in
+the capture.
 
 ---
 
@@ -345,67 +502,162 @@ this spike builds in a temp dir and deletes. No dependency from either family, a
 door for either of them either — an unbuilt door rots. The ban in
 `scripts/dep_audit.py --gate` is therefore a set of **two** families, and the first version of it
 carried only the casonadams crate set, which is how a `rho-sdk` dependency walked through a gate
-whose only job was to fail it (workspace-8jk.2).
+whose only job was to fail it (workspace-8jk.2). **0010-B did not change this paragraph's scope:** the
+ban was made two families by the gate fix, and it stays two families.
 
-The blocker is not the performance number, which is now known and is irrelevant. It
-is the **bus factor and the licence**, stated plainly so nobody re-derives it — and
-pinned to the library whose numbers these are. "the rho crate", "a Rust
-re-implementation of this same harness shape" and "rho does not enter the tree" were
-all written about `casonadams/rho` and read, for an epic, as if they had been written
-about `matthewyjiang/rho`. The sentence as filed, about **`casonadams/rho`**: 95.1% of
-865 commits by one person, a repo ~7 weeks old at the time of writing, 7
-stars, 1 subscriber, 480 downloads, 120,799 LOC across three crates, and **no
-licence file in the published artifact of any of them** while the manifest declares
-`MIT OR Apache-2.0`. A harness that runs unattended for hours against a user's repo
-does not take that in, and a declared-but-unshipped licence is not something to
-resolve later. **`matthewyjiang/rho`** (`rho-sdk`) fails the same four conditions, on
-different numbers and with a different settle story —
-[the score, the definitions and the dates each row can next move are in trigger 3's
-memo](0010-trigger-3-dependency-maintenance-metrics.md), which is the only place in
-this record that carries them. The decision therefore covers both libraries, and no
-longer depends on the numbers in the paragraph above being the right library's.
+**The bar, and what it now says.** This was never a performance objection — that number is known, and
+irrelevant. It is a maintenance objection, and after 0010-B it is a **scored** one rather than a
+paragraph: four definitions — a licence text inside the published artifact of the crate a consumer
+links, more than one human carrying the repo, twelve months on the youngest of three clocks, and a
+settle signal a loop advance can actually be keyed on — written down once in
+[trigger 3's memo](0010-trigger-3-dependency-maintenance-metrics.md) and run per library by
+[`spikes/dependency_maintenance_metrics.py`](../../spikes/dependency_maintenance_metrics.py).
+Both libraries are scored every time. **Trigger 3 is NOT MET by either of them, on none of the four
+definitions**, and the ban therefore stands — which is a *different justification* from the one this
+section carried when it was filed, and it is written here as the new one instead of being glossed over
+the old one.
+
+**What the re-measurement took away**, said plainly, because a correction that only adds is not a
+correction:
+
+* **Dependency weight: withdrawn.** §3 filed a consumer whose shipped graph was several times
+  looprs' own and whose artifact was over three times looprs' binary. Measured against `rho-sdk`, the
+  direction is inverted — the library is *smaller than the tree that would link it*, on every axis the
+  build leg measures, and nearly all of its graph is code looprs already ships (§3-B). Nobody should
+  have to re-derive that in a year, and nobody should have to re-derive the reason the bloat objection
+  was ever available: it was another library's number.
+* **`unsafe` and raw LOC: withdrawn as written.** The figure §3 quoted counted all three crates of the
+  wrong library, tests and benches included; the crate a consumer links forbids `unsafe` in its own
+  source, and the `unsafe` strings its artifact does contain are in code a consumer never compiles.
+* **The licence objection, in the form it was written: replaced, not withdrawn.** As filed it read
+  *"no licence file anywhere, and GitHub's detector sees NONE"* — which is `casonadams/rho`'s shape.
+  `matthewyjiang/rho` has a repo-root `LICENSE`, GitHub reads the repo as MIT and the manifest says
+  MIT — **and the published artifact of the crate a consumer links contains no licence text**, exactly
+  like the other library's. This is the one row the re-measurement was expected to *clear* and did
+  not, and it is stated flatly here because the memo that ran it disagreed with the ticket that asked
+  for it: a declared-but-unreceived licence is the same gap in a nicer repo, and it is a one-file fix
+  upstream has not made. What a consumer receives is what is inside the artifact they receive.
+* **The settle objection, in the form it was written: also replaced, and this one moves the other
+  way.** `rho-sdk` has a named, published, prose-documented terminal event set and passes all but one
+  of the memo's sub-tests for it, where the library §3 was filed against passes barely half — and
+  the sub-test it fails is failed by the library's **own contract text**, which disclaims delivering
+  exactly one terminal event for every run. That is a hole upstream can close in a release, which makes
+  it a different kind of objection from a property of a library's shape. It is still a hole in exactly
+  the place looprs' loop advance is: a best-effort settle event is the one thing a loop that runs
+  unattended for hours cannot be driven by.
+
+**What stands**, under those definitions and on the intended library's own numbers: one human carries
+the repo on either denominator, with the second-named human far below the bar; the published artifact
+is a fraction of the way to the twelve months the definition asks for, on the youngest of the three
+clocks; the licence text is not in the artifact; and the settle signal is best-effort where this loop
+needs a guarantee — including the case a process boundary hands over for free, *a child died*, which
+has no in-process analogue and would have to be rebuilt as deadlines and a watchdog. Those four are the
+ban's justification now. `casonadams/rho`'s rows are in the same capture and are no better, so the
+decision covers both libraries and — unlike the version this section was filed in — no longer depends
+on one paragraph's numbers having been the right library's.
+
+**And the price, even if the bar were cleared.** Meeting trigger 3 re-opens this question; it does not
+answer it. The bill is the
+[six-row inventory above](#the-re-scored-inventory-what-rho-sdk-answers-row-by-row): one RPC command
+whose *guarantee* rather than spelling disappears, a set of rows that need re-derivation rather than
+renaming, one item (`kill_on_drop`) that is not expressible in-process at all, a test seam that loses
+its subject rather than shrinking, and a corpus looprs would become the author of. The memory case is
+real and is not the candidate's own chart's row (§3-B's last paragraph). If the bar is ever met, the
+follow-on is `workspace-bt8` re-opened — the epic that already costs this out — and not a new ticket;
+see forbids 1.
+
+**The sentence as filed, retained.** For the record, and labelled as what it is: the blocker this
+section was originally written with was *"95.1% of 865 commits by one person, a repo ~7 weeks old, 7
+stars, 1 subscriber, 480 downloads, 120,799 LOC across three crates, and no licence file in the
+published artifact of any of them while the manifest declares `MIT OR Apache-2.0`."* Every clause of
+that is true of **`casonadams/rho`** and was written as though it had been about
+**`matthewyjiang/rho`**. It is kept because this record is the page that made that mistake and the
+honest place to say so: a harness that runs unattended for hours against a user's repo does not take
+that in, and a declared-but-unshipped licence is not something to resolve later — a sentence that
+survived being pointed at the right library.
 
 ### 4. The triggers that re-open this, written as numbers rather than as an opinion
 
-Re-litigating this ADR requires re-running the bottom command **and** meeting one of:
+Re-litigating this ADR requires re-running the commands at the bottom **and** meeting one of the four
+below. (0010-B leaves triggers 1 and 4 as numbers and rewrote trigger 3 as definitions — the same rule
+applied honestly: a number inside a trigger is a number that gets retuned, where a definition gets
+evaluated.)
 
 1. **The denominator moves.** The boundary exceeds **1% of pass wall** — i.e. above
    ~31 s of a 3095 s pass, **~100×** today's 308 ms. Realistic route: a much faster
    local model makes token time stop dominating, so re-measure the *ratio*; the ms
    will barely move.
 2. **The seam stops being honoured.** pi's RPC drops or changes one of the six rows
-   in the inventory table (4 commands, 40 spellings, `disposition`, `agent_settled`,
-   EOF-shutdown, `--tools`), or the compatibility budget for `src/wire.rs` stops
+   in the inventory table (4 commands, the wire-spelling rows enumerated there and
+   recounted since, `disposition`, `agent_settled`, EOF-shutdown, `--tools`), or the
+   compatibility budget for `src/wire.rs` stops
    being absorbable. At that point the engine question is forced, and it is forced
    by pi, not by either candidate.
 3. **A `rho` becomes adoptable as a dependency** — the sentence as filed said
    **"rho becomes adoptable as a dependency"**, singular, and it took an epic to learn that there
    are two libraries that answer to that name and that the trigger has to be run against each of
-   them. It is a maintenance test and not a
-   benchmark. It has four conditions — a licence in the published artifact, more than one
-   human carrying the repo, twelve months of history, and a documented settle/turn-complete
-   signal looprs can key a loop on — and **the definitions behind all four, and the score
-   for both libraries that answer to the name `rho`, live in
-   [ADR-0010 trigger 3 as testable metrics](0010-trigger-3-dependency-maintenance-metrics.md)**:
-   the denominator behind "share of commits", whether a drive-by commit counts toward the
-   ≥2, which clock the twelve months run on, and the five sub-tests that make "a documented
-   settle signal" mean *a loop advance can be keyed on it* rather than *the spelling exists*.
-   This page deliberately carries no numbers for this trigger, and no `Today: …` row — the
-   four it used to print were measured against the wrong library, and rule 7 below is why
-   they are not simply replaced with four new ones. **Re-score it rather than re-argue it:**
-   `python3 spikes/dependency_maintenance_metrics.py` reads every input off the public record
-   in seconds — no build, no model call, no endpoint — and prints one verdict per definition
-   per candidate with the URL each number was read from, plus the earliest date a failed row
-   can next be worth re-running.
+   them. It is a maintenance test and not a benchmark. **As amended, this trigger is a pointer and a
+   rule: it carries no number, no date and no verdict of its own.**
+
+   *What it asks* is defined once, in
+   [ADR-0010 trigger 3 as testable metrics](0010-trigger-3-dependency-maintenance-metrics.md) — four
+   definitions, each with the convention that makes it falsifiable rather than arguable: the
+   denominator behind "share of commits", whether a drive-by commit counts toward the ≥2, which clock
+   the twelve months run on, and the five sub-tests that make "a documented settle signal" mean *a
+   loop advance can be keyed on it* rather than *the spelling exists*.
+
+   *What the answer is* is printed, per library, by
+   [`spikes/dependency_maintenance_metrics.py`](../../spikes/dependency_maintenance_metrics.py) →
+   [`spikes/results/dependency-maintenance-metrics.log`](../../spikes/results/dependency-maintenance-metrics.log):
+   one verdict per definition per candidate, each with the URL its number was read from, plus the
+   earliest date a failed row can next be worth re-running. Seconds to run, no build, no model call,
+   no endpoint. **Evaluate it; do not re-derive it, and do not argue with it in prose** — the argument
+   this trigger used to invite was about definitions, and the definitions are now written down.
+
+   The rules that make it a test:
+
+   * **A conjunction.** All four definitions must PASS, for the library named in the proposal, on the
+     date the capture printed. One passing row is not a trigger, and a row that passes for one library
+     says nothing about the other.
+   * **`not measured` is never a pass.** A leg that could not read its input prints that and can never
+     print PASS; a run with no network exits non-zero, so silence is never read as a verdict.
+   * **No `Today: …` line is ever added back to this page.** The four this record used to print were
+     measured against the wrong library, and a dated verdict in prose is a sentence with an expiry
+     date nobody set. Rule 7 below is why they are not simply replaced with four new ones.
+   * **A row moves in the capture or not at all.** A licence file that exists upstream but is not in
+     the published artifact is not a pass; a terminal event that exists but whose delivery the
+     library's own contract disclaims is not a pass; a second maintainer has to show up in the public
+     attribution record, not in a sentence in a README.
+   * **Meeting it re-opens the decision; it does not answer it.** The price against looprs' own six
+     inventory rows is still owed — see the table above, and forbids 1 about which ticket gets
+     written next.
+
+   The fourth definition is five sub-tests rather than one for a reason this repo paid for twice: a
+   settle signal can be named, published and prose-documented and still not arrive on the paths a loop
+   needs — and, as the footprint capture showed on the *right* library, can arrive and still be the
+   wrong thing to advance on. S4 (is it on the stream the host reads) and S5 (does it arrive on every
+   path a run can end) exist for exactly that gap; a proposal that satisfies the first three sub-tests
+   has not met this trigger.
 4. **Passes become concurrent.** The boundary is priced per pass because looprs spawns
    one child per pass. If the loop ever runs N children at once on a constrained
    machine, re-measure: the cost is 299 ms × N of wall and 122 MiB × N of RSS, and the
-   second is the one that bites. (`casonadams/rho` in process is 84 MiB per §3's embed arm, so the
-   memory argument
-   for sharing one engine is real and belongs to whoever builds concurrency. `rho-sdk`'s own
-   embed arms measured the RSS level and the kernel peak per arm in the
-   [`matthewyjiang` capture](../../spikes/results/matthewyjiang-surface-cost.log); that is the
-   number a concurrency proposal gets compared against, not the 84 MiB.)
+   second is the one that bites.
+
+   (`casonadams/rho` in process is 84 MiB per §3's embed arm — that library's number, for that
+   library. **The `rho-sdk` half of this row is measured now, not extrapolated**:
+   [`spikes/rho_footprint_cost.py`](../../spikes/rho_footprint_cost.py) →
+   [`spikes/results/matthewyjiang-footprint-cost.log`](../../spikes/results/matthewyjiang-footprint-cost.log)
+   prices it in the shape looprs would use — one child-process baseline, one host-side baseline, N
+   children against N sessions against N runtimes, and the box's own memory ceiling as the
+   denominator. Its memory rows are written as *host plus added*, which is the only honest pairing
+   when one number is a separate process' resident set and the other is bytes joining a process that
+   was already resident. It also prices the term §3 never did: memory a long pass grows into and does
+   not give back, which a per-pass child that dies never pays, and it closes the boot question — an
+   embedded boot is not free, it is ~free, and it is the same order of a pass as the child's, so the
+   latency leg of this decision does not need a third hearing whoever wins the engine argument.
+   A concurrency proposal gets compared against that capture, not against the 84 MiB, and not against
+   the candidate's own startup/RSS chart, which measures a CLI process and not the shape looprs would
+   run.)
 
 ### 5. Phase 2 (`workspace-bt8`) is closed unworked — the record of what "no" declined to build
 
@@ -442,7 +694,7 @@ check prints which rule it applied. Note that the enforcement list was corrected
 `--gate` carried only the casonadams set until workspace-8jk.2, which is why a
 `rho-sdk` dependency passed it; the record's own identity and §3 attribution are
 amended by workspace-8jk.7 (naming, every page that carries a claim) and
-workspace-8jk.8 (§3's rows and decision 3, re-derived). A rule that lives only in a
+workspace-8jk.8 (§3's rows, the six-row inventory, decision 3 and trigger 3, re-derived). A rule that lives only in a
 decision record is re-litigated by the next person with a benchmark; one that fails a gate is not — provided the gate
 names the right crate, which is what `dep_audit.py --self-test` now checks on every run
 of this step.
@@ -469,6 +721,11 @@ the full text of the costing.
 * Anyone who wants to try either `rho` library again spends one command
   (`LOOPRS_SPIKE_RHO_ID=matthewyjiang` or `=casonadams`) and a cold build, not a
   re-argument.
+* Whether either library is *adoptable* is a command too, and a cheap one:
+  `spikes/dependency_maintenance_metrics.py` re-scores both against the written definitions in
+  seconds, and `spikes/rho_inventory_rescore.py` re-scores the six inventory rows against the
+  published artifact — so both halves of the ban can be checked for staleness without a build, a
+  model call or an opinion.
 
 **What this makes harder, honestly.**
 
@@ -506,7 +763,11 @@ the full text of the costing.
    stays priced without being shipped.
 3. **Do not cite latency for this decision after reading the table.** If someone
    re-litigates on "overhead", the answer is 308 ms, 415 ms at p95, out of 3095 s, and
-   the capture is two clicks away.
+   the capture is two clicks away. **0010-B leaves this rule untouched, on purpose:** it is the one
+   claim in this record that was engine-agnostic from the start, and re-measuring it against the right
+   library confirmed it rather than denting it — an embedded boot is two orders of magnitude smaller
+   than the child's, and the child's own is a hundredth of one percent of a pass, so "faster" is not
+   an argument either candidate has.
 4. **Do not let the typed `bd` tools grow a looprs-side vocabulary.** No derived
    statuses, no re-interpreted board states. The schema mirrors `bd` argv and returns
    what `bd` said — `bd`'s own read stays the one honest read (ADR-0007).
@@ -514,17 +775,36 @@ the full text of the costing.
    in-process engine. The seam is the reason the process contract is testable at all;
    if an engine switch is ever proposed, it has to *add* a fake seam, not ask for
    this one's removal.
-6. **Do not treat the licence gap as a formality.** "Cargo.toml says MIT OR
-   Apache-2.0" is not a licence grant, and nothing upstream — `casonadams/rho`'s three open
-   issues are a release bot and two feature suggestions — is about fixing it. Nor
-   does an upstream fix change the other conditions of §4's trigger 3 — and "fix"
-   now means *the scored row moves*, in the capture, not a page remembers it: the
-   licence a consumer receives is the one inside the artifact of the crate they link,
-   and the intended library has that gap too
+6. **Do not treat the licence gap as a formality — and say *which* library's gap you mean, because
+   they are two different gaps.** For **`casonadams/rho`**: no `LICENSE` at the repo root, no licence
+   file in any of the three published artifacts, and GitHub's detector reads NONE while `Cargo.toml`
+   declares `MIT OR Apache-2.0`; its three open issues are a release bot and two feature suggestions,
+   none of them about this. For **`matthewyjiang/rho`**: the repo *does* have a root `LICENSE`,
+   GitHub reads MIT and the manifest says MIT — and the published artifact of `rho-sdk` (and of
+   `rho-providers`) contains no licence text; the only artifact in that workspace that ships a
+   `LICENSE` is the CLI bin crate, and a sibling crate's file does not travel into another crate's
+   artifact. Two shapes, one defect: **the licence a consumer receives is the one inside the artifact
+   of the crate they link**, and a manifest string is a declaration, not a grant. "Fix" means *the
+   scored row moves in the capture*, not that a page remembers it, and an upstream fix here would not
+   move the other three rows of §4's trigger 3 either
    ([trigger 3 as testable metrics](0010-trigger-3-dependency-maintenance-metrics.md)).
 7. **Do not retype these numbers into another page.** Link here, or link the capture.
    `docs_check.sh` catches contradictory knob defaults; it cannot catch a number
-   quoted twice and retuned once.
+   quoted twice and retuned once. This amendment obeys its own rule: §3-B and the re-scored inventory
+   carry claims and links, not copied measurements.
+8. **Do not re-litigate a dependency with a command that cannot be pointed at it.** The defect that
+   put this record's §3 numbers on the wrong library was not only a misreading; it was a re-runnable
+   script whose subject was a literal in the source, so re-running it reproduced the wrong answer
+   *with the authority of a fresh measurement*, header line included. A re-litigation command whose
+   subject is hardcoded is not a re-litigation command. The fix is not optional in either direction:
+   the identity of the thing being priced is a **parameter** (`--id` / `LOOPRS_SPIKE_RHO_ID`, `--list`
+   to print the candidates), and the identity is **printed in the capture header** from what the run
+   actually queried — `owner/repo` and every `crate@version` it measured — not typed into the source
+   (workspace-8jk.1). And a prohibition is only as good as the check that enforces it: the deny-list in
+   `scripts/dep_audit.py --gate` has to name the crate the decision is about, which it did not for a
+   whole epic, so `rho-sdk = "5"` walked through the gate whose only job was to fail it while the
+   check printed the clause forbidding it (workspace-8jk.2; `--self-test` now asserts the *reason
+   string* per banned name per dependency form).
 
 ---
 
@@ -545,18 +825,32 @@ gets re-run by someone else who assumes they were covered:
   or fork, which is a larger commitment than the ADR is deciding on. If §4 trigger 3
   ever fires, this becomes the first thing worth measuring, and it should be measured
   against the shipped extension, not against nothing.
-* **Memory under concurrency.** One child per pass is looprs' shape, so the
-  122 MiB-per-child figure has no multiplier today. The comparison to `casonadams/rho`'s 84 MiB
-  *in-process* only becomes interesting if that shape changes; trigger 4 says what to
-  re-measure when it does.
+* **Memory under concurrency — measured since, by 0010-B.** One child per pass is looprs' shape, so
+  the 122 MiB-per-child figure had no multiplier in the original record. It has one now:
+  [`spikes/rho_footprint_cost.py`](../../spikes/rho_footprint_cost.py) measures N children against N
+  sessions against N runtimes and extrapolates to the box's own ceiling. Trigger 4 points at it. What
+  remains unmeasured here is looprs *with* concurrency, not either engine's per-unit cost.
+* **The transport half of an embedded engine.** `rho-sdk` ships no model client at all — its providers
+  are a test double, and the real clients are a separate crate — so every embedded row in every capture
+  here measures a runtime plus a provider written by a spike, and carries **no token accounting and no
+  provider-transport cost from either library's shipped code**. "Embed `rho`" is a crate composition;
+  the composition is not priced, because the ticket was about whether the runtime could be a
+  dependency, and it is the first thing a real proposal would owe.
+* **The artifact a user would actually download.** Upstream's own release profile (`opt-level="s"`,
+  fat LTO, one codegen unit, stripped) was OOM-killed twice on the 8 GiB box even at one build job,
+  so the CLI rows in the footprint capture come from a thin-LTO build, named in the leg that used it.
+  The shipped-profile binary is a different artifact and is not measured here.
 * **A macOS leg.** The repo's earlier captures were taken on Darwin; this one was
   taken on the Linux container the loop actually runs in, and says so in its header.
   Absolute ms differ per kernel; the *ratio* is the finding and it is four orders of
   magnitude, which is not kernel-sensitive.
 * **Long-run stability of a shared engine.** An embedded engine that leaks or wedges
   after N passes is a different class of risk from a child that does, because there is
-  no `kill_on_drop` and no blast wall. That was argued from ADR-0002 and ADR-0006, not
-  measured, and it is the argument most likely to be re-litigated.
+  no `kill_on_drop` and no blast wall. Part of that is measured now — the footprint capture's history
+  arm grows one session across dozens of runs and shows what a live host keeps, and the surface
+  capture's wedged-reader and unanswered-approval arms are real wedges — but the original claim, about
+  a *pass count* an embedded engine survives without intervention, is still argued from ADR-0002 and
+  ADR-0006 rather than measured, and it is the argument most likely to be re-litigated.
 
 ---
 
@@ -564,8 +858,9 @@ gets re-run by someone else who assumes they were covered:
 
 - **Date:** 2026-10-12
 - **Ticket:** workspace-8jk.7, under the epic that found the mis-identification
-  (workspace-8jk). **workspace-8jk.8** owns the separate, larger job: re-deriving §3's rows and
-  decision 3 against `rho-sdk`. This section is the naming sweep only.
+  (workspace-8jk). The separate, larger job — re-deriving §3's rows and decision 3 against `rho-sdk` —
+  was workspace-8jk.8's, and it landed as [amendment 0010-B](#amendment-0010-b--the-re-measurement-workspace-8jk8)
+  below; this section is the naming sweep only.
 - **Amends:** the identity of every `rho` mentioned in this record, and in the pages that repeat
   its conclusion — `docs/README.md`, `docs/testing.md`, `docs/guide/contributing.md`,
   `spikes/README.md`, `spikes/rho_surface_cost.py`, `spikes/dependency_maintenance_metrics.py`,
@@ -643,6 +938,101 @@ table in `docs/README.md`, and the checking of it — who, and when, plus what a
 about itself — in
 [contributing → assessing a third-party dependency](../guide/contributing.md#assessing-a-third-party-dependency).
 
+## Amendment 0010-B — the re-measurement (workspace-8jk.8)
+
+- **Date:** 2026-10-12, same day as 0010-A, and deliberately kept separate from it: one amendment was
+  a naming sweep and could be checked by reading, this one is a set of measurements and can only be
+  checked by running.
+- **Ticket:** workspace-8jk.8, the last ticket of the epic that found the mis-identification
+  (workspace-8jk), and the only one of them that changes a verdict's *reason*. Its dependencies are the
+  re-measurement spike (workspace-8jk.4), the EMBED leg against `rho-sdk` (workspace-8jk.3), the
+  contract-fit spike (workspace-8jk.5), the metric-definition memo (workspace-8jk.6), the gate fix
+  (workspace-8jk.2), the parameterised spike driver (workspace-8jk.1) and the embedded footprint
+  measurement (workspace-8jk.11).
+- **Amends:** §3's rows (retained, labelled, and now paired with `rho-sdk`'s own in §3-B), the six-row
+  dependency inventory (re-scored row by row against `rho-sdk`), decision 3 (restated: what the
+  re-measurement withdrew, what it confirmed, and what the ban now rests on), trigger 2's spelling count,
+  trigger 3 (rewritten as definitions plus a rule, with no number of its own), trigger 4 (the
+  `rho-sdk` half is measured), forbids 3, 6, 7 and new forbid 8, and the record's
+  *Measured by* / *Reproduced by* lines. Outside this file it updates
+  [`docs/README.md`](../README.md)'s one-line summary of this record,
+  [`docs/testing.md`](../testing.md)'s description of the gate so it no longer describes the old
+  blocker, [`spikes/README.md`](../../spikes/README.md)'s index rows for the two captures this amendment
+  reads, and [the trigger-3 memo](0010-trigger-3-dependency-maintenance-metrics.md), whose
+  "workspace-8jk.8 has not done it yet" note is now in the past tense.
+
+**What was wrong, stated as a defect rather than as an apology.** This record priced, and then banned,
+**the wrong library**. 0010-A fixed which words pointed where; this one fixes what was measured. The
+§3 table and the blocker paragraph in decision 3 were read off `casonadams/rho`'s artifacts — crates
+`rho`, `rho-engine`, `rho-harness-core`, the crate set
+[crates.io/crates/rho](https://crates.io/crates/rho) serves — while the assessment had been requested
+against `matthewyjiang/rho`'s `rho-sdk`, a different crate set with a different API, published by
+strangers to each other. A third unrelated project, `pyrex41/rho`, publishes the `rho-core` /
+`rho-tools` pair on crates.io and was in no sentence in this record until it had to be named as the
+thing the gate deliberately does not ban. The mis-identification survived a re-runnable spike because
+the spike's own header asserted the wrong owner too — see forbid 8.
+
+**What the re-measurement found, including where it went the other way.** Run against the library it
+was about, the candidate turned out to be **cheaper to link than looprs is** — smaller graph, smaller
+binary, faster build, no exact pins, `unsafe` forbidden in its own source — so the dependency-weight
+half of §3 does not survive, and this record says so rather than quietly dropping those rows. The rows
+that survived did so on their own numbers and not on §3's: the licence gap is still there but has a
+different shape (the repo has a licence, the *crate a consumer links* does not), the bus factor is
+still one human on a bigger and busier repo, history is still nowhere near twelve months, and the
+settle signal — the row that changed the most in the candidate's favour — is a real, named,
+documented event set that the library's own contract disclaims delivering on every path. Trigger 3 is
+**NOT MET** by either library, on none of the four definitions, and so the decision stands on a
+justification this amendment had to write rather than inherit.
+
+**What does not change, and why** — said explicitly, so that a correction is not read as a wholesale
+reversal by the next person to find this page:
+
+* **§1's boundary cost and its pass denominator.** Measured on looprs and pi, with no candidate in
+  either number, so no re-measurement of a candidate can touch them. The claim "embedding the engine is
+  a latency win" stays dead on exactly the evidence that killed it, and now on a second measurement
+  too: the embedded boot is *two orders of magnitude smaller* than the child's boot, and the child's
+  own is a hundredth of one percent of a pass, which is the wrong order of magnitude for an argument.
+  Nothing in the identity correction resurrects it.
+* **§2 and decision 2: the typed `bd` tools.** Shipped on the pi side, priced in prompt bytes per
+  pass, and independent of engine choice in both directions — the engine buys none of the win, and the
+  win costs the same whichever engine is under it. Nothing about which `rho` was which changes a
+  TypeBox schema or a `--tools` allowlist.
+* **The inventory list itself.** Its six rows describe pi and looprs, not a candidate; they are the
+  checklist every engine gets scored against, and 0010-B *scored* them rather than editing them. One
+  row's count was corrected — the spelling count this row first carried was a scrape artifact, not a
+  count of the table, and the corrected figure is in the row itself rather than restated here — which
+  is a fix to the list's own accuracy, not a change to what the list is for.
+* **Decision 1, decision 5, and the ban.** The engine stays a child, the parked epic stays closed
+  unworked, and neither `rho` family enters `Cargo.toml`. The scope of the prohibition never moved
+  after the gate fix made it two families; what moved is the evidence underneath it.
+
+**The reproducibility defect, recorded as the lesson it is.** A re-litigation command whose subject is
+hardcoded in the script is not a re-litigation command: it re-runs, it prints a header asserting an
+identity, and it converts a wrong citation into fresh evidence for the wrong citation. The fix is
+named in forbid 8 and already landed — **identity as a parameter** and **identity printed by the run,
+not typed by the author** (workspace-8jk.1, `spikes/rho_surface_cost.py`), and **the gate's deny-list
+naming the library the decision is actually about**, with the ban tested on its reason string rather
+than its exit code (workspace-8jk.2, `scripts/dep_audit.py --self-test`, wired into
+`scripts/check.sh`). Both are checked on every CI run, so neither is a promise this page has to keep.
+
+**And the part worth saying out loud about the process.** The defect here was **referential**: a
+number filed against the wrong name. The process that produced the numbers was the right process and
+is the reason this amendment was possible at all — measure the boundary instead of assuming it, test
+the cheap arm before the expensive one, price the unknown supply chain instead of reading its README,
+and write the triggers as tests. Two of the three claims this epic was handed died on that evidence
+and are still dead; the third was answered with a real measurement of a real library that just was not
+the library anyone had asked about. A record that measures everything except *what it is measuring* is
+the failure mode, and the durable fixes are the naming rule
+([contributing → assessing a third-party dependency](../guide/contributing.md#assessing-a-third-party-dependency)),
+the parameterised driver, the tested gate and the definitions behind trigger 3 — all of which exist
+now, and none of which required this page to be right the first time.
+
+**What this amendment deliberately does not do.** It fires no trigger; a corrected citation is not new
+evidence about a candidate's adoptability, and §4 says what would be. It prints no new number in §3-B
+or in the inventory table, per forbids 7 — those two tables are claims plus links. It does not delete
+the `casonadams/rho` capture, §3's table, or decision 3's original sentence, all of which are kept and
+labelled, because the point of a decision record is that you can see what was believed when.
+
 ---
 
 ## How to re-litigate this in one command
@@ -667,6 +1057,18 @@ python3 spikes/bd_tools_cost.py                   | tee spikes/results/bd-tools-
 # `rho`, scored against the written definitions in seconds: no build, no model
 # call, and every number printed with the public record it was read from
 python3 spikes/dependency_maintenance_metrics.py  | tee spikes/results/dependency-maintenance-metrics.log
+# the six-row dependency inventory, re-scored row by row against the library the
+# decision is about (matthewyjiang/rho, crate `rho-sdk`) — verdict and first-order
+# cost per row, every cited identifier grepped out of the published artifact so a
+# stale verdict fails the run. Seconds, no build, no model call.
+python3 spikes/rho_inventory_rescore.py           | tee spikes/results/matthewyjiang-inventory-rescore.log
+# the memory/concurrency case trigger 4 left unpriced: the child shape, the host
+# shape, the candidate as a CLI and embedded, N at once, and the box's own ceiling
+# as the denominator. Needs the candidate CLI built (`LOOPRS_SPIKE_RHO`); the
+# driver's own docstring names the knob every arm reads, and every row in the log
+# names the instrument that produced it.
+LOOPRS_SPIKE_RHO=/path/to/rho LOOPRS_SPIKE_CLI_MODEL=1 python3 spikes/rho_footprint_cost.py \
+  | tee spikes/results/matthewyjiang-footprint-cost.log
 ```
 
 Each prints `not measured` with the reason when its prerequisite is missing — no

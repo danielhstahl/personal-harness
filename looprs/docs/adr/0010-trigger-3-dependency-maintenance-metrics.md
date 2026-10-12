@@ -205,8 +205,10 @@ thing a trigger that is meant to survive its author can be made of.
   percent of a pass, the blast wall, the persistence and corpus rows, the wire-vocabulary re-derivation —
   are not trigger-3 rows and no row here touches them. Trigger 3 is a *maintenance* test and always was;
   meeting all four rows would re-open the question, not answer it.
-- **It does not amend ADR-0010's §3 or decision 3**, which carry the wrong library's numbers. That is
-  workspace-8jk.8's job; this page supplies the definitions and the score it links to.
+- **It did not amend ADR-0010's §3 or decision 3**, which carried the wrong library's numbers. That
+  was workspace-8jk.8's job, and it has landed as
+  [ADR-0010's amendment 0010-B](0010-pi-rpc-child-vs-embedded-rho-engine.md#amendment-0010-b--the-re-measurement-workspace-8jk8);
+  this page supplies the definitions and the score that record now links to rather than restating.
 - **Its inputs are dated and third-party.** GitHub's contributor attribution is GitHub's (email→account,
   default branch, capped at 500 contributors); crates.io's version dates are crates.io's; the
   documentation scan reads the README plus up to 30 `docs/**.md` pages (`LOOPRS_DOCS_MAX`) from the

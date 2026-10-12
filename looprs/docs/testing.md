@@ -42,7 +42,12 @@ multi-process, three-backend TUI without a model, a board, or a terminal.
    pulled in transitively ([ADR-0010, decision 3](adr/0010-pi-rpc-child-vs-embedded-rho-engine.md#decision)).
    The engine decision is therefore a failing build rather than a page nobody
    re-reads; the reasoning and every number behind it live in that ADR and are not
-   restated here, per its own "What this forbids" 7. Two things the check states
+   restated here, per its own "What this forbids" 7 — and since that record's
+   amendment 0010-B, "decision 3" means the **scored** blocker: four definitions
+   run per library by `spikes/dependency_maintenance_metrics.py`, written up in
+   [the trigger-3 memo](adr/0010-trigger-3-dependency-maintenance-metrics.md), with
+   the crate-weight objection the original paragraph leaned on withdrawn as the wrong
+   library's measurement. Two things the check states
    rather than assumes: the ban is **project-shaped** — matched on those exact crate
    names, never on a `rho-` prefix, so `pyrex41/rho`'s `rho-core` or `rho-tools` — a
    third, unrelated project that merely shares the prefix — is allowed, and the report
