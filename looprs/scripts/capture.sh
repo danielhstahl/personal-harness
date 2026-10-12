@@ -18,6 +18,12 @@
 # fails — a control run is *supposed* to fail, and you want the log either way.
 # `scripts/docs_check.py` reads the `N/M checks passed` line out of these files;
 # a count in prose that matches none of them is a gate failure.
+#
+# This header says *where* a number came from. A capture of a run that could have
+# priced more than one thing has to say *what* it priced, and it has to come from
+# the driver: owner/repo plus every artifact@version the run resolved, printed
+# from what it queried, not from a literal in the source. Rule and who checks it:
+# docs/guide/contributing.md, "Assessing a third-party dependency" (workspace-8jk.10).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

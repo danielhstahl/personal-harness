@@ -294,7 +294,10 @@ This is the expensive one, and the table is where the cost lands.
 
 1. Copy the shape of `docs/adr/0007-kanban-board.md`: title, status, date,
    ticket, Context, Decision, Consequences, a "what this forbids" list, and
-   measured numbers with the log or spike that produced them.
+   measured numbers with the log or spike that produced them. If the record
+   *prices* a third-party dependency it also carries a **Subjects** line naming
+   `owner/repo` plus the artifacts it measured —
+   [assessing a third-party dependency](#assessing-a-third-party-dependency).
 2. Number it next (`0008`, `0009`, …). Do not renumber existing records; links
    are by number.
 3. Add it to `docs/SUMMARY.md` and to the table in
@@ -313,6 +316,67 @@ This is the expensive one, and the table is where the cost lands.
    skimmed past — which is how every table in this corpus shipped once. The build
    now refuses such a page instead of publishing it (ADR-0008's amendment names the
    ADR whose table this orphaned mid-page).
+
+## Assessing a third-party dependency
+
+Three rules for the thing that *prices* a dependency: the ticket that asks for the price,
+the spike that takes it, the capture that carries it, the ADR that quotes it. They exist
+because of one defect, told in full in
+[ADR-0010's amendment 0010-A](../adr/0010-pi-rpc-child-vs-embedded-rho-engine.md#amendment-0010-a--which-rho-workspace-8jk7):
+a ticket asked what "the rho library" cost, whoever ran it resolved that to a different
+project than the requester had in mind, and the numbers went into a decision record whose
+own header made the substitution invisible. A bare package name is the least specific way
+to name a dependency: the `rho` on crates.io is one project's, `rho-core`/`rho-tools` are a
+second project's, and the crates the request actually meant — `rho-sdk`, `rho-providers`,
+`rho-coding-agent` — belong to a third, under a third naming scheme. The one-sentence
+naming rule lives in
+[the blockquote above the decision-record table](../README.md); this page is the process
+half of it — who checks, and when (workspace-8jk.10).
+
+1. **Naming — checked when the ticket or record is written, by whoever writes it.** A
+   beads ticket, ADR or spike that prices a dependency carries `owner/repo` **plus the
+   published artifact name(s)** in its title or first line, and never relies on a bare
+   package name. A bd ticket is a one-line title plus a body, so the title is where this
+   has to land: *"Price matthewyjiang/rho (`rho-sdk`, `rho-providers`, `rho-coding-agent`)
+   as looprs' engine"*, not *"price the rho library"*. Where the repo name and the artifact
+   names differ, both go down, one per artifact: `matthewyjiang/rho` — `rho-sdk`,
+   `rho-providers`, `rho-coding-agent`. A record gets a **Subjects** bullet for it
+   ([the ADR template](../adr/0008-docs-site.md#6-the-adr-template)), because that is the
+   line a reader skims first. The half no machine can check — *is this the artifact the
+   requester meant?* — is checked by the person who files the request, at the moment they
+   file it, and again at the close, which names the `owner/repo` the quoted numbers were
+   taken from.
+2. **Self-identifying captures — checked when a capture is committed, by whoever commits
+   it.** Any driver that *can* price more than one thing prints the identity of what it
+   measured in its own capture header, **derived from what it actually queried**: the
+   target id, the `owner/repo`, every `crate@version` the run resolved. A subject typed as
+   a literal in the source is not a fact about the run; it is a claim about the source,
+   and it survives being wrong — which is how one mis-identification outlived a
+   re-runnable spike. The reference shape is the `identity:` / `subject:` / `crates
+   measured by this run` block
+   [`spikes/rho_surface_cost.py`](../../spikes/rho_surface_cost.py)
+   prints ahead of its first number: point that driver at another target and the header
+   changes, and a run that cannot resolve what it is asking prints `not measured` instead
+   of a number. A capture whose header cannot be regenerated from what the run queried is
+   not evidence; do not commit it.
+3. **Denominators — checked when a number is quoted, by whoever quotes it.** A
+   supply-chain number names its denominator: human commits vs all commits, shipped graph
+   vs dev graph, published artifact vs repo working tree. Each of those three has already
+   produced one wrong number in this repo's history — bot commits moved a real second
+   maintainer under a share-of-commits bar for free, a ticket's dependency list was a
+   *dev*-dependency list, and a stripped candidate artifact was compared against an
+   unstripped looprs one. The numbers themselves stay in the captures that measured them
+   (ADR-0010 forbids 7); the rule here is that a number arrives with its denominator
+   attached, because a number without one is a number the next person quietly re-tunes.
+
+What is already machine-checked, so nobody has to re-derive it: `scripts/capture.sh`
+writes the provenance header (rev, dirty flag, command) that makes a capture
+attributable at all; `docs_check.py` fails a page that quotes a check count or a size no
+committed capture prints; and `scripts/dep_audit.py --gate` fails a crate ADR-0010 keeps
+out before its numbers can matter. The `docs_check` lint for a bare `rho` in a
+claim-bearing sentence is filed and deliberately unbuilt (workspace-8jk.12) for the
+reason written there: a naming lint with false positives on looprs' own identifiers gets
+disabled inside a week, which is worse than no lint.
 
 ## The testing ladder (a map, not a duplicate)
 
@@ -334,6 +398,7 @@ rung a change has to touch**:
 | memory / cost claims | `src/measure.rs` (needs `LOOPRS_MEASURE_CORPUS`), `spikes/*.py` | `cargo test -- --ignored` |
 | anything behind a cargo feature | the **same** suite over that build; the seam is not allowed to change shape | `cargo test --features notify` |
 | a dependency's right to be in the manifest | `scripts/dep_audit.py` — named in `src/`, or answered at its own line; and never a crate from either `rho` family ADR-0010 keeps out (casonadams/rho or matthewyjiang/rho) | `python3 scripts/dep_audit.py --gate` (and `--self-test` for the ban's own regression test) |
+| an assessment that **prices** a third-party dependency | the capture self-identifies what it measured — `owner/repo` plus every `crate@version` the run resolved, printed from the run and not from a literal — and every number names its denominator | `python3 spikes/rho_surface_cost.py --list` (the selectable targets), then `LOOPRS_SPIKE_RHO_ID=<id> python3 spikes/rho_surface_cost.py \| tee spikes/results/<id>-surface-cost.log`; read the capture's own header back before quoting a row out of it ([the rule](#assessing-a-third-party-dependency)) |
 | the whole gate | `./scripts/check.sh` — fmt, clippy `-D warnings` and tests in **both** feature configurations, dead-code audit, dependency audit, docs gate | `./scripts/check.sh` |
 | docs only | `./scripts/docs_check.sh` | same, or on its own |
 
@@ -401,8 +466,10 @@ is re-litigated by the next person with a benchmark; a red gate is not.
 **The prose-side of the same rule.** A page, ADR or spike that *prices* a third-party
 dependency names it by `owner/repo` **plus the published artifact name** — `matthewyjiang/rho`,
 crate `rho-sdk`, not "`rho`" — at minimum in the capture header. That rule is written once, in
-[the blockquote above the decision-record table](../README.md), and this page points at it rather
-than restating it; ADR-0010's amendment 0010-A is what it was written for.
+[the blockquote above the decision-record table](../README.md), with its process half — who checks
+it, and when — in [assessing a third-party dependency](#assessing-a-third-party-dependency);
+this page points at both rather than restating them. ADR-0010's amendment 0010-A is what they were
+written for.
 
 ## House style
 

@@ -171,6 +171,9 @@ the eighth and the ninth are the same shape rather than approximately the same s
 - **Widens / Amends:** <any prior ADR's rule this extends, quoted>
 - **Measured by:** <the spike script and the committed log that produced the
   numbers used below; if nothing was measured, say "not measured, because X">
+- **Subjects:** <only when the record *prices* a third-party dependency: its
+  `owner/repo` plus the published artifact name(s) and version(s) measured —
+  `matthewyjiang/rho`, crate `rho-sdk` 5.9.0 — and nothing else is a subject>
 
 ## Context
 <what is true, what is hard, and what the reader needs to weigh. Numbers here.>
@@ -191,6 +194,15 @@ Rules the template carries:
 * **A claim with no measurement behind it is worse than no claim.** Either cite the
   spike/log or write "not measured, because X". The second is acceptable. Silence
   is not.
+* **A record that prices a third-party dependency names its Subjects** — `owner/repo`
+  plus the published artifact, never a bare package name — because a claim written
+  against a bare name can be attached to whichever project the next reader has in
+  mind, which is the defect
+  [ADR-0010's amendment 0010-A](0010-pi-rpc-child-vs-embedded-rho-engine.md#amendment-0010-a--which-rho-workspace-8jk7)
+  exists to record. The rest of that rule — the capture that self-identifies, the
+  denominator every number carries, and who checks each — is
+  [contributing → assessing a third-party dependency](../guide/contributing.md#assessing-a-third-party-dependency)
+  (workspace-8jk.10), which is where it is written once.
 * **Amend, do not rewrite.** An amendment is a dated section that cites the ticket
   and states precisely which claim changed and which stand (see ADR-0007's amendment
   to §3's "one read per tick"). A rewritten ADR destroys the record of what was

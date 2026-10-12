@@ -4,7 +4,11 @@
 - **Status:** Accepted — 2026-10-12
 - **Amended:** 2026-10-12 by [workspace-8jk.7](#amendment-0010-a--which-rho-workspace-8jk7) — naming
   only. Every mention of `rho` in this record that carries a claim now says *which* library it
-  carries it about. No number, verdict or prohibition changed.
+  carries it about. No number, verdict or prohibition changed. The durable process fix that came
+  out of the mis-identification — dependency assessments name `owner/repo` plus the artifact, and
+  captures self-identify what they measured — is
+  [contributing → assessing a third-party dependency](../guide/contributing.md#assessing-a-third-party-dependency)
+  (workspace-8jk.10).
 - **Epic:** workspace-eqn (Assessment: keep `pi --mode rpc` child, or embed the rho Rust SDK as
   looprs' engine — the epic's own wording, and the SDK it meant is `matthewyjiang/rho`'s `rho-sdk`)
 - **Subjects (pinned, because this record is the page that got them confused):** three unrelated
@@ -605,6 +609,16 @@ own header asserted the wrong owner/repo too.
   restating it. The process version of that rule (who checks it, and when) is workspace-8jk.10's
   to write, and is deliberately not duplicated here.
 
+**Added when that process rule landed (workspace-8jk.10).** It landed, and it is not duplicated
+here either: the durable fix is
+[contributing → assessing a third-party dependency](../guide/contributing.md#assessing-a-third-party-dependency)
+— name the `owner/repo` and the published artifact in the first line of anything that prices a
+dependency; let a capture print what it actually queried rather than a literal typed into the
+source; give every supply-chain number its denominator. That section is where it is written once;
+it also added the **Subjects** line to
+[ADR-0008 §6's ADR template](0008-docs-site.md#6-the-adr-template) and the testing ladder's row for
+an assessment that prices a dependency.
+
 **What stands, unchanged:** every measurement in this record and in its captures; the 0.0100%-
 of-a-pass denominator and what it kills; decision 1 and decision 2; the §5 record of the epic closed
 unworked; `scripts/dep_audit.py`'s behaviour (it already banned both families after workspace-8jk.2);
@@ -623,9 +637,11 @@ committed captures, each of whose header already names its subject.
 **What would keep it fixed.** A `docs_check` step that fails a bare `rho` in a
 claim-bearing sentence in `docs/adr/*.md` and `docs/README.md` is filed as
 `workspace-8jk.12` and was deliberately not built here: a naming lint with false positives
-on looprs' own identifiers gets disabled inside a week, which is worse than no lint. The
-rule it would enforce is written once, in the blockquote above the decision-record table in
-`docs/README.md`.
+on looprs' own identifiers gets disabled inside a week, which is worse than no lint. The rule it
+would enforce is written once each: the naming sentence in the blockquote above the decision-record
+table in `docs/README.md`, and the checking of it — who, and when, plus what a capture has to print
+about itself — in
+[contributing → assessing a third-party dependency](../guide/contributing.md#assessing-a-third-party-dependency).
 
 ---
 

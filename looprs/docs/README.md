@@ -38,7 +38,7 @@ that states a default the reference contradicts.
 | [guide/wire-protocol.md](guide/wire-protocol.md) | what crosses the session/UI boundary, generated from `WIRE_INVENTORY` in `src/wire.rs`: every role, event and reason, who reads it, and what the unread records are waiting for |
 | [guide/configuration.md](guide/configuration.md) | all 23 `LOOPRS_*` variables the code reads, with defaults, values, `read in`, groups, harness-only variables, and combinations that were actually run |
 | [guide/operator.md](guide/operator.md) | where every file is written, recovery recipes, the diagnostic grep index, what to attach to a bug report, and the privacy note |
-| [guide/contributing.md](guide/contributing.md) | the module map (every file in `src/` accounted for), the end-to-end data-flow diagram, how-to recipes, the testing ladder, house style |
+| [guide/contributing.md](guide/contributing.md) | the module map (every file in `src/` accounted for), the end-to-end data-flow diagram, how-to recipes, the testing ladder, the rule for anything that *prices* a third-party dependency, house style |
 | [guide/improvement-sweep.md](guide/improvement-sweep.md) | what to do with the things you notice while writing docs: the four required elements of a finding, "file it before you fix it", no drive-by refactors on a docs branch, and `scripts/sweep_check.py` |
 | [kanban.md](kanban.md) | the beads board in the frame: what the three columns show, how tall it gets and what `+N more` means, the `LOOPRS_KANBAN` / `LOOPRS_KANBAN_ROWS` / `LOOPRS_KANBAN_POLL_MS` knobs and their defaults, what `stale` means, and how to turn it off |
 | [testing.md](testing.md) | the gate (`./scripts/check.sh`), the fakes, and the scenario index — how a stateful multi-process TUI gets tested with no network, no model and no real `bd` database |
@@ -56,8 +56,10 @@ as the same failure as a broken link, arriving later.
 > capture header. A bare project name is not an identity: three unrelated projects publish crates
 > whose names begin `rho`, and one library's numbers got recorded as another's for exactly that
 > reason ([ADR-0010's amendment 0010-A](adr/0010-pi-rpc-child-vs-embedded-rho-engine.md#amendment-0010-a--which-rho-workspace-8jk7)).
-> The process half of this rule — who checks it, and when — lives with the process-rule ticket, not
-> here.
+> The process half of this rule — who checks it, and when, plus the capture that has to
+> self-identify what it measured and the denominator every number carries — is written once
+> in [contributing → assessing a third-party dependency](guide/contributing.md#assessing-a-third-party-dependency)
+> (workspace-8jk.10), not here.
 
 | ADR | decides |
 | --- | --- |

@@ -31,6 +31,16 @@ Drop a driver under `spikes/` without a row and the gate names it; `--list-spike
 prints every driver, whether the index carries it, and which of its committed
 captures is current.
 
+> **A capture has to name what it measured.** `scripts/capture.sh` writes the
+> provenance header — rev, dirty flag, the command — and the driver adds the
+> **subject**: a driver that can price more than one thing prints the `owner/repo`
+> and every `crate@version` it *actually resolved*, ahead of its first number, as
+> [`spikes/rho_surface_cost.py`](rho_surface_cost.py) does (`identity:` / `subject:` /
+> `crates measured by this run`). A subject typed as a literal in the source is a claim
+> about the source, not about the run, and it survives being wrong. The rule, and who
+> checks it: [contributing → assessing a third-party
+> dependency](../docs/guide/contributing.md#assessing-a-third-party-dependency).
+
 | File | What it is |
 |---|---|
 | `examples/spike_bash.rs` | The harness. `spawn_pipes()` (Option A) and `spawn_pty()` (Option B) are the only per-option code; everything after that is shared. |

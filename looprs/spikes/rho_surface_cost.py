@@ -90,6 +90,13 @@ crate@version the run actually measured before any number follows. Two
 unrelated projects answer to the name `rho` here, and a third pair
 (rho-core/rho-tools) belongs to pyrex41, so a bare "rho" is not an identity.
 
+That header block is the reference implementation of the capture
+self-identification rule (workspace-8jk.10): a driver that can price more than
+one thing prints the identity derived from what it queried — target id,
+owner/repo, every `crate@version` resolved — and never a subject string typed
+into the source. Rule and who checks it: `docs/guide/contributing.md`,
+"Assessing a third-party dependency".
+
   * `matthewyjiang` — matthewyjiang/rho: rho-sdk (the embeddable runtime),
     rho-providers, rho-coding-agent (the CLI). **The library ADR-0010 was
     requested against; the default when no id is given.**
