@@ -676,10 +676,37 @@ the tempting half-measures are worth naming, because they are the ones that rot:
 | an `EngineRuntime` trait over the pi RPC transport, behaviour-preserving | a trait with exactly one implementation is §3's unbuilt door wearing a different hat: it pays the indirection in the file that ADR-0002 says is load-bearing and buys an abstraction no second implementation has ever been tested through |
 | an engine backend for either `rho` library behind `--features rho` | forbidden below, rule 2; and the default-off build of it would be compiled by nobody, which is how a feature rots |
 | porting the beads machine off `PiRpc` | the machine's control logic — `agent_settled` as the only end-of-pass signal, the serial tag, per-pass `--tools` gating — is correct and would be rewritten against an engine nothing runs |
-| an in-tree fake engine plus a transport contract suite | the shell fake is the seam every process-level test stands on; rule 5 says a second engine would have to *add* a fake, not ask for this one's removal |
+| an in-tree fake engine plus a transport contract suite | the shell fake is the seam every process-level test stands on; rule 5 says a second engine would have to *add* a fake, not ask for this one's removal. The disposition pass records the added half as **cheap** for `matthewyjiang/rho`, which ships a scripted provider as public API — and *cheap-and-additive* is a different sentence from *redundant*, which is the one this row exists to refuse; rule 5 is unchanged by it |
 | engine selection: `LOOPRS_ENGINE`, status band, docker image, docs | a knob with one valid value is a knob to be miscorrected, and it would be documented in the same pages that today say the engine is the pi child |
-| re-baselining every corpus-justified constant and generated page | the largest ticket in the set, and it is pure cost unless an engine actually changes — this repo's constants are justified by committed logs, and moving engines invalidates the logs |
+| re-baselining every corpus-justified constant and generated page | the largest ticket in the set, and it is pure cost unless an engine actually changes — this repo's constants are justified by committed logs, and moving engines invalidates the logs. **Re-priced by the disposition pass:** the switch would not even supply the logs — `rho-sdk` persists nothing unless a host writes the store — so this ticket is now a persistence-format decision *and* a re-baseline, and larger than it was filed. The finding is in the ticket's own text, with the capture |
 | shipping the typed `bd` tool surface | **the exception: already shipped**, by decision 2 above (`extensions/bd_tools.ts`), which is the proof that this ticket never needed an engine at all |
+
+**Disposition pass (`workspace-8jk.9`, 2026-10-12).** After amendment 0010-B every parked ticket was
+re-read against this record as amended, and each now carries a one-paragraph disposition in its own `bd`
+notes — still declined, declined-and-re-priced, or re-filed. The verdict is six declined (three of them
+re-priced) and one shipped long ago from outside the epic, and **nothing was re-filed, because re-filing
+hinged on decision 3 flipping and it did not**: trigger 3 is NOT MET by either library on any of the four
+definitions, and that scored bar is now the epic's stated blocker in place of the licence-and-bus-factor
+sentence that was `casonadams/rho`'s. Three of those dispositions are written down here because they are
+the ones a sympathetic re-reader would otherwise re-derive wrongly:
+
+* **`.1` and `.2` — the one-implementation `EngineRuntime` trait, and a feature-gated backend for either
+  `rho` — stay declined on their own merits whichever library is under discussion.** A one-impl trait is
+  the unbuilt door ADR-0009 rule 2 names, and no re-pricing of a candidate changes that argument. This is
+  stated in advance on purpose: a corrected library is exactly the moment someone reaches for "just the
+  trait seam, nothing else", and that compromise is the failure, not a smaller migration.
+* **Two tickets moved in price without moving in verdict, in opposite directions.** Porting the beads
+  machine got *dearer*: the re-scored inventory's rows 1, 3 and 4 make its control logic a redesign
+  rather than a rename. The scripted fake-engine arm got *cheaper*, because `rho-sdk` ships a scripted
+  provider as public API — and that is the sentence the fake-child seam does **not** get to lose: forbid
+  5 is re-stated as unchanged, not re-litigated.
+* **The re-baselining ticket's text carried an estimate the persistence finding voids** — an embedded
+  `rho-sdk` writes no session file, so there is no corpus to capture — and its description now says so,
+  with the re-priced surface and the capture that measured it, instead of leaving the next reader to work
+  from a stale figure.
+
+This pass opened no implementation ticket, which is the whole point of it: forbid 1 is about not opening
+migration work without a met trigger and a fresh capture, and a disposition is neither.
 
 The decision now has a check behind it, not only prose. `scripts/dep_audit.py --gate`
 — a step of `scripts/check.sh`, and therefore of CI — fails if a crate from either
@@ -702,7 +729,8 @@ of this step.
 Re-opening this work costs more than a wish: a §4 trigger named in the ticket, a fresh
 capture beside it, an amendment to this ADR, and then `bd show workspace-bt8.1` …
 `.7`, the seven parked tickets, which are closed rather than deleted and still carry
-the full text of the costing.
+the full text of the costing — and, since `workspace-8jk.9`, a disposition paragraph each
+saying what the amended version of this record did and did not change about it.
 
 ---
 
