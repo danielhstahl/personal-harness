@@ -301,10 +301,21 @@ Re-litigating this ADR requires re-running the bottom command **and** meeting on
    being absorbable. At that point the engine question is forced, and it is forced
    by pi, not by rho.
 3. **rho becomes adoptable as a dependency**, which is a maintenance test and not a
-   benchmark: a licence file in the published artifact, ≥2 human contributors each
-   carrying >5% of commits, ≥12 months of history, and a documented event vocabulary
-   that carries a settle/turn-complete signal looprs can key a loop on. Today: 0, 1,
-   7 weeks, and no.
+   benchmark. It has four conditions — a licence in the published artifact, more than one
+   human carrying the repo, twelve months of history, and a documented settle/turn-complete
+   signal looprs can key a loop on — and **the definitions behind all four, and the score
+   for both libraries that answer to the name `rho`, live in
+   [ADR-0010 trigger 3 as testable metrics](0010-trigger-3-dependency-maintenance-metrics.md)**:
+   the denominator behind "share of commits", whether a drive-by commit counts toward the
+   ≥2, which clock the twelve months run on, and the five sub-tests that make "a documented
+   settle signal" mean *a loop advance can be keyed on it* rather than *the spelling exists*.
+   This page deliberately carries no numbers for this trigger, and no `Today: …` row — the
+   four it used to print were measured against the wrong library, and rule 7 below is why
+   they are not simply replaced with four new ones. **Re-score it rather than re-argue it:**
+   `python3 spikes/dependency_maintenance_metrics.py` reads every input off the public record
+   in seconds — no build, no model call, no endpoint — and prints one verdict per definition
+   per candidate with the URL each number was read from, plus the earliest date a failed row
+   can next be worth re-running.
 4. **Passes become concurrent.** The boundary is priced per pass because looprs spawns
    one child per pass. If the loop ever runs N children at once on a constrained
    machine, re-measure: the cost is 299 ms × N of wall and 122 MiB × N of RSS, and the
@@ -413,7 +424,11 @@ the full text of the costing.
 6. **Do not treat the licence gap as a formality.** "Cargo.toml says MIT OR
    Apache-2.0" is not a licence grant, and nothing upstream (the repo's three open
    issues are a release bot and two feature suggestions) is about fixing it. Nor
-   does an upstream fix change the other four rows of §4's trigger 3.
+   does an upstream fix change the other conditions of §4's trigger 3 — and "fix"
+   now means *the scored row moves*, in the capture, not a page remembers it: the
+   licence a consumer receives is the one inside the artifact of the crate they link,
+   and the intended library has that gap too
+   ([trigger 3 as testable metrics](0010-trigger-3-dependency-maintenance-metrics.md)).
 7. **Do not retype these numbers into another page.** Link here, or link the capture.
    `docs_check.sh` catches contradictory knob defaults; it cannot catch a number
    quoted twice and retuned once.
@@ -468,6 +483,10 @@ LOOPRS_SPIKE_RHO_ID=matthewyjiang python3 spikes/rho_surface_cost.py \
   | tee spikes/results/matthewyjiang-surface-cost.log
 # the control arm: typed bd tools, bash+bd vs typed, on the real model
 python3 spikes/bd_tools_cost.py                   | tee spikes/results/bd-tools-cost.log
+# trigger 3 alone — the maintenance test, both libraries that answer to the name
+# `rho`, scored against the written definitions in seconds: no build, no model
+# call, and every number printed with the public record it was read from
+python3 spikes/dependency_maintenance_metrics.py  | tee spikes/results/dependency-maintenance-metrics.log
 ```
 
 Each prints `not measured` with the reason when its prerequisite is missing — no

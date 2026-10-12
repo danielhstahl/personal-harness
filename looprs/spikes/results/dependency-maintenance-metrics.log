@@ -1,0 +1,173 @@
+# dependency-maintenance-metrics — captured 2026-10-12T17:38:48Z, tree 23da115
+# ran: python3 spikes/dependency_maintenance_metrics.py
+definitions: docs/adr/0010-trigger-3-dependency-maintenance-metrics.md — that memo is the normative text; this driver is the
+             measurement it points at. Re-score by re-running this and re-reading the memo,
+             not by re-typing a number into a page (ADR-0010 forbids 7).
+subjects:    casonadams/rho (rho), matthewyjiang/rho (rho-sdk)
+evaluated against: ADR-0010 §4 trigger 3 — all four definitions must hold.
+method:      nothing is built, linked or shipped here (ADR-0009 rule 2). Every number is
+             read from GitHub, crates.io, the published .crate artifact, the candidate's
+             published docs, or a capture already committed under spikes/results/.
+             conventions: 12 months = 365 d; liveness bar ≤90 d since the last
+             push; bus-factor denominator floor 20 human commits; bots excluded
+             from the human denominator by GitHub's own type field.
+github api:    anonymous — core quota remaining 34/60 at run start; a rate-limited leg prints `not measured`, never a verdict
+
+##############################################################################
+# casonadams/rho — the library a consumer would link is rho
+##############################################################################
+
+== 1. LICENCE — the licence a consumer RECEIVES, not the one a manifest declares ==
+rho 0.12.0:  cargo cache
+    licence file inside the published artifact: NONE
+    manifest declares: license = "MIT OR Apache-2.0"  (a declaration, not a grant)
+    read from: the local cargo cache copy of rho-0.12.0 (published as https://static.crates.io/crates/rho/rho-0.12.0.crate)
+rho-engine 0.12.0:  cargo cache
+    licence file inside the published artifact: NONE
+    manifest declares: license = "MIT OR Apache-2.0"  (a declaration, not a grant)
+    read from: the local cargo cache copy of rho-engine-0.12.0 (published as https://static.crates.io/crates/rho-engine/rho-engine-0.12.0.crate)
+rho-harness-core 0.12.0:  cargo cache
+    licence file inside the published artifact: NONE
+    manifest declares: license = "MIT OR Apache-2.0"  (a declaration, not a grant)
+    read from: the local cargo cache copy of rho-harness-core-0.12.0 (published as https://static.crates.io/crates/rho-harness-core/rho-harness-core-0.12.0.crate)
+    (context) repo-root LICENSE: absent   licence GitHub's detector reads: NONE DETECTED
+    rule: scored on the crate(s) a consumer links — rho — not on a sibling crate's file, which does not travel inside another artifact
+    crates a consumer links that ship no licence text: rho
+verdict: licence = FAIL
+
+== 2. BUS FACTOR — share of commits, and whose share counts ==
+read from: https://api.github.com/repos/casonadams/rho/contributors?per_page=100 (1 page(s), GitHub's own commit attribution, default branch)
+attributed commits: 865 all-time, of which 824 human (41 bot: github-actions[bot] 41)
+    casonadams                   823    95.1% of all    99.9% of human   counts toward the ≥2
+    tysongoulding                  1     0.1% of all     0.1% of human   drive-by: counted in the denominator, cannot satisfy the ≥2
+bar: ≥2 humans each carrying >5% of the HUMAN denominator
+    humans above 5% of human commits: 1 (casonadams 823)
+    same test against the all-commits denominator: 1 (printed so a change of convention is visible, not quiet)
+verdict: bus_factor = FAIL (bus factor 1 — the second human (tysongoulding, 1) needs 43 more attributed commits to clear the bar alone)
+
+== 3. HISTORY — which clock, and does it clear twelve months ==
+read from: GitHub repo + releases APIs, crates.io versions API; ages measured to 2026-10-12 (12 months = 365 d)
+    clock repo created (GitHub)                  2026-08-19                           54 d =  1.8 months   short
+    clock first GitHub release                   v0.1.1 2026-09-02                    40 d =  1.3 months   BINDS (shortest)
+    clock first crates.io publish of rho         0.1.0 2026-09-02                     40 d =  1.3 months   BINDS (shortest)
+    context, printed not scored: family-wide first publish rho 0.1.0 2026-09-02; first ≥1.0.0 publish of rho: never (no ≥1.0.0 publish); last push 2026-10-11
+    liveness guard (a dead repo may not spend history it stopped making): last push 1 d ago, bar ≤90 d → PASS
+    rule: EVERY clock ≥ 365 d, so the youngest one binds — 3 of 3 fall short: repo created (GitHub), first GitHub release, first crates.io publish of rho
+    earliest date this leg can pass: 2027-09-02 (the binding clock's own date + 12 months); re-run after it rather than re-arguing before it
+verdict: history = FAIL
+
+== 4. SETTLE VOCABULARY — a signal a loop advance can be keyed on ==
+the vocabulary in question: RpcEvent (the RPC protocol enum) and the Presenter trait the embed host implements — the two vocabularies an in-process host sees
+claim under test:           RpcEvent::TurnEnd names a turn end in the RPC protocol, and Presenter::print_turn_completed is a hook for it — both are surface, not delivery: the embed arm saw completion arrive as run_turn's return value
+declared terminal set:      TurnEnd, print_turn_completed
+S1 named in the published artifact's host-facing vocabulary: PASS
+    TurnEnd                rho-harness-core:src/rpc/protocol.rs → RpcEvent
+    print_turn_completed   rho-harness-core:src/presentation/presenter.rs → Presenter   (declared with an EMPTY default body: a host that does not override it is handed nothing at that moment)
+S2 rendered in the published API docs (docs.rs): PASS
+    TurnEnd                https://docs.rs/rho-harness-core/latest/rho_harness_core/rpc/protocol/enum.RpcEvent.html
+    print_turn_completed   https://docs.rs/rho-harness-core/latest/rho_harness_core/presentation/presenter/trait.Presenter.html
+    read from: https://docs.rs/rho-harness-core/latest/rho_harness_core/rpc/protocol/enum.RpcEvent.html https://docs.rs/rho-harness-core/latest/rho_harness_core/presentation/types/enum.UiEvent.html https://docs.rs/rho-harness-core/latest/rho_harness_core/presentation/presenter/trait.Presenter.html
+S3 prose-documented (a written page states when it fires): FAIL  — 6 of 6 published pages read (README + docs/**.md)
+    no published page names the terminal set and states when it fires: an identifier in rustdoc is a spelling shipped, not a contract written
+S4 delivered to the host on its stream: FAIL  — read from spikes/results/rho-surface-cost.log
+    census: 398 of 398 host callbacks recorded by the embed arm(s) (2 arm(s) in that capture), kinds: activity_finished=5, activity_started=8, thinking_token=266, token=113, tool_chunk=1, tool_finished=3, tool_started=2
+    terminal kinds among them: NONE
+    settle seen — run_turn return value: Completed
+    settle seen — run_turn return value: Completed
+S5 guaranteed on every path the run can end: not measured — nothing to guarantee a delivery of yet
+    sub-tests: S1 named=PASS, S2 API-published=PASS, S3 prose-documented=FAIL, S4 delivered-on-stream=FAIL, S5 guaranteed=not measured
+verdict: settle_vocabulary = FAIL (2 of 5 sub-tests; the trigger asks for all five)
+
+##############################################################################
+# matthewyjiang/rho — the library a consumer would link is rho-sdk
+##############################################################################
+
+== 1. LICENCE — the licence a consumer RECEIVES, not the one a manifest declares ==
+rho-sdk 5.9.0:  cargo cache
+    licence file inside the published artifact: NONE
+    manifest declares: license = "MIT"  (a declaration, not a grant)
+    read from: the local cargo cache copy of rho-sdk-5.9.0 (published as https://static.crates.io/crates/rho-sdk/rho-sdk-5.9.0.crate)
+rho-providers 2.16.0:  cargo cache
+    licence file inside the published artifact: NONE
+    manifest declares: license = "MIT AND Apache-2.0"  (a declaration, not a grant)
+    read from: the local cargo cache copy of rho-providers-2.16.0 (published as https://static.crates.io/crates/rho-providers/rho-providers-2.16.0.crate)
+rho-coding-agent 2.20.0:  cargo cache
+    licence file inside the published artifact: ['LICENSE']
+    manifest declares: license = "MIT AND Apache-2.0"  (a declaration, not a grant)
+    read from: the local cargo cache copy of rho-coding-agent-2.20.0 (published as https://static.crates.io/crates/rho-coding-agent/rho-coding-agent-2.20.0.crate)
+    (context) repo-root LICENSE: present   licence GitHub's detector reads: MIT
+    rule: scored on the crate(s) a consumer links — rho-sdk — not on a sibling crate's file, which does not travel inside another artifact
+    crates a consumer links that ship no licence text: rho-sdk
+verdict: licence = FAIL
+
+== 2. BUS FACTOR — share of commits, and whose share counts ==
+read from: https://api.github.com/repos/matthewyjiang/rho/contributors?per_page=100 (1 page(s), GitHub's own commit attribution, default branch)
+attributed commits: 1238 all-time, of which 919 human (319 bot: github-actions[bot] 298, dependabot[bot] 17, devin-ai-integration[bot] 3, pullfrog[bot] 1)
+    matthewyjiang                903    72.9% of all    98.3% of human   counts toward the ≥2
+    wuisabel-gif                  16     1.3% of all     1.7% of human   drive-by: counted in the denominator, cannot satisfy the ≥2
+bar: ≥2 humans each carrying >5% of the HUMAN denominator
+    humans above 5% of human commits: 1 (matthewyjiang 903)
+    same test against the all-commits denominator: 1 (printed so a change of convention is visible, not quiet)
+verdict: bus_factor = FAIL (bus factor 1 — the second human (wuisabel-gif, 16) needs 32 more attributed commits to clear the bar alone)
+
+== 3. HISTORY — which clock, and does it clear twelve months ==
+read from: GitHub repo + releases APIs, crates.io versions API; ages measured to 2026-10-12 (12 months = 365 d)
+    clock repo created (GitHub)                  2026-06-21                          113 d =  3.7 months   short
+    clock first GitHub release                   rho-agent-v0.1.0 2026-06-21         113 d =  3.7 months   short
+    clock first crates.io publish of rho-sdk     1.0.0 2026-07-15                     89 d =  2.9 months   BINDS (shortest)
+    context, printed not scored: family-wide first publish rho-coding-agent 0.4.0 2026-06-22; first ≥1.0.0 publish of rho-sdk: 1.0.0 2026-07-15; last push 2026-10-10
+    liveness guard (a dead repo may not spend history it stopped making): last push 2 d ago, bar ≤90 d → PASS
+    rule: EVERY clock ≥ 365 d, so the youngest one binds — 3 of 3 fall short: repo created (GitHub), first GitHub release, first crates.io publish of rho-sdk
+    earliest date this leg can pass: 2027-07-15 (the binding clock's own date + 12 months); re-run after it rather than re-arguing before it
+verdict: history = FAIL
+
+== 4. SETTLE VOCABULARY — a signal a loop advance can be keyed on ==
+the vocabulary in question: the RunEvent stream the host consumes from Run::next_event()
+claim under test:           RunEvent::{Completed,Failed,Cancelled} settle a run; Run::outcome is the authoritative result
+declared terminal set:      Completed, Failed, Cancelled
+S1 named in the published artifact's host-facing vocabulary: PASS
+    Completed              rho-sdk:src/event.rs → RunEvent
+    Failed                 rho-sdk:src/event.rs → RunEvent
+    Cancelled              rho-sdk:src/event.rs → RunEvent
+S2 rendered in the published API docs (docs.rs): PASS
+    Completed              https://docs.rs/rho-sdk/latest/rho_sdk/enum.RunEvent.html
+    Failed                 https://docs.rs/rho-sdk/latest/rho_sdk/enum.RunEvent.html
+    Cancelled              https://docs.rs/rho-sdk/latest/rho_sdk/enum.RunEvent.html
+    read from: https://docs.rs/rho-sdk/latest/rho_sdk/enum.RunEvent.html
+S3 prose-documented (a written page states when it fires): PASS  — 30 of 30 published pages read (README + docs/**.md)
+    https://raw.githubusercontent.com/matthewyjiang/rho/main/docs/sdk/events-and-cancellation.md: Run-->>Host: Completed or Cancelled or Failed
+    https://raw.githubusercontent.com/matthewyjiang/rho/main/docs/sdk/events-and-cancellation.md: 13. A run that reaches a normal cooperative terminal path emits one of `Completed`, `Cancelled`, or `Failed`.
+    https://raw.githubusercontent.com/matthewyjiang/rho/main/docs/sdk/events-and-cancellation.md: The implementation does not guarantee a terminal event for every worker exit; see [known limitations](#known-limitations). Run drop/abort, task panic, failed terminal delivery, and some cancellation or persistence-error races arou
+    https://raw.githubusercontent.com/matthewyjiang/rho/main/docs/sdk/events-and-cancellation.md: `SessionState` exposes `Idle`, `Running`, `WaitingForHostInput`, `Cancelling`, `Completed`, and `Failed`. `Completed` and `Failed` remain observable after the worker exits; a later run may transition either terminal state back to 
+    authority claim — https://raw.githubusercontent.com/matthewyjiang/rho/main/docs/sdk/index.md: | Streaming | `Session::start` returns a bounded, ordered `RunEvent` stream; always take `Run::outcome` as authoritative |
+    authority claim — https://raw.githubusercontent.com/matthewyjiang/rho/main/docs/sdk/concepts.md: - obtaining the final typed `RunOutcome` (authoritative even if the event stream ends early)
+S4 delivered to the host on its stream: PASS  — read from spikes/results/matthewyjiang-surface-cost.log
+    census: 29 of 29 host callbacks recorded by the embed arm(s) (3 arm(s) in that capture), kinds: AssistantTextDelta=2, Completed=3, ModelCallCompleted=6, Started=3, StepStarted=6, ToolFinished=3, ToolProposed=3, ToolStarted=3
+    terminal kinds among them: {'Completed': 3}
+    settle seen — arm.settle_event: Completed
+    settle seen — arm.settle_event: Completed
+    settle seen — scripted.settle_event: Completed
+    settle seen — gate1.sdk_default.settle: Completed
+    settle seen — gate6.approval_channel_closed.settle: Completed
+    settle seen — gate7.human_never_arrives.settle: NONE — no event inside the probe's idle window (run still live)
+    settle seen — settle1.completed.settle_event: Completed
+    settle seen — settle2.permanent_failure.settle_event: Failed
+    settle seen — settle3.retry_then_ok.settle_event: Completed
+    settle seen — settle4.dead_socket.settle_event: Failed
+S5 guaranteed on every path the run can end: FAIL
+    its own documentation says — https://raw.githubusercontent.com/matthewyjiang/rho/main/docs/sdk/events-and-cancellation.md: The implementation does not guarantee a terminal event for every worker exit; see [known limitations](#known-limitations). Run drop/abort, task panic, failed terminal delivery, and some cancellation or persistence-error races around nonterminal event
+    its own documentation says — https://raw.githubusercontent.com/matthewyjiang/rho/main/docs/sdk/events-and-cancellation.md: The runtime does not guarantee delivery of exactly one terminal event (`Completed`, `Cancelled`, or `Failed`) for every run. This remains part of the public contract until a future release documents a deliberate change.
+    and the capture shows — settle5.dropped_run.terminal_events_observed: 0
+    and the capture shows — settle6.stop_reading.session_state_while_stalled: Running
+    and the capture shows — blast5.tool_panic.inner: inner.settle NONE — stream closed with no terminal event
+    sub-tests: S1 named=PASS, S2 API-published=PASS, S3 prose-documented=PASS, S4 delivered-on-stream=PASS, S5 guaranteed=FAIL
+verdict: settle_vocabulary = FAIL (4 of 5 sub-tests; the trigger asks for all five)
+
+== SUMMARY — ADR-0010 §4 trigger 3, one row per definition ==
+definition            casonadams/rho              matthewyjiang/rho           
+licence             FAIL                        FAIL                        
+bus_factor          FAIL                        FAIL                        
+history             FAIL                        FAIL                        
+settle_vocabulary   FAIL                        FAIL                        
+trigger 3 for casonadams/rho             NOT MET (0 of 4 definitions; the trigger is a conjunction)
+trigger 3 for matthewyjiang/rho          NOT MET (0 of 4 definitions; the trigger is a conjunction)

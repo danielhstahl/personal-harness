@@ -30,3 +30,4 @@
   * [ADR-0008 — The documentation site](adr/0008-docs-site.md)
   * [ADR-0009 — The highlighter is warmed, and the regex engine stays pure Rust](adr/0009-highlighter-warm-start-and-the-regex-backend.md)
   * [ADR-0010 — Keep the pi RPC child; typed bd tools, not an embedded engine](adr/0010-pi-rpc-child-vs-embedded-rho-engine.md)
+  * [ADR-0010 trigger 3 as testable metrics — bus factor, history, and a settle vocabulary](adr/0010-trigger-3-dependency-maintenance-metrics.md)
