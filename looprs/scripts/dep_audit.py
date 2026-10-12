@@ -31,11 +31,29 @@ escape hatch, and it is deliberately the same shape as a per-item
 `#[allow(dead_code)]`: it names the thing and the reason in the place a reader is
 already looking, which is the rule `src/session/mod.rs` states for dead code.
 
+A third question, and the only one here with a *decision* behind it rather than a
+convention: ADR-0010 decided that the engine stays a `pi --mode rpc` child and that
+`rho` does not enter the tree — not as an optional dependency, not behind a feature
+flag, because an unbuilt door rots. That is prose in an ADR, and prose in an ADR is
+what the next person with a benchmark and a bad day re-litigates. So the ban is
+checked here, in the gate that already reads this manifest, for the manifest *and*
+the lockfile (a transitive pull is the same event as a direct one, and is the one
+nobody edits by hand). See `BANNED` for the escape route, which is deliberately a
+decision amendment and not a flag.
+
     ./scripts/dep_audit.py            # the table
-    ./scripts/dep_audit.py --gate     # fail on an unjustified offender
+    ./scripts/dep_audit.py --gate     # fail on an unjustified offender or a banned crate
     ./scripts/dep_audit.py --features # also print the resolved feature surface
 
-Exit 0 with the gate when every dependency is accounted for.
+Exit 0 with the gate when every dependency is accounted for and nothing banned is
+present. The ban half is testable without touching this manifest — the audit resolves
+its crate root from its own path, so a scratch dir holding a copy of this script and
+a poisoned `Cargo.toml` fails for real:
+
+    d=$(mktemp -d); mkdir -p $d/scripts; cp scripts/dep_audit.py $d/scripts/; \
+      printf '[dependencies]\nrho = "0.12"\n' > $d/Cargo.toml; \
+      python3 $d/scripts/dep_audit.py --gate; echo "exit $?"   # 1
+
 """
 from __future__ import annotations
 
@@ -49,6 +67,21 @@ CRATE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(CRATE)
 
 MARKER = "dep-audit:"
+
+# Crates ADR-0010 keeps out of the tree. Not a performance list and not a taste list:
+# the ADR's blocker is the licence (no licence file in the published artifact of any
+# of the three, while the manifest declares `MIT OR Apache-2.0`) and the bus factor,
+# which do not expire when someone's benchmark moves. The route to changing this is
+# ADR-0010 §4 — a named trigger beside a fresh capture, and an amendment to the ADR —
+# not an escape hatch in a script. There is deliberately no allow-marker for these,
+# the way there is none for a dependency that does not exist.
+BANNED = {
+    "rho": "ADR-0010 §3",
+    "rho-engine": "ADR-0010 §3",
+    "rho-harness-core": "ADR-0010 §3",
+}
+
+BANNED_ALT = "|".join(re.escape(name) for name in sorted(BANNED, key=len, reverse=True))
 
 
 def manifest_deps(table: str) -> list[dict]:
@@ -140,6 +173,51 @@ def justified(dep: dict) -> str | None:
     return None
 
 
+def banned_in_manifest() -> list[str]:
+    """`Cargo.toml:<line>` for every banned crate declared as a dependency.
+
+    Every dependency-shaped table counts: `[dependencies]`, `[dev-dependencies]`,
+    `[build-dependencies]` and the `[target.*.dependencies]` forms, whether written
+    as an entry (`rho = "0.12"`), an inline table with `package = "rho"`, or a
+    `[dependencies.rho]` section. An *optional* entry is not different: ADR-0010
+    forbids the feature-flag door explicitly, and an optional dep is that door.
+    """
+    hits: list[str] = []
+    entry = re.compile(rf"^({BANNED_ALT})\s*=")
+    table = re.compile(rf"^\[[^\]]*dependenc(?:y|ies)\.({BANNED_ALT})\]")
+    renamed = re.compile(rf'package\s*=\s*"({BANNED_ALT})"')
+    with open("Cargo.toml", encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            found = entry.match(stripped) or table.match(stripped) or renamed.search(stripped)
+            if found:
+                crate = found.group(1)
+                hits.append(f"Cargo.toml:{n}: {stripped}   [{BANNED[crate]}]")
+    return hits
+
+
+def banned_in_lock() -> list[str]:
+    """`Cargo.lock:<line>` for a banned crate in the *resolved* graph.
+
+    The manifest question is "did someone add it"; this one is "did it arrive", and
+    the two are not the same event — a transitive pull lands in the lockfile with no
+    manifest line to fail, which is exactly how a banned engine would actually get
+    in.
+    """
+    if not os.path.exists("Cargo.lock"):
+        return []
+    hits: list[str] = []
+    with open("Cargo.lock", encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            match = re.match(r'^name = "([^"]+)"', line.strip())
+            if match and match.group(1) in BANNED:
+                crate = match.group(1)
+                hits.append(f"Cargo.lock:{n}: {crate}   [{BANNED[crate]}]")
+    return hits
+
+
 def feature_surface() -> None:
     print("resolved feature surface (shipped graph, `-e normal`):")
     for line in (
@@ -182,24 +260,48 @@ def main() -> int:
         sample = (in_src or in_dev or ["-"])[0]
         print(f"{crate:<18} {len(in_src):>6} {len(in_dev):>15}  {status} ({sample})")
 
+    banned = banned_in_manifest() + banned_in_lock()
+
     if args.features:
         print()
         feature_surface()
 
     print()
+    bad: list[str] = []
     if not offenders:
         print("dep audit: every [dependencies] entry is named in src/ — nothing riding along")
-        return 0
+    else:
+        for dep, why, reason in offenders:
+            if reason:
+                print(f"  answered   {dep['name']}: {why} — manifest says: {reason}")
+            else:
+                print(f"  UNJUSTIFIED {dep['name']}: {why}")
+                bad.append(dep["name"])
+            if dep["optional"]:
+                print(f"             (optional entry; feature `{dep['name']}` gates it)")
 
-    bad = []
-    for dep, why, reason in offenders:
-        if reason:
-            print(f"  answered   {dep['name']}: {why} — manifest says: {reason}")
-        else:
-            print(f"  UNJUSTIFIED {dep['name']}: {why}")
-            bad.append(dep["name"])
-        if dep["optional"]:
-            print(f"             (optional entry; feature `{dep['name']}` gates it)")
+    if banned:
+        print(
+            f"  BANNED     {len(banned)} reference(s) to a crate this tree may not depend "
+            f"on ({', '.join(sorted(BANNED))}):"
+        )
+        for hit in banned:
+            print(f"             {hit}")
+    else:
+        print(
+            "banned-dependency check: "
+            f"none of {', '.join(sorted(BANNED))} in Cargo.toml or Cargo.lock — ADR-0010 holds"
+        )
+
+    if args.gate and banned:
+        print("\ndep audit: FAIL — a crate ADR-0010 keeps out of the tree is present")
+        print("The decision is `docs/adr/0010-pi-rpc-child-vs-embedded-rho-engine.md`; the blocker")
+        print("there is the licence and the bus factor, not the boundary cost, so it does not")
+        print("expire when a benchmark moves. Re-opening it means a §4 trigger named beside a")
+        print("fresh capture and an amendment to that ADR — the phase-2 epic that priced this")
+        print("work (workspace-bt8) was closed unworked, so no half-built engine seam exists to")
+        print("wire a backend into. Do not add it optionally or behind a feature flag either.")
+        return 1
 
     if args.gate and bad:
         print(f"\ndep audit: FAIL — {', '.join(bad)}")

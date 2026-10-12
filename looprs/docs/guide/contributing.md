@@ -333,7 +333,7 @@ rung a change has to touch**:
 | the **shape of a page** — that a table rendered as a table, that a phone gets one column, that a header spans the screen it is read on | the docs build refuses a page whose markdown syntax survived, `check_layout_css` closes the grid and the viewport meta statically, and `spikes/docs_layout.py` measures the frame in a real browser. Both halves exist because the failure this closed was invisible on the laptop that caused it; the static half is the gate, the browser half is a spike, and the reason is ADR-0008's no-install rule | `./scripts/docs_check.sh` (no install, offline); `python3 spikes/docs_layout.py` after `./scripts/docs.sh build` (needs playwright + a Chromium, exits 2 with instructions if either is missing) |
 | memory / cost claims | `src/measure.rs` (needs `LOOPRS_MEASURE_CORPUS`), `spikes/*.py` | `cargo test -- --ignored` |
 | anything behind a cargo feature | the **same** suite over that build; the seam is not allowed to change shape | `cargo test --features notify` |
-| a dependency's right to be in the manifest | `scripts/dep_audit.py` — named in `src/`, or answered at its own line | `python3 scripts/dep_audit.py --gate` |
+| a dependency's right to be in the manifest | `scripts/dep_audit.py` — named in `src/`, or answered at its own line; and never a crate a decision already kept out (`rho`, per ADR-0010) | `python3 scripts/dep_audit.py --gate` |
 | the whole gate | `./scripts/check.sh` — fmt, clippy `-D warnings` and tests in **both** feature configurations, dead-code audit, dependency audit, docs gate | `./scripts/check.sh` |
 | docs only | `./scripts/docs_check.sh` | same, or on its own |
 
@@ -370,6 +370,18 @@ knowing before you trust one signal:
   the app's remote-session copy path, so the app and the spike ship one
   implementation rather than two that merely agree. The premise was wrong; the
   manifest says so where the feature is declared.
+
+**And one dependency question is already decided, so it is checked.** ADR-0010
+([../adr/0010-pi-rpc-child-vs-embedded-rho-engine.md](../adr/0010-pi-rpc-child-vs-embedded-rho-engine.md))
+decided that the agent engine stays a `pi --mode rpc` child and that `rho` does not
+enter the tree — not directly, not optionally, not behind a feature flag, and the
+phase-2 epic that would have built the abstraction was closed unworked rather than
+worked. That is the only dependency question in this repo with a decision behind it
+rather than a convention, so the audit answers it too: `rho`, `rho-engine` and
+`rho-harness-core` may appear in neither `Cargo.toml` nor `Cargo.lock`, renamed or
+optional or pulled in transitively, and the gate fails naming the ADR section that
+reopens the question and the evidence it would need. Prose in a decision record is
+re-litigated by the next person with a benchmark; a red gate is not.
 
 ## House style
 

@@ -33,7 +33,11 @@ multi-process, three-backend TUI without a model, a board, or a terminal.
    comment. The counterpart of step 5 for the other half of the tree: an
    unjustified allow in the source and an unjustified dependency in the manifest
    are the same failure, and the blanket that used to cover the second one
-   (`unused_dependencies = "allow"`) is what this replaced
+   (`unused_dependencies = "allow"`) is what this replaced. The same step also
+   enforces the one dependency question a decision has already answered: none of
+   `rho`, `rho-engine`, `rho-harness-core` may appear in `Cargo.toml` **or
+   `Cargo.lock`** ([ADR-0010](adr/0010-pi-rpc-child-vs-embedded-rho-engine.md)), so
+   the engine decision is a failing build rather than a page nobody re-reads
 7. `scripts/docs_check.sh` — the docs rot gate: no dead internal link, no page
    outside the site tree, every `LOOPRS_*` the code reads is in the
    [configuration reference](guide/configuration.md), no two pages state a

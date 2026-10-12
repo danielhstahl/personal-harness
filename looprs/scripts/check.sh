@@ -19,7 +19,10 @@
 #         `src/`, or answered at its own line in the manifest. This is the
 #         counterpart of step 4 for the other half of the tree, and the reason the
 #         `unused_dependencies = "allow"` blanket could be deleted rather than
-#         argued about.
+#         argued about. It also enforces the one dependency question ADR-0010 has
+#         already decided — no `rho` in `Cargo.toml` *or* `Cargo.lock`, optional or
+#         transitive — so an engine decision lives in the gate and not only in a
+#         page nobody re-reads.
 #   7. `scripts/docs_check.sh` — no dead link or orphan page, every `LOOPRS_*` the
 #         code reads is documented, no two defaults disagree, the keymap tables
 #         still match `CHORD_TABLE`, the wire protocol page still matches

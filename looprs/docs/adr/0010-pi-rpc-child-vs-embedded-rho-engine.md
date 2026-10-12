@@ -311,6 +311,39 @@ Re-litigating this ADR requires re-running the bottom command **and** meeting on
    second is the one that bites. (rho in process is 84 MiB, so the memory argument
    for sharing one engine is real and belongs to whoever builds concurrency.)
 
+### 5. Phase 2 (`workspace-bt8`) is closed unworked — the record of what "no" declined to build
+
+The costing was done before the decision rather than after it: a second epic,
+`workspace-bt8`, held the seven tickets the GO branch would have needed, filed and
+parked and gated on this record, with the instruction that if this ADR came back
+"stay on pi RPC" the epic was to be closed unworked — and that closing it unworked was
+the good outcome, not the lazy one.
+
+It came back that way, so on 2026-10-12 the epic and all seven of its children were
+closed unworked with this record as the close reason. Nothing from it was built, and
+the tempting half-measures are worth naming, because they are the ones that rot:
+
+| the parked ticket | why it does not get built "anyway, just the seam" |
+| --- | --- |
+| an `EngineRuntime` trait over the pi RPC transport, behaviour-preserving | a trait with exactly one implementation is §3's unbuilt door wearing a different hat: it pays the indirection in the file that ADR-0002 says is load-bearing and buys an abstraction no second implementation has ever been tested through |
+| a `rho` backend behind `--features rho` | forbidden below, rule 2; and the default-off build of it would be compiled by nobody, which is how a feature rots |
+| porting the beads machine off `PiRpc` | the machine's control logic — `agent_settled` as the only end-of-pass signal, the serial tag, per-pass `--tools` gating — is correct and would be rewritten against an engine nothing runs |
+| an in-tree fake engine plus a transport contract suite | the shell fake is the seam every process-level test stands on; rule 5 says a second engine would have to *add* a fake, not ask for this one's removal |
+| engine selection: `LOOPRS_ENGINE`, status band, docker image, docs | a knob with one valid value is a knob to be miscorrected, and it would be documented in the same pages that today say the engine is the pi child |
+| re-baselining every corpus-justified constant and generated page | the largest ticket in the set, and it is pure cost unless an engine actually changes — this repo's constants are justified by committed logs, and moving engines invalidates the logs |
+| shipping the typed `bd` tool surface | **the exception: already shipped**, by decision 2 above (`extensions/bd_tools.ts`), which is the proof that this ticket never needed an engine at all |
+
+The decision now has a check behind it, not only prose. `scripts/dep_audit.py --gate`
+— a step of `scripts/check.sh`, and therefore of CI — fails if `rho`, `rho-engine` or
+`rho-harness-core` appears in `Cargo.toml` **or in `Cargo.lock`**, direct, renamed,
+optional or transitive. A rule that lives only in a decision record is re-litigated by
+the next person with a benchmark; one that fails a gate is not.
+
+Re-opening this work costs more than a wish: a §4 trigger named in the ticket, a fresh
+capture beside it, an amendment to this ADR, and then `bd show workspace-bt8.1` …
+`.7`, the seven parked tickets, which are closed rather than deleted and still carry
+the full text of the costing.
+
 ---
 
 ## Consequences
@@ -348,9 +381,11 @@ Re-litigating this ADR requires re-running the bottom command **and** meeting on
 
 ## What this forbids
 
-1. **Do not open a migration ticket because this one closed.** Phase 2 is gated on a
-   §4 trigger being met and named, with a fresh capture beside it. "The engine seems
-   slow" is not a trigger; the ratio is.
+1. **Do not open a migration ticket because this one closed.** Phase 2 is
+   `workspace-bt8`, and §5 records that it was closed unworked rather than worked.
+   Re-opening it means re-opening *it*, with a §4 trigger met and named and a fresh
+   capture beside it, not filing a new ticket that has not paid for the evidence.
+   "The engine seems slow" is not a trigger; the ratio is.
 2. **Do not add `rho` to `Cargo.toml` — not as an optional dependency, not behind a
    feature flag.** ADR-0009 rule 2, verbatim in effect: an unbuilt feature rots, and
    the rho leg here deliberately builds a *copy* of the idea in a scratch crate so it
