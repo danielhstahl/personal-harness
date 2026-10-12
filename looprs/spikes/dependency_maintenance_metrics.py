@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ADR-0010 §4 trigger 3 as four testable checks, scored against both libraries that answer to "rho".
+"""ADR-0010 §4 trigger 3 as four testable checks, scored against both libraries that answer to "rho" — matthewyjiang/rho (the crate a consumer links is `rho-sdk`) and casonadams/rho (`rho`, `rho-engine`, `rho-harness-core`).
 
 What this is
 ------------

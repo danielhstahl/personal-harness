@@ -373,19 +373,21 @@ knowing before you trust one signal:
 
 **And one dependency question is already decided, so it is checked.** ADR-0010
 ([../adr/0010-pi-rpc-child-vs-embedded-rho-engine.md](../adr/0010-pi-rpc-child-vs-embedded-rho-engine.md))
-decided that the agent engine stays a `pi --mode rpc` child and that `rho` does not
-enter the tree — not directly, not optionally, not behind a feature flag, and the
+decided that the agent engine stays a `pi --mode rpc` child and that neither `rho`
+library enters the tree — not directly, not optionally, not behind a feature flag, and the
 phase-2 epic that would have built the abstraction was closed unworked rather than
 worked. That is the only dependency question in this repo with a decision behind it
-rather than a convention, so the audit answers it too. Two unrelated projects publish
-a `rho`, so the deny-list is a set of **families**, each carrying the clause that bans
+rather than a convention, so the audit answers it too. Three unrelated projects publish
+crates whose names begin `rho` and two of them are in scope, so the deny-list is a set
+of **families**, each carrying the clause that bans
 it: casonadams/rho's `rho`, `rho-engine`, `rho-harness-core`, and matthewyjiang/rho's
 `rho-sdk`, `rho-providers`, `rho-coding-agent`, `rho-agent-tools`, `rho-tui-pty`. None
 of them may appear in `Cargo.toml` or in `Cargo.lock`, renamed or optional or
 feature-gated or pulled in transitively, and a failure names the family it matched and
 the clause behind it (`matched matthewyjiang/rho family, ADR-0010 decision 3`) rather
 than just a word. Matching is per family and **name-exact**, never a `rho-` prefix: a
-crate from a third project that merely starts with `rho` is not banned, and the report
+crate from the third project that merely shares the prefix — `pyrex41/rho`'s `rho-core`,
+`rho-tools`, `rho-server`, … — is not banned, and the report
 prints that judgement when it sees one, because silence here reads as approval. The
 first version of this list carried only the casonadams crate set — the library ADR-0010
 §3 got *filed* against, not the one its decision was requested against — so a
@@ -395,6 +397,12 @@ forbids it (workspace-8jk.2). That is why the ban is tested and not merely writt
 dependency form in scratch trees, asserts the reason string and not just the verdict,
 and checks that a benign `rho`-prefixed crate stays green. Prose in a decision record
 is re-litigated by the next person with a benchmark; a red gate is not.
+
+**The prose-side of the same rule.** A page, ADR or spike that *prices* a third-party
+dependency names it by `owner/repo` **plus the published artifact name** — `matthewyjiang/rho`,
+crate `rho-sdk`, not "`rho`" — at minimum in the capture header. That rule is written once, in
+[the blockquote above the decision-record table](../README.md), and this page points at it rather
+than restating it; ADR-0010's amendment 0010-A is what it was written for.
 
 ## House style
 

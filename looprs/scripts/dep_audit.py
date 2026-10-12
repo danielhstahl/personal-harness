@@ -33,16 +33,19 @@ already looking, which is the rule `src/session/mod.rs` states for dead code.
 
 A third question, and the only one here with a *decision* behind it rather than a
 convention: ADR-0010 decided that the engine stays a `pi --mode rpc` child and that
-`rho` does not enter the tree — not as an optional dependency, not behind a feature
+**neither** library answering to the name `rho` enters the tree — neither
+`matthewyjiang/rho`'s set (`rho-sdk`, `rho-providers`, `rho-coding-agent`,
+`rho-agent-tools`, `rho-tui-pty`) nor `casonadams/rho`'s (`rho`, `rho-engine`,
+`rho-harness-core`) — not as an optional dependency, not behind a feature
 flag, because an unbuilt door rots. That is prose in an ADR, and prose in an ADR is
 what the next person with a benchmark and a bad day re-litigates. So the ban is
 checked here, in the gate that already reads this manifest, for the manifest *and*
 the lockfile (a transitive pull is the same event as a direct one, and is the one
 nobody edits by hand).
 
-The ban is a set of *families*, because two unrelated projects answer to the name
-`rho` and the first version of this check conflated them: it carried the crate set
-of the library ADR-0010 §3 got *filed* against (`rho`, `rho-engine`,
+The ban is a set of *families*, because three unrelated projects publish crates whose
+names begin `rho`, two of them are in scope here, and the first version of this check
+conflated them: it carried the crate set of the library ADR-0010 §3 got *filed* against (`rho`, `rho-engine`,
 `rho-harness-core` from casonadams/rho) while the decision was requested against
 matthewyjiang/rho, which publishes `rho-sdk`, `rho-providers`, `rho-coding-agent`
 (and `rho-agent-tools`, `rho-tui-pty`). A `rho-sdk = "5"` therefore passed a gate
@@ -97,7 +100,9 @@ MARKER = "dep-audit:"
 # allow-marker for these, the way there is none for a dependency that does not exist.
 #
 # Why families and not a flat list: the flat list was the bug. A name is not an
-# identity — `rho` is a word three unrelated projects have chosen — so a deny-list
+# identity — `rho` is a word three unrelated projects have chosen (casonadams, whose
+# crate is literally `rho`; matthewyjiang, whose library is `rho-sdk`; and pyrex41,
+# who is in neither decision) — so a deny-list
 # of bare names silently means "the crate set of whichever repo the author had open".
 # Each family here states its publisher and the clause that bans it, so a failure can
 # say *which* decision it enforces instead of gesturing at an ADR.

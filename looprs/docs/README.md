@@ -50,6 +50,15 @@ as the same failure as a broken link, arriving later.
 
 ## Decision records
 
+> **The naming rule this table obeys (workspace-8jk.7):** an ADR or spike that *prices* a
+> third-party dependency names it by **`owner/repo` plus the published artifact name** — not
+> "`rho`", but `matthewyjiang/rho`'s `rho-sdk` or `casonadams/rho`'s `rho` — at minimum in the
+> capture header. A bare project name is not an identity: three unrelated projects publish crates
+> whose names begin `rho`, and one library's numbers got recorded as another's for exactly that
+> reason ([ADR-0010's amendment 0010-A](adr/0010-pi-rpc-child-vs-embedded-rho-engine.md#amendment-0010-a--which-rho-workspace-8jk7)).
+> The process half of this rule — who checks it, and when — lives with the process-rule ticket, not
+> here.
+
 | ADR | decides |
 | --- | --- |
 | [0001 — How the Bash terminal state gets a shell](adr/0001-bash-terminal-state-pty.md) | `bash -i` on a **real pty** rather than pipes, and everything that follows from owning a terminal: resize forwarding, the full-screen child handover |
@@ -61,4 +70,4 @@ as the same failure as a broken link, arriving later.
 | [0007 — The kanban board](adr/0007-kanban-board.md) | what the board shows: the `bd` status → column mapping (one table, linked from [kanban.md](kanban.md) rather than copied into it), the freshness/stale states, one `bd` read per tick and what it costs, and the ten things the band must not do |
 | [0008 — The documentation site](adr/0008-docs-site.md) | why a hand-rolled generator over `pulldown-cmark` rather than `mdbook`; why nothing moved; why the generated HTML is built and not committed; the diagram and ADR-template policy |
 | [0009 — The highlighter is warmed, and the regex engine stays pure Rust](adr/0009-highlighter-warm-start-and-the-regex-backend.md) | why the warm start runs on a detached thread at startup instead of paying first-paint stalls, why the warm list is the corpus's list and no longer, and why `default-fancy` is kept against the C backend despite the measured tax |
-| [0010 — Keep the `pi --mode rpc` child; typed `bd` tools, not an embedded engine](adr/0010-pi-rpc-child-vs-embedded-rho-engine.md) | the engine stays a stdio child, with the boundary cost measured rather than assumed; the typed `bd` tools land on the pi side instead of the engine side; neither `rho` — casonadams/rho or matthewyjiang/rho — enters the tree on licence and bus-factor grounds, and `scripts/dep_audit.py --gate` now fails if one tries |
+| [0010 — Keep the `pi --mode rpc` child; typed `bd` tools, not an embedded engine](adr/0010-pi-rpc-child-vs-embedded-rho-engine.md) | the engine stays a stdio child, with the boundary cost measured rather than assumed; the typed `bd` tools land on the pi side instead of the engine side; neither `rho` library — `casonadams/rho` (`rho`, `rho-engine`, `rho-harness-core`) or `matthewyjiang/rho` (`rho-sdk`, `rho-providers`, `rho-coding-agent`) — enters the tree on licence and bus-factor grounds, and `scripts/dep_audit.py --gate` now fails if one tries. **Amended 2026-10-12 (0010-A): the naming in this record and in every page that repeats it now says which of the two libraries each claim belongs to** |

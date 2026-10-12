@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """workspace-eqn.3 / .4, parameterized by workspace-8jk.1 — what linking **a** rho
-as looprs' engine would cost and what it would replace.
+library as looprs' engine would cost and what it would replace. '**A** `rho`, on
+purpose: two unrelated libraries answer to that name — `matthewyjiang/rho` (crates
+`rho-sdk`, `rho-providers`, `rho-coding-agent`) and `casonadams/rho` (crates `rho`,
+`rho-engine`, `rho-harness-core`) — and `pyrex41/rho` is a third project that shares
+the prefix and is not a candidate here. See 'Why the identity is a parameter' below.
 
 The proposal in ADR-0010 is that looprs stops driving `pi --mode rpc` as a child
 and links a `rho` crate as a library. Two claims ride on that: less overhead,
@@ -165,7 +169,8 @@ DEFAULT_TARGET = "matthewyjiang"
 #                      tokio and serde_json
 #   arms               EMBED arms to run: (label, extra env, needs an endpoint).
 #                      The question each arm asks is a property of the candidate,
-#                      not of the script — rho's is the permission gate, rho-sdk's
+#                      not of the script — casonadams/rho's question is the permission
+#                      gate, matthewyjiang/rho's `rho-sdk`
 #                      is the endpoint versus its scripted fake-provider seam.
 #   capture            where a re-run of this identity belongs
 TARGETS = {

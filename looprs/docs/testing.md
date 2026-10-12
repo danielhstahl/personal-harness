@@ -44,14 +44,17 @@ multi-process, three-backend TUI without a model, a board, or a terminal.
    re-reads; the reasoning and every number behind it live in that ADR and are not
    restated here, per its own "What this forbids" 7. Two things the check states
    rather than assumes: the ban is **project-shaped** — matched on those exact crate
-   names, never on a `rho-` prefix, so an unrelated third party's `rho-core` or
-   `rho-tools` is allowed, and the report says so out loud instead of leaving the
+   names, never on a `rho-` prefix, so `pyrex41/rho`'s `rho-core` or `rho-tools` — a
+   third, unrelated project that merely shares the prefix — is allowed, and the report
+   says so out loud instead of leaving the
    silence to be read as a verdict — and the ban has its own test.
    `--self-test` copies the audit into scratch trees, one per banned name per
    dependency form plus the benign near-misses, and asserts each **reason string**
    (`matched matthewyjiang/rho family, ADR-0010 decision 3`) rather than just the
    exit code. It exists because the deny-list carried the crate set of the wrong
-   `rho` for a whole epic: `rho-sdk = "5"` passed a gate whose only job was to fail
+   library for a whole epic — `casonadams/rho`'s set, on a decision requested against
+   `matthewyjiang/rho`'s `rho-sdk` — so
+   `rho-sdk = "5"` passed a gate whose only job was to fail
    it, while printing the clause that forbids it (workspace-8jk.2). A check whose
    failure looks like a pass needs a test on the reason, not the verdict
 7. `scripts/docs_check.sh` — the docs rot gate: no dead internal link, no page

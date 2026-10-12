@@ -4,7 +4,9 @@
 - **Status:** Accepted — definitions dated 2026-10-12; the score below is dated the same day and
   expires the moment any input to it moves
 - **Defines:** [ADR-0010](0010-pi-rpc-child-vs-embedded-rho-engine.md) §4 trigger 3 — *"rho becomes
-  adoptable as a dependency"* — which until this page was four fill-in phrasings rather than four tests
+  adoptable as a dependency"* — which until this page was four fill-in phrasings rather than four
+  tests, and which names one library where two answer to the word: every row below is therefore run
+  once per library (see **Subjects**)
 - **Measured by:** [`spikes/dependency_maintenance_metrics.py`](../../spikes/dependency_maintenance_metrics.py)
   → [`spikes/results/dependency-maintenance-metrics.log`](../../spikes/results/dependency-maintenance-metrics.log)
   (seconds; no build, no model call, no endpoint)
@@ -190,7 +192,8 @@ library the decision was about:
   release, versus one that is a property of the library's shape.
 
 **And the conclusion, without hedging: trigger 3 is NOT MET by either library.** Zero of four definitions
-pass for both. The maintenance objection to `rho` — one person, three months of published artifact, and a
+pass for both. The maintenance objection to **either** `rho` library — one person, three
+months of published artifact, and a
 licence you do not receive — survives the identity correction whole, and the correction adds a finding
 nobody had: the library this decision was *about* fails the licence test too. Nothing in this memo
 re-opens ADR-0010; it gives trigger 3 a bar that can be re-run instead of re-argued, which is the only
