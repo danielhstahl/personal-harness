@@ -1,0 +1,75 @@
+# pi-rpc-boundary-cost — captured 2026-10-12T12:23:17Z, tree 2775b8c (dirty tree: uncommitted changes on top of that commit)
+# ran: python3 spikes/pi_rpc_boundary_cost.py
+workspace-eqn boundary measurement — host Linux 7.0.14-linuxkit, 8 cpus, python 3.14.5
+engine under test: pi 1.0.0
+bd: /app/.npm-global/bin/bd   corpus: /home/appuser/.pi/agent/sessions/--Users-danielstahl-Documents-code-ml-personal-harness-pi-beads-looprs--
+
+Read before quoting a number: every figure here is one machine, one
+model endpoint and one kernel. The ADR cites this capture; a number typed
+into a second page is a number that will drift (ADR-0009's rule 4).
+
+== 1. SPAWN — the per-pass price of the child ==
+shape                                           spawn→first ms  rtt ms med  rtt ms p95  peak RSS MiB child CPU ms  eof→exit ms
+------------------------------------------------------------------------------------------------------------------------------
+worker (`pi --mode rpc`)                                 299.1        0.13       10.79         122.2          400          7.9
+                                               run-to-run spread on spawn→first: min 297.0 ms, max 313.9 ms over 7 runs
+planner (`pi --mode rpc --tools read,bash`)              300.0        0.14       11.04         121.8          400          8.0
+                                               run-to-run spread on spawn→first: min 296.3 ms, max 317.0 ms over 7 runs
+no-session (`pi --mode rpc --no-session`)                298.6        0.15       10.81         121.8          400          8.7
+                                               run-to-run spread on spawn→first: min 296.3 ms, max 300.6 ms over 7 runs
+looprs' fake child (control)                              12.9        0.07        0.22           9.9            0          2.9
+                                               run-to-run spread on spawn→first: min 12.8 ms, max 13.3 ms over 7 runs
+
+Note: 'spawn→first' is fork-to-first-correlated-response, the only
+handshake looprs waits on; the child is not asked to be warm, only to
+answer. RSS/CPU are the kernel's own numbers read from /proc from
+outside the child, per this repo's convention (`spikes/ram_e2e.py`).
+
+== 3. DENOMINATOR — what a pass costs, measured over real passes ==
+corpus                        /home/appuser/.pi/agent/sessions/--Users-danielstahl-Documents-code-ml-personal-harness-pi-beads-looprs--
+passes                        87
+pass wall s                   median 3095   p10 36   p90 7206
+model time s (per pass)       median 2441   = 78.9% of the pass
+tool+gap time s (per pass)    median 409   = 13.2% of the pass
+assistant steps per pass      median 114
+session entries per pass      median 243
+session bytes per pass        median 855 KiB
+bash tool calls per pass      91.2
+of which mention `bd`         9.4
+
+== 2. STREAM — one real pass over the boundary, in records and bytes ==
+prompt disposition            started
+warm prompt response ms       2.67   (the command's own round trip: accepted, not finished)
+records back until settle     78
+bytes back until settle       39491  (23.7 KiB/s)
+pass wall s                   1.6
+record rate while running     48.0 records/s
+
+Do NOT divide by this pass: a toy prompt that finishes in seconds is
+the wrong denominator, which is the whole reason leg 3 measures real
+passes. This leg exists to say what crosses the boundary per unit of
+work — records and bytes — not what share of a trivial run it is.
+
+== 4. BUDGET — the upper bound on what removing the child could buy ==
+child spawn+handshake         299 ms
+stdin-EOF shutdown            8 ms
+10 correlated requests @ 0.13 ms             1 ms
+per-pass boundary total       308 ms
+  …charged at the measured p95 instead of the median (10.8 ms a request —
+  Node's event loop, not the pipe): 415 ms. Both are noise against the denominator.
+
+Divided by the denominator the corpus leg measured, not one invented here:
+  median pass                  3095 s  ->  the whole boundary is 0.0100% of a pass
+
+What the boundary carries over a median pass (leg 2's streaming rate
+of a real tool-using turn × leg 3's median assistant steps):
+  ~5.5k records, ~2.8 MB per pass at 114 steps
+  What parsing those costs looprs is priced separately with looprs'
+  own parser: `spikes/results/rpc-serde-cost.log`.
+
+What a library engine does NOT remove: the engine's own model client,
+session writing, tool execution, syntax highlighting and the ~100 MiB of
+runtime those need. What it removes is the fork, the interpreter boot, the
+stdio framing and one IPC hop per command — i.e. the row above.
+
+Done.

@@ -1,0 +1,97 @@
+# rho-surface-cost — captured 2026-10-12T12:54:35Z, tree 2775b8c (dirty tree: uncommitted changes on top of that commit)
+# ran: bash -c python3 -u spikes/rho_surface_cost.py | tee /tmp/rho_run5.log
+workspace-eqn rho surface/price measurement — host Linux 7.0.14-linuxkit, 8 cpus
+crate under assessment: rho 0.12.0 (casonadams/rho)
+Read before quoting a number: cold builds and one machine. The ADR cites
+this capture; a number typed into a second page is a number that drifts.
+
+== 1. PRICE — a cold release build of a consumer of the crate ==
+scratch crate: /tmp/eqn-rho-i2hckn75/rho-embed
+target dir:    /tmp/eqn-rho-i2hckn75/rho-target  (cold)
+rho leg:       rc=0  210s wall  472 crates compiled
+shipped graph: 432 packages (`cargo tree -e normal`)
+artifact:      28256056 B (26.9 MiB) — the spike binary with rho linked in
+
+looprs today:  rc=0  33s wall  144 crates compiled  artifact 8563432 B (8.2 MiB)
+               138 packages shipped today
+
+delta:         +294 packages on the shipped graph, 3.30x the artifact
+packages rho would add that looprs does not ship: 326
+
+== 2. SUPPLY — what the public record says about the maintainer ==
+crates.io:     rho 0.12.0, 33 releases, first published 2026-09-02, updated 2026-10-03
+               downloads 480 total / 480 last 90 days
+               published licence field: see Cargo.toml (leg 3)
+github:        casonadams/rho: 7 stars, 1 forks, 1 subscribers, 3 open issues
+               created 2026-08-19, last push 2026-10-11
+               licence as GitHub's licence detector sees it: NONE DETECTED
+contributors:  2 human, 1 bot; 865 commits attributed
+               casonadams carries 823 of 865 = 95.1% (bus factor of 1)
+               the rest: [('tysongoulding', 1)]
+
+== 3. SURFACE — what the published crates.io artifact actually is ==
+rho                 255 .rs files    49715 LOC   11 `unsafe`  licence file in published artifact: NONE
+rho-engine          302 .rs files    53163 LOC   24 `unsafe`  licence file in published artifact: NONE
+rho-harness-core    112 .rs files    17921 LOC    9 `unsafe`  licence file in published artifact: NONE
+total               669 .rs files   120799 LOC   44 `unsafe`
+
+exact-pinned dependencies (an `=` requirement each): ['0.8.0-alpha.6']
+features: ['default', 'ui']
+dev-dependencies (built for rho's own tests, not by a library consumer): ['iroh', 'reqwest', 'rig', 'tempfile']
+  That last line matters: `rig` and `iroh` are named in the ticket as what
+  rho drags in, and in this version they are dev-dependencies. What a
+  consumer actually links is leg 1's `cargo tree`, which is the number to quote.
+
+event vocabulary — looprs' WIRE_INVENTORY vs rho's own protocol:
+  looprs keys behaviour on 40 wire spellings (src/wire.rs)
+  rho names 53 event/variant spellings across RpcEvent + UiEvent
+  intersection: 3 — ['error', 'turn_end', 'turn_start']
+  i.e. 37 of looprs' 40 rows change meaning,
+  not spelling, which is the expensive kind of change: the tests in
+  `app::tests::wire_protocol` exist to make each row say what the harness
+  does with the value, and every one of those rows is re-derived by hand.
+
+== 4. EMBED — drive one tool-using turn with rho linked into the process ==
+
+-- permission gate ON (rho's default)
+   turn.status	Completed
+   turn.tool_calls	2
+   turn.model_requests	3
+   turn.reply	I wasn't able to run that command — the `bash` tool requires permissio
+   events.total	331
+   event.activity_finished	3
+   event.activity_started	5
+   event.thinking_token	215
+   event.token	106
+   event.tool_finished	2
+   tools.registered	8	bash,edit,fd,read,rg,web_fetch,web_search,write
+   ms.config	0.7
+   ms.engine	15.8
+   ms.turn	8204.7
+   rss_after_turn_kib	86152
+
+-- permission gate OFF (config.permission.enabled=false)
+   turn.status	Completed
+   turn.tool_calls	1
+   turn.model_requests	2
+   turn.reply	```
+   events.total	67
+   event.activity_finished	2
+   event.activity_started	3
+   event.thinking_token	51
+   event.token	7
+   event.tool_chunk	1
+   event.tool_finished	1
+   event.tool_started	2
+   tools.registered	8	bash,edit,fd,read,rg,web_fetch,web_search,write
+   ms.config	0.4
+   ms.engine	12.1
+   ms.turn	2323.8
+   rss_after_turn_kib	86344
+
+What this leg is for: it is the *decision-relevant* half. Everything the
+loop needs from a child over stdio has to be re-expressed as these calls
+(`platform::agent_engine`, `engine::run_turn`, a `Presenter`), and the
+events the host is handed are rho's, not pi's — see leg 3's intersection.
+
+Done.

@@ -1,0 +1,40 @@
+# bd-tools-cost — captured 2026-10-12T12:58:51Z, tree 2775b8c (dirty tree: uncommitted changes on top of that commit)
+# ran: python3 -u spikes/bd_tools_cost.py
+workspace-eqn typed-bd-tools measurement — bd at bd, extension spikes/bd_tools/bd_tools.ts
+pi: 1.0.0
+
+== 1. CALL — one bd interaction, three ways ==
+shape                                            min ms  median ms   max ms
+--------------------------------------------------------------------------
+fork a shell (`bash -c 'true'`)                     1.1        1.3      2.7
+fork+exec bd (`bd ready`)                         164.6      171.0    275.9
+through a shell (`bash -c 'bd ready'`)            168.9      170.9    188.8
+`bd show` on a real id                            179.0      186.9    243.3
+typed tool call (`spawnSync bd ready`)            172.0      178.0    250.0
+
+Reading: the row that matters is the *difference* between 'through a
+shell' and 'fork+exec bd'. That gap is the only thing a typed tool can
+remove from the call path, because `bd` itself is a separate process in
+every architecture on the table — including one where the agent engine
+is a Rust library: there is no bd library to link, only the CLI.
+
+== 2/3. PROMPT + PASS — the same question, bash+bd vs the typed tool ==
+arm            tools in prompt  tool calls                     reqs  tokens in  tokens out  wall s  answer
+----------------------------------------------------------------------------------------------------------
+bash + bd                   197 bash                               2       2795          63     2.1 '5'
+typed tools                 587 bd_ready                           2       3802          54     2.1 '5'
+bash + bd                   197 bash                               2       2792         127     3.2 '5'
+typed tools                 587 bd_ready                           2       3794          68     2.4 '5'
+
+tool-section bytes: bash arm 197, typed arm 587 (+390 bytes, ≈97 extra prompt tokens on every model request of the pass)
+model requests: bash arm [2], typed arm [2] — the schema rides on every one of them, which is the honest way to price it
+
+Both arms called tools on these runs: bash arm ['bash'], typed arm ['bd_ready'].
+
+Neither arm is cheaper: the typed arm is *typed* — schema-validated params,
+no shell quoting, the refusal path returned as data, and `--tools` gating a
+bare bash command cannot have. That is what the control arm was for: it
+isolates the tooling win from the engine question, and the engine buys
+neither of them.
+
+Done.

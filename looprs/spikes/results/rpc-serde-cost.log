@@ -1,0 +1,52 @@
+# rpc-serde-cost — captured 2026-10-12T12:23:31Z, tree 2775b8c (dirty tree: uncommitted changes on top of that commit)
+# ran: env LOOPRS_MEASURE_CORPUS=/home/appuser/.pi/agent/sessions/--Users-danielstahl-Documents-code-ml-personal-harness-pi-beads-looprs-- cargo run -q --release --example spike_rpc_serde_cost
+rpc serde cost — parser: serde_json (the same call src/services/pi.rs makes)
+corpus: /home/appuser/.pi/agent/sessions/--Users-danielstahl-Documents-code-ml-personal-harness-pi-beads-looprs--
+passes: 40 (LOOPRS_MEASURE_TICKETS caps this; default 40)
+
+one pass, session-file shape (median of 40 passes):
+  session bytes            1228330
+  records                  248
+  parse all records        2.2 ms
+  parse + re-encode        5.4 ms
+  per record               8.90 µs parse, 21.69 µs parse+encode
+  throughput               556.4 MB/s parse
+
+per-pass table (name, bytes, records, parse µs, parse+encode µs):
+  2026-10-03T00-33-48-793Z_01a0ff2e-70f8-7098-94b7-c54a95eddc00.jsonl         9798      8        55        58
+  2026-10-03T00-42-00-929Z_01a0ff35-f361-7198-995b-0e7ac2309777.jsonl        84266     31       227       318
+  2026-10-03T11-13-26-536Z_01a10178-0a07-71e5-a012-4263e646e70b.jsonl         8619      8        35        45
+  2026-10-03T21-00-20-877Z_01a10391-5e0c-7507-ae35-b3e029079abf.jsonl       211357     70       493       669
+  2026-10-03T21-28-13-177Z_01a103aa-e279-736b-a698-e795db9b0d1a.jsonl       499195    164      1243      1724
+  2026-10-03T22-29-39-011Z_01a103e3-2042-7327-b78e-59fbc247643d.jsonl       630922    243      1597      2140
+  2026-10-03T23-35-18-029Z_01a1041f-3b0c-7280-b985-725d125d2358.jsonl       657748    175      1325      1941
+  2026-10-04T00-20-32-113Z_01a10448-a4f1-747a-ad7c-6deed39c0fd4.jsonl      1029418    249      2074      3044
+  2026-10-04T01-35-13-589Z_01a1048d-06b5-7595-8a29-9ef63ddd48d8.jsonl       875713    196      1790      2632
+  2026-10-04T02-20-03-103Z_01a104b6-109f-7768-90e2-7391c445c706.jsonl       944659    212      1872      2721
+  2026-10-04T02-59-28-346Z_01a104da-27d9-7075-b11e-f33063de46d8.jsonl       837729    142      1566      2334
+  2026-10-04T11-12-48-907Z_01a1069d-d30a-76ca-9afa-6b375d3df4b0.jsonl       765699    208      1672      2412
+  … 28 more passes not listed
+
+record size histogram (bytes → count, capped at 4096):
+     134 → 40
+     155 → 40
+     191 → 40
+     196 → 1
+     197 → 1
+     199 → 1
+     200 → 1
+     203 → 1
+     204 → 1
+     209 → 1
+     272 → 1
+     273 → 1
+     274 → 22
+     275 → 6
+     276 → 5
+     277 → 7
+
+Read this with the RPC record count from spikes/results/pi-rpc-boundary-cost.log:
+the session corpus is the *coarser* population (one record per message, not one
+per streamed delta), so µs/record here is a floor on the RPC stream's count and a
+ceiling on its per-record size. Any pass whose boundary cost is claimed to matter
+has to beat the denominator in that log, not this one.
