@@ -1,0 +1,549 @@
+# matthewyjiang-surface-cost — captured 2026-10-12T16:37:09Z, tree 81e830d
+# ran: python3 spikes/rho_surface_cost.py
+workspace-8jk rho surface/price measurement — host Linux 7.0.14-linuxkit, 8 cpus
+machine:       aarch64 (no model name in /proc/cpuinfo); 8124776 kB RAM
+cold builds:   three cold `--release` builds in target dirs of
+               their own — the scratch consumer of the library, looprs at its default
+               feature set, and looprs `--features notify` (the artifact docker/ and the
+               release job actually build). Budget ~7 min of wall on 8 cpus, plus the
+               EMBED arms. LOOPRS_RHO_TARGET reuses the consumer's dir and the header of
+               leg 1 says so: a reused dir is never reported as cold.
+note:          supersedes results/matthewyjiang-surface-cost-embed-8jk3.log for legs 1-3 (its artifact row was measured stripped-against-unstripped, and it carried no per-crate graph size, no named = pins, no src/tests LOC split and no [profile.release] finding). All four legs here are one run on one machine, so the EMBED rows travel with the price rows they are read against.
+identity:      matthewyjiang — the library ADR-0010 was requested against
+subject:       matthewyjiang/rho (github.com/matthewyjiang/rho)
+crates measured by this run (3):
+               rho-sdk 5.9.0   [crates.io max_stable_version (no pin given)]
+               rho-providers 2.16.0   [crates.io max_stable_version (no pin given)]
+               rho-coding-agent 2.20.0   [crates.io max_stable_version (no pin given)]
+consumer:      a library consumer links rho-sdk; rho-coding-agent is the CLI bin crate and rho-providers is its provider table — neither is in the shipped-graph number
+capture:       spikes/results/matthewyjiang-surface-cost.log
+Read before quoting a number: cold builds and one machine. The ADR cites
+this capture; a number typed into a second page is a number that drifts.
+
+== 1. PRICE — a cold release build of a consumer of the library ==
+scratch crate: /tmp/eqn-rho-ayxaasmi/rho-embed
+embed program: spikes/embed_programs/matthewyjiang-rho-sdk.main.rs — written against matthewyjiang/rho's API, not portable to another crate that shares the name
+consumer deps: rho-sdk = "5.9.0"
+               (a library consumer links rho-sdk; rho-coding-agent is the CLI bin crate and rho-providers is its provider table — neither is in the shipped-graph number)
+target dir:    /tmp/eqn-rho-ayxaasmi/rho-target  (cold)
+rho leg:       rc=0  29s wall  101 crates compiled
+shipped graph: 95 packages (`cargo tree -e normal`)
+artifact:      7945136 B (7.6 MiB) as built — the spike binary with the library linked in, 5642752 B (5.4 MiB) stripped
+               profile: cargo's default `--release` on both sides; this scratch manifest
+               declares no [profile.release], because looprs' own manifest declares none.
+
+looprs today:  rc=0  35s wall  144 crates compiled  138 packages shipped today
+               artifact 8572312 B (8.2 MiB) as built, 5973944 B (5.7 MiB) stripped
+
+looprs as it ships (--features notify, what docker/Dockerfile and the release job build):
+               rc=0  67s wall  214 crates compiled  200 packages shipped
+               artifact 15098296 B (14.4 MiB) as built, 10766344 B (10.3 MiB) stripped
+
+delta:         -43 packages on the shipped graph, 0.93x the artifact  (0.94x stripped against stripped)
+               against the shipped (notify) build: -105 packages, 0.53x the artifact
+packages the candidate would add that looprs does not ship: 58  (7) against the notify build
+
+shipped graph per crate — which of these a library consumer actually links:
+  rho-sdk                54 packages as the only dependency a consumer declares   [this is what a library consumer links]
+  rho-providers         215 packages as the only dependency a consumer declares   [NOT linked by a library consumer — quote this only for the CLI]
+  rho-coding-agent      520 packages as the only dependency a consumer declares   [NOT linked by a library consumer — quote this only for the CLI]
+  Read these two numbers apart: the 95-package row above is the EMBED spike, which
+  also declares what its own program needs (tokio features, serde_json, and an HTTP
+  client for the endpoint arm). The library-only graph is the line above naming the
+  library crate — that is the one a dependency-cost row should quote.
+  (a library consumer links rho-sdk; rho-coding-agent is the CLI bin crate and rho-providers is its provider table — neither is in the shipped-graph number)
+
+== 2. SUPPLY — what the public record says about the maintainer ==
+subject:       matthewyjiang/rho
+crates.io:     rho-sdk 5.9.0, 54 releases, first published 2026-07-15, updated 2026-10-10
+               downloads 3321 total / 3321 last 90 days
+               cadence: 18.5 releases/month over 2.9 months since first publish; last publish 1 day(s) ago
+crates.io:     rho-providers 2.16.0, 79 releases, first published 2026-07-18, updated 2026-10-10
+               downloads 2956 total / 2956 last 90 days
+               cadence: 27.9 releases/month over 2.8 months since first publish; last publish 1 day(s) ago
+crates.io:     rho-coding-agent 2.20.0, 151 releases, first published 2026-06-22, updated 2026-10-10
+               downloads 2713 total / 1999 last 90 days
+               cadence: 40.8 releases/month over 3.7 months since first publish; last publish 1 day(s) ago
+github:        matthewyjiang/rho: 10 stars, 2 forks, 0 subscribers, 3 open issues
+               created 2026-06-21, last push 2026-10-10
+               licence as GitHub's licence detector sees it: MIT
+contributors:  2 human + 4 bot; 1238 commits attributed in total, 919 of them human
+               top human matthewyjiang carries 903 of 1238 all-time = 72.9%  |  903 of 919 human-only = 98.3%
+               humans above 5% of the HUMAN total: 1 (matthewyjiang) — the bus factor under the convention below
+               other humans: [('wuisabel-gif', 16)]
+               bots (excluded from the human denominator): [('github-actions[bot]', 298), ('dependabot[bot]', 17), ('devin-ai-integration[bot]', 3), ('pullfrog[bot]', 1)]
+               convention: the share a bus-factor trigger reads is the HUMAN one
+               (bot commits excluded). Both denominators are printed on every run so
+               a re-run cannot move the trigger by changing the convention quietly.
+
+== 3. SURFACE — what the published crates.io artifact actually is ==
+subject:       matthewyjiang/rho
+rho-sdk 5.9.0: cargo cache
+rho-providers 2.16.0: cargo cache
+rho-coding-agent 2.20.0: cargo cache
+rho-sdk             150 .rs files    40478 LOC    7 `unsafe`  licence file in published artifact: NONE  (Cargo.toml says: MIT)  <-- artifact carries NO licence file; the manifest claim is not something a consumer receives
+                   shape: lib
+                   of which src/ (+build.rs):  131 files   35165 LOC   |  shipped but never compiled by a consumer (tests/examples/benches): 19 files 5313 LOC
+                   [profile.release] declared by the published manifest: none
+rho-providers       240 .rs files    58862 LOC   24 `unsafe`  licence file in published artifact: NONE  (Cargo.toml says: MIT AND Apache-2.0)  <-- artifact carries NO licence file; the manifest claim is not something a consumer receives
+                   shape: lib
+                   of which src/ (+build.rs):  240 files   58862 LOC   |  shipped but never compiled by a consumer (tests/examples/benches): 0 files 0 LOC
+                   [profile.release] declared by the published manifest: none
+rho-coding-agent   1299 .rs files   328852 LOC  129 `unsafe`  licence file in published artifact: ['LICENSE']  (Cargo.toml says: MIT AND Apache-2.0)
+                   shape: lib+bin:rho
+                   of which src/ (+build.rs): 1284 files  323729 LOC   |  shipped but never compiled by a consumer (tests/examples/benches): 15 files 5123 LOC
+                   [profile.release] declared by the published manifest: opt-level = "s" lto = "fat" codegen-units = 1 strip = "symbols"
+total              1689 .rs files   428192 LOC  160 `unsafe`
+library only        150 .rs files    40478 LOC    7 `unsafe`   <- rho-sdk, which is what a consumer links.
+                   The total above also counts rho-coding-agent, rho-providers, which a library consumer does not link;
+                   quoting it as a dependency cost is how a graph that includes the CLI's TUI got
+                   cited as the price of the library.
+  Those [profile.release] lines are a property of upstream's workspace, not of the
+  dependency: cargo applies the profile of the workspace root only, and ignores a
+  [profile.release] block inside a dependency's manifest. Nothing here makes the
+  consumer's binary smaller — leg 1's artifact rows are built under looprs' profile.
+
+rho-sdk — exact-pinned dependencies (an `=` requirement each): none
+  features: {'default': '[]'}
+  dev-dependencies (built for the crate's own tests, not by a library consumer): ['pretty_assertions', 'proptest', 'tempfile', 'tokio']
+  optional (feature-gated) dependencies, absent from a default build: none
+  That last line matters: a heavy dependency named in a ticket as what a
+  library 'drags in' is often dev-only. What a consumer actually links is
+  leg 1's `cargo tree -e normal`, which is the number to quote.
+
+rho-providers — exact-pinned dependencies (an `=` requirement each): none
+  features: {'default': '["bundled-sqlite"]'}
+  dev-dependencies (built for the crate's own tests, not by a library consumer): ['pretty_assertions', 'serde_json', 'tempfile']
+  optional (feature-gated) dependencies, absent from a default build: none
+  That last line matters: a heavy dependency named in a ticket as what a
+  library 'drags in' is often dev-only. What a consumer actually links is
+  leg 1's `cargo tree -e normal`, which is the number to quote.
+
+rho-coding-agent — exact-pinned dependencies (an `=` requirement each): ['agent-client-protocol = "=2.2.0"', 'mermaid-rs-renderer = "=0.3.1"', 'starlark = "=0.14.2"']
+  features: {'default': '["bundled-sqlite"]'}
+  dev-dependencies (built for the crate's own tests, not by a library consumer): ['pretty_assertions', 'termwiz', 'tokio', 'windows-sys']
+  optional (feature-gated) dependencies, absent from a default build: none
+  That last line matters: a heavy dependency named in a ticket as what a
+  library 'drags in' is often dev-only. What a consumer actually links is
+  leg 1's `cargo tree -e normal`, which is the number to quote.
+
+event vocabulary — looprs' WIRE_INVENTORY vs matthewyjiang/rho's own protocol:
+  read from: ['rho-sdk:src/event.rs', 'rho-sdk:src/tool.rs']
+  looprs keys behaviour on 40 wire spellings (src/wire.rs)
+  the candidate names 51 event/variant spellings in those files
+  intersection: 0 — []
+  i.e. 40 of looprs' 40 rows change meaning,
+  not spelling, which is the expensive kind of change: the tests in
+  `app::tests::wire_protocol` exist to make each row say what the harness
+  does with the value, and every one of those rows is re-derived by hand.
+
+== 4. EMBED — drive one tool-using turn with the library linked into the process ==
+endpoint:        http://llm.home:8080/v1 answered 200, model halogen-qwen3.8-flash-next
+arm cap:         300s each (LOOPRS_SPIKE_ARM_TIMEOUT)
+
+-- endpoint, unattended: allow-process policy, nobody to approve
+   crate.linked	rho-sdk	5.9.0
+   host.pid	273479
+   host.rss_before_kib	3640
+   arm.label	openai-compatible endpoint, unattended (allow-process policy)
+   arm.policy	ScopedWorkspacePolicy::allow_processes() — unattended, no approval handler
+   tools.registered	bash
+   engine.build_ms	0.1
+   arm.session_ms	0.1
+   arm.turn_ms	2614.3
+   arm.first_token_ms	2614.2
+   arm.sdk_ttfb_ms	n/a
+   arm.sdk_call_ms	1077.0
+   arm.rss_kib	6544
+   arm.rss_peak_kib	6544
+   arm.events_total	10
+   arm.events_by_kind	AssistantTextDelta=1,Completed=1,ModelCallCompleted=2,Started=1,StepStarted=2,ToolFinished=1,ToolProposed=1,ToolStarted=1
+   arm.events_order	Started,StepStarted,ModelCallCompleted,ToolProposed,ToolStarted,ToolFinished,StepStarted,AssistantTextDelta,ModelCallCompleted,Completed
+   arm.stream_closed	true
+   arm.tool_calls	1
+   arm.settle_event	Completed
+   arm.tool_authorization	AllowedByPolicy [auth 0.0 ms]
+   	first_token_ms is measured host-side, at the first AssistantTextDelta. The
+   	spike's provider implements the non-streaming send_turn, so the SDK has no
+   	delta to time and sdk_ttfb_ms is n/a; sdk_call_ms is the runtime's own
+   	per-model-call latency from ModelCallMetrics, which is reported either way.
+   arm.tool_result	Success(ToolOutput { content: "LOOPRS_SPIKE_OK\n exit=Some(0)", metadata: ToolMetadata { operation: None, affected_paths: [], command_summary: None, urls: [], diff: None, assets: [], presentation_noti…
+   arm.outcome	Ok
+   arm.stop_reason	EndTurn
+   arm.reply	LOOPRS_SPIKE_OK
+   arm.approval_audit	empty — the audit records denials and cancellations only; an allowed-by-policy call leaves no row
+   host.rss_peak_kib	6548
+   (rc=0, 2.6s, 31 lines)
+
+-- endpoint, SDK default gating: DenyAllPolicy + DenyApprovals
+   crate.linked	rho-sdk	5.9.0
+   host.pid	273513
+   host.rss_before_kib	3628
+   arm.label	openai-compatible endpoint, SDK default gating
+   arm.policy	SDK default: DenyAllPolicy + DenyApprovals (no approval handler configured)
+   tools.registered	bash
+   engine.build_ms	0.0
+   arm.session_ms	0.0
+   arm.turn_ms	5863.6
+   arm.first_token_ms	5863.6
+   arm.sdk_ttfb_ms	n/a
+   arm.sdk_call_ms	4217.2
+   arm.rss_kib	6544
+   arm.rss_peak_kib	6544
+   arm.events_total	10
+   arm.events_by_kind	AssistantTextDelta=1,Completed=1,ModelCallCompleted=2,Started=1,StepStarted=2,ToolFinished=1,ToolProposed=1,ToolStarted=1
+   arm.events_order	Started,StepStarted,ModelCallCompleted,ToolProposed,ToolStarted,ToolFinished,StepStarted,AssistantTextDelta,ModelCallCompleted,Completed
+   arm.stream_closed	true
+   arm.tool_calls	1
+   arm.settle_event	Completed
+   arm.tool_authorization	denied(Policy): capability is denied by default [auth 0.0 ms]
+   	first_token_ms is measured host-side, at the first AssistantTextDelta. The
+   	spike's provider implements the non-streaming send_turn, so the SDK has no
+   	delta to time and sdk_ttfb_ms is n/a; sdk_call_ms is the runtime's own
+   	per-model-call latency from ModelCallMetrics, which is reported either way.
+   arm.tool_result	Failure(ToolFailure { kind: PolicyDenied, message: "authorization denied: capability is denied by default" })
+   arm.outcome	Ok
+   arm.stop_reason	EndTurn
+   arm.reply	I attempted to run the command, but the tool call was rejected.  Outpu…
+   arm.approval_audit	Process:DeniedByPolicy
+   host.rss_peak_kib	6552
+   (rc=0, 5.9s, 31 lines)
+
+-- scripted provider — the fake-provider seam, no endpoint involved
+   labelled arm: no model endpoint involved. It exercises the runtime,
+   the in-process tool round trip and the event stream, and says nothing
+   about the model — reported separately so it can never be read as the
+   endpoint arm passing.
+   crate.linked	rho-sdk	5.9.0
+   host.pid	273546
+   host.rss_before_kib	3636
+   arm.label	scripted provider — the fake-provider seam (no endpoint)
+   	labelled arm: ScriptedProvider — no endpoint involved. It exercises the runtime,
+   	the in-process tool round trip and the event stream, and nothing about the model.
+   engine.build_ms	0.0
+   scripted.session_ms	0.0
+   scripted.turn_ms	0.9
+   scripted.first_token_ms	n/a
+   scripted.sdk_ttfb_ms	n/a
+   scripted.sdk_call_ms	0.0
+   scripted.rss_kib	5028
+   scripted.rss_peak_kib	5028
+   scripted.events_total	9
+   scripted.events_by_kind	Completed=1,ModelCallCompleted=2,Started=1,StepStarted=2,ToolFinished=1,ToolProposed=1,ToolStarted=1
+   scripted.events_order	Started,StepStarted,ModelCallCompleted,ToolProposed,ToolStarted,ToolFinished,StepStarted,ModelCallCompleted,Completed
+   scripted.stream_closed	true
+   scripted.tool_calls	1
+   scripted.settle_event	Completed
+   scripted.tool_authorization	AllowedByPolicy [auth 0.0 ms]
+   scripted.tool_result	Success(ToolOutput { content: "LOOPRS_SPIKE_OK\n exit=Some(0)", metadata: ToolMetadata { operation: None, affected_paths: [], command_summary: None, urls: [], d…
+   scripted.outcome	Ok
+   scripted.stop_reason	EndTurn
+   scripted.reply	done
+   scripted.model_requests	2
+   scripted.request1	messages=1 advertised_tools=[bash] tool_schema_bytes=190
+   scripted.request2	messages=3 advertised_tools=[bash] tool_schema_bytes=190
+   	What the fake cannot do: it is not a process. argv, exit codes, stdin-EOF
+   	shutdown, stderr, and a child that dies on its own — the things
+   	LOOPRS_PI_BIN's fakes prove — have no analogue here, because there is no
+   	child. It replaces the *tool round trip* half of the fake, not the process half.
+   host.rss_peak_kib	5036
+   (rc=0, 0.0s, 33 lines)
+
+-- tool gating: policy, approval handler, pre-tool hook, per-request visibility
+   labelled arm: no model endpoint involved. It exercises the runtime,
+   the in-process tool round trip and the event stream, and says nothing
+   about the model — reported separately so it can never be read as the
+   endpoint arm passing.
+   crate.linked	rho-sdk	5.9.0
+   host.pid	273558
+   host.rss_before_kib	3636
+   arm.label	tool gating probes — scripted provider (no endpoint)
+   	rho-sdk has four places a tool can be stopped, and one of them is not a gate.
+   	Each probe below runs the same one-tool turn against the scripted provider.
+   gate1.sdk_default.turn_ms	0.2
+   gate1.sdk_default.settle	Completed
+   gate1.sdk_default.tool_result	Failure(ToolFailure { kind: PolicyDenied, message: "authorization denied: capability is denied by default" })
+   gate1.sdk_default.outcome	Ok
+   gate1.sdk_default.stop_reason	EndTurn
+   gate1.sdk_default.reply	done
+   	DenyApprovals answers immediately: an unattended host gets a denial, not a hang.
+   gate2.allow_policy.turn_ms	0.6
+   gate2.allow_policy.authorization	AllowedByPolicy [auth 0.0 ms]
+   gate2.allow_policy.tool_result	Success(ToolOutput { content: "LOOPRS_SPIKE_OK\n exit=Some(0)", metadata: ToolMetadata { operation: None, affected_paths: [], command_summary: None, urls: [], d…
+   gate2.allow_policy.outcome	Ok
+   gate2.allow_policy.stop_reason	EndTurn
+   gate2.allow_policy.reply	done
+   gate3.ungated_tool.turn_ms	0.5
+   gate3.ungated_tool.tool_result	Success(ToolOutput { content: "LOOPRS_SPIKE_UNGATED_RAN\n exit=Some(0)", metadata: ToolMetadata { operation: None, affected_paths: [], command_summary: None, ur…
+   gate3.ungated_tool.approval_audit	empty — the SDK never saw the command
+   	A host-provided tool that runs the command itself is outside every gate:
+   	policy, hook and approval handler all hang off ToolContext::authorize, and
+   	`ToolOrigin::HostProvided` says so in the source — "SDK policy cannot
+   	sandbox it". looprs' own tool in this spike is exactly that shape.
+   gate4.visibility.turn_ms	302.4
+   gate4.visibility.registered	bash,extra
+   gate4.visibility.request1	advertised=[bash,extra] tool_schema_bytes=284
+   gate4.visibility.request2	advertised=[bash] tool_schema_bytes=190
+   gate4.visibility.outcome	Ok
+   gate4.visibility.stop_reason	EndTurn
+   gate4.visibility.reply	done
+   	Visibility is per model request (the runtime asks before every request),
+   	not per pass: there is no argv, and the allowlist is installed on the
+   	runtime. A loop either mutates shared state like this, or rebuilds the
+   	runtime per pass — priced on the next line, in microseconds.
+   gate4.rebuild_runtime_us_each	1.9
+   gate5.hook.turn_ms	0.2
+   gate5.hook.authorization	denied(Hook): LOOPRS_SPIKE hook denial [auth 0.0 ms]
+   gate5.hook.audit	Process:DeniedByHook
+   gate6.approval_channel_closed.settle	Completed
+   gate6.approval_channel_closed.ms	0.2
+   gate6.approval_channel_closed.authorization	denied(Host): approval request receiver was dropped [auth 0.0 ms]
+   gate6.approval_channel_closed.outcome	Ok
+   gate6.approval_channel_closed.stop_reason	EndTurn
+   gate6.approval_channel_closed.reply	done
+   	The shipped ChannelApprovalHandler fails closed: a responder that is gone
+   	is a Deny, not a hang — the same fail-closed shape as DenyApprovals. The
+   	hang is what a *live* handler waiting on a person does, which is next.
+   gate7.human_never_arrives.settle	NONE — no event inside the probe's idle window (run still live)
+   gate7.human_never_arrives.session_state	Running
+   gate7.human_never_arrives.ms_before_outside_cancel	2001.7
+   gate7.human_never_arrives.after_outside_cancel	events=[Cancelled=1,ToolFinished=1] settle=Cancelled
+   gate7.human_never_arrives.outcome	Err(operation cancelled)
+   gate7.human_never_arrives.retryable	no
+   	A live approval handler that nobody answers holds the run open indefinitely.
+   	Only the host can end it, by cancelling from outside the run; a stdio child
+   	dying is a fact you can observe, and an in-process run waiting on your own
+   	handler is not, unless you put the deadline there yourself.
+   host.rss_peak_kib	5368
+   (rc=0, 2.3s, 61 lines)
+
+-- end-of-run signal: completion, provider death, dropped Run, unread stream
+   labelled arm: no model endpoint involved. It exercises the runtime,
+   the in-process tool round trip and the event stream, and says nothing
+   about the model — reported separately so it can never be read as the
+   endpoint arm passing.
+   crate.linked	rho-sdk	5.9.0
+   host.pid	273574
+   host.rss_before_kib	3640
+   arm.label	end-of-run signal probes — scripted + dead socket (no endpoint)
+   	The question this arm exists for: is there an event a loop can key its advance
+   	on, in every case where the thing driving the turn stops working.
+   settle1.completed.settle_event	Completed
+   settle1.completed.stream_closed	true
+   settle1.completed.turn_ms	1.2
+   settle1.completed.events	Started,StepStarted,ModelCallCompleted,ToolProposed,ToolStarted,ToolFinished,StepStarted,ModelCallCompleted,Completed
+   settle1.completed.outcome	Ok
+   settle1.completed.stop_reason	EndTurn
+   settle1.completed.reply	done
+   settle1.completed.session_state	Completed
+   settle2.permanent_failure.settle_event	Failed
+   settle2.permanent_failure.events	Started,StepStarted,AssistantTextDelta,Failed
+   settle2.permanent_failure.turn_ms	9.6
+   settle2.permanent_failure.outcome	Err(provider failed: connection reset by peer)
+   settle2.permanent_failure.retryable	no
+   settle2.permanent_failure.session_state	Failed
+   settle2.permanent_failure.history_kinds	User,aborted-or-other
+   	A dead provider is a Failed event *and* an Err from outcome(); the partial
+   	answer is committed as AbortedAssistant history, not thrown away.
+   settle3.retry_then_ok.settle_event	Completed
+   settle3.retry_then_ok.events	Started,StepStarted,AssistantTextDelta,ProviderStreamReset,AssistantTextDelta,ModelCallCompleted,Completed
+   settle3.retry_then_ok.turn_ms	1023.7
+   settle3.retry_then_ok.outcome	Ok
+   settle3.retry_then_ok.stop_reason	EndTurn
+   settle3.retry_then_ok.reply	recovered
+   	The retry is observable (ProviderStreamReset) and costs the SDK's own
+   	backoff — 1s, then 2s, then 4s — before the run fails for good.
+   settle4.dead_socket.settle_event	Failed
+   settle4.dead_socket.events	Started,StepStarted,ProviderStreamReset×3,Failed
+   settle4.dead_socket.turn_ms	7008.6
+   settle4.dead_socket.outcome	Err(provider failed: error sending request for url (http://127.0.0.1:9/v1/chat/completions))
+   settle4.dead_socket.retryable	yes
+   settle5.dropped_run.trials	5
+   settle5.dropped_run.terminal_events_observed	0
+   	A dropped Run produces no event anyone can read: the reader is the thing
+   	that was dropped. looprs' `child died mid-run` case has no in-process
+   	analogue because there is no process to die — see the blast arm for the
+   	children that survive the equivalent of a child dying.
+   settle5b.cancel_mid_tool.settle	Cancelled
+   settle5b.cancel_mid_tool.events	Started,StepStarted,ToolCallUpdated,ModelCallCompleted,ToolProposed,ToolStarted,Cancelled
+   settle5b.cancel_mid_tool.turn_ms	9.5
+   settle5b.cancel_mid_tool.outcome	Err(operation cancelled)
+   settle5b.cancel_mid_tool.retryable	no
+   settle5b.cancel_mid_tool.session_state	Idle
+   	Cancel is cooperative: the run advances to Cancelled only when the tool
+   	future yields, so a tool that blocks without polling the token holds the
+   	run open — with no thread to interrupt and no process to kill.
+   settle6.stop_reading.events_read_before_idle	15
+   settle6.stop_reading.events_arrived_during_idle	0
+   settle6.stop_reading.session_state_while_stalled	Running
+   settle6.stop_reading.after_resuming_reads	AssistantTextDelta=187,Completed=1,ModelCallCompleted=1
+   settle6.stop_reading.settle	Completed
+   settle6.stop_reading.outcome	Ok
+   settle6.stop_reading.stop_reason	EndTurn
+   settle6.stop_reading.reply	eventually done
+   	The event channel is bounded (64), so a host that stops reading wedges the
+   	run silently: no error, no timeout, no terminal event, and the session
+   	still reports Running. A stdio child that stopped draining is observable
+   	as a process; a wedged in-process run is not.
+   settle7.second_run_on_busy_session	refused: session already has an active run
+   host.rss_peak_kib	6468
+   (rc=0, 13.0s, 65 lines)
+
+-- steering, clear_queue analogue, and the host-input round trip
+   labelled arm: no model endpoint involved. It exercises the runtime,
+   the in-process tool round trip and the event stream, and says nothing
+   about the model — reported separately so it can never be read as the
+   endpoint arm passing.
+   crate.linked	rho-sdk	5.9.0
+   host.pid	273680
+   host.rss_before_kib	3644
+   arm.label	steering / clear_queue / host-input probes (no endpoint)
+   	looprs sends four RPC commands: prompt, steer, clear_queue, abort. The mapping
+   	onto rho-sdk is prompt→Session::start, steer→Run::steer, abort→Run::cancel.
+   	clear_queue is the awkward one — shown in probe 3.
+   	fake provider accepted mid-turn steering: SPIKE_STEER_MARK do the other thing
+   steer1.accepting_provider.provider_request1	advertised=[bash] newest_message=User([Text("go")])
+   steer1.accepting_provider.provider_request2	advertised=[bash] newest_message=User([Text("SPIKE_STEER_MARK do the other thing")])
+   steer1.accepting_provider.settle	Completed
+   steer1.accepting_provider.events	Started,StepStarted,AssistantTextDelta×2,SteeringDelivered,AssistantTextDelta×10,ModelCallCompleted,ToolProposed,ToolStarted,ToolFinished,SteeringApplied,StepStarted,AssistantTextDelta,ModelCallCompleted,Completed
+   steer1.accepting_provider.steer_in_history	true
+   steer1.accepting_provider.model_requests	2
+   steer1.accepting_provider.outcome	Ok
+   steer1.accepting_provider.stop_reason	EndTurn
+   steer1.accepting_provider.reply	done
+   steer2.default_provider.settle	Completed
+   steer2.default_provider.events	Started,StepStarted,AssistantTextDelta×12,ModelCallCompleted,ToolProposed,ToolStarted,ToolFinished,SteeringApplied,StepStarted,AssistantTextDelta,ModelCallCompleted,Completed
+   steer2.default_provider.steer_in_history	true
+   steer2.default_provider.outcome	Ok
+   steer2.default_provider.stop_reason	EndTurn
+   steer2.default_provider.reply	done
+   	SteeringDelivered is the provider saying it took the input inside the
+   	current turn; SteeringApplied is the SDK putting it into history at the
+   	turn boundary. rho-sdk's own default provider path drops the former, so a
+   	host can only rely on the boundary — the same guarantee pi's steer gives.
+   steer3.clear_queue_analogue.retraction_outcomes	AlreadyApplied,Retracted,Retracted
+   steer3.clear_queue_analogue.steer_still_in_history	true
+   steer3.clear_queue_analogue.events	Started,SteeringApplied,StepStarted,ToolCallUpdated,ModelCallCompleted,ToolProposed,ToolStarted,ToolFinished,StepStarted,AssistantTextDelta,ModelCallCompleted,Completed
+   steer3.clear_queue_analogue.outcome	Ok
+   steer3.clear_queue_analogue.stop_reason	EndTurn
+   steer3.clear_queue_analogue.reply	done
+   	pi's clear_queue empties a queue the harness owns. Here the host must keep
+   	every SteeringId it staged and retract each one, and a retraction that
+   	loses the race reports AlreadyApplied — there is no state where queued
+   	input is guaranteed discardable, because the loop may apply it at any step.
+   steer4.host_input.answered_from	ToolHostInputRequested
+   steer4.host_input.answered	true
+   steer4.host_input.events	Started,StepStarted,ModelCallCompleted,ToolProposed,ToolStarted,ToolHostInputRequested,ToolFinished,StepStarted,ModelCallCompleted,Completed
+   steer4.host_input.tool_result	Success(ToolOutput { content: "host answered Spike approval: {\"approve\": [\"yes\"]}", metadata: ToolMetadata { operation: None, affected_paths: [], command_summary: None, urls: [], diff: None, asset…
+   steer4.host_input.outcome	Ok
+   steer4.host_input.stop_reason	EndTurn
+   steer4.host_input.reply	done
+   host.rss_peak_kib	5284
+   (rc=0, 1.6s, 45 lines)
+
+-- cancellation and the blast wall: tool children on cancel, drop, SIGKILL, panic
+   labelled arm: no model endpoint involved. It exercises the runtime,
+   the in-process tool round trip and the event stream, and says nothing
+   about the model — reported separately so it can never be read as the
+   endpoint arm passing.
+   crate.linked	rho-sdk	5.9.0
+   host.pid	273695
+   host.rss_before_kib	3632
+   arm.label	cancellation and blast-wall probes (no endpoint)
+   	looprs' blast wall today is a process: kill_on_drop reaps the child, and a
+   	panic in pi cannot take the terminal with it. In process, none of that is
+   	automatic — these probes measure what the host has to build itself.
+   blast1.cancel.settle	Cancelled
+   blast1.cancel.turn_ms	647.0
+   blast1.cancel.outcome	Err(operation cancelled)
+   blast1.cancel.retryable	no
+   blast1.cancel.child_pid	273705
+   blast1.cancel.child_alive	true
+   blast1.cancel.child_ppid	273695
+   blast1.cancel.child_still_ours	true
+   blast2.kill_on_drop.settle	Cancelled
+   blast2.kill_on_drop.outcome	Err(operation cancelled)
+   blast2.kill_on_drop.retryable	no
+   blast2.kill_on_drop.child_pid	273728
+   blast2.kill_on_drop.child_alive	false
+   blast2.kill_on_drop.child_ppid	-
+   blast2.kill_on_drop.child_still_ours	false
+   	blast2 is the argument looprs has to make against itself: killing the
+   	child is easy when you wrote the spawn. In process, every tool author has
+   	to remember it, and the SDK has no view of what a host tool spawned.
+   blast3.drop_run.events_seen	6
+   blast3.drop_run.session_state_after_drop	Idle
+   blast3.drop_run.child_pid	273730
+   blast3.drop_run.child_alive	true
+   blast3.drop_run.child_ppid	273695
+   blast3.drop_run.child_still_ours	true
+   	The Run's Drop cancels the token and aborts the worker task. Aborting is
+   	not awaiting: the tool future is dropped where it stands, so a blocking
+   	spawn is not unwound and its child outlives the run.
+   blast4.sigkill_holder.holder_pid	273731
+   blast4.sigkill_holder.tool_child_pid	Some(273741)
+   blast4.sigkill_holder.holder_reaped	true
+   blast4.sigkill_holder.child_alive_after_host_kill	true
+   blast4.sigkill_holder.child_ppid_after_host_kill	1
+   blast4.sigkill_holder.child_reparented_to_init	true
+   	Nothing reaps a tool's children when the engine dies inside the host
+   	process: there is no kill_on_drop on a process looprs did not spawn.
+   	ADR-0006 makes leaving the terminal clean possible; it cannot help with a
+   	panic or a kill in looprs' own process.
+   blast5.tool_panic.stderr_bytes	191
+   blast5.tool_panic.written_to_terminal	thread 'tokio-rt-worker' (273746) panicked at src/main.rs:350:17:
+   blast5.tool_panic.exit_code	0
+   blast5.tool_panic.host_survived	true
+   blast5.tool_panic.inner	inner.settle NONE — stream closed with no terminal event
+   blast5.tool_panic.inner	inner.events Started,StepStarted,ModelCallCompleted,ToolProposed,ToolStarted
+   blast5.tool_panic.inner	inner.outcome Err(operation interrupted: run task failed: task 9 panicked with message "LOOPRS_SPIKE_PANIC inside a rho-sdk tool call")
+   blast5.tool_panic.inner	inner.retryable no
+   	The panic is contained by the task the runtime spawned on, so the host
+   	process lives — but the panic text goes to this process' stderr, which in
+   	looprs is the user's terminal, mid-frame. That is the ADR-0006 hazard the
+   	process boundary was also buying against.
+   blast.probe_children_swept	2
+   host.rss_peak_kib	5304
+   (rc=0, 3.2s, 58 lines)
+
+-- persistence: what is written, in what format, and the opt-out
+   labelled arm: no model endpoint involved. It exercises the runtime,
+   the in-process tool round trip and the event stream, and says nothing
+   about the model — reported separately so it can never be read as the
+   endpoint arm passing.
+   crate.linked	rho-sdk	5.9.0
+   host.pid	273755
+   host.rss_before_kib	3632
+   arm.label	persistence probes (no endpoint)
+   persist.turn_ms	1.1
+   persist.sdk_writes_files_by_default	no path exists in the SDK to write to
+   persist.schema_version	2
+   persist.schema_version_oldest_accepted	1
+   persist.snapshot_bytes	795
+   persist.snapshot_top_level_keys	compaction,history,provider,revision,schema_version,session_id
+   persist.snapshot_history_messages	4
+   persist.snapshot_mentions_reasoning	false
+   persist.snapshot_mentions_credentials	false
+   persist.checkpoint_store_saved	true
+   persist.checkpoint_store_is	host-supplied trait impl; the in-memory one is in-process only
+   persist.restored_first_request_messages	5
+   persist.restored_reply	Completed=1,ModelCallCompleted=1,Started=1,StepStarted=1
+   persist.restored_history_messages	6
+   persist.files_created_in_scratch_dir	0
+   persist.home_dot_rho_created	false
+   persist.rho_home_env_touched	Some("/tmp/rho-home-68t80cv9")
+   	rho-sdk writes nothing: persistence is a value (`SessionSnapshot`, versioned
+   	JSON) plus a host-implemented `SessionStore` trait, and `InMemorySessionStore`
+   	is the only shipped impl. There is no session file, so there is nothing to opt
+   	out of — which is the opposite of pi's session-file behaviour looprs' corpus
+   	measurements currently depend on.
+   host.rss_peak_kib	5188
+   (rc=0, 0.0s, 27 lines)
+
+What this leg is for: it is the *decision-relevant* half. Everything the
+loop needs from a child over stdio has to be re-expressed as this library's
+calls, and the events the host is handed are the library's, not pi's — see
+leg 3's intersection. The program that proves it is per target, because the
+two candidates' APIs are not the same API.
+
+Done.
