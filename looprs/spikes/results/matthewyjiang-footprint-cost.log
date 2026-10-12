@@ -1,0 +1,429 @@
+# matthewyjiang-footprint-cost — captured 2026-10-12T20:41:10Z, tree 3c29fd4 (dirty tree: uncommitted changes on top of that commit)
+# ran: env LOOPRS_SPIKE_RHO=/tmp/rho-cli-target/release/rho LOOPRS_SPIKE_CLI_MODEL=1 LOOPRS_RHO_TARGET=/tmp/rho-footprint-target python3 spikes/rho_footprint_cost.py
+workspace-8jk.11 footprint measurement — host Linux 7.0.14-linuxkit, 8 cpus, 7934.4 MiB RAM, aarch64 container, python 3.14.5
+pi: /home/appuser/.pi/agent/bin/pi   candidate CLI: /tmp/rho-cli-target/release/rho
+subject: matthewyjiang/rho — crate `rho-sdk`, CLI crate `rho-coding-agent`. Not casonadams/rho, not pyrex41/rho.
+crate resolved: rho-sdk 5.9.0 (crates.io max_stable_version (no pin given))
+model endpoint: reachable at http://llm.home:8080/v1
+candidate CLI version: rho 2.20.0
+ceiling: cgroup memory.max (no limit), MemAvailable 7038.2 MiB
+
+Read before quoting a number: one machine, one endpoint, one kernel, and the CLI rows
+and the embedded rows answer different questions (see leg 3's and leg 4's notes).
+Two RSS instruments appear, and each row says which it is: the pi rows use the
+boundary capture's `/proc` VmRSS sampler at 5–10 ms (a child that stays alive),
+the one-shot child rows use VmHWM sampled at ~20 µs, and the embedded arms print
+the same VmHWM from inside the process so the two readings can be compared.
+
+== 1. pi --mode rpc, re-measured with the boundary capture's own method ==
+shape                                                fork→first ms peak RSS MiB rtt ms med rtt ms p95  cpu ms eof→exit ms
+-------------------------------------------------------------------------------------------------------------------------
+worker (`pi --mode rpc`)                                     316.3        121.4       0.15      11.24     410         8.4
+                                                     run-to-run fork→first: 299.8–330.2 ms over 7 runs
+                                                     Method is `spikes/pi_rpc_boundary_cost.py`'s: the same correlated `get_state` handshake and
+                                                     the same /proc sampler in the parent, so this row and that capture's row are the
+                                                     same measurement taken twice, not two measurements of one thing.
+
+== 2. looprs' own RSS — the host the candidate would be added to ==
+shape                                                 VmRSS MiB   peak MiB  VmHWM MiB
+------------------------------------------------------------------------------------
+looprs, booted and idle in a pty (3 boots)                 39.6       39.6       39.6
+                                                     run-to-run VmRSS: 39.6–39.6 MiB over 3 boots; every boot painted 1762 bytes into a 40×100 pty, so none of them is a process that started and drew nothing
+
+This is the line the previous capture did not have: its memory row put a *child's* RSS
+next to an *in-process engine's* RSS, and every byte the host already spends came along for
+free in the comparison. `bd` is /bin/echo and `pi` is /usr/bin/false here, so the run
+touches no real board; the figure is looprs' own resident set, kernel-accounted.
+
+== 3. the candidate as a CLI — the shape its own chart measures ==
+provenance: no aarch64-linux release asset exists upstream (the published assets are macOS x2 and Windows x1), so this shape had to be built from the crates.io artifact. Upstream's own `[profile.release]` is the size-tuning pass the repo note records — `opt-level = "s", `lto = "fat", `codegen-units = 1`, `strip = "symbols"` — and that fat-LTO link was SIGKILLed by the kernel (OOM) **twice** on this 8 GiB box, once at cargo's default job count and once at `CARGO_BUILD_JOBS=1`, so the shipped profile is not buildable here at all. What the CLI rows below measured is therefore `cargo build --release --bin rho --locked` with `CARGO_PROFILE_RELEASE_LTO=thin`: every other release knob as upstream, one deviation named in the row, and a note that the fat-LTO build a user would download is a *different* artifact whose size this capture does not measure.
+candidate binary: /tmp/rho-cli-target/release/rho (rc=0)
+candidate version: rho 2.20.0
+candidate binary: 45,426,120 B on disk (43.3 MiB), stripped of symbols
+shape                                                fork→first ms   exit ms peak RSS MiB  cpu ms   rc
+------------------------------------------------------------------------------------------------------
+rho --version (binary boot, no provider touched)               2.0       2.3          9.6       3    0
+                                                     run-to-run fork→first: 1.7–2.3 ms over 7 runs; peak column = VmHWM, 11 samples/run (rusage would have read 18.9 MiB: the spawner's pages, so not used)
+rho run --help (boot + clap parse, no session)                 1.9       2.1         10.9       3    0
+                                                     run-to-run fork→first: 1.8–2.2 ms over 7 runs; peak column = VmHWM, 10 samples/run (rusage would have read 18.9 MiB: the spawner's pages, so not used)
+pi --version (the same shape, for the chart's claim)         221.3     227.5        110.5     278    0
+                                                     run-to-run fork→first: 216.2–236.2 ms over 7 runs; peak column = VmHWM, 1414 samples/run (rusage would have read 110.0 MiB: the spawner's pages, so not used)
+
+one-shot shape: `/tmp/rho-cli-target/release/rho --provider spike --model halogen-qwen3.8-flash-next run --output jsonl` with provider `spike` defined in
+  /tmp/8jk11-cli-quwhspmd/rho-home/config.toml
+  probe: rc=0  fork→first 148.71808301541023 ms  wall 483 ms
+  stdout: {"schema_version":1,"seq":1,"type":"run.started","run_id":"77d83e14-dc7f-4a92-bd53-ef13b1ea23c1","session_id":"dcb13e3b-1cb9-458a-b195-4c96b40cd4df","workspace"
+  stdout: {"schema_version":1,"seq":2,"type":"assistant.text_delta","attempt":1,"text":"present"}
+  stdout: {"schema_version":1,"seq":3,"type":"run.completed","reason":"completed","text":"present"}
+
+rho run --output jsonl (one real one-shot turn, 3 runs)          29.2     381.8         27.6      28    0
+                                                     run-to-run fork→first: 28.7–29.4 ms over 3 runs; peak column = VmHWM, 2701 samples/run (rusage would have read 27.2 MiB: the spawner's pages, so not used)
+(the CLI scratch $RHO_HOME stays at /tmp/8jk11-cli-quwhspmd/rho-home so leg 5's N-concurrent `rho run` children read the same provider config)
+
+What each column means, because the shapes are not the same question:
+  fork→first  — process start to the first newline the shape prints. For pi that is the
+                first correlated RPC response (leg 1, a different question); for the
+                candidate CLI it is the version string, or for `rho run` the first JSONL
+                record — a session header, so it says the CLI is up and has started the
+                turn, not that a model answered. The wall column is the whole turn.
+  peak RSS    — VmHWM, the kernel's own high-water mark for that address space, read from
+                /proc while the child lives. `os.wait4`'s rusage is *not* the instrument:
+                on this box it reports the spawner's resident set for any child small or
+                fast enough that the exec has not cleared it (a `/bin/true` spawned here
+                reads ~19 MiB, which is this driver's own Python), so every short-lived
+                row would have been inflated. The spread line under each row prints what
+                rusage would have said, so the mistake is visible instead of hidden.
+The candidate's chart measures column 1 and column 3 of the CLI rows. It is not the row
+looprs would pay for; leg 4 is.
+
+== 4. the candidate embedded — the shape looprs would actually use ==
+scratch host crate: /tmp/8jk11-embed-fr392d94/rho-footprint-spike
+embed program:     spikes/embed_programs/matthewyjiang-rho-sdk.footprint.rs
+manifest deps:     [dependencies]; rho-sdk = "5.9.0"; tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "sync"] }; serde_json = "1"; futures = "0.3"
+target dir:        /tmp/rho-footprint-target  (REUSED — not a cold build)
+build:             rc=0  5s wall  1 crates compiled
+shipped graph:     68 packages (`cargo tree -e normal`)
+artifact:          3517672 B
+
+Boot of the host itself (spawn → the first line it prints; same definition as leg 3's first column):
+embedded host, nothing constructed yet                         1.0       1.7          3.1       3    0
+                                                     run-to-run fork→first: 0.8–1.4 ms over 7 runs; peak column = VmHWM, 8 samples/run (rusage would have read 19.1 MiB: the spawner's pages, so not used)
+
+The embedded program's own header says why there is no embedded-with-a-real-model arm here:
+  rho-sdk 5.9.0 depends on serde, serde_json, thiserror, tokio, tracing, url, uuid — no
+  HTTP client of any kind, and its only provider is `ScriptedProvider`, a test double.
+  The model clients live in `rho-providers`, which is what composes a working agent.
+  So embedding rho is a *crate composition* decision, not a dependency line, and the
+  real-endpoint rows in this capture are the CLI's, which is that composition already
+  built. Everything below measures the runtime, not the transport.
+
+-- floor — the control: same binary, rho-sdk linked, nothing constructed
+   rc=0 wall=2 ms peak RSS 3.1 MiB cpu=3 ms; read from inside the same process: VmHWM 2.9 MiB over 9 samples taken from outside — the two instruments agree
+   host.pid	398202
+   payload_kib	64
+   arm	floor
+   floor.nothing_constructed	rss_kib=2948 hwm_kib=2948 private_dirty_kib=348 swap_kib=0 threads=9 note=rho-sdk linked, no runtime, no session
+   floor.builder_allocated	rss_kib=3000 hwm_kib=3000 private_dirty_kib=360 swap_kib=0 threads=9 note=Rho::builder() allocated, never built
+   floor.rss_kib	3004
+   floor.rss_peak_kib	3004
+      	This arm is the control subtracted from every embedded row below.
+   host.rss_exit_kib	3004
+   host.rss_peak_exit_kib	3004
+
+-- ladder — runtime, session, three runs, second session, second runtime
+   rc=0 wall=4 ms peak RSS 4.5 MiB cpu=4 ms; read from inside the same process: VmHWM 4.4 MiB over 19 samples taken from outside — the two instruments agree
+   host.pid	398212
+   payload_kib	64
+   arm	ladder
+   ladder.start	rss_kib=2960 hwm_kib=2960 private_dirty_kib=352 swap_kib=0 threads=9 
+   ladder.after_runtime	rss_kib=3332 hwm_kib=3332 private_dirty_kib=692 swap_kib=0 threads=9 step_ms=0.14 note=Rho built: provider + tool registry wired
+   ladder.after_session	rss_kib=3404 hwm_kib=3404 private_dirty_kib=764 swap_kib=0 threads=9 step_ms=0.03 note=one session, empty history
+   ladder.after_run_1	rss_kib=4172 hwm_kib=4172 private_dirty_kib=1416 swap_kib=0 threads=9 step_ms=0.56 events=10 terminal=Completed outcome=true
+   ladder.after_run_2	rss_kib=4308 hwm_kib=4308 private_dirty_kib=1548 swap_kib=0 threads=9 step_ms=0.21 events=10 terminal=Completed outcome=true
+   ladder.after_run_3	rss_kib=4448 hwm_kib=4448 private_dirty_kib=1688 swap_kib=0 threads=9 step_ms=0.23 events=10 terminal=Completed outcome=true
+   ladder.after_session_2	rss_kib=4448 hwm_kib=4448 private_dirty_kib=1688 swap_kib=0 threads=9 note=second session on the same runtime
+   ladder.after_session_2_run	rss_kib=4464 hwm_kib=4464 private_dirty_kib=1704 swap_kib=0 threads=9 events=10 terminal=Completed outcome=true
+   ladder.after_runtime_2	rss_kib=4584 hwm_kib=4584 private_dirty_kib=1824 swap_kib=0 threads=9 note=second runtime in the same process
+   ladder.after_runtime_2_run	rss_kib=4584 hwm_kib=4584 private_dirty_kib=1824 swap_kib=0 threads=9 events=10 terminal=Completed outcome=true
+   host.rss_exit_kib	4516
+   host.rss_peak_exit_kib	4516
+
+-- bigtool — the ladder where the tool answers with 256 KiB of text
+   rc=0 wall=4 ms peak RSS 5.9 MiB cpu=5 ms; read from inside the same process: VmHWM 5.6 MiB over 21 samples taken from outside — the two instruments agree
+   host.pid	398222
+   payload_kib	256
+   arm	bigtool
+   payload_kib	256
+   bigtool.start	rss_kib=2928 hwm_kib=2928 private_dirty_kib=316 swap_kib=0 threads=9 
+   bigtool.after_session	rss_kib=3860 hwm_kib=3860 private_dirty_kib=892 swap_kib=0 threads=9 
+   bigtool.after_run_1	rss_kib=4760 hwm_kib=4760 private_dirty_kib=1292 swap_kib=0 threads=9 events=10 terminal=Completed outcome=true
+   bigtool.after_run_2	rss_kib=5280 hwm_kib=5280 private_dirty_kib=1808 swap_kib=0 threads=9 events=10 terminal=Completed outcome=true
+   bigtool.after_run_3	rss_kib=6056 hwm_kib=6056 private_dirty_kib=2584 swap_kib=0 threads=9 events=10 terminal=Completed outcome=true
+   bigtool.tool_calls	3
+   bigtool.tool_output_bytes_per_call	262144
+   host.rss_exit_kib	4632
+   host.rss_peak_exit_kib	5776
+
+-- history — one session, 40 runs of 64 KiB tool output: a long pass growing
+   rc=0 wall=25 ms peak RSS 11.6 MiB cpu=27 ms; read from inside the same process: VmHWM 11.3 MiB over 165 samples taken from outside — the two instruments agree
+   host.pid	398232
+   payload_kib	64
+   arm	history
+   runs	40
+   history.start	rss_kib=2976 hwm_kib=2976 private_dirty_kib=344 swap_kib=0 threads=9 
+   history.after_run_10	rss_kib=5496 hwm_kib=5540 private_dirty_kib=2012 swap_kib=0 threads=9 events=10 terminal=Completed outcome=true since_last=1952 history_messages=40
+   history.after_run_20	rss_kib=6832 hwm_kib=7632 private_dirty_kib=3348 swap_kib=0 threads=9 events=10 terminal=Completed outcome=true since_last=1460 history_messages=80
+   history.after_run_30	rss_kib=8140 hwm_kib=9556 private_dirty_kib=4656 swap_kib=0 threads=9 events=10 terminal=Completed outcome=true since_last=1308 history_messages=120
+   history.after_run_40	rss_kib=9520 hwm_kib=11616 private_dirty_kib=7892 swap_kib=0 threads=9 events=10 terminal=Completed outcome=true since_last=1380 history_messages=160
+      	Every turn here feeds a tool result back into history, so this is the
+      	shape of a pass that has been going a while. A single-run row cannot show
+      	that a long pass grows, or how fast.
+   host.rss_exit_kib	7552
+   host.rss_peak_exit_kib	11616
+
+-- steptiming, no sleeps — where a run's wall time goes when nothing is waiting
+   rc=0 wall=3 ms peak RSS 4.2 MiB cpu=4 ms; read from inside the same process: VmHWM 4.1 MiB over 15 samples taken from outside — the two instruments agree
+   host.pid	398242
+   payload_kib	64
+   arm	steptiming
+   model_ms	0  tool_ms	0
+   steptiming.break_at_terminal_1	events=[Started@0.2,StepStarted@0.2,ModelCallCompleted@0.2,ToolProposed@0.2,ToolStarted@0.2,ToolFinished@0.3,StepStarted@0.3,AssistantTextDelta@0.3,ModelCallCompleted@0.3] terminal_at_ms=0.321875 break_ms=0.3 is_running_at_break=false drop_ms=0.00 is_running_after_drop=false next_start_ms=0.02 next_first_event_ms=0.07 next_pass=started
+   steptiming.drain_to_close_1	events=10 terminal_at_ms=0.2 stream_close_ms=0.2 settle_window_ms=0.0
+   steptiming.break_at_terminal_2	events=[Started@0.1,StepStarted@0.1,ModelCallCompleted@0.1,ToolProposed@0.1,ToolStarted@0.1,ToolFinished@0.1,StepStarted@0.2,AssistantTextDelta@0.2,ModelCallCompleted@0.2] terminal_at_ms=0.237708 break_ms=0.2 is_running_at_break=false drop_ms=0.00 is_running_after_drop=false next_start_ms=0.02 next_first_event_ms=0.07 next_pass=started
+   steptiming.drain_to_close_2	events=10 terminal_at_ms=0.2 stream_close_ms=0.2 settle_window_ms=0.0
+   steptiming.break_at_terminal_3	events=[Started@0.1,StepStarted@0.1,ModelCallCompleted@0.1,ToolProposed@0.1,ToolStarted@0.1,ToolFinished@0.2,StepStarted@0.2,AssistantTextDelta@0.2,ModelCallCompleted@0.2] terminal_at_ms=0.185833 break_ms=0.2 is_running_at_break=false drop_ms=0.00 is_running_after_drop=false next_start_ms=0.02 next_first_event_ms=0.06 next_pass=started
+   steptiming.drain_to_close_3	events=10 terminal_at_ms=0.2 stream_close_ms=0.2 settle_window_ms=0.0
+      	What this pair of rows is for: two things a loop cares about that no other
+      	row in this capture can show. First, at the top of the file's two-run
+      	latency: with no sleeps anywhere, a whole run — two model turns and a tool
+      	call through the runtime — takes well under a millisecond, so the per-run
+      	cost a `ladder` row shows is the work it was given, not a fixed tax the
+      	runtime charges for existing. Second, `settle_window_ms`: the gap between
+      	the terminal event and the stream actually closing. On pi that gap is ~456
+      	ms and the loop has to wait for it (ADR-0010's settle row). Run this arm
+      	twice, with and without turn latency: the window is ~0 either way, so the
+      	wait is cheap here — but `settlerace` shows the session still refuses an
+      	advance that ignores it.
+   host.rss_exit_kib	4244
+   host.rss_peak_exit_kib	4244
+
+-- steptiming, 120 ms turns — same shapes at a realistic turn latency, for `settle_window_ms`
+   rc=0 wall=2191 ms peak RSS 4.6 MiB cpu=8 ms; read from inside the same process: VmHWM 4.4 MiB over 15364 samples taken from outside — the two instruments agree
+   host.pid	398252
+   payload_kib	64
+   arm	steptiming
+   model_ms	120  tool_ms	0
+   steptiming.break_at_terminal_1	events=[Started@0.1,StepStarted@0.1,ModelCallCompleted@121.4,ToolProposed@121.4,ToolStarted@121.5,ToolFinished@121.6,StepStarted@121.6,AssistantTextDelta@244.3,ModelCallCompleted@244.3] terminal_at_ms=244.302333 break_ms=244.3 is_running_at_break=false drop_ms=0.00 is_running_after_drop=false next_start_ms=0.03 next_first_event_ms=0.09 next_pass=started
+   steptiming.drain_to_close_1	events=10 terminal_at_ms=242.3 stream_close_ms=242.3 settle_window_ms=0.0
+   steptiming.break_at_terminal_2	events=[Started@0.1,StepStarted@0.1,ModelCallCompleted@121.3,ToolProposed@121.3,ToolStarted@121.3,ToolFinished@121.4,StepStarted@121.5,AssistantTextDelta@241.9,ModelCallCompleted@241.9] terminal_at_ms=241.907958 break_ms=241.9 is_running_at_break=false drop_ms=0.01 is_running_after_drop=false next_start_ms=0.03 next_first_event_ms=0.13 next_pass=started
+   steptiming.drain_to_close_2	events=10 terminal_at_ms=243.6 stream_close_ms=243.6 settle_window_ms=0.0
+   steptiming.break_at_terminal_3	events=[Started@0.1,StepStarted@0.1,ModelCallCompleted@121.4,ToolProposed@121.4,ToolStarted@121.5,ToolFinished@121.5,StepStarted@121.6,AssistantTextDelta@242.5,ModelCallCompleted@242.5] terminal_at_ms=242.550375 break_ms=242.6 is_running_at_break=false drop_ms=0.00 is_running_after_drop=false next_start_ms=0.02 next_first_event_ms=0.14 next_pass=started
+   steptiming.drain_to_close_3	events=10 terminal_at_ms=245.0 stream_close_ms=245.0 settle_window_ms=0.0
+      	What this pair of rows is for: two things a loop cares about that no other
+      	row in this capture can show. First, at the top of the file's two-run
+      	latency: with no sleeps anywhere, a whole run — two model turns and a tool
+      	call through the runtime — takes well under a millisecond, so the per-run
+      	cost a `ladder` row shows is the work it was given, not a fixed tax the
+      	runtime charges for existing. Second, `settle_window_ms`: the gap between
+      	the terminal event and the stream actually closing. On pi that gap is ~456
+      	ms and the loop has to wait for it (ADR-0010's settle row). Run this arm
+      	twice, with and without turn latency: the window is ~0 either way, so the
+      	wait is cheap here — but `settlerace` shows the session still refuses an
+      	advance that ignores it.
+   host.rss_exit_kib	4528
+   host.rss_peak_exit_kib	4528
+
+-- settlerace, 120 ms turns — advance on the event holding the run, dropping it, or draining
+   rc=0 wall=44042 ms peak RSS 4.6 MiB cpu=91 ms; read from inside the same process: VmHWM 4.4 MiB over 309229 samples taken from outside — the two instruments agree
+   host.pid	398285
+   payload_kib	64
+   arm	settlerace
+   model_ms	120
+   settlerace.break_on_event_run_held	trials=30 session_busy_refusals=8 other_refusals=0 still_refused_after_20ms=0 wall_ms=14693.3
+   	refused 8× with: SessionBusy
+   settlerace.break_on_event_run_dropped	trials=30 session_busy_refusals=2 other_refusals=0 still_refused_after_20ms=0 wall_ms=14667.1
+   	refused 2× with: SessionBusy
+   settlerace.drain_stream_then_advance	trials=30 session_busy_refusals=0 other_refusals=0 still_refused_after_20ms=0 wall_ms=14677.5
+      	Why a memory/concurrency capture carries this: ADR-0010's settle row asks
+      	whether a loop advance can be keyed on the terminal event. It cannot, and
+      	the two rows that look safe are the ones that lose: reading to the event
+      	and advancing, with the run held or dropped, gets refused some fraction of
+      	the trials; dropping the run first lowers the rate and does not remove it.
+      	The session's run slot is released asynchronously with respect to the
+      	terminal event, and `is_running()` disagrees with `start()` in both
+      	directions at that moment — `steptiming` rows show it reading true on trials
+      	where the next `start` worked and false on ones where it refused — so neither
+      	the event nor that predicate is a gate. Draining the stream to its end is the
+      	only shape here with zero refusals. That is ADR-0010's rule arriving
+      	from the opposite direction: on pi the loop has to *wait* for the stream to
+      	close (its settle window is ~456 ms), and on this engine the close costs
+      	nothing (`steptiming`'s `settle_window_ms`) but still has to be waited for.
+      	A host that advances on the event has to treat `SessionBusy` as retryable;
+      	a host that advances on the close does not have to handle it at all.
+   host.rss_exit_kib	4476
+   host.rss_peak_exit_kib	4488
+
+-- settlerace, 20 ms turns — the same three shapes, tighter
+   rc=0 wall=16138 ms peak RSS 4.6 MiB cpu=138 ms; read from inside the same process: VmHWM 4.4 MiB over 112737 samples taken from outside — the two instruments agree
+   host.pid	398519
+   payload_kib	64
+   arm	settlerace
+   model_ms	20
+   settlerace.break_on_event_run_held	trials=60 session_busy_refusals=1 other_refusals=0 still_refused_after_20ms=0 wall_ms=5397.3
+   	refused 1× with: SessionBusy
+   settlerace.break_on_event_run_dropped	trials=60 session_busy_refusals=1 other_refusals=0 still_refused_after_20ms=0 wall_ms=5351.5
+   	refused 1× with: SessionBusy
+   settlerace.drain_stream_then_advance	trials=60 session_busy_refusals=0 other_refusals=0 still_refused_after_20ms=0 wall_ms=5383.3
+      	Why a memory/concurrency capture carries this: ADR-0010's settle row asks
+      	whether a loop advance can be keyed on the terminal event. It cannot, and
+      	the two rows that look safe are the ones that lose: reading to the event
+      	and advancing, with the run held or dropped, gets refused some fraction of
+      	the trials; dropping the run first lowers the rate and does not remove it.
+      	The session's run slot is released asynchronously with respect to the
+      	terminal event, and `is_running()` disagrees with `start()` in both
+      	directions at that moment — `steptiming` rows show it reading true on trials
+      	where the next `start` worked and false on ones where it refused — so neither
+      	the event nor that predicate is a gate. Draining the stream to its end is the
+      	only shape here with zero refusals. That is ADR-0010's rule arriving
+      	from the opposite direction: on pi the loop has to *wait* for the stream to
+      	close (its settle window is ~456 ms), and on this engine the close costs
+      	nothing (`steptiming`'s `settle_window_ms`) but still has to be waited for.
+      	A host that advances on the event has to treat `SessionBusy` as retryable;
+      	a host that advances on the close does not have to handle it at all.
+   host.rss_exit_kib	4476
+   host.rss_peak_exit_kib	4476
+
+-- sessions — one runtime, N sessions, no runs
+   rc=0 wall=2 ms peak RSS 3.5 MiB cpu=3 ms; read from inside the same process: VmHWM 3.3 MiB over 7 samples taken from outside — the two instruments agree
+   host.pid	398620
+   payload_kib	64
+   arm	sessions
+   n	8
+   sessions.runtime_kib	3328
+   sessions.added_kib	92
+   sessions.added_kib_per_session	11
+   sessions.threads_with_n_sessions	9
+   host.rss_exit_kib	3428
+   host.rss_peak_exit_kib	3428
+
+-- concurrent — one runtime, N sessions, N runs in flight at once
+   n=2: rc=0 host peak RSS 4.7 MiB | runtime 3320 KiB | N runs added 1120 KiB over the runtime | wall 144.8 ms vs one-lane-at-a-time 145.5 ms vs sequential 288.5 ms | model calls in flight 2 | tool calls in flight 2 (max_parallel_tools=default:1)
+     concurrent.is_running_mid_run	true
+     concurrent.second_run_on_busy_session	refused: SessionBusy
+     concurrent.is_running_after_drain	false
+   n=4: rc=0 host peak RSS 5.4 MiB | runtime 3324 KiB | N runs added 1468 KiB over the runtime | wall 145.8 ms vs one-lane-at-a-time 145.4 ms vs sequential 577.7 ms | model calls in flight 4 | tool calls in flight 4 (max_parallel_tools=default:1)
+     concurrent.is_running_mid_run	true
+     concurrent.second_run_on_busy_session	refused: SessionBusy
+     concurrent.is_running_after_drain	false
+   n=8: rc=0 host peak RSS 6.4 MiB | runtime 3340 KiB | N runs added 2120 KiB over the runtime | wall 146.2 ms vs one-lane-at-a-time 150.8 ms vs sequential 1156.5 ms | model calls in flight 8 | tool calls in flight 8 (max_parallel_tools=default:1)
+     concurrent.is_running_mid_run	true
+     concurrent.second_run_on_busy_session	refused: SessionBusy
+     concurrent.is_running_after_drain	false
+
+-- engines — N whole runtimes in one process (the other way to get N concurrent passes), one run each, then all shut down and dropped
+   n=2: rc=0 host peak RSS 4.4 MiB | added 464 KiB building them (232 KiB each) in 0.1 ms | runs wall 190.2 ms | after shutdown+drop, 1380 KiB still resident and 10 (started at 9) threads
+   n=4: rc=0 host peak RSS 4.6 MiB | added 616 KiB building them (154 KiB each) in 0.3 ms | runs wall 385.3 ms | after shutdown+drop, 1400 KiB still resident and 10 (started at 9) threads
+   n=8: rc=0 host peak RSS 4.8 MiB | added 880 KiB building them (110 KiB each) in 0.4 ms | runs wall 759.1 ms | after shutdown+drop, 1464 KiB still resident and 10 (started at 9) threads
+
+What each number here is:
+  rss_kib / hwm_kib — VmRSS and VmHWM for *this* process, read from /proc/self/status by
+                      the process itself. VmHWM is the kernel's high-water mark, so a
+                      peak cannot be missed by a sampling interval.
+  private_dirty_kib — from /proc/self/smaps_rollup: the resident pages that belong to
+                      this address space rather than to shared mappings, which is what
+                      a host actually pays when it links something in.
+  added               — minus the `floor` row of the same binary: the cost of using the
+                      runtime, not the cost of having linked it.
+  threads             — /proc/self/task count: an embedded runtime arrives with threads,
+                      and a host that builds N of them should know whether they multiply.
+
+The provider in this program is a stub that sleeps and answers, and it is *part of the*
+*measurement* rather than overhead: rho-sdk ships no model client, so any embedding host
+is writing or vendoring one. Its footprint is inside these numbers on purpose.
+
+== 5. N at once — children against an in-process engine ==
+MemTotal 7934.4 MiB   MemAvailable 7038.2 MiB at capture start, 7030.8 MiB here   cgroup memory.max (no limit)
+ceiling used for the extrapolation: 7038.2 MiB  — the container has no memory.max, so this is what was free when the capture started, not a quota
+
+(a) N `pi --mode rpc` children warm at once — today's shape
+   n=2: all warm in 405 ms   per-child peak median 120.1 MiB   sum 240.2 MiB   MemAvailable after 6903.4 MiB (drop 127.4 MiB)
+   n=4: all warm in 593 ms   per-child peak median 124.0 MiB   sum 494.8 MiB   MemAvailable after 6715.5 MiB (drop 315.3 MiB)
+   n=8: all warm in 1165 ms   per-child peak median 118.8 MiB   sum 955.3 MiB   MemAvailable after 6452.7 MiB (drop 578.1 MiB)
+
+(b) N candidate CLI children at once
+   n=2 × `rho --version`: all done in 4 ms   per-child fork→first 3 ms   per-child peak 10.0 MiB   sum 20.0 MiB
+   n=4 × `rho --version`: all done in 8 ms   per-child fork→first 5 ms   per-child peak 2.9 MiB   sum 15.7 MiB
+   n=8 × `rho --version`: all done in 12 ms   per-child fork→first 3 ms   per-child peak 6.7 MiB   sum 47.0 MiB
+   (LOOPRS_SPIKE_CLI_MODEL set: N × `rho run` with a real prompt)
+   n=2 × `rho run`: all done in 606 ms   per-child peak 27.7 MiB   sum 55.3 MiB
+   n=4 × `rho run`: all done in 990 ms   per-child peak 27.7 MiB   sum 111.3 MiB
+   n=8 × `rho run`: all done in 1661 ms   per-child peak 27.7 MiB   sum 222.3 MiB
+
+== 6. the rows the amendment ticket has to carry ==
+pass denominator: median 2814 s over 89 real passes
+  re-derived here from the same session corpus the boundary capture cites; the corpus
+  is live, so it is not the same file count as the ADR's row (87 passes, 3095 s); the
+  two are quoted separately rather than smoothed into one number.
+
+MEMORY — every shape as host + added, never one absolute against another:
+  looprs, booted and idle (leg 2)           39.6 MiB
+  + one `pi --mode rpc` child (leg 1)       +121.4 MiB   = 161.0 MiB for today's shape, per pass, +121.4 MiB again for every pass in flight
+  + rho runtime, one session, one run       +1.2 MiB   — each rung below is a delta over the rung before it, and all of it is measured against the
+    `floor` control: the same binary with rho-sdk linked and nothing constructed
+      runtime built                       +0.4 MiB
+      + session                          +0.1 MiB
+      + first run (a tool call included)  +0.8 MiB
+  …of which linking rho-sdk alone costs     2.9 MiB before any runtime exists (that is `floor`'s own RSS, and a host pays it whether or not it builds anything)
+  …and a long pass grows in place            9520 KiB resident, up from 2976 KiB, after 40 runs of 64 KiB tool output on one session — about 238 KiB per run held
+  by that session. A per-pass child pays none of this because it dies; a host that
+  keeps one runtime alive pays it and cannot forget it.
+  …and the history is the term               a 256 KiB tool payload costs 2196 KiB across three runs; `ladder`'s empty tool prices none of it, and a beads pass is mostly tool output
+  = candidate shape                        40.8 MiB
+  difference per pass                      120.2 MiB — and the two rows are not the same kind of number:
+  pi's is a separate process's resident set, the candidate's is bytes added to a
+  host that was already resident. That is the correction the last capture owed.
+
+  What the added row is and what it is not: it is rho's runtime with a provider and a
+  tool written by this spike, because `rho-sdk` ships no model client at all (leg 4's
+  dependency list). `bigtool` and `history` price the history a pass grows; nothing
+  here prices the tool suite, session store, compactor and permission surface a port
+  would wire in — and pi's child-in-full already contains all of those, plus Node. So
+  the honest pairing is runtime + host's own work against pi's child-in-full; reading
+  the ratio as 'rho is N× smaller than pi' is a scope error these rows are written to
+  make impossible.
+
+  The CLI row, kept separate on purpose: `rho --version` peaks at 9.6 MiB and answers in 2 ms; `pi --version` 110.5 MiB / 221 ms; `rho run` with a real turn peaks 27.6 MiB. That is the candidate's own chart's row, and it is not the embedded number: a CLI
+  child pays config loading, the provider table and a terminal layer a host already has.
+
+STARTUP — the same pair, against the denominator rather than on their own:
+  `pi --mode rpc` spawn→first          316 ms  = 0.0112% of a median pass
+  `rho --version` spawn→first          2.0 ms  = 0.000070% of a median pass
+  embedded host, process exists           1.0 ms (spawn→first line printed)
+  + runtime + session + first run       0.14 + 0.03 + 0.56 ms = 0.73 ms  = 0.000026% of a median pass
+  (the run here is a real run through the runtime with a 0 ms provider and a 0 ms
+   tool, so what is left in it is the runtime's own work, not a model's — the
+   `steptiming` arm is what that number is made of.)
+
+  Answer to the question trigger 4 asked to keep closed: an embedded boot is not free,
+  it is ~free — same order of a pass as the child's, so the latency leg stays dead
+  whichever engine gets picked and does not need a third hearing.
+
+CONCURRENCY — N at once, and which shape runs out of room first:
+  N=2: 240.2 MiB across N pi children, 405 ms to all warm   |   20.0 MiB across N rho CLI children (4 ms)   |   one runtime, N sessions: peak 4.7 MiB, 144.8 ms for N runs (sequential: 288.5 ms)   |   N runtimes in one process: peak 4.4 MiB, +464 KiB
+  N=4: 494.8 MiB across N pi children, 593 ms to all warm   |   15.7 MiB across N rho CLI children (8 ms)   |   one runtime, N sessions: peak 5.4 MiB, 145.8 ms for N runs (sequential: 577.7 ms)   |   N runtimes in one process: peak 4.6 MiB, +616 KiB
+  N=8: 955.3 MiB across N pi children, 1165 ms to all warm   |   47.0 MiB across N rho CLI children (12 ms)   |   one runtime, N sessions: peak 6.4 MiB, 146.2 ms for N runs (sequential: 1156.5 ms)   |   N runtimes in one process: peak 4.8 MiB, +880 KiB
+  Memory ceiling 7038.2 MiB ÷ pi's 121.4 MiB a child = ~57 concurrent passes before this box is out of memory (~28 before half of it is gone), against 6.4 MiB for the same N embedded in one process.
+  The runtime shape does not multiply: one process, ~1.4 MiB added by all the concurrent runs together, and the wall time is where the concurrency actually shows up (the row above: N runs together vs
+  the same N runs one after another). Memory is not what limits the embedded shape.
+  Which degrades first: the child shapes, because N children pay N runtimes. The
+  embedded shape's limit is not memory at these numbers at all — it is the session
+  rule below.
+
+THE CONCURRENCY RULE — the ticket's fifth question, and the answer is the right shape,
+  with one wrinkle:
+  `one active Run per Session`, hit the way a loop hits it: refused: SessionBusy
+  while a run is in flight (`is_running` = true), and 
+  ACCEPTED once it has drained (`is_running` = false). N passes are N
+  sessions, so the rule does not collide with looprs' shape; two runs on one
+  session is a bug in a host, not a limitation of the engine.
+  The wrinkle, measured three ways at two turn latencies (leg 4, `settlerace`; the
+  counts are `session_busy_refusals` out of the trials printed on the same row):
+    start the next run on the terminal event, still holding the first Run
+      8/30 refused, 0 still refused after 20 ms   |   1/60 refused, 0 still refused after 20 ms
+    same, but drop the first Run before starting the next
+      2/30 refused, 0 still refused after 20 ms   |   1/60 refused, 0 still refused after 20 ms
+    drain the first run's stream to the end, then advance
+      0/30 refused, 0 still refused after 20 ms   |   0/60 refused, 0 still refused after 20 ms
+  Which is the answer, and it is the ADR's answer, arrived at from the other side.
+  Advancing on the terminal event is refused some fraction of trials; dropping the
+  run first lowers the rate and does not remove it. The session's run slot is
+  released asynchronously with respect to the event, and `is_running()` disagrees
+  with `start()` in both directions at that moment, so neither the event nor that
+  predicate is a gate. Draining the stream to its end is the only shape with zero
+  refusals, at both pacings. On pi the loop has to *wait*
+  for the stream to close because pi's settle window is ~456 ms (ADR-0010); on this
+  engine that window measures ~0 ms (`steptiming`'s `settle_window_ms`) and still
+  has to be waited for. So switching engines would not have removed the settle
+  discipline, which is a fact ADR-0010's settle row did not know and should carry.
+
+Done.
