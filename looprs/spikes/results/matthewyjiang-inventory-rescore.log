@@ -1,0 +1,442 @@
+# matthewyjiang-inventory-rescore — captured 2026-10-12T17:08:55Z, tree 3b90022
+# ran: python3 spikes/rho_inventory_rescore.py
+subject:       matthewyjiang/rho (github.com/matthewyjiang/rho)
+library:       rho-sdk 5.9.0   [cargo cache]
+library source : /home/appuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rho-sdk-5.9.0
+host:          Linux 7.0.14-linuxkit, 8 cpus
+behavioural evidence beside this scoring: spikes/results/matthewyjiang-surface-cost-embed-8jk3.log
+scope:         ADR-0010's six-row dependency inventory, re-scored row by row. Pricing only:
+               nothing was added to Cargo.toml, nothing was built, no feature flag was proposed.
+read before quoting: every count here is derived from the tree or from the published artifact;
+               the verdicts are hand-written and their citations are checked in leg 3.
+
+== 1. THE INVENTORY, RECOUNTED OFF looprs' OWN TREE ==
+commands looprs sends    : 4 — abort, clear_queue, prompt, steer
+    abort        at src/services/pi.rs:246
+    clear_queue  at src/session/pi_chat.rs:407
+    prompt       at src/services/pi.rs:217, src/session/pi_chat.rs:214
+    steer        at src/session/pi_chat.rs:212
+WIRE_INVENTORY rows      : 51 (46 concrete + 5 catch-all rows)
+distinct spellings       : 46 (the catch-all marker counts once)
+groups                   : role=9, event=17, assistant-event=13, compaction-reason=4, stop-reason=8
+rows with a named reader : 25  (these are behaviour ports)
+rows declared, unread    : 26  (these are documentation rows when an engine changes)
+
+  CORRECTION — the ADR's '40 wire spellings' is a regex artifact, not a count
+  of the table. `rho_surface_cost.py` scrapes looprs' side with
+      wire:\s*"([a-z_]+)"
+  which cannot see a camelCase spelling or the catch-all row. That regex finds
+  40 values; the table has 51 rows / 46 distinct spellings. The
+  values it drops are:
+      *anything else*        (assistant-event, compaction-reason, event, role, stop-reason)
+      bashExecution          (role)
+      branchSummary          (role)
+      compactionSummary      (role)
+      toolResult             (role)
+      toolUse                (stop-reason)
+  None of them is a nothing: four are roles with a reader, one is a stop reason,
+  and the catch-all is the row that records looprs' forward-compatibility policy.
+  No row count below reuses the 40.
+
+protocol semantics       : data.disposition, settle-as-only-end-of-pass,
+                           refusal-as-success:false, correlation by client id
+process semantics        : stdin-EOF shutdown (ADR-0002 Q1), kill_on_drop,
+                           stderr never to the terminal, per-pass --tools gating
+                           call sites in src/services/pi.rs: 6
+      pi.rs:42: child: Child, // kill_on_drop: pi dies with the TUI
+      pi.rs:97: .stdin(Stdio::piped())
+      pi.rs:98: .stdout(Stdio::piped())
+      pi.rs:99: .stderr(Stdio::null()) // or a log file; never the TUI's terminal
+      pi.rs:100: .kill_on_drop(true)
+      pi.rs:182: pub fn close_stdin(&mut self) {
+                           --tools gating sites: src/services/bd_tools.rs:246, src/services/bd_tools.rs:265, src/services/bd_tools.rs:455, src/session/beads/machine.rs:738, src/session/beads/tests/tools.rs:75, src/session/beads/tests/tools.rs:142 (+1 more)
+
+== 2. THE CANDIDATE'S OWN VOCABULARY (rho-sdk, from the published artifact) ==
+prior method, reused verbatim: read ['rho-sdk:src/event.rs', 'rho-sdk:src/tool.rs']
+  looprs spellings that method could see : 40
+  candidate spellings in those two files : 51
+  string intersection                    : 0 — []
+  That is what the prior capture's headline measured: a string intersection.
+  It is evidence about spellings and no evidence at all about meaning, and the
+  sentence it was printed with ('40 of 40 change meaning') was asserted, not
+  measured. Leg 3 measures the meaning, one row at a time.
+
+RunEvent's own variants        : 30
+    Started, StepStarted, AssistantTextDelta, ReasoningDelta, ReasoningSummaryDelta, ToolCallUpdated, ToolProposed, ToolStarted, ToolUpdated, ToolFinished, UsageUpdated, ProviderContextUpdated, HostInputRequested, CompactionStarted, CompactionCompleted, Completed, Cancelled, Failed, SteeringApplied, ProviderDiagnostic, ProviderStreamReset, ToolHostInputRequested, WebSearch, ProviderRequestRetry, ModelCallCompleted, HostedToolActivity, ProviderServiceTierFallback, SteeringDelivered, ToolDetached, BoundaryInputApplied
+  (the 51 names the prior method scraped from those two files include 21 that belong to sibling enums and struct fields in the same files — StopReason, ToolCompletion, ProviderStreamResetReason, ToolOrigin and friends. And the coincidence that looprs' table also has 51 rows is a coincidence, not a comparison.)
+
+files the meaning of looprs' groups lives in (prior capture read two of them):
+  [prior] src/event.rs                 enums: ProviderStreamResetReason, StopReason, ToolCompletion, RunEvent
+          why: RunEvent and RunOutcome: the run's event vocabulary, its terminal events, its StopReason
+  [prior] src/tool.rs                  enums: ToolExecutionMode, OperationKind, ToolOrigin, ToolInvocationSource, ScriptedToolOutcome
+          why: ToolOrigin/ToolSecurity/ToolContext: what a tool is and who owns it
+  [added] src/model.rs                 enums: Message, ContentBlock, ServiceTier, ModelResponse, ModelEvent, GenerationOutputTokens, ContextUsageSource
+          why: Message and ModelUsage: the history roles and the token-window fields
+  [added] src/compaction.rs            enums: CompactionThreshold, CompactorCancellationMode, CompactionTrigger
+          why: CompactionTrigger/CompactionOutcome: the compaction reason set
+  [added] src/compaction_decision.rs   enums: CompactionSkipReason, CompactionExtent
+          why: CompactionSkipReason: the endings a compaction can have that never reach the stream
+  [added] src/error.rs                 enums: Error, ProviderErrorKind, Retryability
+          why: Error/Retryability: what a refusal is when there is no `success:false` on a pipe
+  [added] src/client.rs                enums: SystemPrompt
+          why: Rho/RhoBuilder/ShutdownOutcome: the process-level surface, incl. event channel capacity
+  [added] src/session.rs               enums: SessionState
+          why: Session/UserInput/SessionState: prompt-shaped surface
+  [added] src/run.rs                   enums: —
+          why: Run/SteeringHandle: steer, retract, cancel, outcome
+  [added] src/steering.rs              enums: SteeringRetraction
+          why: SteeringRetraction: the clear_queue analogue's outcomes
+  [added] src/persistence.rs           enums: —
+          why: SessionSnapshot/SessionStore: the corpus row
+  [added] src/provider.rs              enums: ProviderRequestEvent, ProviderStreamEvent, ProviderCancellationMode
+          why: ScriptedProvider/ScriptedTurn: the test-seam row
+
+  The additions are not decoration: looprs' five groups are role, event,
+  assistant-event, compaction-reason and stop-reason. Two files can answer the
+  `event` group and cannot answer the other four — the roles are in model.rs,
+  the compaction reasons are in compaction.rs, the stop reasons are a two-value
+  enum in event.rs, and pi's nested assistant-event envelope exists nowhere.
+
+candidate facts pinned from the artifact (each is a grep this run can fail):
+  [  ok   ] event channel is bounded, and the default is the number 8jk.3 wedged it at
+           src/client.rs: 'DEFAULT_EVENT_CAPACITY: usize = 64'
+  [  ok   ] there is a runtime shutdown, with a count of what it cancelled
+           src/client.rs: 'pub fn shutdown(&self) -> ShutdownOutcome'
+  [  ok   ] a busy session is a typed refusal, not a `success:false`
+           src/error.rs: 'SessionBusy'
+  [  ok   ] steering retraction has named outcomes, one of which is a lost race
+           src/steering.rs: 'pub enum SteeringRetraction'
+  [  ok   ] visibility is asked per model request (the --tools analogue)
+           src/tool/registry.rs: 'fn is_advertised(&self, name: &str) -> bool'
+  [  ok   ] a host-provided tool is outside every SDK gate
+           src/tool.rs: 'SDK policy cannot sandbox it'
+  [  ok   ] persistence is a snapshot value plus a host trait, not a file
+           src/persistence.rs: 'pub trait SessionStore'
+  [  ok   ] the scripted arm ships as public API
+           src/provider.rs: 'pub struct ScriptedProvider'
+  [  ok   ] the run's final value carries usage and a stop reason
+           src/event.rs: 'pub struct RunOutcome'
+  [  ok   ] usage fields are Options, so 'nothing reported' is a state
+           src/model.rs: 'pub struct ModelUsage'
+  [  ok   ] the SDK forbids unsafe in its own source
+           src/lib.rs: '#![forbid(unsafe_code)]'
+
+  `unsafe` in the artifact: 8 occurrences total, 1 in src/ — and the one
+  src/ occurrence is the `#![forbid(unsafe_code)]` attribute itself, so the library
+  forbids unsafe and the rest is bench code a consumer never compiles. The
+  workspace-8jk.4 capture counts the word across the whole artifact, so its rho-sdk
+  `unsafe` column should be read as benches-and-all, not as code that ships.
+
+== 3. ROW 2 IN DETAIL — one verdict per row of WIRE_INVENTORY ==
+role/user                          same       READ  cost=shim
+    pi : painting pi's copy as well as the box's prints every prompt twice, which is worse than printing neither
+    rho: nothing arrives to drop: the host supplied the text through Session::start, so the drop-arm becomes dead code and the double-print it guards cannot happen
+    via: UserInput, start
+role/assistant                     narrowed   READ  cost=redesign
+    pi : the only role whose `message_end` is authoritative — for the streamed entry and for the token window
+    rho: pi seals one authoritative assistant message; rho commits per step and finalises per run, so 'the authoritative message_end' becomes two clocks
+    via: Completed, RunOutcome, live_history, UsageUpdated
+role/toolResult                    narrowed   READ  cost=redesign
+    pi : the same record `tool_execution_end` already carried; a second copy here is a second card for one call
+    rho: rho's completion has four states (Success/CompletedFailure/Failure/Unavailable) and says the status is the output's flag, not the variant name
+    via: ToolFinished, ToolCompletion, is_failure
+role/system                        absent     READ  cost=retire the guarantee
+    pi : the prompt and tool declarations normally live in the session file; one reaching the stream is not something this harn
+    rho: Message::System exists in history but never on the stream; the unrendered-role note for it can never fire
+    via: System
+role/bashExecution                 absent     READ  cost=retire the guarantee
+    pi : a shell command run *inside* pi (the RPC `bash` command), not this harness's shell — different shell, different pty, a
+    rho: no engine-side shell record exists on rho's stream at all (the nearest is a tool call looprs itself registered), so the row's 'a shell that is not this one' case disappears with it
+role/custom                        narrowed   READ  cost=redesign
+    pi : a context message an extension pushed into the child; whose it was and what it said are the extension's business, that
+    rho: closest carrier is an internal host input accepted at a runtime checkpoint, and it is stamped with session/run ids rather than an extension identity
+    via: append_message, BoundaryInputApplied, boundary_input_channel
+role/branchSummary                 absent     READ  cost=retire the guarantee
+    pi : pi's own summary of a branch of the session tree; the summary text is not shown, so without this a run rewrites its ow
+    rho: rho-sdk has no branch concept; session-tree machinery lives in the rho-coding-agent bin crate, not in the library looprs would link
+role/compactionSummary             narrowed   READ  cost=redesign
+    pi : what a compaction summarised into, arriving after the fact; the card the user saw for that work came off `compaction_s
+    rho: rho commits the summary into history/snapshot and announces it with CompactionCompleted; there is no summary record arriving after the fact
+    via: CompactionCompleted, CompactionOutcome, committed_snapshot
+role/*anything else*               mechanism  READ  cost=redesign
+    pi : pi tells consumers to tolerate custom roles an augmented host merges into the union; this arm carries the string rathe
+    rho: pi's additivity is a wire property (serde(other) makes an unknown role harmless without recompiling); rho's is a release property (#[non_exhaustive] forces a catch-all arm at compile time, and a new variant needs a new dependency version before looprs can even see it)
+    via: non_exhaustive
+event/agent_start                  renamed    READ  cost=shim
+    pi : the run began; the status row learns that from the mirror, not from the transcript
+    rho: RunEvent::Started{run_id, revision}; the liveness mirror reads the same fact
+    via: Started, RunId
+event/agent_end                    narrowed   unread cost=shim
+    pi : retries, steering and follow-ups can continue after this, which is exactly why the live region stops on `agent_settled
+    rho: rho has no 'the agent stopped but more may follow' event: the pair pi keeps apart becomes StepStarted versus a terminal event, which is a coarser cut than the one the row's waiting_on asks for
+    via: StepStarted, Completed, Cancelled, Failed
+event/agent_settled                narrowed   READ  cost=redesign
+    pi : 'this session has no more automatic work'. Who advances the beads loop as a result is the beads session's business and
+    rho: covers every case where the run is still being read, and covers nothing when it is not: 8jk.3 settle5 observed 0 terminal events from a dropped Run and settle6 wedged the run on the bounded 64-slot channel with SessionState still Running; pi's 'the child died' is an observable fact about a process, and there is no process
+    via: Completed, Failed, Cancelled, outcome, SessionState
+event/turn_start                   renamed    unread cost=shim
+    pi : declared so 'a turn began' stays a distinguishable fact in the record; the turn-level row is what would read it
+    rho: RunEvent::StepStarted{step, estimated_context_tokens}
+    via: StepStarted, estimated_context_tokens
+event/turn_end                     absent     unread cost=retire the guarantee
+    pi : the other half of the same boundary; pi also carries the turn's tool results here, which the tool cards already report
+    rho: no step-end event exists; ModelCallCompleted is per provider request, not per step, and does not carry the turn's tool results
+    via: ModelCallCompleted
+event/message_start                absent     unread cost=retire the guarantee
+    pi : a message began and has no text in it yet; what this waits for is the live region's start-of-message cursor
+    rho: no message-start event; the nearest is the step boundary, and the live-region cursor this row waits for still does not exist
+    via: StepStarted
+event/message_update               renamed    READ  cost=shim
+    pi : delta-only on the wire; the nested `assistantMessageEvent` rows say which part of which block each delta is
+    rho: rho's deltas are top-level events, so pi's envelope disappears — and with it the assistant-event group as a group
+    via: AssistantTextDelta, ReasoningDelta, ToolCallUpdated
+event/message_end                  narrowed   READ  cost=redesign
+    pi : what this event means depends on its `role`, so this row is a pointer: the eight answers live in the roles table, not 
+    rho: the token window's single source becomes three candidate clocks (step commit, per-call usage, run outcome) and rho's usage fields are Options
+    via: UsageUpdated, ModelCallCompleted, RunOutcome, live_history
+event/tool_execution_start         renamed    READ  cost=shim
+    pi : the card the user reads; the assistant-side `toolcall_*` events are the same call seen from the model's own stream
+    rho: RunEvent::ToolStarted{call_id, name, metadata}; ToolProposed is an extra earlier stage pi folds into toolcall_end
+    via: ToolStarted, ToolMetadata
+event/tool_execution_update        renamed    unread cost=shim
+    pi : the card is drawn at start and rewritten at end; the partial output is the same content the end record carries, so not
+    rho: RunEvent::ToolUpdated{call_id, progress}; rho's progress is typed where pi's is a payload
+    via: ToolUpdated, ToolProgress
+event/tool_execution_end           renamed    READ  cost=shim
+    pi : the biggest single thing a beads pass writes, and the reason the card goes through the view: the cap and the journal b
+    rho: RunEvent::ToolFinished{call_id, result}
+    via: ToolFinished, ToolCompletion
+event/auto_retry_start             narrowed   unread cost=shim
+    pi : attempt / max / delay / error: four fields someone watching a frozen transcript would give anything for; the row answe
+    rho: ProviderRequestRetry is a unit variant: attempt/max/delay are not on it. ProviderStreamResetReason::RetryableFailure carries retry_after and nothing else; the ladder's shape is 1s/2s/4s in the runtime (8jk.3 settle3)
+    via: ProviderRequestRetry, ProviderStreamReset, retry_after
+event/auto_retry_end               narrowed   unread cost=shim
+    pi : a run that recovers need not be shown; a run that does not should not be silent, which is why the pair is kept rather 
+    rho: the end of the ladder is the run's Failed{message, retryability, revision}, i.e. a run-terminal event, not a retry outcome
+    via: Failed, Retryability
+event/compaction_start             renamed    READ  cost=shim
+    pi : a paid LLM call that prints nothing of its own; without the card the run looks hung for exactly as long as the summary
+    rho: RunEvent::CompactionStarted{trigger, message_count}
+    via: CompactionStarted, CompactionTrigger
+event/compaction_end               narrowed   READ  cost=redesign
+    pi : three endings, three drawings — a cancel is not painted in failure's colour, because a cancel that looks like a crash 
+    rho: orchestration/compaction.rs emits CompactionCompleted only after a successful commit; a cancelled or failing compaction returns Err and emits nothing, so looprs' three endings (freed / cancelled / failed) collapse to one plus a run-terminal event that no longer says which compaction it belonged to
+    via: CompactionCompleted, CompactorCancellationMode
+event/extension_error              absent     unread cost=retire the guarantee
+    pi : path and message captured; the surfacing this waits for is the status row's, because the screen is the harness's even 
+    rho: rho-sdk has no extension runtime: hooks are in-process traits, so a fault inside the engine's own machinery is a panic or an Err inside looprs' process, and the row that says 'something inside the child broke' has nothing left to report
+    via: PreToolUseGate, HookObserver
+event/*anything else*              mechanism  READ  cost=redesign
+    pi : `#[serde(other)]` is the feature that makes additive protocol changes harmless — a new pi event type lands here and ch
+    rho: serde(other) at the wire level vs #[non_exhaustive] at the type level — see the role catch-all row
+    via: non_exhaustive
+assistant-event/start              absent     unread cost=retire the guarantee
+    pi : the SDK's cumulative `partial` snapshot is stripped for the wire, so this event carries nothing but its own beginning
+    rho: no message-start event under rho's flat delta stream
+    via: StepStarted
+assistant-event/text_start         absent     unread cost=retire the guarantee
+    pi : the block index is what a live region that shows more than one block per message would need; today one message is one 
+    rho: no block-boundary events; there is no block index to disambiguate, so this row's waiting_on becomes impossible rather than unimplemented
+    via: AssistantTextDelta
+assistant-event/text_delta         same       READ  cost=shim
+    pi : the visible stream: the only nested event that is printed as it lands
+    rho: RunEvent::AssistantTextDelta{text}: the one row in the whole table that means the same thing on both sides
+    via: AssistantTextDelta
+assistant-event/text_end           narrowed   READ  cost=redesign
+    pi : the authoritative block text, read by the beads planner for its own final message; the transcript keeps the deltas it 
+    rho: the beads planner's 'last words' come from RunOutcome::text() / the committed EnrichedAssistant, i.e. from the run's value rather than a stream event — same fact, different door
+    via: RunOutcome, text, EnrichedAssistant, history
+assistant-event/thinking_start     absent     unread cost=retire the guarantee
+    pi : what it waits for is the live region saying 'pi is thinking' before the first delta arrives
+    rho: no marker for where reasoning began
+    via: ReasoningDelta
+assistant-event/thinking_delta     narrowed   READ  cost=redesign
+    pi : this contradicts the comment this file carried for three tickets ('thinking is parsed and deliberately not shown'), wh
+    rho: ReasoningDelta, plus ReasoningSummaryDelta: rho may hand back a provider-produced *summary* of reasoning (AssistantMessage::reasoning_summary says raw reasoning must never be stored there), so looprs' italic+dim paint survives but paints different text
+    via: ReasoningDelta, ReasoningSummaryDelta, reasoning_summary
+assistant-event/thinking_end       absent     unread cost=retire the guarantee
+    pi : the deltas are already on screen; the finished text would be a second copy of the same reasoning
+    rho: no block-boundary events
+    via: ReasoningDelta
+assistant-event/toolcall_start     narrowed   unread cost=shim
+    pi : the assistant-side view of the same call; kept so the two can be correlated when the live region draws calls as the mo
+    rho: ToolCallUpdated{index, id, name, arguments_delta} collapses start and delta into one variant
+    via: ToolCallUpdated
+assistant-event/toolcall_delta     renamed    unread cost=shim
+    pi : streaming argument fragments are parsed, unread, and available for the day a card can show a call filling in
+    rho: ToolCallUpdated.arguments_delta
+    via: ToolCallUpdated, arguments_delta
+assistant-event/toolcall_end       renamed    unread cost=shim
+    pi : the run's card already reports the call and its result; this is the model's copy of the same object
+    rho: RunEvent::ToolProposed{call}
+    via: ToolProposed
+assistant-event/done               narrowed   unread cost=shim
+    pi : `reason` is `stop` | `length` | `toolUse` | `deferred` on this arm; `length` means the answer the user is reading was 
+    rho: rho's StopReason is {EndTurn, MaxSteps}: `stop` maps, `length` (the answer on screen got cut off — the row this file calls its clearest gap) has no rho value, and MaxSteps is a step budget, not an output-token limit
+    via: StopReason, EndTurn, MaxSteps
+assistant-event/error              narrowed   unread cost=shim
+    pi : `reason` is `aborted` | `error` here; the two are different questions and the wire keeps them apart
+    rho: the turn-scoped error becomes a run-terminal Failed/Cancelled; 'this turn failed but the session continues' is not a state rho's run model has
+    via: Failed, Cancelled
+assistant-event/*anything else*    mechanism  unread cost=redesign
+    pi : a nested event type this file does not name lands here and changes nothing, which is what keeps a pi upgrade from writ
+    rho: nested additivity has no analogue because the nesting has no analogue
+    via: non_exhaustive
+compaction-reason/manual           renamed    READ  cost=shim
+    pi : `/compact`: the user asked for it, and the card says so rather than leaving the pause unattributed
+    rho: CompactionTrigger::Manual
+    via: CompactionTrigger, Manual
+compaction-reason/threshold        renamed    READ  cost=shim
+    pi : context nearly full: pi acted on its own, which reads differently to the user than being asked
+    rho: CompactionTrigger::Automatic
+    via: CompactionTrigger, Automatic
+compaction-reason/overflow         renamed    READ  cost=shim
+    pi : the provider rejected the prompt as too big — the one reason that arrived as an error rather than as a plan
+    rho: CompactionTrigger::ContextOverflow
+    via: CompactionTrigger, ContextOverflow
+compaction-reason/*anything else*  mechanism  READ  cost=redesign
+    pi : prints its own spelling: the card keeps saying *something* where the old empty-string fallback said nothing at all
+    rho: a Rust enum has no unknown-value carrier, so the card can no longer 'keep saying something' where a new value arrives; the skip reasons (PolicyDisabled/BelowThreshold/PendingAsyncTools) are a *different* set that never reaches the stream, so they are not the replacement
+    via: CompactionSkipReason
+stop-reason/pending                absent     unread cost=retire the guarantee
+    pi : the reason on a partial message while it streams; pi does not persist it
+    rho: no per-partial-message reason on the stream; AbortedAssistant is a history entry committed after a dead provider, not a live reason
+    via: AbortedAssistant
+stop-reason/stop                   renamed    unread cost=shim
+    pi : finished speaking
+    rho: rho_sdk::StopReason::EndTurn
+    via: StopReason, EndTurn
+stop-reason/length                 absent     unread cost=not expressible
+    pi : cut off by the output token limit: the only value here that says the answer on screen is incomplete, and it currently 
+    rho: rho-sdk's public model layer has no provider finish reason at all — `finish_reason`/`max_tokens` appear nowhere in its src — so the one value that says 'what the user is reading is incomplete' is still unreported, and is unreported by a type that cannot be extended at the wire level
+stop-reason/toolUse                absent     unread cost=retire the guarantee
+    pi : stopped to call a tool — which the tool card reports anyway, one event later
+    rho: a step that calls a tool is not a stop reason in rho; ToolProposed is the event instead
+    via: ToolProposed
+stop-reason/error                  renamed    unread cost=shim
+    pi : the turn failed; the assistant-side `error` event carries it with the message attached
+    rho: Failed{message, retryability} / Error; strictly better typed than pi's bare reason
+    via: Failed, Retryability, Error
+stop-reason/aborted                renamed    unread cost=shim
+    pi : the user cancelled it — the one reason on this list that is an answer to a keystroke rather than to a model
+    rho: RunEvent::Cancelled{revision} / Error::Cancelled
+    via: Cancelled, Error
+stop-reason/deferred               absent     unread cost=not expressible
+    pi : the provider parked the response for later retrieval; the handle lives on the message record, which this file does not
+    rho: no provider-parked-response concept in the SDK's model layer
+stop-reason/*anything else*        mechanism  unread cost=redesign
+    pi : keeps its spelling, so a stop reason pi adds shows up as itself in the record rather than being coerced into one of th
+    rho: same as the other catch-alls: unknown-value tolerance is a compile-time property of the dependency, not a runtime property of looprs
+    via: non_exhaustive
+
+verdict tally   : same=2, renamed=15, narrowed=15, absent=14, mechanism=5   (total 51 rows)
+cost tally      : not expressible=2, redesign=14, retire the guarantee=12, shim=23
+
+THE EXPENSIVE SET — rows a change of engine cannot settle by renaming:
+  role/assistant                     narrowed   reader=app::apply_pi → SessionView::finish_stream, Tokens::add
+  role/toolResult                    narrowed   reader=app::apply_pi — the arm that leaves the card alone
+  role/custom                        narrowed   reader=app::apply_pi — the unrendered-role note
+  role/compactionSummary             narrowed   reader=app::apply_pi — the unrendered-role note
+  role/*anything else*               mechanism  reader=app::apply_pi — the unrendered-role note
+  event/agent_settled                narrowed   reader=session::pi_chat (liveness) + app::apply_pi → ChatState::Stopped
+  event/message_end                  narrowed   reader=app::apply_pi — per role, see the roles table above
+  event/compaction_end               narrowed   reader=app::apply_pi → SessionView::finish_compaction
+  event/*anything else*              mechanism  reader=wire::parse, which logs what it cannot parse at all
+  assistant-event/text_end           narrowed   reader=session::beads::machine — the planner's 'last words'
+  assistant-event/thinking_delta     narrowed   reader=app::apply_pi → SessionView::push_delta(Thinking)
+  assistant-event/*anything else*    mechanism  reader=None
+  compaction-reason/*anything else*  mechanism  reader=components::compaction::compaction_line
+  stop-reason/length                 absent     reader=None
+  stop-reason/deferred               absent     reader=None
+  stop-reason/*anything else*        mechanism  reader=None
+  (16 rows re-derived by hand and re-tested; the other 35 are either a `match` arm, a retired row, or a guarantee that simply goes away)
+
+citation check  : OK — every rho-sdk identifier named above appears in the published artifact (150 .rs files read)
+
+== 4. THE SURFACE THAT GETS RE-DERIVED, IN UNITS ==
+tests in the tree                 : 917
+tests asserting on a wire spelling: 12 spellings hit 18 test functions (unfiltered quoted matches: 40; the filter keeps a body that also names a wire type or a `"type"` tag — a bash test quoting `"error"` is not a wire assertion)
+    threshold                4 tests   e.g. src/app/tests/token_window.rs::a_compaction_shows_a_live_card_while_it_runs
+    aborted                  3 tests   e.g. src/app/tests/token_window.rs::the_compaction_wire_format_parses
+    user                     2 tests   e.g. src/app/tests/pi_state.rs::pi_copies_of_the_user_message_never_reach_the_transcript
+    toolResult               1 tests   e.g. src/app/tests/pi_state.rs::pi_copies_of_the_user_message_never_reach_the_transcript
+    assistant                1 tests   e.g. src/app/tests/token_window.rs::the_wire_usage_record_parses_as_pi_writes_it
+    message_end              1 tests   e.g. src/app/tests/token_window.rs::the_wire_usage_record_parses_as_pi_writes_it
+    message_update           1 tests   e.g. src/app/tests/token_window.rs::the_wire_usage_record_parses_as_pi_writes_it
+    text_delta               1 tests   e.g. src/app/tests/token_window.rs::the_wire_usage_record_parses_as_pi_writes_it
+    manual                   1 tests   e.g. src/app/tests/token_window.rs::an_aborted_compaction_says_aborted_and_a_failed_one_says_why
+    compaction_end           1 tests   e.g. src/app/tests/token_window.rs::the_compaction_wire_format_parses
+tests in app::tests::wire_protocol: 11 (they run the roles through apply_pi and diff the transcript against the row)
+tests in app::tests::token_window : 23
+app::apply_pi                     : src/app.rs:1740–1881, 142 lines, 8 explicit PiEvent arms plus the `_` arm
+docs/guide/wire-protocol.md       : 90 generated table rows, generated from WIRE_INVENTORY by scripts/docs_check.py --fix-wire
+src/wire.rs                       : 1452 lines
+
+the same surface counted through the Rust variants instead of the strings:
+  test functions in the tree    : 917
+  rows whose variant is named   : 12 of 46 concrete rows
+  test functions naming one     : 28 (and every test that quotes a spelling also names the variant)
+  the rows none of them names   : assistant-event/done, assistant-event/error, assistant-event/start, assistant-event/text_end, assistant-event/text_start, assistant-event/thinking_delta, assistant-event/thinking_end, assistant-event/thinking_start, assistant-event/toolcall_delta, assistant-event/toolcall_end, assistant-event/toolcall_start, event/agent_end, event/agent_start, event/auto_retry_end, event/auto_retry_start, event/extension_error, event/tool_execution_end, event/tool_execution_update, event/turn_end, event/turn_start, role/bashExecution, role/branchSummary, role/compactionSummary, role/custom, role/system, role/toolResult, role/user, stop-reason/aborted, stop-reason/deferred, stop-reason/error, stop-reason/length, stop-reason/pending, stop-reason/stop, stop-reason/toolUse
+
+the test seam:
+  fixtures                      : fake_bd.sh, fake_pi.sh, fake_pi_chat.py, fake_pi_dies.sh
+  tests that drive the fake     : 94 test functions read the fake child's journal (argv, verbs, prompts, pids)
+  spikes on LOOPRS_PI_BIN       : 16 — bash_e2e.py, cancel_e2e.py, fake_pi_slow.py, flash_e2e.py, log_budget_e2e.py, mouse_clipboard_e2e.py, mouse_scroll_e2e.py, pi_rpc_boundary_cost.py, ram_e2e.py, resize_e2e.py, resize_transient_e2e.py, scrollback_e2e.py, shutdown_e2e.py, status_e2e.py, tmux_keyboard_e2e.py, viewport_e2e.py
+
+the corpus coupling:
+  replays pi session files      : src/measure.rs, examples/spike_rpc_serde_cost.rs, spikes/pi_rpc_boundary_cost.py, spikes/regex_backend_cost.sh
+  constants cited to a pi-format capture: 7 files — src/components/line_render.rs, src/measure.rs, src/services/journal.rs, src/session/view/buffer.rs, src/session/view/rewrap.rs, src/state/scrollback.rs, src/utils/md.rs
+
+== 5. THE GAP TABLE — one row per inventory row of ADR-0010 ==
+
+--- row 1: RPC commands looprs sends
+    verdict : different-but-expressible
+    cost    : shim, plus one redesign
+    expressible via: prompt → `Session::start(UserInput)` (or `Session::complete` for a run whose events nobody pumps); steer → `Run::steer` / `SteeringHandle::steer`; abort → `Run::cancel` / `CancellationToken`.
+    and the part that is not / what looprs would build: clear_queue is the row that changes kind rather than spelling. There is no queue the host can empty: staged steering is retracted one id at a time with `SteeringHandle::steer_retractable` + `retract_steering`, and a retraction that loses the race reports AlreadyApplied (8jk.3 steer3: AlreadyApplied,Retracted,Retracted). So the command does not disappear — the guarantee disappears: pi's clear_queue answers with the text it pulled (`queued_text` reads data.steering/data.followUp), and rho promises no state in which queued input is discardable. The Esc path in session/pi_chat.rs (clear_queue-then-abort, the 600 ms CANCEL_WAIT, putting the pulled text back in the box) is redesigned, not renamed. abort also changes kind: `Run::cancel` is cooperative, so a tool future that never yields holds the run with no thread to interrupt and no process to kill (8jk.3 settle5b).
+
+--- row 2: Wire spellings behaviour is keyed on
+    verdict : no answer for a minority, different-but-expressible for most — and the expensive ones are the read ones
+    cost    : redesign
+    expressible via: See leg 3 for the per-row verdicts and named APIs.
+    and the part that is not / what looprs would build: The prior capture's headline (3 of 40 against casonadams/rho, 0 of 40 against this library) measured spelling overlap, which is 0 and therefore uninformative. Measured by meaning, most rows are renamed or narrowed and reachable through RunEvent; the rows that cannot be answered are the ones pi gets from being a *process* or a *typed union with a serde escape hatch*: the unknown-value catch-alls, the message/step boundary rows, the block-boundary rows, and the `length` stop reason (rho-sdk's src contains no finish_reason/max_tokens concept at all, so the row this repo calls its clearest gap is still a gap). First-order cost, row by row: not expressible=2, redesign=14, retire the guarantee=12, shim=23. And the test surface is not the quoted strings (28 test functions quote a spelling or name the variant that catches it, leg 4) — it is every row's re-derivation into a new inventory, with the generated page and the wire_protocol tests rewritten with it.
+
+--- row 3: Protocol semantics
+    verdict : 3 of 4 different-but-expressible (one of them better than pi), 1 no answer
+    cost    : redesign
+    expressible via: `data.disposition` — DIFFERENT-BUT-EXPRESSIBLE, AND BETTER: there is no disposition field because there is no command/response, and the fork it carried is typed instead — `Session::start(UserInput)` answers `Ok(Run)` or `Err(Error::SessionBusy)`, so "the prompt took but no run is coming" and "the prompt was refused" are two arms of one `match`. looprs' `disposition_of` helper and its deliberate fail-safe default of "started" (`pi.rs`) both go away, and the class of bug they were written against stops being constructible — which is the one row in this whole table where the alternative is the better design, and 8jk.3 settle7 is its evidence (a second run on a busy session: refused, typed). Refusal — DIFFERENT-BUT-EXPRESSIBLE: pi answers a refusal with `success:false` and stays alive; here it is a typed `Error` (PolicyDenied / SessionBusy / Authentication / Persistence / InvalidHostResponse …) carrying `Retryability`, which is more structure than a boolean and requires the beads machine to decide per variant what today it decides from one flag. Correlation by client-assigned `id` — THE MECHANISM DISAPPEARS: no id, no `Pending` map, no `fail_all` drain, each call carrying its own await, so the correlation-and-drain machinery of `src/services/pi.rs` (the `Pending` state, `fail_all`, the id routing in the reader task) becomes deleted code and its tests delete with it.
+    and the part that is not / what looprs would build: The no-answer half is settle-as-only-end-of-pass, which is the row the beads loop advances on. `Completed` / `Failed` / `Cancelled` on the stream plus `Run::outcome()` cover every case where someone is still reading, and cover nothing when the run stops being readable: 8jk.3 settle5 saw 0 terminal events from a dropped Run, settle6 wedged the run on the bounded 64-slot channel with `SessionState` still `Running`, and gate7 held a run open indefinitely on an approval nobody answers. pi's "the child died" is a fact about a process you can observe from outside; here there is no process, so looprs must put a deadline in every await and build the watchdog that `kill_on_drop` plus `fail_all` give it for free today — the same conclusion ADR-0010 reached about the wrong library, arrived at again against the right one, and still a design change in the beads machine rather than a shim.
+
+--- row 4: Process semantics
+    verdict : 1 trivial, 2 design changes in the beads machine, 1 impossible
+    cost    : redesign, and one item not expressible
+    expressible via: stdin-EOF-as-shutdown — TRIGGER GONE, DRAIN A DESIGN CHANGE: there is no stdin, so ADR-0002 Q1's "EOF then drain then exit" becomes an in-process quiescence wait on `Rho::shutdown()` (which returns `ShutdownOutcome{cancelled_runs}`), and 8jk.3 gate7 showed a run waiting on an unanswered approval never ends by itself — the deadline looprs has to add is what EOF used to be for. Per-pass `--tools` gating — DESIGN CHANGE: visibility maps cleanly (`ToolVisibility::is_advertised`, asked per model request, runtime rebuilt per pass at 1.8 µs (8jk.3 gate4)) but it is shared mutable state on a long-lived runtime rather than argv the beads machine builds per pass and a test can read back; execution rights are a second and different mechanism (`WorkspacePolicy` + `PreToolUseGate`).
+    and the part that is not / what looprs would build: Two items stop being things that exist, and one of them is impossible rather than merely expensive. kill_on_drop — IMPOSSIBLE: 8jk.3 blast2/blast3 show a dropped Run cancelling its token while a blocking tool's child stays alive, and blast4 re-parents it to init after the host is killed, so the blast wall moves from one flag on one spawn to process-group discipline looprs imposes on every tool it registers — and gate3's finding is that a host-provided tool escapes the SDK's gates entirely (`ToolOrigin::HostProvided`: "SDK policy cannot sandbox it"), which is the shape of looprs' own tool. stderr-never-reaching-the-terminal — DESIGN CHANGE: pi's stderr is `Stdio::null()`, whereas a panic inside a rho tool prints on looprs' own stderr mid-frame (8jk.3 blast5 wrote to the terminal while the host survived with exit 0); ADR-0006's clean-exit work does not cover a panic in looprs' process, so this buys a panic hook plus a policy decision about the user's terminal. The trivial half is honestly trivial: the pipe framing, the line reader and the correlation drain are deleted, and the ~250 lines of `src/services/pi.rs` that *are* the boundary go with them — deletion is cheap, but it is the deletion of the thing ADR-0010 decision 1 says the blast wall and the test seam stand on.
+
+--- row 5: Test seam (LOOPRS_PI_BIN + tests/fixtures/)
+    verdict : different-but-expressible for one half, no answer for the other
+    cost    : shim for new arms; redesign for the process-level ones
+    expressible via: ScriptedProvider/ScriptedTurn (+ ScriptedTool, ScriptedCompactor) is a better scripted arm than anything in tests/fixtures/: it records `RecordedModelRequest` (advertised tool list, tool-schema bytes, message count), it is deterministic without a shell, it costs no model call, and it drives the real runtime, the real tool round trip and the real event stream. Every beads-loop test that asks 'does the loop advance on a settle' is better written against it.
+    and the part that is not / what looprs would build: What it cannot prove, in principle rather than as a TODO: argv (there is no argv), exit codes (no exit), stdin-EOF shutdown (no stdin), stderr (no stream), a child that dies on its own (no child), and orphaned tool children (8jk.3 blast1/blast3 — the only way to see them is to be a process outside the process). The honest framing is not 'the seam shrinks': the fake child proves looprs' own PiRpc framing, correlation and drain code, and on an in-process engine that code does not exist, so the seam loses its subject. ADR-0010 rule 5 says a switch must *add* a fake seam rather than ask for this one's removal, and this row is why: 94 test functions read the fake child's journal and 16 spikes run it (leg 4), every one of them either rewritten against a scripted provider or re-expressed as a harness-level process test to keep proving what it proves today.
+
+--- row 6: Corpus coupling (pi session files)
+    verdict : no answer — the corpus has to be rebuilt or bought back with an adapter
+    cost    : redesign (largest row; it is the whole hidden cost)
+    expressible via: rho-sdk's persistence is better than opt-out: it is opt-in and host-implemented. `Session::snapshot` yields a versioned `SessionSnapshot` (schema_version 2, MIN_SESSION_SNAPSHOT_SCHEMA_VERSION 1), the only shipped store is `InMemorySessionStore`, and 8jk.3 persist saw 0 files created in a scratch dir and no `~/.rho`. There is nothing to switch off, and nothing to measure.
+    and the part that is not / what looprs would build: So the corpus does not get a new format from the engine — it gets no format, and looprs becomes the author of one. Either looprs writes a pi-shaped session file itself out of rho events and history (a new, unsupported, permanent translation layer between a dependency's history types and the record vocabulary leg 1 counts), or every corpus-justified constant is re-baselined against captures taken through the new engine, which requires a corpus of real passes that does not exist yet. The nearest shipped rho transcript format is rho-coding-agent's — `<created_at>_<id>/session.jsonl`, SESSION_VERSION 4, records of `StoredStateTransition::{Snapshot, SnapshotDelta}` over a session tree — which is a *snapshot delta log*, is `pub(super)` inside a bin crate (not linkable), and is not pi's `type=message` / `message.role` record stream that src/measure.rs parses. Leg 4 counts the 7 source files whose constants cite a pi-format capture. That is before the record-shape change: bytes-per-record and structure-count-per-pass are the denominators for the scrollback retention, rewrap transient, highlighter fence census and live-preview numbers, and a delta log changes the shape, not just the values. ADR-0010 named this row the largest hidden cost in the comparison; the right library does not reduce it, it only removes the licence objection from the row above it.
+
+--- also reported: the surface the amendment has to re-derive, and the test counts
+    generated page     : docs/guide/wire-protocol.md — 90 generated table rows, regenerated from WIRE_INVENTORY by scripts/docs_check.py --fix-wire
+    app::apply_pi      : 8 explicit PiEvent arms plus the `_` arm, every one re-pointed at a different event type
+    the token window   : Tokens::add folds pi's usage at the authoritative assistant message_end (the code comment records the cumulative-usage trap); rho reports usage as per-call Options on step, call and run clocks
+    tests on the vocab : 28 test functions quote a wire spelling or name the variant that catches it (leg 4 lists the split)
+
+--- THE GAP TABLE IN SIX LINES
+    row 1  RPC commands looprs sends            shim, plus one redesign
+    row 2  Wire spellings behaviour is keyed on redesign
+    row 3  Protocol semantics                   redesign
+    row 4  Process semantics                    redesign, and one item not expressible
+    row 5  Test seam (LOOPRS_PI_BIN + tests/fixtures/) shim for new arms; redesign for the process-level ones
+    row 6  Corpus coupling (pi session files)   redesign (largest row; it is the whole hidden cost)
+
+Done.
