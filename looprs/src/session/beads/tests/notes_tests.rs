@@ -5,10 +5,13 @@
 //! unverifiable note never says the board is empty.
 
 use crate::services::bd::{Bead, BeadStatus};
+use crate::services::bd_tools::{DEFAULT_WORKER_TOOLS, Source, Surface};
+use crate::services::prompts::worker;
+use crate::session::ActiveBead;
 
 use crate::session::beads::notes::{
-    MAX_PLAN_LISTED, clip, held_elsewhere_note, no_plan_note, plan_note,
-    resume_already_worked_note, resume_note, unverifiable_note,
+    Arrival, MAX_PLAN_LISTED, clip, held_elsewhere_note, no_plan_note, plan_note,
+    resume_already_worked_note, resume_note, unverifiable_note, worker_prompt,
 };
 
 use super::*;
@@ -125,4 +128,76 @@ fn the_resume_guard_note_names_both_ways_out() {
     assert!(note.contains("not closed"), "{note}");
     assert!(note.contains("bd close looprs-mid"), "{note}");
     assert!(note.contains("new instruction"), "{note}");
+}
+
+// ---------------- the worker prompt, and the tool surface it has to match ------------
+
+/// The prompt is built from the same [`Surface`] the spawn argv is, so a verb
+/// appears in the prose exactly when the pass can call it. Both directions are
+/// asserted, because both have their own failure: promise a tool the child lacks and
+/// the worker reports a verb that fails; hide one it has and it shells out for it
+/// anyway.
+#[test]
+fn the_prompt_names_the_verbs_the_pass_holds() {
+    let claim = ActiveBead {
+        id: "looprs-26r".into(),
+        title: "Beads loop never self-starts".into(),
+    };
+
+    let typed = worker_prompt(
+        &claim,
+        Arrival::Fresh,
+        &Surface::new(DEFAULT_WORKER_TOOLS, Source::Embedded),
+    );
+    for tool in ["bd_show", "bd_close", "bd_remember"] {
+        assert!(typed.contains(tool), "the pass has {tool}: {typed}");
+    }
+    assert!(
+        !typed.contains("bd show <id>") && !typed.contains("bd close <id>"),
+        "the CLI forms have no business in a prompt whose pass holds the tools: {typed}"
+    );
+    assert!(
+        !typed.contains("bd_ready") && !typed.contains("bd_claim"),
+        "work discovery is the loop's job; the prompt must not advertise it back: {typed}"
+    );
+
+    let shell = worker_prompt(&claim, Arrival::Fresh, &Surface::off());
+    assert!(
+        shell.contains("bd show <id>") && shell.contains("bd close <id>"),
+        "{shell}"
+    );
+    assert!(
+        !shell.contains("bd_close"),
+        "the off surface is the prompt this loop shipped before, not a hybrid: {shell}"
+    );
+}
+
+/// A resumed pass gets the same rule, because it gets the same tools: the order to
+/// *look before writing* has to name a door the worker is holding.
+#[test]
+fn a_resumed_pass_is_told_to_read_the_ticket_in_the_shape_it_can() {
+    let claim = ActiveBead {
+        id: "looprs-mid".into(),
+        title: "the ticket that was mid-flight".into(),
+    };
+    let typed = worker_prompt(
+        &claim,
+        Arrival::Resumed,
+        &Surface::new("read,bash,bd_show", Source::Embedded),
+    );
+    assert!(typed.contains("`bd_show` with id looprs-mid"), "{typed}");
+    let shell = worker_prompt(&claim, Arrival::Resumed, &Surface::off());
+    assert!(shell.contains("`bd show looprs-mid`"), "{shell}");
+}
+
+/// A narrower allowlist than the default is a coherent pass, not one that lies to
+/// the model: what is left out of `--tools` is left out of the prose too, and the
+/// bullet that loses its tool falls back to the CLI rather than vanishing.
+#[test]
+fn a_narrow_surface_promises_narrowly() {
+    let prompt = worker(&Surface::new("read,bash,bd_close", Source::Embedded));
+    assert!(prompt.contains("bd_close"), "{prompt}");
+    assert!(!prompt.contains("bd_show"), "{prompt}");
+    assert!(!prompt.contains("bd_remember"), "{prompt}");
+    assert!(prompt.contains("`bd remember`"), "{prompt}");
 }

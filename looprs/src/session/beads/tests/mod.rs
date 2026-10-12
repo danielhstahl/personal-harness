@@ -15,7 +15,9 @@
 //!   pass can end without it;
 //! * [`notes_tests`](notes_tests) — the wording, pinned without a subprocess;
 //! * [`tables`](tables) — the step machine and the guards as enumerable tables
-//!   (looprs-6ol).
+//!   (looprs-6ol);
+//! * [`tools`](tools) — the typed `bd` surface: the argv the worker is gated with and
+//!   the prompt wording that has to match it (ADR-0010 decision 2).
 //!
 //! What more than one section drives lives here: the fake-binary fixtures, the
 //! board JSON the sections need, and the readers that turn a [`SessionEvent`]
@@ -37,6 +39,7 @@ mod planner;
 mod resume;
 mod startup;
 mod tables;
+mod tools;
 
 use super::*;
 use crate::session::cancel;

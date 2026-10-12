@@ -6,6 +6,12 @@ WORKDIR /app
 # Copy manifest files first to leverage Docker cache
 COPY looprs/Cargo.toml ./
 COPY looprs/Cargo.lock ./
+# The typed `bd` tool extension. It is not read at runtime from a tree —
+# `src/services/bd_tools.rs` embeds it with `include_str!` and writes it to the
+# cache dir when a pass is armed — but `include_str!` is resolved at *compile*
+# time, so the file has to be in the build context for the build to get off the
+# ground. Same reason `src` is here.
+COPY looprs/extensions ./extensions
 # Copy actual source code
 COPY looprs/src ./src
 

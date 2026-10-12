@@ -8,8 +8,8 @@
 //! `notes_tests` in [`tests`](super::tests)).
 
 use crate::services::bd::{Bead, BeadStatus};
-
-use crate::services::prompts::{WORKER, generate_prompt};
+use crate::services::bd_tools::Surface;
+use crate::services::prompts::{generate_prompt, worker};
 use crate::session::ActiveBead;
 
 /// How the ticket reached the worker being prompted (looprs-hjo).
@@ -32,13 +32,18 @@ pub(super) enum Arrival {
 /// agent to go find work — is a race with every other hand on the board, and the
 /// worker would end up doing (and billing) a different ticket than the one the
 /// loop reports, guards and verifies. Hence `bd ready` is gone from the worker's
-/// command list in `prompts::WORKER`: a prompt that advertises it invites the
+/// command list in `prompts::worker`: a prompt that advertises it invites the
 /// agent to shop.
+///
+/// The `bd` verbs come from the pass's [`Surface`], which is the same value the
+/// spawn argv is built from: the prompt may name a tool only if the child was
+/// given it, and may leave a tool out of the prose only if it is not there either
+/// ([`services::bd_tools`](crate::services::bd_tools) rule 2).
 ///
 /// A resumed ticket adds one paragraph — [`resumed_note_for_worker`] — and nothing
 /// else changes. That is deliberate: a resumed pass is not a lesser pass, and it
 /// gets the same claim, the same guard and the same close-check as a fresh one.
-pub(super) fn worker_prompt(claim: &ActiveBead, arrival: Arrival) -> String {
+pub(super) fn worker_prompt(claim: &ActiveBead, arrival: Arrival, surface: &Surface) -> String {
     let mut instructions = format!(
         "Your assigned ticket: {id} — {title}\n\n\
          The harness has already run `bd update {id} --claim`, so this ticket is yours. \
@@ -48,9 +53,9 @@ pub(super) fn worker_prompt(claim: &ActiveBead, arrival: Arrival) -> String {
         title = claim.title,
     );
     if let Arrival::Resumed = arrival {
-        instructions.push_str(&resumed_note_for_worker(&claim.id));
+        instructions.push_str(&resumed_note_for_worker(&claim.id, surface));
     }
-    generate_prompt(WORKER, &instructions)
+    generate_prompt(&worker(surface), &instructions)
 }
 
 /// The paragraph a worker gets when the ticket handed to it was already
@@ -59,12 +64,21 @@ pub(super) fn worker_prompt(claim: &ActiveBead, arrival: Arrival) -> String {
 /// Written as an order to *look before writing*, because "continue" is ambiguous
 /// about a half-finished state: the work may be committed, staged, unstaged, or only
 /// ever have existed in the previous session's head.
-fn resumed_note_for_worker(id: &str) -> String {
+///
+/// The read it orders is named in whichever shape the pass can perform — the
+/// `bd_show` tool or the `bd show` command — for the same reason the rest of the
+/// prompt is: "go look at the ticket" has to name a door the worker is holding.
+fn resumed_note_for_worker(id: &str, surface: &Surface) -> String {
+    let show = if surface.has("show") {
+        format!("`bd_show` with id {id}")
+    } else {
+        format!("`bd show {id}`")
+    };
     format!(
         "\nThis ticket was ALREADY `in_progress` on the board when this harness claimed it: a \
          previous session — most likely one that crashed, was killed or was cancelled partway \
          through — was working it. Do not assume nothing has been done. Before writing \
-         anything, find out what state it is in: `bd show {id}` for the ticket and any notes \
+         anything, find out what state it is in: {show} for the ticket and any notes \
          an earlier session left on it, `git status` and `git diff` for uncommitted work, and \
          `git log` for work that is already committed. Then continue from there: do not start \
          over, and do not redo what is already done.\n"

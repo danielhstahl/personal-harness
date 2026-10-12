@@ -46,6 +46,11 @@ fn bare_loop() -> (BeadsLoop, mpsc::UnboundedReceiver<SessionEvent>) {
         // anything, and a clipboard reached through a default would make
         // that a matter of luck.
         clipboard: Arc::new(crate::services::clipboard::Noop),
+        // And the same reason again: the typed-tool surface decides both the
+        // worker's argv and its prompt wording, and `from_env` would let a
+        // `LOOPRS_BEADS_WORKER_TOOLS` in somebody's shell change what a table
+        // asserts. Off is the row these tables were written against.
+        bd_tools: crate::services::bd_tools::Surface::off(),
     };
     (
         BeadsLoop::new(SessionId::new(TerminalType::Beads, 0), tx, ctl_tx, cfg),

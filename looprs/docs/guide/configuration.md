@@ -11,7 +11,7 @@ table indexes it. [`./scripts/docs_check.sh`](../../scripts/docs_check.sh) compa
 the defaults wherever two pages state them and fails on a disagreement, so the
 exception cannot rot into a contradiction.
 
-**30 `LOOPRS_*` variables are read by `src/`** — 29 until `LOOPRS_WARM_HIGHLIGHT` arrived with `looprs-00u.16`. That count is not from the docs:
+**32 `LOOPRS_*` variables are read by `src/`** — 29 until `LOOPRS_WARM_HIGHLIGHT` arrived with `looprs-00u.16`, and 30 until the typed `bd` tool surface arrived with workspace-01z. That count is not from the docs:
 `./scripts/docs_check.py --list-knobs` prints them with the `file:line` of every
 read, and the gate that keeps this page complete is a step of
 [`./scripts/check.sh`](../../scripts/check.sh).
@@ -30,7 +30,7 @@ you is that **changing a variable means restarting the app**.
 The grep index, the resolved paths and the level each diagnostic needs is
 [`./operator.md`](operator.md#3-the-log); this page owns the knobs and their
 defaults. Every resolved choice is logged once at startup — `grep -E 'logging:
-|kanban board|clipboard:|notifications|highlight warm' "$LOG"` prints the whole resolved set,
+|kanban board|clipboard:|notifications|highlight warm|bd tools' "$LOG"` prints the whole resolved set,
 where `$LOG` is
 
 ```sh
@@ -63,6 +63,26 @@ board" are different facts and the app is not allowed to conflate them
 `LOOPRS_SHELL_BIN` pointing at something that is not bash is warned about at spawn,
 not silently accepted: exit codes and readiness detection need bash, and a zsh that
 half-works is worse than a refusal that names the fix.
+
+## The beads worker's `bd` verbs
+
+What board verbs a worker pass is given, and where the extension that defines them
+is loaded from. The feature and its price are
+[driving the beads loop](beads-loop.md#the-workers-bd-verbs-are-tools); these are
+the knobs and their defaults, which are written down here and nowhere else.
+
+| knob | default | values | what it changes | set at | read in |
+| --- | --- | --- | --- | --- | --- |
+| `LOOPRS_BEADS_WORKER_TOOLS` | `read,bash,edit,write,bd_show,bd_close,bd_remember` | the whole `pi --tools` allowlist, comma-separated and named in full; `off` / `none` / `no` / `0` / `false` take the surface off entirely | Which tools a worker pass gets, and — from the same resolved value — which `bd` verbs its prompt is allowed to name. Drop `bash` and the pass has no shell at all; drop the `bd_*` names and it shells `bd` out as this loop did before. | startup | [`Surface::from_env`](../../src/services/bd_tools.rs), carried on [`SessionConfig`](../../src/session/mod.rs) |
+| `LOOPRS_BD_TOOLS_EXT` | *(unset — the copy embedded in the binary is written to the cache dir and loaded)* | a path to a readable `.ts` | Where `pi -e` gets the typed-tool schema from. A path that is not a file is warned about and the embedded copy is used; a pass that cannot load any extension at all is **refused** rather than run. | startup | [`Surface::extension`](../../src/services/bd_tools.rs) |
+
+Two things follow from the defaults and are worth saying next to them. The allowlist
+is spelled out rather than written as pi's `+name` delta form because **pi 1.0.0's
+delta form declares no tools at all** — `pi --tools +bd_show` gives a worker nothing,
+so every tool has to be named. And `bd_claim` / `bd_ready` are absent from the
+default on purpose: this loop claims the ticket it pays for and picks the work
+itself, so handing a worker those two verbs re-opens the race the harness was built
+to close. They are one value away for a loop that wants them.
 
 ## Terminal modes, and the exit contract
 

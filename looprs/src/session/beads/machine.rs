@@ -432,8 +432,21 @@ impl BeadsLoop {
         // The session is built against locals: if any step below fails, `worker`
         // drops here and kill_on_drop reaps it, so a failed pass cannot leave an
         // orphan behind.
-        let worker = self.spawn_worker(&[])?;
-        let disposition = worker.rpc.prompt(&worker_prompt(claim, arrival)).await?;
+        //
+        // The typed-tool argv comes first and can refuse the pass on its own: if the
+        // extension the prompt's verbs depend on cannot be loaded, paying for a
+        // worker that would settle with the ticket still open is the worse failure.
+        let tool_args = self
+            .cfg
+            .bd_tools
+            .spawn_args()
+            .map_err(|e| anyhow!("cannot start the worker pass for {}: {e}", claim.id))?;
+        let tool_argv: Vec<&str> = tool_args.iter().map(String::as_str).collect();
+        let worker = self.spawn_worker(&tool_argv)?;
+        let disposition = worker
+            .rpc
+            .prompt(&worker_prompt(claim, arrival, &self.cfg.bd_tools))
+            .await?;
         if disposition == "handled" {
             // pi took the prompt but started no run, so no `agent_settled` will ever
             // arrive to advance the loop. Do not hold an idle session open.
@@ -718,6 +731,10 @@ impl BeadsLoop {
             .map(|b| b.id)
             .collect();
 
+        // The planner stays on `read,bash`, deliberately: the verb a planner lives on
+        // is `bd create`, which the typed surface does not mirror — the five verbs it
+        // ships are the ones a *work* pass needs, and that is the set that was priced
+        // (ADR-0010 §2). Adding a sixth tool is a new measurement, not a free line.
         let args = vec!["--tools", "read,bash"];
         let worker = self.spawn_worker(&args)?;
         let said = worker.said.clone();

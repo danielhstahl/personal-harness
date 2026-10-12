@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""workspace-eqn.5 / .7 — typed `bd` tools: what they cost, what they save, and whether the engine matters for them.
+"""workspace-eqn.5 / .7, shipped by workspace-01z — typed `bd` tools: what they cost.
 
 ADR-0010's proposal sells two things at once. One of them — typed tool calls
 instead of the worker shelling `bd` out of its bash tool — does not need an
 engine swap at all: pi registers schema-validated tools from an extension
-(`spikes/bd_tools/bd_tools.ts`), and the worker's `--tools` allowlist gates them
-like the built-ins. This spike is that arm, measured, so the engine question can
-be argued without the tooling question riding on it.
+(`extensions/bd_tools.ts` — the shipped one, which is what this measures), and the
+worker's `--tools` allowlist gates them like the built-ins. This spike is that arm,
+measured, so the engine question can be argued without the tooling question riding
+on it, and so the number the shipped prompt cost is quoted from is a capture rather
+than an opinion.
+
+Leg 2 prices the tool section for the tool lists looprs actually spawns with: pi's
+four built-ins (what the worker had before the typed surface), the shipped default
+`LOOPRS_BEADS_WORKER_TOOLS`, the full five verbs, and a shell-less list. Note the
+plain-name requirement: pi 1.0.0's `+name` delta form declares *no* tools at all, so
+every tool has to be named, and the byte counts below are for whole allowlists.
 
 Three legs:
 
@@ -51,10 +59,21 @@ import tempfile
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXT = os.path.join(REPO, "spikes", "bd_tools", "bd_tools.ts")
+EXT = os.path.join(REPO, "extensions", "bd_tools.ts")
 BD = os.environ.get("LOOPRS_SPIKE_BD", "bd")
 N = int(os.environ.get("LOOPRS_SPIKE_N", "15"))
 BASE_URL = os.environ.get("LOOPRS_SPIKE_BASE_URL", "http://llm.home:8080/v1")
+#: The verbs `extensions/bd_tools.ts` registers, and the shipped default list —
+#: mirrored from `src/services/bd_tools.rs`, whose own test reads them out of the
+#: extension so this file cannot quietly price a different set.
+VERBS = ["ready", "show", "claim", "close", "remember"]
+DEFAULT_WORKER_TOOLS = "read,bash,edit,write,bd_show,bd_close,bd_remember"
+
+
+def probe_model():
+    """HTTP code from the model endpoint, or '' when curl cannot say."""
+    return subprocess.run(["curl", "-s", "-m", "10", "-o", "/dev/null", "-w", "%{http_code}",
+                           BASE_URL + "/models"], capture_output=True, text=True).stdout.strip()
 
 
 def med(xs):
@@ -156,10 +175,58 @@ def pi_pass(label, extra_tools, prompt, extra_argv):
             "stderr": p.stderr[-200:] if p.returncode else ""}
 
 
+#: The tool lists looprs actually spawns with, as priced objects. The first is what
+#: the worker had before this surface existed; the second is
+#: `DEFAULT_WORKER_TOOLS` in `src/services/bd_tools.rs`, i.e. what ships; the third
+#: is the extension's whole vocabulary; the fourth is the shell-less gate the knob
+#: makes possible. Keep in sync with the Rust — `cargo test` reads the shipped list
+#: out of the extension, and this table is the byte price of the same names.
+TOOL_LISTS = [
+    ("built-ins only (pre-surface)", "read,bash,edit,write", []),
+    ("shipped default (+show,close,remember)", DEFAULT_WORKER_TOOLS, ["-e", EXT]),
+    ("all five verbs", "read,bash,edit,write," + ",".join("bd_" + v for v in VERBS), ["-e", EXT]),
+    ("no shell (+show,claim,close)", "read,edit,write,bd_show,bd_claim,bd_close", ["-e", EXT]),
+]
+
+#: Assistant steps per pass, measured over this project's own session corpus in
+#: ADR-0010. Schemas ride on every one of them, which is the only reason a per-call
+#: measurement of the schema is the wrong number.
+STEPS_PER_PASS = 114
+
+
+def leg_sizes():
+    """What the tool section costs, for the allowlists looprs really passes."""
+    print("\n== 2. PROMPT — the tool section, per allowlist, read out of a real run ==")
+    code = probe_model()
+    if code != "200":
+        print(f"not measured: model endpoint {BASE_URL} answered {code!r} "
+              f"(or LOOPRS_SPIKE_NO_MODEL is set)")
+        return
+    rows = []
+    for i, (label, tools, extra) in enumerate(TOOL_LISTS):
+        # A stable session name per row: this leg is a measurement, and a run that
+        # could not be reproduced byte for byte is a worse witness than a shorter one.
+        r = pi_pass(f"size{i}", tools, "Reply with exactly: ok", extra)
+        rows.append((label, tools, len(r["tools_section"])))
+    base = rows[0][2]
+    print(f"{'allowlist':40} {'bytes':>6} {'vs built-ins':>13} {'≈ tokens/req':>13} "
+          f"{'≈ tokens/pass':>15}")
+    print("-" * 92)
+    for label, tools, n in rows:
+        d = n - base
+        print(f"{label:40} {n:6} {d:+13} {d // 4:+13} {(d // 4) * STEPS_PER_PASS:+15}")
+    print(f"\nPer-pass is ×{STEPS_PER_PASS} model requests — the median pass of this corpus "
+          f"makes that many\nassistant steps (ADR-0010), and a schema is prompt on every one. "
+          f"That is the number\nto quote, not the per-call one, and it is what the extension's "
+          f"header states.")
+    print("Note: pi 1.0.0's `+name` delta form declares *no* tools at all, so every "
+          "allowlist\nabove is spelled in full; a delta list would price as nothing and "
+          "leave the worker tool-less.")
+
+
 def leg_prompt_and_pass():
-    print("\n== 2/3. PROMPT + PASS — the same question, bash+bd vs the typed tool ==")
-    code = subprocess.run(["curl", "-s", "-m", "10", "-o", "/dev/null", "-w", "%{http_code}",
-                           BASE_URL + "/models"], capture_output=True, text=True).stdout.strip()
+    print("\n== 3. PASS — the same question, bash+bd vs the typed tool ==")
+    code = probe_model()
     if code != "200" or os.environ.get("LOOPRS_SPIKE_NO_MODEL"):
         print(f"not measured: model endpoint {BASE_URL} answered {code!r} "
               f"(or LOOPRS_SPIKE_NO_MODEL is set)")
@@ -169,6 +236,10 @@ def leg_prompt_and_pass():
     q_typed = ("How many tickets are ready on this beads board right now? Answer with "
                "just the number. Find out with the bd_ready tool.")
     repeats = int(os.environ.get("LOOPRS_SPIKE_REPEATS", "2"))
+    # The typed arm is the shipped worker list plus `bd_ready`, which the shipped
+    # default leaves out on purpose (the loop picks the work; a worker that can ask
+    # what is ready is a worker that shops). The bash arm is the pre-surface list.
+    typed_tools = "read,bash,edit,write,bd_ready"
     runs = []
     hdr = (f"{'arm':14} {'tools in prompt':16} {'tool calls':30} {'reqs':5} "
            f"{'tokens in':10} {'tokens out':11} {'wall s':7} answer")
@@ -176,9 +247,8 @@ def leg_prompt_and_pass():
     print("-" * len(hdr))
     for i in range(repeats):
         for name, tools, prompt, extra in (
-            ("bash + bd", "read,bash", q_bash, []),
-            ("typed tools", "read,bash,bd_ready,bd_show,bd_claim,bd_close,bd_remember", q_typed,
-             ["-e", EXT]),
+            ("bash + bd", "read,bash,edit,write", q_bash, []),
+            ("typed tools", typed_tools, q_typed, ["-e", EXT]),
         ):
             r = pi_pass(f"{name.split()[0]}{i}", tools, prompt, extra)
             r["arm"], r["iter"] = name, i
@@ -207,21 +277,29 @@ def leg_prompt_and_pass():
     typed_acted = all(any(c.startswith("bd_") for c in r["calls"]) for r in typed_runs)
     print()
     if typed_acted and not bash_acted:
-        print("What actually happened: the typed arm reached for `bd_ready` every time; the")
+        print("What actually happened: the typed arm reached for a `bd_*` tool every time; the")
         print("bash arm was told, in prose, to run `bd ready` and answered without calling")
         print("any tool at least once. That is the real argument for the typed surface — an")
         print("entry in the tool list is a guarantee the model can act on, a sentence in a")
-        print("prompt is a preference. It also means the two arms are not the same answer by")
-        print("different routes, and anyone comparing their token counts has to say so.")
+        print("prompt is a preference.")
     else:
-        print(f"Both arms called tools on these runs: bash arm {sorted({c for r in bash_runs for c in r['calls']})}, "
-              f"typed arm {sorted({c for r in typed_runs for c in r['calls']})}.")
+        print(f"What actually happened: the bash arm reached for {sorted({c for r in bash_runs for c in r['calls']})}, "
+              f"the typed arm for {sorted({c for r in typed_runs for c in r['calls']})}.")
+    # The repeats are not a confidence interval and this run says so. One typed arm
+    # above wandered into a long bash loop and billed over a million tokens on a
+    # question the other three passes answered in two requests. That is the local
+    # model, not the schema: leg 3 is one free-form question against one endpoint,
+    # and it is printed as what happened rather than trimmed to what flatters the
+    # arm it was written to favour. Read the per-arm spread before quoting any of it.
+    spread = sorted(r["requests"] for r in runs)
+    print(f"\nRepeats are {repeats} per arm against one local endpoint, and the request counts "
+          f"across\nall of them were {spread}. Quote the spread, not the mean: what this leg is "
+          f"evidence of\nis which tool the model reaches for, not how many tokens a pass costs.")
     print(
         "\nNeither arm is cheaper: the typed arm is *typed* — schema-validated params,\n"
         "no shell quoting, the refusal path returned as data, and `--tools` gating a\n"
-        "bare bash command cannot have. That is what the control arm was for: it\n"
-        "isolates the tooling win from the engine question, and the engine buys\n"
-        "neither of them."
+        "bare bash command cannot have. That is what this arm was for: it isolates the\n"
+        "tooling win from the engine question, and the engine buys neither of them."
     )
 
 
@@ -230,6 +308,7 @@ def main():
     print(f"pi: {subprocess.run(['pi', '--version'], capture_output=True, text=True).stdout.strip()}")
     print()
     leg_call()
+    leg_sizes()
     leg_prompt_and_pass()
     print("\nDone.")
 

@@ -361,6 +361,16 @@ impl BeadStep {
 pub struct SessionConfig {
     pub pi_bin: String,
     pub bd_bin: String,
+    /// The typed `bd` tool surface the beads worker is given: which of the five
+    /// verbs the extension registers, and where `pi -e` loads it from.
+    ///
+    /// Carried here for the same reason the two binaries are: it is resolved once
+    /// from the environment at startup, and the loop must not go reading the
+    /// environment at the spawn boundary. It is *one* value rather than a tool list
+    /// plus a prompt flag because the argv and the worker prompt have to agree about
+    /// which verbs the pass has ([`services::bd_tools`](crate::services::bd_tools));
+    /// two fields that must be set together is one field too many.
+    pub bd_tools: crate::services::bd_tools::Surface,
     /// The shell BashSession spawns. `$SHELL` if set, else `/bin/bash`.
     pub shell_bin: String,
     /// Where a finished ticket is announced, out of band
@@ -431,6 +441,7 @@ impl Default for SessionConfig {
         Self {
             pi_bin: std::env::var("LOOPRS_PI_BIN").unwrap_or_else(|_| "pi".to_string()),
             bd_bin: crate::services::bd::bd_bin_from_env(),
+            bd_tools: crate::services::bd_tools::Surface::from_env(),
             shell_bin: default_shell_bin(),
             notifier: Arc::new(crate::services::notification::Noop),
             clipboard: Arc::new(crate::services::clipboard::Noop),

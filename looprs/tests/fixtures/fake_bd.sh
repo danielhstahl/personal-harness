@@ -18,7 +18,8 @@
 #                       that one ticket
 #   READ_CMD         -> the command run for `ready` / `list` (usually `cat <board>`)
 #   SHOW_CMD         -> the command run for `show` (usually `cat <show>`, sometimes `[]`)
-#   WRITE_CMD        -> the command run for `update` / `create` / `close`
+#   WRITE_CMD        -> the command run for `update` / `create` / `close` / `remember`
+#   MEMORY           -> the note file `bd remember` appends `key<TAB>text` lines to
 #   EVENTS_CMD       -> the command run for `events tail` (usually `journal_tail …`)
 #   JOURNAL          -> the fake events journal: one JSON record per line
 #   JOURNAL_TRUNC    -> two ints, "<floor> <head>": makes `--since` below floor a refusal
@@ -141,10 +142,44 @@ if [ "$verb" = "events" ] && [ -e "{{JOURNAL_FAIL}}" ]; then
   echo "fake bd: events journal probe refused (journal fail marker set)" >&2
   exit 5
 fi
+# `bd remember "<insight>" [--key k]` — the note a worker leaves for the next
+# session, and the verb the typed `bd_remember` tool runs. The fake keeps notes in
+# their own file rather than in the board because real `bd` does: a memory is not a
+# ticket, and a test that could not tell "the worker wrote a note" from "the worker
+# moved a ticket" could not tell the two failure modes apart either.
+#
+# The text is the first positional *after* the verb, which is what `bd` takes, and
+# the key is `--key`'s value; with no `--key`, real `bd` slugs one from the text and
+# so does this, badly, which is fine — nothing keys a test on the slug.
+remember_key=""
+remember_text=""
+remember_seen=no
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--key" ]; then remember_key="$arg"; prev="$arg"; continue; fi
+  prev="$arg"
+  case "$arg" in --*) continue ;; esac
+  if [ "$remember_seen" = no ]; then
+    [ "$arg" = remember ] && remember_seen=yes
+    continue
+  fi
+  [ -z "$remember_text" ] && remember_text="$arg"
+done
 case "$verb" in
   ready|list) {{READ_CMD}} ;;
   show) {{SHOW_CMD}} ;;
   update|create|close) {{WRITE_CMD}} ;;
+  remember)
+    # In a subshell on purpose: a personality's answer is often `exit 0`, and this
+    # script still has its own work to do after it.
+    ( {{WRITE_CMD}} )
+    rc=$?
+    [ "$rc" -ne 0 ] && exit "$rc"
+    key="$remember_key"
+    [ -n "$key" ] || key="$(printf '%s' "$remember_text" | tr -cs '[:alnum:]' '-' | cut -c1-40)"
+    printf '%s\t%s\n' "$key" "$remember_text" >>"{{MEMORY}}"
+    echo "fake bd: remembered under $key"
+    ;;
   events) {{EVENTS_CMD}} ;;
   *) echo "fake bd: unsupported verb $verb" >&2; exit 2 ;;
 esac

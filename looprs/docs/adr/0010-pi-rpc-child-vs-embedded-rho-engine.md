@@ -48,9 +48,11 @@ separated from each other:
   pass. There is
   no denominator under which "the child is slow" is a finding about this loop.
 * **(a) is real, and it does not need the engine.** pi registers schema-validated
-  tools from an extension today; [`spikes/bd_tools/bd_tools.ts`](../../spikes/bd_tools/bd_tools.ts)
-  is a working one — five typed `bd` verbs, called by the real model on a real pass
-  in this ticket's own A/B. The engine swap was never what was buying that.
+  tools from an extension today; the five typed `bd` verbs in
+  [`spikes/bd_tools_cost.py`](../../spikes/bd_tools_cost.py)'s arm are a working one —
+  called by the real model on a real pass in this ticket's own A/B, and shipped since
+  as [`extensions/bd_tools.ts`](../../extensions/bd_tools.ts). The engine swap was
+  never what was buying that.
 * **And (a) buys less than it sounds like.** `bd` is a Go binary over a SQLite file.
   There is no `bd` library to link in *any* engine, so a typed tool removes the
   shell from the call path and nothing else; rho's engine would shell out to the
@@ -145,9 +147,9 @@ one, and it lands inside looprs' own process instead of beside it.
 ### 2. The typed `bd` tools, measured (`bd-tools-cost.log`)
 
 Cheapest-path arm: no engine change, a pi extension, the worker's existing `--tools`
-gating. [`spikes/bd_tools/bd_tools.ts`](../../spikes/bd_tools/bd_tools.ts) registers
-`bd_ready`, `bd_show`, `bd_claim`, `bd_close`, `bd_remember` with TypeBox schemas and
-`exposure: "model"`.
+gating. The spike's extension — now the shipped
+[`extensions/bd_tools.ts`](../../extensions/bd_tools.ts) — registered `bd_ready`,
+`bd_show`, `bd_claim`, `bd_close`, `bd_remember` with TypeBox schemas.
 
 * It works end to end on a real pass: asked "how many tickets are ready", the model
   called `bd_ready` (not `bash`) and answered from its result, on both repeats.
@@ -247,8 +249,18 @@ terminal clean, and it cannot help with a panic in its own process.
 
 ### 2. Take the typed `bd` tools, on the pi side, as the follow-up ticket
 
-`spikes/bd_tools/bd_tools.ts` graduates from spike to shipped extension when that
-ticket runs, and the ticket owes three things, all measured above: it must keep
+**Shipped by workspace-01z as [`extensions/bd_tools.ts`](../../extensions/bd_tools.ts),
+with the loop's side of it in [`src/services/bd_tools.rs`](../../src/services/bd_tools.rs)
+and the knob family indexed at
+[configuration → the beads worker's `bd` verbs](../guide/configuration.md#the-beads-workers-bd-verbs).**
+The three obligations below are what that ticket owed. The numbers it owed them with
+are in the capture named at the top for the decision, and in
+[`spikes/results/bd-tools-cost-shipped.log`](../../spikes/results/bd-tools-cost-shipped.log)
+for the surface as shipped — that second capture is the same driver run against the
+shipped file and the allowlists the loop actually passes, and it is the one that prices
+the cost per *pass*. This ADR does not restate either set, per its own rule 7.
+
+The ticket owes three things, all measured above: it must keep
 `bd`'s CLI as the single source of truth (the schema mirrors argv; if `bd` changes,
 the schema changes with it — a second vocabulary for the board is how looprs-037-style
 constructions happen again); it must state the prompt cost in tokens per pass, not

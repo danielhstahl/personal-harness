@@ -681,6 +681,21 @@ impl Fakes {
             .collect()
     }
 
+    /// The argv each fake `pi` was spawned with, one list per spawn, in order.
+    ///
+    /// `fake_pi.sh` logs `spawn pid=… args=$*`, so this is the only way a test can
+    /// see the *command line* the harness chose. That is what the typed-tool gating
+    /// is made of — `-e <extension> --tools <list>` — and a test that read only the
+    /// prompt could not tell a tool a child was given from a sentence about a tool.
+    pub fn pi_spawn_args(&self) -> Vec<Vec<String>> {
+        self.read(&self.pi_log)
+            .lines()
+            .filter_map(|l| l.strip_prefix("spawn pid="))
+            .filter_map(|l| l.split_once(" args="))
+            .map(|(_pid, args)| args.split(' ').map(str::to_string).collect())
+            .collect()
+    }
+
     /// Every command the fake `pi` received, in the order it received it, as
     /// `"<verb> <rest>"` lines. Order is the whole point of several tests: Esc has
     /// to `clear_queue` *before* it `abort`s, a follow-up has to arrive as
@@ -775,6 +790,22 @@ impl Fakes {
     /// queried once per decision, not once per question" style assertions).
     pub fn bd_call_count(&self, cmd: &str) -> usize {
         self.bd_log().iter().filter(|l| *l == cmd).count()
+    }
+
+    /// The notes a worker left through `bd remember`, as `(key, text)` in the order
+    /// they were written.
+    ///
+    /// This is the fake's half of the typed `bd_remember` tool: the extension runs
+    /// `bd remember "<text>" [--key k]` against whatever binary the run was given,
+    /// so the process-level seam has to answer that verb rather than refuse it — a
+    /// fake that answered `unsupported verb` would make the tool untestable, which is
+    /// exactly what ADR-0010's third obligation is about.
+    pub fn memories(&self) -> Vec<(String, String)> {
+        self.read(&self.journal_file.with_extension("memory"))
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .map(|(k, t)| (k.to_string(), t.to_string()))
+            .collect()
     }
 
     // The pid markers `tests/fixtures/fake_bd.sh` writes on the way in and out
@@ -1014,6 +1045,10 @@ fn bd_script(
         .replace("{{WRITE_CMD}}", &write_cmd)
         .replace("{{EVENTS_CMD}}", &events_cmd)
         .replace("{{JOURNAL}}", &journal.display().to_string())
+        .replace(
+            "{{MEMORY}}",
+            &journal.with_extension("memory").display().to_string(),
+        )
         .replace(
             "{{JOURNAL_TRUNC}}",
             &journal.with_extension("trunc").display().to_string(),

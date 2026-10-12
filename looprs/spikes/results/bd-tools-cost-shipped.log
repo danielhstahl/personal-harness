@@ -1,0 +1,61 @@
+# bd-tools-cost (shipped surface) — captured 2026-10-12T13:53:27Z, tree 918ac6a (dirty tree: uncommitted changes on top of that commit)
+# ran: python3 -u spikes/bd_tools_cost.py
+# workspace-01z: the same driver, run against the SHIPPED extension (extensions/bd_tools.ts)
+# and the allowlists looprs actually passes, so the prompt cost the ticket owes is a capture
+# and not an estimate. ADR-0010 cites spikes/results/bd-tools-cost.log for the numbers that
+# decision was made on; this is the re-measurement of what that decision shipped as.
+workspace-eqn typed-bd-tools measurement — bd at bd, extension extensions/bd_tools.ts
+pi: 1.0.0
+
+== 1. CALL — one bd interaction, three ways ==
+shape                                            min ms  median ms   max ms
+--------------------------------------------------------------------------
+fork a shell (`bash -c 'true'`)                     0.9        1.1      1.7
+fork+exec bd (`bd ready`)                         163.8      170.3    177.4
+through a shell (`bash -c 'bd ready'`)            169.1      172.3    198.0
+`bd show` on a real id                            179.6      185.8    288.0
+typed tool call (`spawnSync bd ready`)            168.0      171.0    274.0
+
+Reading: the row that matters is the *difference* between 'through a
+shell' and 'fork+exec bd'. That gap is the only thing a typed tool can
+remove from the call path, because `bd` itself is a separate process in
+every architecture on the table — including one where the agent engine
+is a Rust library: there is no bd library to link, only the CLI.
+
+== 2. PROMPT — the tool section, per allowlist, read out of a real run ==
+allowlist                                 bytes  vs built-ins  ≈ tokens/req   ≈ tokens/pass
+--------------------------------------------------------------------------------------------
+built-ins only (pre-surface)                339            +0            +0              +0
+shipped default (+show,close,remember)      562          +223           +55           +6270
+all five verbs                              729          +390           +97          +11058
+no shell (+show,claim,close)                481          +142           +35           +3990
+
+Per-pass is ×114 model requests — the median pass of this corpus makes that many
+assistant steps (ADR-0010), and a schema is prompt on every one. That is the number
+to quote, not the per-call one, and it is what the extension's header states.
+Note: pi 1.0.0's `+name` delta form declares *no* tools at all, so every allowlist
+above is spelled in full; a delta list would price as nothing and leave the worker tool-less.
+
+== 3. PASS — the same question, bash+bd vs the typed tool ==
+arm            tools in prompt  tool calls                     reqs  tokens in  tokens out  wall s  answer
+----------------------------------------------------------------------------------------------------------
+bash + bd                   339 bash                               2       3996         199     7.5 '8'
+typed tools                 441 bd_ready                           2       4193          65     3.9 '8'
+bash + bd                   339 bash                               2       3996          69     2.5 '8'
+typed tools                 441 bd_ready                           2       4192          58     4.6 '8'
+
+tool-section bytes: bash arm 339, typed arm 441 (+102 bytes, ≈25 extra prompt tokens on every model request of the pass)
+model requests: bash arm [2], typed arm [2] — the schema rides on every one of them, which is the honest way to price it
+
+What actually happened: the bash arm reached for ['bash'], the typed arm for ['bd_ready'].
+
+Repeats are 2 per arm against one local endpoint, and the request counts across
+all of them were [2, 2, 2, 2]. Quote the spread, not the mean: what this leg is evidence of
+is which tool the model reaches for, not how many tokens a pass costs.
+
+Neither arm is cheaper: the typed arm is *typed* — schema-validated params,
+no shell quoting, the refusal path returned as data, and `--tools` gating a
+bare bash command cannot have. That is what this arm was for: it isolates the
+tooling win from the engine question, and the engine buys neither of them.
+
+Done.

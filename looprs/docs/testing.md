@@ -234,7 +234,7 @@ error, not a spawn failure in whichever test got there first):
 | `tests/fixtures/fake_pi.sh` | a `pi` that answers a prompt with one canned response (started / handled / refused — the `{{REPLY}}` token) |
 | `tests/fixtures/fake_pi_dies.sh` | a `pi` that exits non-zero before answering anything |
 | `tests/fixtures/fake_pi_chat.py` | a stateful `pi --mode rpc`: remembers its conversation, holds a run open until the test touches `settle`, honours `abort` |
-| `tests/fixtures/fake_bd.sh` | a `bd` that logs every command and answers each verb from a file the test rewrites mid-run |
+| `tests/fixtures/fake_bd.sh` | a `bd` that logs every command and answers each verb from a file the test rewrites mid-run — including `remember`, whose notes go to their own file the way real `bd` keeps them off the board |
 
 The levers a test has, once the fakes are up:
 
@@ -245,6 +245,8 @@ The levers a test has, once the fakes are up:
 | `Fakes::journal_head()` / `bump_journal(n)` / `set_journal(lines)` | read and move the journal on its own: stay quiet while the board does not change, make n changes, or hand the probe a script of records verbatim |
 | `Fakes::truncate_journal(floor, head)` / `disable_journal(true)` / `fail_journal(true)` | the three ways the probe itself goes bad: a watermark the retention has pruned (exit 1 + a typed `events_journal_truncated` refusal), a workspace with `events-journal` off (exit 0, empty, a note on stderr), and a `bd` that cannot answer at all. `fail_journal` breaks the **probe only** — the board reads stay healthy, which is what makes "a failed probe is never 'nothing changed'" a testable claim rather than a hope |
 | `Fakes::set_show(json)` | change what `bd show <id> --json` says — i.e. "did the worker close it" |
+| `Fakes::memories()` | the notes a worker left through `bd remember`, as `(key, text)`: the read-back end of the typed `bd_remember` tool |
+| `Fakes::pi_spawn_args()` | the argv each fake `pi` was spawned with — the only way to assert what `--tools` a pass was gated with, as opposed to what the prompt said about it |
 | `Fakes::fail_bd(true)` | every subsequent `bd` exits 3, mid-pass |
 | `Fakes::refuse_claim(true)` | only `bd update … --claim` fails (exit 4); reads still work |
 | `Fakes::settle()` | release the chat fake's held-open run |
@@ -285,6 +287,25 @@ The scenarios the chore (looprs-6ol) listed, each with the tests that carry it.
 - `session::beads::tests::announce::the_active_ticket_is_published_when_taken_and_when_released`
 - `session::beads::tests::claim::the_worker_is_told_its_ticket_not_invited_to_go_shopping`
 - pure: `session::beads::tests::tables::the_claim_guard_skips_refuses_and_works_in_that_order_pure`
+
+### The typed `bd` tool surface (workspace-01z)
+
+ADR-0010 decision 2, shipped: the worker's board verbs are pi tools, gated by
+`--tools` and named in the prompt only when the pass actually holds them. One resolved
+[`Surface`](../src/services/bd_tools.rs) feeds both, and these are what pin
+that it feeds both in the same direction:
+
+- `session::beads::tests::tools::the_default_pass_loads_the_extension_and_names_every_tool`
+- `session::beads::tests::tools::turning_the_surface_off_spawns_the_child_the_way_it_was_always_spawned`
+- `session::beads::tests::tools::the_prompt_names_the_verbs_this_pass_was_given_and_no_others`
+- `session::beads::tests::tools::an_extension_that_is_not_there_refuses_the_pass_by_name`
+- `session::beads::tests::tools::the_planner_is_untouched_by_the_typed_surface`
+- `session::beads::tests::tools::the_fake_bd_answers_every_verb_the_typed_surface_runs`
+- `session::beads::tests::notes_tests::the_prompt_names_the_verbs_the_pass_holds`
+- `session::beads::tests::notes_tests::a_resumed_pass_is_told_to_read_the_ticket_in_the_shape_it_can`
+- `session::beads::tests::notes_tests::a_narrow_surface_promises_narrowly`
+- the extension and the knob grammar cannot drift: `services::bd_tools::tests::embedded_schema_names_the_same_tools`
+- and the embedded copy is what `pi -e` gets: `services::bd_tools::tests::the_embedded_copy_materialises_to_what_shipped`
 
 ### Crash recovery — finishing what a dead session left (looprs-hjo)
 

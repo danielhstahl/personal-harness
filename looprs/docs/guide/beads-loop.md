@@ -225,6 +225,63 @@ show both within a poll interval and, if you changed it with `bd dolt pull` or a
 merge, within the sweep interval rather than the poll interval
 ([kanban.md → the sweep](../kanban.md#how-the-band-is-refreshed)).
 
+## The worker's `bd` verbs are tools
+
+A worker pass does not have to reach the board through its shell. The five verbs in
+[`extensions/bd_tools.ts`](../../extensions/bd_tools.ts) are registered as
+schema-validated pi tools, and the loop spawns the worker with the extension loaded
+and an explicit allowlist:
+
+```sh
+pi --mode rpc -e <the copy looprs embeds, written to the cache dir> \
+   --tools read,bash,edit,write,bd_show,bd_close,bd_remember
+```
+
+That allowlist is `LOOPRS_BEADS_WORKER_TOOLS`, and the extension's origin is
+`LOOPRS_BD_TOOLS_EXT` — both indexed at
+[configuration → the beads worker's `bd` verbs](configuration.md#the-beads-workers-bd-verbs).
+The schema is a mirror of `bd`'s argv and nothing more, on purpose
+([ADR-0010 "What this forbids" 4](../adr/0010-pi-rpc-child-vs-embedded-rho-engine.md),
+[ADR-0007](../adr/0007-kanban-board.md)): there is no second board vocabulary in this
+repo, and `bd`'s own read stays the only honest one. Each tool runs the same `bd` the
+loop reads the board with — the child inherits `$LOOPRS_BD_BIN`, so there is still
+exactly one binary and one board — and answers with `bd`'s own words, exit code
+included.
+
+**What that buys.** An argument list with no shell in front of it, so a ticket id
+cannot be empty or quoted wrong; a refusal ("somebody else holds that lease") that
+arrives as a result the worker reads rather than as a zero-exiting command it has to
+be suspicious of; and a gate a shell cannot offer, because
+`LOOPRS_BEADS_WORKER_TOOLS=read,edit,write,bd_show,bd_claim,bd_close` is a worker with
+no shell at all — which is the right shape for a pass that reads tickets, closes them
+and has no business touching the tree.
+
+**What it does not buy is speed.** The layer a typed tool removes is the shell, and
+the shell is about a millisecond against a `bd` call of about a hundred and seventy
+([`spikes/results/bd-tools-cost-shipped.log`](../../spikes/results/bd-tools-cost-shipped.log)).
+Anyone re-selling this as a latency win has not read the capture.
+
+**What it costs is prompt, charged per model request rather than per call.** A schema
+is part of the system prompt, so it rides on every step of the pass whether the worker
+calls it once or never. The capture prices each allowlist looprs actually passes and
+multiplies by the measured assistant-step count of a median pass of this project's own
+corpus; that log and [ADR-0010 §2](../adr/0010-pi-rpc-child-vs-embedded-rho-engine.md)
+own the numbers and this page will not retype them, and the extension's own header
+states them in the file someone would otherwise price later. On a context budget that
+cannot pay, take the surface off:
+
+```sh
+LOOPRS_BEADS_WORKER_TOOLS=off looprs    # the bash path, exactly as this loop shipped before
+```
+
+and the worker's prompt goes back to naming `bd show` / `bd close` / `bd remember` as
+commands with it. That is why the surface is one resolved value instead of a tool list
+plus a prompt flag: the argv and the instructions are read from the same
+[`Surface`](../../src/services/bd_tools.rs), so a pass can never be told about a verb
+it was not given, nor handed a verb its instructions do not mention. The planner is
+not typed — its verb is `bd create`, which the extension deliberately does not mirror —
+and still gets `--tools read,bash`.
+
 ## Where the fakes come in
 
 Every claim above is tested against `tests/fixtures/fake_bd.sh` and

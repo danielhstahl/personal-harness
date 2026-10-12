@@ -1,4 +1,5 @@
 pub mod bd;
+pub mod bd_tools;
 pub mod board_poller;
 pub mod clipboard;
 pub mod journal;
