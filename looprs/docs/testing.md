@@ -79,7 +79,14 @@ multi-process, three-backend TUI without a model, a board, or a terminal.
    stated difference that does not equal the subtraction it claims
    (looprs-00u.27: ADR-0008's own corpus table said 7,071 lines under `docs/`
    and 7,056 including `spikes/`, and the table whose job was to be the
-   measurement was the thing that could not be true)
+   measurement was the thing that could not be true) — and, in `docs/adr/*.md`
+   and `docs/README.md`, no claim-bearing sentence may name a dependency as the
+   bare word `rho` until the page has pinned which library it means, because the
+   naming rule of
+   [the decision-record index](README.md#decision-records) is now a failing build
+   rather than a sentence someone has to remember (workspace-8jk.12; `--list-rho`
+   prints every claim the gate read and what licensed it, and `--self-test` proves
+   the check can fail)
 
 The same gate is declared three ways, because each one catches a different kind of
 person:
@@ -94,7 +101,7 @@ The docs step is new with the docs site and follows the same shape on purpose: t
 half a prose review catches is not checkable, but a dead link, an undocumented knob
 and a drifted table all are, and a docs rule that is not checked has a half-life of
 about a month. `./scripts/docs_check.sh` runs in under a second, needs no network
-and no cargo, and its seven checks are described in
+and no cargo, and its checks are described in
 [ADR-0008](adr/0008-docs-site.md) and in
 [the contributor guide](guide/contributing.md). The generator itself is
 `./scripts/docs.sh` (`build` / `serve` / `check`).

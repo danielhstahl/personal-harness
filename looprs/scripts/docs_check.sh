@@ -13,6 +13,13 @@
 #         the command that produced it — the re-count that looprs-00u.27 asked to
 #         be a re-run rather than a re-type
 #
+#   ./scripts/docs_check.sh --list-rho    # every claim-bearing bare-`rho` sentence in
+#         docs/adr + docs/README.md, and what licenses it (workspace-8jk.12)
+#
+#   ./scripts/docs_check.sh --self-test   # the bare-`rho` naming lint's own regression
+#         cases, run over in-memory text: a planted claim must fail, naming the page,
+#         the line and both libraries, and the false-positive shapes must stay green
+#
 # Runs in well under a second, needs no network and no cargo, and is a step of
 # ./scripts/check.sh. See the Python file for what the checks are and why each one
 # is worth a gate.

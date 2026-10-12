@@ -373,10 +373,16 @@ What is already machine-checked, so nobody has to re-derive it: `scripts/capture
 writes the provenance header (rev, dirty flag, command) that makes a capture
 attributable at all; `docs_check.py` fails a page that quotes a check count or a size no
 committed capture prints; and `scripts/dep_audit.py --gate` fails a crate ADR-0010 keeps
-out before its numbers can matter. The `docs_check` lint for a bare `rho` in a
-claim-bearing sentence is filed and deliberately unbuilt (workspace-8jk.12) for the
-reason written there: a naming lint with false positives on looprs' own identifiers gets
-disabled inside a week, which is worse than no lint.
+out before its numbers can matter. **And since workspace-8jk.12 the naming rule above is
+checked, not just written:** `docs_check.py` fails a claim-bearing sentence in
+`docs/adr/*.md` or `docs/README.md` that names a dependency as the bare word `rho`
+without the page having pinned which library it means — `owner/rho` beside a crate name
+above it, or a `<!-- rho-named: owner/repo -->` marker on the line. It reads only those
+two places, never `src/` and never `spikes/`, because the objection to building it was
+right: a naming lint with false positives on looprs' own `rho-` identifiers gets
+disabled inside a week, which is worse than no lint. `--list-rho` prints every claim the
+gate read and what licensed it; `--self-test` plants a bare claim in memory and asserts
+that it fails, naming the page, the line and both candidate libraries.
 
 ## The testing ladder (a map, not a duplicate)
 

@@ -52,7 +52,14 @@
 #         (looprs-00u.27: the table whose whole job is to be the measurement —
 #         ADR-0008's corpus table — said 7,071 lines under `docs/` and 7,056
 #         *including* `spikes/`, a superset fifteen lines smaller than its own
-#         part, typed from two different moments and contradicted by nothing)
+#         part, typed from two different moments and contradicted by nothing), and no
+#         claim in `docs/adr/*.md` or `docs/README.md` may name a dependency as the
+#         bare word `rho` until the page has said which library it means — an
+#         `owner/rho` beside a crate name above it, or a `rho-named:` marker on the
+#         line (workspace-8jk.12: ADR-0010 priced the wrong library for a whole epic
+#         because "the rho library" is not an identity, and workspace-8jk.7's sweep
+#         fixed the pages without guarding them — the next page that says "rho does
+#         not enter the tree" would otherwise re-create the defect silently)
 #
 # The order is deliberate: fmt and clippy are seconds-long and explain themselves, so
 # they run before the ~20s test suite rather than after it. Step 7 runs last for the
@@ -110,9 +117,11 @@ python3 "$(dirname "${BASH_SOURCE[0]}")/dep_audit.py" --gate
 echo "==> ADR-0010 ban self-test (every banned crate, every dependency form, in scratch trees)"
 python3 "$(dirname "${BASH_SOURCE[0]}")/dep_audit.py" --self-test
 
-echo "==> docs rot gate (links, knob coverage, keymap coverage, wire protocol coverage, measurement claims)"
+echo "==> docs rot gate (links, knob coverage, keymap coverage, wire protocol coverage, measurement claims, quoted test names, the spike index, inclusive sizes, page shape, dependency naming)"
+python3 "$(dirname "${BASH_SOURCE[0]}")/docs_check.py" --self-test
 "$(dirname "${BASH_SOURCE[0]}")/docs_check.sh"
 
 echo
 echo "gate: clean (fmt, clippy -D warnings in both feature configurations, tests in both,"
-echo "        dead-code audit, dependency audit and its ADR-0010 ban self-test, docs)"
+echo "        dead-code audit, dependency audit and its ADR-0010 ban self-test, docs and"
+echo "        the docs gate's own naming self-test)"

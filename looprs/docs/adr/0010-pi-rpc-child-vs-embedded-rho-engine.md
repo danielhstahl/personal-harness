@@ -958,11 +958,17 @@ tree means looprs' own naming — the Greek-alphabet filler in `src/main.rs` and
 committed captures, each of whose header already names its subject.
 
 **What would keep it fixed.** A `docs_check` step that fails a bare `rho` in a
-claim-bearing sentence in `docs/adr/*.md` and `docs/README.md` is filed as
-`workspace-8jk.12` and was deliberately not built here: a naming lint with false positives
-on looprs' own identifiers gets disabled inside a week, which is worse than no lint. The rule it
-would enforce is written once each: the naming sentence in the blockquote above the decision-record
-table in `docs/README.md`, and the checking of it — who, and when, plus what a capture has to print
+claim-bearing sentence in `docs/adr/*.md` and `docs/README.md` was filed as
+`workspace-8jk.12` and is **now built**: the gate's ninth check reads exactly those two
+places, asks whether the sentence carries a verdict or a measurement, and fails it unless
+the page has pinned an `owner/rho` beside a crate name above it or the line carries a
+`<!-- rho-named: owner/repo -->` marker. Its corpus is narrow for the reason this record
+kept repeating: a naming lint with false positives on looprs' own identifiers gets
+disabled inside a week, which is worse than no lint — `src/` and `spikes/` are out of
+scope by construction, and `./scripts/docs_check.py --self-test` runs the planted-claim
+case against in-memory text so the check cannot fail open. The rule it enforces is written
+once each: the naming sentence in the blockquote above the decision-record table in
+`docs/README.md`, and the checking of it — who, and when, plus what a capture has to print
 about itself — in
 [contributing → assessing a third-party dependency](../guide/contributing.md#assessing-a-third-party-dependency).
 

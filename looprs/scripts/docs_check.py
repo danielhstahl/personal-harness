@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The documentation rot gate (looprs-00u.10 / ADR-0008).
 
-Seven checks that keep the site true after the day it was written:
+Nine checks that keep the site true after the day it was written — the ninth keeps a
+decision record honest about **which library it priced**:
 
 1. **Links and orphans** — every relative link in every Markdown page resolves,
    every `#anchor` exists in the page it names, and every `.md` under `docs/` is
@@ -64,6 +65,23 @@ Seven checks that keep the site true after the day it was written:
    see. This is the static half of `spikes/docs_layout.py`, and it is static on
    purpose: a browser cannot be a gate in a project whose whole argument for its
    own generator is that nothing has to be installed (ADR-0008 Q1).
+9. **Which `rho` a claim means** (workspace-8jk.12) — a claim-bearing sentence in
+   `docs/adr/*.md` or `docs/README.md` may not name a dependency as the bare word
+   `rho` unless the page has already pinned which library it means (an `owner/rho`
+   beside a crate name) or the line carries an explicit
+   `<!-- rho-named: owner/repo -->`. ADR-0010 priced one library for a whole epic
+   because a ticket said "the rho library" and three unrelated projects publish
+   crates whose names begin `rho`; workspace-8jk.7 fixed the pages, and a fixed
+   page is not a guarded one — the next page that says "rho does not enter the
+   tree" re-creates the defect and nothing in the tree can contradict it. A
+   sentence is claim-bearing when it carries a verdict or a measurement verb, or
+   when it is a table row whose first cell names a spike or an ADR. looprs' own
+   naming (the Greek filler in `src/`, the `rho::` paths in `spikes/embed_programs/*`,
+   the `rho leg:` capture label) is out of scope by construction: the corpus is
+   narrow on purpose, because a naming lint with false positives gets disabled
+   inside a week. `--self-test` proves the check can fail: planted claims, the two
+   licensing routes, a marker that has outlived its case and the false-positive
+   controls all run over in-memory text, and the assertions are on the message.
 
 Run from anywhere; runs in well under a second; no network, no cargo, no build.
 
@@ -73,6 +91,8 @@ Run from anywhere; runs in well under a second; no network, no cargo, no build.
     ./scripts/docs_check.py --list-captures # every committed capture and its total
     ./scripts/docs_check.py --list-spikes   # every driver, indexed or not, with its captures
     ./scripts/docs_check.py --list-corpus   # today's corpus line counts, by the book
+    ./scripts/docs_check.py --list-rho      # every bare-`rho` claim and what licenses it
+    ./scripts/docs_check.py --self-test     # the naming lint's own regression cases
 """
 
 from __future__ import annotations
@@ -1908,6 +1928,483 @@ def check_spike_index() -> tuple[list[str], int]:
     return bad, len(drivers)
 
 
+# ───────────── check 9: which `rho` a claim is about (workspace-8jk.12) ─────────────
+#
+# Told in full in ADR-0010's amendment 0010-A, which is also why this is a gate and
+# not a paragraph: a ticket asked what "the rho library" cost, whoever ran the spike
+# resolved that to a different project than the one the request meant, and the wrong
+# library's numbers went into a decision record and stayed there for an epic. Three
+# unrelated projects publish crates whose names begin `rho`; a bare project name is
+# not an identity. workspace-8jk.7 swept the bare word out of the pages that carry a
+# claim, but a sweep is a one-time act — the next page that says "rho does not enter
+# the tree" re-creates the defect, silently, and nothing in the tree can contradict
+# it. This is that contradiction.
+#
+# The rule is the one 8jk.7 applied by hand, encoded rather than tightened:
+#
+#   * a **bare `rho`** — `(?<![\w/.-])rho(?![-\w])`, so `casonadams/rho`, `rho-sdk`
+#     and `rho_surface_cost.py` are already named and `rho` in a link target is
+#     masked out — sitting inside a **claim-bearing sentence**; and
+#   * a claim-bearing sentence is one that also carries a verdict or a measurement
+#     verb, or a table row whose first cell names a spike or an ADR (that row *is*
+#     a measurement, whether or not it has a verb in it);
+#   * the page may pin its subject **at or above the sentence** — a mention of
+#     `owner/rho` beside a backticked published artifact name, which is what "by
+#     `owner/repo` plus the published artifact name" looks like in a page. A pin
+#     inside the sentence itself counts too: the sentence that names the library may
+#     use the short form in the same breath. Bare `rho` after a pin is fine: that is
+#     the convention, not a loophole, and a stricter lint is a lint that gets muted;
+#   * `<!-- rho-named: owner/repo -->` on the line or the line above licenses one
+#     line — the same shape as a `dep-audit:` marker and a `#[allow(dead_code)]`
+#     reason: name the thing in the place the reader is already looking. An escape
+#     that excuses nothing fails, so the markers cannot quietly become a dump.
+#
+# The corpus is one directory and one page wide and no wider: `docs/adr/*.md` and
+# `docs/README.md`. looprs' own naming — the Greek-alphabet filler in `src/`, the
+# `rho::` crate paths and local bindings in `spikes/embed_programs/*`, the `rho leg:`
+# label a capture prints — is out of scope by construction, and whatever is left is
+# covered by the escape comment. That narrowness is the ticket: a naming lint with
+# false positives on the project's own identifiers gets disabled inside a week, which
+# is worse than no lint at all.
+
+#: The naming corpus: the decision records and the page that indexes them. Never
+#: `src/`, never `spikes/` — see the comment above.
+NAMING_PAGES = [DOCS / "README.md"]
+NAMING_GLOB = DOCS / "adr"
+
+#: A bare `rho`: not part of a longer word, not a path segment, not a hyphenated
+#: crate name. `rho::platform` counts as bare on purpose — a crate path names the
+#: crate called `rho`, which is exactly the ambiguous one.
+BARE_RHO_RE = re.compile(r"(?<![\w/.-])rho(?![-\w])")
+
+#: What makes a sentence *claim-bearing*: it decides something or measures something.
+#: This list is the vocabulary this corpus actually uses for that (ADR-0010's verdicts
+#: and its units), not a general English classifier. `ban`/`ms`/`LOC` are
+#: word-bounded so "adoptable", "terms" and "loc" stay out; "enters the tree" is the
+#: phrase the verdict is written with.
+CLAIM_VERB_RE = re.compile(
+    r"enter(?:s|ing|ed)?\s+the\s+tree|\bforbid\w*|\bban(?:s|ned|ning)?\b|"
+    r"licen[cs]e\w*|bus factor|\bLOC\b|\bcommits?\b|\bMiB\b|\bms\b|\bcrates?\b|"
+    r"protocol|settle\w*|\bpric(?:e|es|ing|ed)\b",
+    re.I,
+)
+
+#: A pinned subject: the `owner/rho` repo **and** a backticked artifact name. Both
+#: halves are required, because the rule being enforced is "`owner/repo` plus the
+#: published artifact", and a page that names the repo in passing without ever
+#: saying which crate it priced has not pinned anything. The backticks are part of
+#: that, not punctuation: this corpus writes every crate name in them, so "ships
+#: three crates" names no artifact and pins nothing.
+SUBJECT_REPO_RE = re.compile(r"\b[A-Za-z0-9][A-Za-z0-9._-]*/rho\b")
+ARTIFACT_NAME_RE = re.compile(r"`[a-z][a-z0-9_+.]*(-[a-z0-9+.]+)*`")
+
+#: A marker inside a code span is documentation of the marker, not a marker.
+CODE_SPAN_RE = re.compile(r"`[^`\n]+`")
+
+#: The per-line escape hatch: `<!-- rho-named: owner/repo -->` on the line itself or
+#: the line above it.
+RHO_ESCAPE_RE = re.compile(r"<!--\s*rho-named:\s*([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\s*-->")
+
+#: The first cell of a table row that is itself a measurement or a decision: a
+#: spike driver, a capture, or an ADR. Such a row carries a claim even when it has
+#: no verb in it — "| `rho_surface_cost.py` | `rho` … |" is a claim about `rho`.
+SPIKE_OR_ADR_CELL_RE = re.compile(
+    r"ADR-?\s?\d|adr/|spike|\.py\b|\.sh\b|\.log\b|crates\.io", re.I
+)
+
+#: The two identities every claim has to choose between, quoted from ADR-0010's
+#: **Subjects** bullet. Printed in the failure because the usual cause is a writer
+#: who knows there are two and did not know which one the number belonged to.
+RHO_CANDIDATES = (
+    "`casonadams/rho` (crates `rho`, `rho-engine`, `rho-harness-core`)",
+    "`matthewyjiang/rho` (crates `rho-sdk`, `rho-providers`, `rho-coding-agent`, "
+    "`rho-agent-tools`, `rho-tui-pty`)",
+)
+
+#: Sentence ends, plus any closing quote/bracket after them. `;` and `:` count: a
+#: semicolon joins two claims, and a colon introduces one.
+SENTENCE_END = ".!?;:"
+SENTENCE_CLOSE = "\"'”’)]*`"
+
+
+def naming_pages() -> list[Path]:
+    """The corpus: `docs/README.md` plus every `docs/adr/*.md`."""
+    pages = sorted(NAMING_GLOB.glob("*.md")) if NAMING_GLOB.is_dir() else []
+    return pages + [p for p in NAMING_PAGES if p.is_file()]
+
+
+def mask_link_targets(text: str) -> str:
+    """Blank Markdown link targets, keeping every offset identical.
+
+    A target is machinery, not a claim: `[the memo](adr/0010-trigger-3-…)` must not
+    become a claim about `rho` because its filename says `rho`, and a link to
+    `wire-protocol.md` must not make the sentence carry a verdict. Blanking (rather
+    than deleting) keeps the offsets `markdown_units` maps back to line numbers.
+    """
+    out: list[str] = []
+    last = 0
+    for m in LINK_RE.finditer(text):
+        out.append(text[last : m.start(2)])
+        out.append(" " * len(m.group(2)))
+        last = m.end(2)
+    out.append(text[last:])
+    return "".join(out)
+
+
+def mask_code_spans(text: str) -> str:
+    """Blank inline code spans, keeping every offset identical.
+
+    Only the escape-comment hunt uses this, and the reason is the difference between
+    a marker and a sentence *about* a marker: a page that documents
+    ``<!-- rho-named: owner/repo -->`` in backticks is writing about the gate, and
+    must not be read as carrying one (nor as excusing itself). A bare `rho` inside a
+    code span, by contrast, is exactly the thing being flagged, so the claim hunt
+    reads the unmasked text.
+    """
+    out: list[str] = []
+    last = 0
+    for m in CODE_SPAN_RE.finditer(text):
+        out.append(text[last : m.start()])
+        out.append(" " * (m.end() - m.start()))
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out)
+
+
+def split_sentences(text: str) -> list[tuple[int, str]]:
+    """`(offset, sentence)` for one block of text.
+
+    Deliberately dumb: break after `.!?;:` (plus a closing quote or bracket) when
+    whitespace follows. That is enough to keep *"`rho` does not enter the tree"* out
+    of the sentence next to it while keeping a claim wrapped across two source lines
+    in one piece — the shape this corpus writes in. A split in the wrong place can
+    only ever lose a verb-adjacency, not invent one, and the pin rule means a
+    mis-split on a page that has named its library costs nothing at all.
+    """
+    out: list[tuple[int, str]] = []
+    start = i = 0
+    n = len(text)
+    while i < n:
+        if text[i] in SENTENCE_END:
+            j = i + 1
+            while j < n and text[j] in SENTENCE_CLOSE:
+                j += 1
+            if j >= n or text[j].isspace():
+                if text[start : i + 1].strip():
+                    out.append((start, text[start : i + 1]))
+                while j < n and text[j].isspace():
+                    j += 1
+                start = i = j
+                continue
+        i += 1
+    if start < n and text[start:].strip():
+        out.append((start, text[start:]))
+    return out
+
+
+def subject_pinned_at(lines: list[str]) -> int:
+    """The line of the page's first pinned subject (`owner/rho` + an artifact), else 0.
+
+    Fence-aware: a pinned subject quoted inside a ``` block is an example, not the
+    page's subject — the same rule the measurement-claim check uses for markers.
+    """
+    in_fence = False
+    for i, line in enumerate(lines, start=1):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if SUBJECT_REPO_RE.search(line) and ARTIFACT_NAME_RE.search(line):
+            return i
+    return 0
+
+
+def naming_findings(label: str, text: str) -> tuple[list[str], list[dict]]:
+    """`(violations, claims)` for one page of the naming corpus.
+
+    `claims` is every claim-bearing bare-`rho` sentence found, licensed or not, each
+    with how it was licensed — that list is the pass count, and `--list-rho` prints
+    it so the gate's view can be checked by hand.
+    """
+    lines = text.splitlines()
+    quiet = [mask_code_spans(l) for l in lines]  # markers written *about* the gate
+    pin = subject_pinned_at(lines)
+    bad: list[str] = []
+    claims: list[dict] = []
+
+    for unit, headers, lineno_of in markdown_units(text):
+        row_claim = bool(headers) and unit.lstrip().startswith("|") and bool(
+            SPIKE_OR_ADR_CELL_RE.search(split_row(unit)[0])
+        )
+        masked = mask_link_targets(unit)
+        for offset, sentence in split_sentences(masked):
+            if not BARE_RHO_RE.search(sentence):
+                continue
+            if not (row_claim or CLAIM_VERB_RE.search(sentence)):
+                continue
+            lineno = lineno_of(offset)
+            end_line = lineno_of(offset + len(sentence) - 1)
+            escape = None
+            for candidate in (lineno, lineno - 1):
+                if 1 <= candidate <= len(quiet):
+                    m = RHO_ESCAPE_RE.search(quiet[candidate - 1])
+                    if m:
+                        escape = (candidate, m.group(1))
+                        break
+            licensed_by = None
+            why_not = ""
+            if escape:
+                licensed_by = f"escape comment at line {escape[0]} (`{escape[1]}`)"
+            elif pin and pin <= end_line:
+                licensed_by = (
+                    f"subject pinned at line {pin}"
+                    + (" (in the sentence itself)" if pin > lineno else "")
+                )
+            elif pin:
+                why_not = (
+                    f"the page's first pinned subject is line {pin}, which is **below** "
+                    f"this claim — a claim has to be pinned before it is argued"
+                )
+            else:
+                why_not = (
+                    "nothing above this line names an `owner/rho` beside a crate name"
+                )
+            claims.append(
+                {
+                    "page": label,
+                    "line": lineno,
+                    "sentence": " ".join(sentence.split()),
+                    "why": (
+                        "row's first cell names a spike/ADR"
+                        if row_claim
+                        else "claim verb in the sentence"
+                    ),
+                    "licensed_by": licensed_by,
+                    "escape": escape[0] if escape else None,
+                }
+            )
+            if licensed_by:
+                continue
+            because = (
+                "the row's first cell names a spike or an ADR"
+                if row_claim
+                else "a verdict or measurement verb sits in the sentence"
+            )
+            bad.append(
+                f"{label}:{lineno}: a claim names `rho` bare, so it does not say which "
+                f"library it prices or forbids "
+                f"({because}"
+                f"; {why_not})\n"
+                f"    the sentence: “{claims[-1]['sentence']}”\n"
+                f"    it has to choose between {RHO_CANDIDATES[0]} and {RHO_CANDIDATES[1]}\n"
+                f"    fix: name it there, pin it above, or write "
+                f"`<!-- rho-named: owner/repo -->` on the line "
+                f"(the rule is docs/README.md's naming blockquote; the sweep this "
+                f"gates is ADR-0010 amendment 0010-A)"
+            )
+
+    # An escape comment that excuses nothing is a marker that has outlived its case.
+    used = {c["escape"] for c in claims if c["escape"]}
+    for i, line in enumerate(quiet, start=1):
+        m = RHO_ESCAPE_RE.search(line)
+        if m and i not in used:
+            bad.append(
+                f"{label}:{i}: `<!-- rho-named: {m.group(1)} -->` excuses no bare `rho` "
+                f"claim on this line or the one under it — drop the marker (an escape "
+                f"that outlives its case is how a lint becomes folklore)"
+            )
+    return bad, claims
+
+
+def check_naming(pages=None) -> tuple[list[str], int]:
+    """Every claim-bearing bare-`rho` sentence in `docs/adr` + `docs/README.md` names
+    the library it is about, or the page has already pinned which one it means.
+
+    Returns `(violations, claims_checked)`; the count is printed on a clean run so
+    "the gate checks the naming" stays a number rather than becoming a claim.
+    """
+    bad: list[str] = []
+    claims: list[dict] = []
+    for page in naming_pages() if pages is None else pages:
+        b, c = naming_findings(rel(page), page.read_text(encoding="utf-8"))
+        bad += b
+        claims += c
+    return bad, len(claims)
+
+
+#: The naming lint's own regression cases, run in memory over in-process text so
+#: nothing in the tree is touched. Why a self-test lives inside the check it tests:
+#: `dep_audit.py --self-test` exists because a ban that failed for the wrong reason
+#: looked like a pass for a whole epic, and this check fails open in exactly the same
+#: way — a regex that stopped matching `rho` at all would print a clean gate and a
+#: number. Every case therefore asserts on the **message**, not only the exit code.
+#: The set is both directions: the planted claim the acceptance criterion names, the
+#: two ways a page is allowed to license it, the marker that has outlived its case,
+#: and the shapes that must **not** be flagged — a fully-qualified claim, a
+#: non-claim sentence, a fenced transcript, and looprs' own `rho-`/`rho_`/`/rho`
+#: identifiers sitting in a sentence full of measurement verbs.
+NAMING_SELFTEST: list[dict] = [
+    {
+        "name": "planted bare claim, page never names its subject",
+        "page": "docs/adr/0001-bash-terminal-state-pty.md",
+        "text": (
+            "# ADR-0001: Bash terminal state\n\n"
+            "Some unrelated prose about ptys.\n\n"
+            "rho does not enter the tree.\n"
+        ),
+        "expect": "fail",
+        "contains": [
+            "docs/adr/0001-bash-terminal-state-pty.md:5",
+            "rho does not enter the tree",
+            "casonadams/rho",
+            "matthewyjiang/rho",
+            "rho-named",
+        ],
+    },
+    {
+        "name": "same claim on a page that pinned its subject above",
+        "page": "docs/adr/0010-x.md",
+        "text": (
+            "# ADR-0010: The engine question\n\n"
+            "**Subjects:** matthewyjiang/rho, whose crate is `rho-sdk`.\n\n"
+            "rho does not enter the tree.\n"
+        ),
+        "expect": "pass",
+    },
+    {
+        "name": "same claim licensed by an escape comment on the line above",
+        "page": "docs/adr/0010-x.md",
+        "text": (
+            "# ADR-0010: The engine question\n\n"
+            "<!-- rho-named: matthewyjiang/rho -->\n"
+            "rho does not enter the tree.\n"
+        ),
+        "expect": "pass",
+    },
+    {
+        "name": "an escape comment that excuses no claim is itself a failure",
+        "page": "docs/adr/0010-x.md",
+        "text": (
+            "# ADR-0010: The engine question\n\n"
+            "<!-- rho-named: matthewyjiang/rho -->\n"
+            "Nothing at all is claimed here about ptys.\n"
+        ),
+        "expect": "fail",
+        "contains": ["excuses no bare `rho` claim", "rho-named: matthewyjiang/rho"],
+    },
+    {
+        "name": "the pin arrives below the claim (a claim is pinned before it is argued)",
+        "page": "docs/adr/0010-x.md",
+        "text": (
+            "# ADR-0010: The engine question\n\n"
+            "rho does not enter the tree.\n\n"
+            "**Subjects:** matthewyjiang/rho, whose crate is `rho-sdk`.\n"
+        ),
+        "expect": "fail",
+        "contains": ["**below** this claim"],
+    },
+    {
+        "name": "a fully-qualified claim is not a bare one",
+        "page": "docs/adr/0010-x.md",
+        "text": (
+            "# ADR-0010: The engine question\n\n"
+            "`matthewyjiang/rho`'s `rho-sdk` does not enter the tree; its crates are\n"
+            "priced at 3 MiB and 40 ms per settle.\n"
+        ),
+        "expect": "pass",
+    },
+    {
+        "name": "a bare `rho` in a sentence that claims nothing is prose, not a verdict",
+        "page": "docs/adr/0010-x.md",
+        "text": (
+            "# ADR-0010: The engine question\n\n"
+            "The word `rho` is Greek, and this page spells it that way on purpose.\n"
+        ),
+        "expect": "pass",
+    },
+    {
+        "name": "a claim inside a ``` fence is a transcript, not a claim",
+        "page": "docs/adr/0010-x.md",
+        "text": (
+            "# ADR-0010: The engine question\n\n"
+            "```\n"
+            "$ grep -r 'rho does not enter the tree'\n"
+            "```\n"
+        ),
+        "expect": "pass",
+    },
+    {
+        "name": "looprs' own `rho-`/`rho_`/`/rho` identifiers in a sentence of measurement verbs",
+        "page": "docs/adr/0010-x.md",
+        "text": (
+            "# ADR-0010: The engine question\n\n"
+            "`rho-sdk` is 120,799 LOC and `rho_surface_cost.py` prices it in ms; the\n"
+            "commits and the crates.io listing at https://crates.io/crates/rho are in\n"
+            "the capture.\n"
+        ),
+        "expect": "pass",
+    },
+    {
+        "name": "a table row whose first cell names a spike carries a claim without a verb",
+        "page": "docs/adr/0010-x.md",
+        "text": (
+            "# ADR-0010: The engine question\n\n"
+            "| spike | what it priced |\n"
+            "| --- | --- |\n"
+            "| `rho_surface_cost.py` | `rho` at 0.12.0 |\n"
+        ),
+        "expect": "fail",
+        "contains": ["first cell names a spike", "`rho` at 0.12.0"],
+    },
+    {
+        "name": "the marker shape written in backticks is prose about the gate, not a marker",
+        "page": "docs/adr/0010-x.md",
+        "text": (
+            "# ADR-0010: The engine question\n\n"
+            "Write `<!-- rho-named: owner/repo -->` on the line to license a claim.\n"
+        ),
+        "expect": "pass",
+    },
+]
+
+
+def naming_self_test() -> int:
+    """Run the naming lint's regression cases over in-memory text."""
+    failures: list[str] = []
+    for case in NAMING_SELFTEST:
+        bad, _claims = naming_findings(case["page"], case["text"])
+        blob = "\n".join(bad)
+        wanted_fail = case["expect"] == "fail"
+        if bool(bad) != wanted_fail:
+            failures.append(
+                f"{case['name']}: expected {'a failure' if wanted_fail else 'a pass'}, "
+                f"got {'FAIL: ' + blob if bad else 'pass'}"
+            )
+            continue
+        for needle in case.get("contains", []):
+            if needle not in blob:
+                failures.append(
+                    f"{case['name']}: the failure did not say {needle!r} — it said:\n    {blob}"
+                )
+        for needle in case.get("forbid", []):
+            if needle in blob:
+                failures.append(f"{case['name']}: the failure said {needle!r}")
+    if failures:
+        print(f"naming self-test: FAIL — {len(failures)} of {len(NAMING_SELFTEST)} cases wrong")
+        for f in failures:
+            print(f"  {f}")
+        return 1
+    print(
+        f"naming self-test: clean — {len(NAMING_SELFTEST)} cases, nothing on disk touched: "
+        f"a planted bare-`rho` claim fails and names the page, the line and both "
+        f"libraries; a pinned page and a `rho-named:` escape each license it; an "
+        f"escape that excuses nothing fails; qualified names, non-claim prose, "
+        f"fenced transcripts and looprs' own `rho-` identifiers stay green"
+    )
+    return 0
+
+
 # ──────────────────────────────── main ────────────────────────────────
 
 
@@ -1949,7 +2446,21 @@ def main() -> int:
         action="store_true",
         help="print today's corpus line counts with the command that produces each one",
     )
+    ap.add_argument(
+        "--list-rho",
+        action="store_true",
+        help="print every claim-bearing bare-`rho` sentence in docs/adr + docs/README.md "
+        "and what licenses it (the pin line, or a rho-named escape)",
+    )
+    ap.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run the bare-`rho` naming lint's own regression cases in memory",
+    )
     args = ap.parse_args()
+
+    if args.self_test:
+        return naming_self_test()
 
     if args.list_knobs:
         for knob, where in sorted(code_knobs().items()):
@@ -2028,6 +2539,20 @@ def main() -> int:
             print(f"{what:26s} {lines:>7,d} lines  {cmd}")
         return 0
 
+    if args.list_rho:
+        rows: list[dict] = []
+        for page in naming_pages():
+            _, claims = naming_findings(rel(page), page.read_text(encoding="utf-8"))
+            rows += claims
+        for r in sorted(rows, key=lambda r: (r["page"], r["line"])):
+            verdict = r["licensed_by"] or "NOT LICENSED"
+            print(
+                f"{r['page']}:{r['line']:<5d} [{r['why']:31s}] {verdict}"
+                f"  \u201c{r['sentence'][:96]}\u201d"
+            )
+        print(f"{len(rows)} claim-bearing bare-`rho` sentence(s) in the naming corpus")
+        return 0
+
     pages = corpus_pages()
     violations: list[str] = []
     violations += check_links(pages)
@@ -2045,6 +2570,8 @@ def main() -> int:
     violations += size_violations
     layout_violations, layout_pairs_checked = check_layout_css()
     violations += layout_violations
+    naming_violations, rho_claims_checked = check_naming()
+    violations += naming_violations
 
     if (args.fix_keymap or args.fix_wire) and not violations:
         print("docs_check: regenerated the generated tables; no other violations")
@@ -2058,9 +2585,10 @@ def main() -> int:
         print("  These are docs-rot failures: a link that lands nowhere, a knob the")
         print("  reference does not list, a page nothing links to, a table that has")
         print("  drifted from the code it claims to describe, a spike under")
-        print("  spikes/ that the harness's own index does not carry, or a stylesheet")
+        print("  spikes/ that the harness's own index does not carry, a stylesheet")
         print("  whose grid names an area no template defines (which is how the site")
-        print("  came out unreadable on a phone and perfect on a desktop).")
+        print("  came out unreadable on a phone and perfect on a desktop), or a claim")
+        print("  about `rho` that never says which library it prices.")
         return 1
 
     if not args.quiet:
@@ -2073,7 +2601,9 @@ def main() -> int:
             f"driver(s) under spikes/ all indexed in spikes/README.md, "
             f"{size_pairs_checked} inclusive size row(s) reconciled against their "
             f"parent row, {layout_pairs_checked} grid-area/template pair(s) closed "
-            f"at every breakpoint)"
+            f"at every breakpoint, {rho_claims_checked} claim-bearing bare-`rho` "
+            f"sentence(s) in docs/adr + docs/README.md all pinned to an "
+            f"`owner/rho` + crate name)"
         )
     return 0
 
