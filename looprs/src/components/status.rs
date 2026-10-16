@@ -20,10 +20,11 @@
 //! · which bead and how long a *background* run is on
 //! · bg: <mode> <verb>            ← ADR-0002's reason for this row
 //! · Esc cancel · how long this run has been going · what it cost (↑in ↓out)
+//! · how full the context is (ctx)
 //! · which bead · what it is doing · THE ERROR · which mode
 //! ```
 //!
-//! Three deliberate calls inside that order:
+//! Four deliberate calls inside that order:
 //!
 //! * **the error is never dropped, only shortened.** "Something failed" must
 //!   survive a 40-column window even when "what failed" cannot. The full text is
@@ -38,6 +39,12 @@
 //!   where some of those tokens came from, so it is worth room when there is room
 //!   and the first thing handed back when there is not — and it can never be the
 //!   reason the in/out pair is missing.
+//! * **the room outranks the bill.** `ctx` is how much context the model is
+//!   carrying; `↑↓` is what the run has cost. A bill is history and is still in
+//!   the journal tomorrow; a context is a live limit — cross it and the run
+//!   compacts again or the provider refuses the prompt (looprs-leg). So under
+//!   pressure the bill surrenders first, which is also why the two are separate
+//!   segments rather than one: they give up at different widths on purpose.
 //!
 //! [`SEP`] costs three columns, which is why the row drops *whole* segments rather
 //! than trimming each one: a fragment of everything tells you less than a whole of
@@ -92,12 +99,16 @@ mod keep {
     /// nobody watches, what it cost is the more actionable half of the pair — and
     /// ranks under the bead id, because "which ticket" beats "how much".
     pub const TOKENS: u8 = 10;
-    pub const BEAD_ID: u8 = 11;
-    pub const VERB: u8 = 12;
+    /// `ctx 32.0k` — the context the model is carrying. Kept longer than the bill
+    /// above it: a limit you are about to hit beats a total you can read off the
+    /// journal afterwards (looprs-leg).
+    pub const CONTEXT: u8 = 11;
+    pub const BEAD_ID: u8 = 12;
+    pub const VERB: u8 = 13;
     /// Never dropped — shortened instead (`Cut::Short`).
-    pub const ERROR: u8 = 13;
+    pub const ERROR: u8 = 14;
     /// Never cut at all, except by the last-resort clip.
-    pub const MODE: u8 = 14;
+    pub const MODE: u8 = 15;
 }
 
 /// How a segment gives up its columns when the row runs out of them.
@@ -268,6 +279,14 @@ pub struct Status<'a> {
     /// [`Tokens`] and [`SessionView::tokens`](crate::session::view::SessionView::tokens)
     /// for what the window covers per mode.
     pub tokens: Tokens,
+    /// Tokens this session's model is **carrying**, for the `ctx` segment — or
+    /// `None` when nothing has measured it yet (see
+    /// [`SessionView::context`](crate::session::view::SessionView::context)).
+    ///
+    /// A different question from [`Self::tokens`], and the two must never be
+    /// conflated: the window is what the run has *spent* and never goes down,
+    /// this is the room it has left and a compaction drops it on purpose.
+    pub context: Option<u64>,
     /// The row's own animation phase. `App` advances it off the frame tick, at
     /// the row's pace rather than the panel's.
     pub spinner: usize,
@@ -385,6 +404,20 @@ fn segments(s: &Status<'_>) -> Vec<Seg> {
                 keep::TOKEN_CACHE,
             ));
         }
+    }
+
+    // How full the context is, as opposed to what the run has cost. Its own label
+    // rather than a third arrow because the two numbers move differently: the
+    // bill above only ever goes up, and this one comes down the moment a
+    // compaction lands — which is the fact this segment was added to show
+    // (looprs-leg). Absent until something measures it: `ctx 0` would read as an
+    // empty context rather than an unmeasured one.
+    if let Some(n) = s.context.filter(|n| *n > 0) {
+        segs.push(Seg::new(
+            format!("ctx {}", fmt_tokens(n)),
+            Style::new().fg(Color::Yellow),
+            keep::CONTEXT,
+        ));
     }
 
     // Warm children: resident, idle, and invisible without this.
@@ -647,6 +680,7 @@ mod tests {
             background: vec![],
             warm: vec![],
             tokens: Tokens::default(),
+            context: None,
             spinner: 0,
         }
     }
@@ -860,6 +894,7 @@ mod tests {
                 output: 42_100,
                 cache: 8_400_000,
             },
+            context: Some(152_300),
             spinner: 3,
         };
         for width in 1u16..=120 {
@@ -905,6 +940,7 @@ mod tests {
                 output: 512,
                 cache: 900_000,
             },
+            context: None,
             spinner: 0,
         };
         let (txt, w) = render(&s, 40);
@@ -1077,6 +1113,7 @@ mod tests {
                 output: 42_100,
                 cache: 9_100_000,
             },
+            context: None,
             spinner: 0,
         };
 
@@ -1103,6 +1140,85 @@ mod tests {
             "in/out should outlive the cache detail: {txt:?}"
         );
         // And of course the answers the row exists to give are all still there.
+        assert!(
+            txt.contains("Beads") && txt.contains("working") && txt.contains("looprs-guh"),
+            "{txt:?}"
+        );
+    }
+
+    // ────────────────────────── the context figure ──────────────────────────
+
+    /// `ctx` is the room the model is carrying, and it is the one number on this
+    /// row that a compaction makes smaller (looprs-leg). It is printed **with its
+    /// label** because a bare fourth number next to the bill would be read as a
+    /// fourth cost figure, which is the exact misreading the ticket was filed on.
+    #[test]
+    fn the_context_figure_is_printed_with_its_label_once_measured() {
+        let mut s = plain(TerminalType::Pi, SessionStatus::Running);
+        let (txt, _) = render(&s, 100);
+        assert!(
+            !txt.contains("ctx"),
+            "never measured, nothing printed: {txt:?}"
+        );
+
+        // A measurement of zero is not a measurement: `ctx 0` would read as an
+        // empty context when the truth is an unmeasured one.
+        s.context = Some(0);
+        assert!(!render(&s, 100).0.contains("ctx"), "zero is not measured");
+
+        s.context = Some(32_000);
+        let (txt, _) = render(&s, 100);
+        assert!(txt.contains("ctx 32.0k"), "{txt:?}");
+    }
+
+    /// The room outranks the bill. Under pressure the **cost** pair surrenders and
+    /// `ctx` stays: a context limit you are about to hit is actionable now, a
+    /// running total is still in the journal tomorrow.
+    ///
+    /// Found rather than hard-coded, like the cache test above it: the test says
+    /// "the bill went first" and does not rot when a segment changes length.
+    #[test]
+    fn the_context_figure_outlives_the_in_out_pair() {
+        let b = bead();
+        let active = Sess {
+            mode: TerminalType::Beads,
+            status: SessionStatus::Running,
+            step: Some(BeadStep::WorkTickets),
+            bead: Some(&b),
+            elapsed: Some(Duration::from_secs(42)),
+            error: None,
+        };
+        let s = Status {
+            active,
+            background: vec![sess(TerminalType::Pi, SessionStatus::Running)],
+            warm: vec![TerminalType::Bash],
+            tokens: Tokens {
+                input: 1_234_567,
+                output: 42_100,
+                cache: 9_100_000,
+            },
+            context: Some(32_400),
+            spinner: 0,
+        };
+
+        let full = render(&s, 300).1 as u16;
+        assert!(
+            render(&s, 300).0.contains("ctx 32.4k"),
+            "it is in the full row"
+        );
+
+        // The first width at which the bill is gone …
+        let bill_gone = (1..=full)
+            .rev()
+            .find(|w| !render(&s, *w).0.contains('\u{2191}'))
+            .expect("the in/out pair survived every width");
+        // … and `ctx` is still on the row at it.
+        let (txt, w) = render(&s, bill_gone);
+        assert!(w <= bill_gone as usize, "{w} > {bill_gone}");
+        assert!(
+            txt.contains("ctx 32.4k"),
+            "the room should outlive the bill: {txt:?}"
+        );
         assert!(
             txt.contains("Beads") && txt.contains("working") && txt.contains("looprs-guh"),
             "{txt:?}"
@@ -1173,6 +1289,7 @@ mod peek {
                     background: vec![],
                     warm: vec![],
                     tokens: Tokens::default(),
+                    context: None,
                     spinner: 0,
                 },
             ),
@@ -1190,6 +1307,7 @@ mod peek {
                     background: vec![],
                     warm: vec![TerminalType::Pi],
                     tokens: Tokens::default(),
+                    context: None,
                     spinner: 4,
                 },
             ),
@@ -1214,6 +1332,7 @@ mod peek {
                     }],
                     warm: vec![TerminalType::Bash],
                     tokens: Tokens::default(),
+                    context: None,
                     spinner: 2,
                 },
             ),
@@ -1235,6 +1354,7 @@ mod peek {
                         output: 3_100,
                         cache: 1_800_000,
                     },
+                    context: Some(32_400),
                     spinner: 7,
                 },
             ),
@@ -1252,6 +1372,7 @@ mod peek {
                     background: vec![],
                     warm: vec![],
                     tokens: Tokens::default(),
+                    context: None,
                     spinner: 0,
                 },
             ),

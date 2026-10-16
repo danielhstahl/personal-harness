@@ -485,6 +485,7 @@ mod tests {
             title: format!("{id} title"),
             status: BeadStatusFallback::Known(status),
             issue_type: BeadIssueType::Task,
+            parent: None,
         }
     }
 

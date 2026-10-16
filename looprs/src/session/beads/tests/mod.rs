@@ -11,6 +11,8 @@
 //!   cannot re-work one it did not close (looprs-w7q);
 //! * [`resume`](resume) — a ticket left `in_progress` by a dead session is worked
 //!   before anything new is picked up (looprs-hjo);
+//! * [`hierarchy`](hierarchy) — a parent is worked after its children, never
+//!   before them (looprs-lpw);
 //! * [`announce`](announce) — the one `notify` call, and the five other ways a
 //!   pass can end without it;
 //! * [`notes_tests`](notes_tests) — the wording, pinned without a subprocess;
@@ -32,6 +34,7 @@ mod announce;
 mod claim;
 mod drive;
 mod handle;
+mod hierarchy;
 mod notes_tests;
 mod planner;
 mod resume;
@@ -101,6 +104,33 @@ const BLOCKED_THEN_READY: &str = r#"{
   "data": [
     {"id": "looprs-26r", "title": "waiting on somebody else", "status": "blocked", "issue_type": "bug"},
     {"id": "looprs-99", "title": "the next ticket", "status": "open", "issue_type": "task"}
+  ],
+  "schema_version": 1
+}"#;
+
+/// A planner's epic and its two children, in the order real `bd ready` returns
+/// them (measured on `bd` 1.3.1): the **container** on top — it is the P1 bead and
+/// the first one created — and the actual work underneath it, each child naming its
+/// parent. The rows carry what `bd` actually puts on a ready row: no child list on
+/// the parent, not even a populated count.
+///
+/// That order is looprs-lpw: a loop that takes the top of this list buys a pass over
+/// a paragraph of intent while the work sits two rows down.
+const EPIC_AND_CHILDREN: &str = r#"{
+  "data": [
+    {"id": "looprs-epic", "title": "Epic: build the thing", "status": "open", "issue_type": "epic"},
+    {"id": "looprs-epic.1", "title": "the first piece", "status": "open", "issue_type": "task", "parent": "looprs-epic"},
+    {"id": "looprs-epic.2", "title": "the second piece", "status": "open", "issue_type": "task", "parent": "looprs-epic"}
+  ],
+  "schema_version": 1
+}"#;
+
+/// The same epic after both children closed: nothing is left under it, so the
+/// container is the only thing on the board still owed a hand — the pass that
+/// decides whether the epic is really finished, and closes it.
+const EPIC_ALONE: &str = r#"{
+  "data": [
+    {"id": "looprs-epic", "title": "Epic: build the thing", "status": "open", "issue_type": "epic"}
   ],
   "schema_version": 1
 }"#;
@@ -263,6 +293,30 @@ fn bead(id: &str, title: &str) -> Bead {
     bead_status(id, title, crate::services::bd::BeadStatus::Open)
 }
 
+/// As [`bead`], hanging under `parent` — the shape a planner's epic and its
+/// children have, and the only shape that tells the loop a ticket is somebody's
+/// child (looprs-lpw).
+fn bead_child(id: &str, title: &str, parent: &str) -> Bead {
+    Bead {
+        parent: Some(parent.to_string()),
+        ..bead(id, title)
+    }
+}
+
+/// As [`bead_child`], with a chosen status, for "the child is a human's ticket and
+/// must not hold its parent down".
+fn bead_child_status(
+    id: &str,
+    title: &str,
+    parent: &str,
+    status: crate::services::bd::BeadStatus,
+) -> Bead {
+    Bead {
+        parent: Some(parent.to_string()),
+        ..bead_status(id, title, status)
+    }
+}
+
 /// As [`bead`], with a chosen status — the knob for "this ticket is not for a
 /// worker", which the guard tests use without needing a board file for it.
 fn bead_status(id: &str, title: &str, status: crate::services::bd::BeadStatus) -> Bead {
@@ -271,6 +325,7 @@ fn bead_status(id: &str, title: &str, status: crate::services::bd::BeadStatus) -
         title: title.to_string(),
         status: crate::services::bd::BeadStatusFallback::Known(status),
         issue_type: crate::services::bd::BeadIssueType::Task,
+        parent: None,
     }
 }
 

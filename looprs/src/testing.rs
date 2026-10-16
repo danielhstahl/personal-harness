@@ -879,11 +879,10 @@ impl Drop for Fakes {
         // for a third of a second (BdFake::Slow): a slow fake that outlives its
         // test is a slow fake turning up in the next one's timing.
         for pid in self.pi_pids().into_iter().chain(self.bd_pids()) {
-            let _ = Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            // Through the same helper the assertions use: with no `kill` binary to
+            // exec this cleanup silently did nothing, and every fake this test
+            // leaked showed up in the next one's process count (looprs-2v6).
+            let _ = send_signal("-9", pid);
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -1028,10 +1027,22 @@ fn bd_script(
         )
 }
 
-/// Is this pid still a live process (not a reaped one)?
-pub fn process_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
+/// Send one signal to `pid` through **bash's `kill` builtin**, and report whether
+/// the kernel accepted it.
+///
+/// The builtin rather than `Command::new("kill")` is the whole point: `kill` is not
+/// a binary on the image this crate ships inside (`docker/Dockerfile` installs no
+/// procps), and a spawn that fails to start answers `false` — which reads exactly
+/// like "no such process". Every "the harness did not kill that child" assertion in
+/// the suite was therefore quietly unsatisfiable there, because the witness could
+/// not exist (looprs-2v6). bash is already a hard requirement of these tests —
+/// every fake `pi` and `bd` is a bash script — so this asks something the suite
+/// already depends on instead of something it happens to have.
+pub fn send_signal(flag: &str, pid: u32) -> bool {
+    Command::new("bash")
+        // `$0` swallows the program name bash would otherwise advertise in its own
+        // error text; `$1`/`$2` keep the flag and the pid out of the script body.
+        .args(["-c", "kill \"$1\" \"$2\"", "looprs", flag, &pid.to_string()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -1039,14 +1050,15 @@ pub fn process_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Is this pid still a live process (not a reaped one)?
+pub fn process_alive(pid: u32) -> bool {
+    send_signal("-0", pid)
+}
+
 /// Stop a process dead, from outside. This is the ticket's "kill the pi child out
 /// from under the app": the app is not cooperating, and the child just goes away.
 pub fn kill_pid(pid: u32) {
-    let _ = Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    let _ = send_signal("-9", pid);
 }
 
 // ---------------------------------------------------------------------------------

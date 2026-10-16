@@ -266,13 +266,9 @@ impl BeadsSession {
                     BeadsCmd::Active(false) => {
                         task.parked = true;
                     }
-                    BeadsCmd::Submit(text) => {
-                        if let Err(e) = task.inner.launch_create_tickets(&text).await {
-                            tracing::error!("planner pass failed: {e:#}");
-                            task.inner.report_error(format!("planner: {e:#}"));
-                            task.inner.set_step(StepCause::Awaiting);
-                        }
-                    }
+                    // A planner pass is a pass, so it takes the same flag a worker
+                    // pass takes — see [`BeadsTask::submit`].
+                    BeadsCmd::Submit(text) => task.submit(&text).await,
                     // This command *is* the settle signal for the pass that made
                     // it, so it is what retires `streaming`. Deferred while
                     // parked, so a Tab back produces one pass rather than one per

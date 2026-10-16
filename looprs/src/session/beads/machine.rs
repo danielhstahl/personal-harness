@@ -13,13 +13,13 @@
 
 use super::guards::StepCause;
 use super::notes::{
-    Arrival, MAX_SKIPPED_LISTED, already_worked_note, held_elsewhere_note,
+    Arrival, MAX_SKIPPED_LISTED, already_worked_note, children_first_note, held_elsewhere_note,
     resume_already_worked_note, resume_note, worker_prompt,
 };
 
 use super::BeadsCmd;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
@@ -196,6 +196,35 @@ pub(super) enum Recovery {
     Refused(Bead),
 }
 
+/// How many workable children each bead in `beads` has *in that same list*.
+///
+/// The parent side of the looprs-lpw rule, and it can only be built from the child
+/// side: `bd`'s list rows put `parent` on a child and nothing at all on the parent
+/// (the epic's own row says nothing about what hangs below it, and its
+/// `*_count` fields are per-verb and read 0 on a `ready` row — see
+/// [`Bead::parent`]). So "does this bead still have unfinished work under it?" is
+/// answered by looking for a listed bead that names it, which is why
+/// [`ready_with`] must not be paginated: cut the page and the parent looks
+/// childless again.
+///
+/// "Workable" is doing real work in here. A child that a human took out of the loop
+/// (`blocked`, `deferred`) is not work this loop can do, so it must not hold its
+/// parent down: an epic whose only listed children are blocked is exactly as
+/// workable as an epic with no children at all, and deferring it would park the
+/// loop over a ticket it is allowed to take.
+fn unfinished_children(beads: &[Bead]) -> HashMap<&str, usize> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for bead in beads {
+        if bead.needs_human() {
+            continue;
+        }
+        if let Some(parent) = bead.parent() {
+            *counts.entry(parent).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
 impl BeadsLoop {
     /// Builds the loop without touching any process: it starts parked in
     /// `AwaitInput`. Work only begins when [`BeadsLoop::next`] is called, so a
@@ -305,7 +334,9 @@ impl BeadsLoop {
     ///    — it is *invisible*, and a loop that reads only `ready` takes the next
     ///    ticket and abandons that one (looprs-hjo). [`recover_in_progress`] is what
     ///    makes the unfinished one outrank the untouched ones.
-    /// 2. **Otherwise, what is ready?** [`pick_bead`], with its skip/refuse rules.
+    /// 2. **Otherwise, what is ready?** [`pick_bead`], with its skip/defer/refuse
+    ///    rules — including the one that works a child before the epic that merely
+    ///    contains it (looprs-lpw).
     ///
     /// The claim comes before the spawn in both branches because everything after a
     /// claim is paid for: the pass is only worth reporting, verifying and guarding
@@ -452,30 +483,54 @@ impl BeadsLoop {
 
     /// Decide which bead this pass works, given what `bd ready` offered.
     ///
-    /// Three rules, in this order, and each one is a thing that used to go wrong:
+    /// Four rules, in this order, and each one is a thing that used to go wrong:
     ///
     /// 1. **A ticket that needs a human is skipped, out loud.** `blocked` and
     ///    `deferred` mean somebody — a planner, or a worker that gave up — took it
     ///    out of the loop on purpose, and `bd ready` should not have listed it.
     ///    Spending a metered pass on one is the worst possible answer; staying
     ///    quiet about the skip would make it indistinguishable from a lost ticket.
-    /// 2. **A ticket this loop already worked is refused, never re-run.** If the
-    ///    first workable bead is one whose pass already ended without closing it,
-    ///    starting another pass on it is the runaway this ticket was filed for:
-    ///    `bd ready` will keep offering a bead for exactly as long as it stays
-    ///    open, and every pass is billed. The refusal parks the loop with its two
-    ///    ways out, both of which belong to a human.
-    /// 3. **Otherwise the first workable bead**, in `bd`'s own priority order.
+    /// 2. **A parent is worked after its children, never before them (looprs-lpw).**
+    ///    A parent bead — the epic a planner wrote first, usually at a higher
+    ///    priority — is a *container*: the work is in the children. `bd ready` does
+    ///    not know that and lists the parent first, so the loop used to claim the
+    ///    epic, spend a pass reading a paragraph of intent, and leave the children
+    ///    untouched. A bead that is named as the parent of another workable bead in
+    ///    this same list is therefore walked past, out loud, and becomes workable
+    ///    again once nothing is left under it. A hierarchy resolves depth-first for
+    ///    free: an epic, its child and that child's own subtask all defer to the one
+    ///    below them, and the list re-sorts itself as the leaves close.
+    /// 3. **A ticket this loop already worked is refused, never re-run.** If the
+    ///    first bead that survives the two rules above is one whose pass already
+    ///    ended without closing it, starting another pass on it is the runaway this
+    ///    ticket was filed for: `bd ready` will keep offering a bead for exactly as
+    ///    long as it stays open, and every pass is billed. The refusal parks the
+    ///    loop with its two ways out, both of which belong to a human. It is checked
+    ///    *after* rule 2 on purpose: stepping a parent aside is not a licence to walk
+    ///    past the guard and re-buy a ticket this loop already paid for — and the
+    ///    deferral is still said out loud, because a refusal on a child while its
+    ///    epic sits on top of the list otherwise reads as a mispick.
+    /// 4. **Otherwise the first workable bead**, in `bd`'s own priority order.
     ///
     /// What is deliberately *not* a rule: an unknown status is workable. Skipping
     /// what this build cannot classify would let a `bd` upgrade silently empty the
-    /// board, which is looprs-037's conflation wearing a different hat.
+    /// board, which is looprs-037's conflation wearing a different hat. Nor is "the
+    /// epic is unworkable, never touch it": a parent with nothing left under it is
+    /// the one who knows the epic, so it gets the pass and closes it — and a parent
+    /// whose children are all blocked, deferred or gone is workable the moment
+    /// `bd` itself says it is.
     pub(super) fn pick_bead(&self, beads: &[Bead]) -> Pick {
+        let children = unfinished_children(beads);
         let mut skipped: Vec<Bead> = Vec::new();
+        let mut deferred: Vec<(Bead, usize)> = Vec::new();
         let mut pick = Pick::Nothing;
         for bead in beads {
             if bead.needs_human() {
                 skipped.push(bead.clone());
+                continue;
+            }
+            if let Some(n) = children.get(bead.id()) {
+                deferred.push((bead.clone(), *n));
                 continue;
             }
             pick = if self.worked.contains(bead.id()) {
@@ -486,6 +541,17 @@ impl BeadsLoop {
             break;
         }
         self.report_skipped(&skipped);
+        // Only a pick that *moved* is worth a sentence: a pass that would have worked
+        // the epic anyway did not need this rule to say so. A refusal counts as
+        // moving — a loop that parks on a re-offered child while its epic sits on top
+        // of the ready list is precisely the sight that reads as a bug from outside.
+        let moved = match &pick {
+            Pick::Work(chosen) | Pick::AlreadyWorked(chosen) => Some(chosen),
+            Pick::Nothing => None,
+        };
+        if let Some(chosen) = moved {
+            self.report_deferred_parents(&deferred, chosen);
+        }
         pick
     }
 
@@ -506,6 +572,18 @@ impl BeadsLoop {
             note.push_str(&format!("\n  \u{2026} and {rest} more"));
         }
         self.report_system(note);
+    }
+
+    /// "These parents went to the back of the queue, and here is the child that
+    /// jumped them." Said once per pass, and only when the rule actually changed
+    /// the answer: a loop that quietly works `epic.7` when `epic` was sitting on
+    /// top of the ready list reads like a loop that picked the wrong ticket, which
+    /// is the same complaint [`resume_note`](super::notes::resume_note) answers.
+    fn report_deferred_parents(&self, deferred: &[(Bead, usize)], chosen: &Bead) {
+        if deferred.is_empty() {
+            return;
+        }
+        self.report_system(children_first_note(chosen, deferred));
     }
 
     /// Spawn one pass's `pi` child and wire its records into this session.

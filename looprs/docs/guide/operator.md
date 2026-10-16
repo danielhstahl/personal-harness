@@ -249,7 +249,9 @@ Work outside-in: **row → transcript → log → spikes.**
 **1. Read the status row.** It answers "is there a process, what is it doing, did
 anything fail" and the answer is a small closed set. `paused · ✗ …` means `bd` said
 no; `child gone` means a backend died; a spinner with no output means something is
-running with a long tail.
+running with a long tail. `↑ ↓` is what the run has **spent** and only ever climbs;
+`ctx` is how full its **context** is and falls the moment a compaction lands — a
+`ctx` that survives a compaction unchanged is a bug to report, not a slow model.
 [Verb table](beads-loop.md#telling-a-finished-pass-from-a-wedged-one).
 
 **2. Read that mode's transcript**, not the one on screen. Each mode has its own

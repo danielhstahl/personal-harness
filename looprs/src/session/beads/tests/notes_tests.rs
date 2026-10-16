@@ -7,8 +7,8 @@
 use crate::services::bd::{Bead, BeadStatus};
 
 use crate::session::beads::notes::{
-    MAX_PLAN_LISTED, clip, held_elsewhere_note, no_plan_note, plan_note,
-    resume_already_worked_note, resume_note, unverifiable_note,
+    MAX_DEFERRED_LISTED, MAX_PLAN_LISTED, children_first_note, clip, held_elsewhere_note,
+    no_plan_note, plan_note, resume_already_worked_note, resume_note, unverifiable_note,
 };
 
 use super::*;
@@ -125,4 +125,47 @@ fn the_resume_guard_note_names_both_ways_out() {
     assert!(note.contains("not closed"), "{note}");
     assert!(note.contains("bd close looprs-mid"), "{note}");
     assert!(note.contains("new instruction"), "{note}");
+}
+
+/// The children-before-parent note (looprs-lpw) has to make a deferral legible:
+/// which parent was passed over, which child got worked instead, and how many
+/// children are still holding that parent down. Said silently, the pass reads like
+/// the loop picked the wrong ticket off the top of the ready list — which is exactly
+/// what it looked like it did before this rule existed.
+#[test]
+fn the_children_first_note_names_the_parent_the_child_and_the_count() {
+    let epic = bead("looprs-epic", "Epic: build the thing");
+    let note = children_first_note(
+        &bead_child("looprs-epic.2", "the second piece", "looprs-epic"),
+        &[(epic.clone(), 2)],
+    );
+    assert!(note.contains("working looprs-epic.2"), "{note}");
+    assert!(note.contains("looprs-epic ("), "and the parent: {note}");
+    assert!(note.contains("Epic: build the thing"), "{note}");
+    assert!(
+        note.contains("2 child ticket(s) still ready"),
+        "the number that says how long the epic waits: {note}"
+    );
+    assert!(
+        note.contains("container") && note.contains("goes last"),
+        "{note}"
+    );
+    assert!(!note.contains("error") && !note.contains("skip"), "{note}");
+}
+
+/// Bounded like every other list note: a board with forty open epics gets the count
+/// and a readable head, not a dump.
+#[test]
+fn the_children_first_note_lists_up_to_the_cap_and_counts_the_rest() {
+    let deferred: Vec<(Bead, usize)> = (0..MAX_DEFERRED_LISTED + 2)
+        .map(|i| (bead(&format!("looprs-e{i}"), &format!("epic {i}")), i + 1))
+        .collect();
+    let note = children_first_note(&bead("looprs-x.1", "the work"), &deferred);
+    assert!(note.contains("looprs-e0 ("), "{note}");
+    assert!(
+        !note.contains(&format!("looprs-e{MAX_DEFERRED_LISTED} (")),
+        "past the cap only the count is shown: {note}"
+    );
+    assert!(note.contains("and 2 more"), "{note}");
+    assert_eq!(note.lines().count(), MAX_DEFERRED_LISTED + 2, "{note}");
 }

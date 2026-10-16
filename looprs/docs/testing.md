@@ -253,6 +253,14 @@ The levers a test has, once the fakes are up:
 | `Fakes::bd_log()` / `pi_commands()` / `pi_verbs()` | the command order, for "claim before spawn", `clear_queue` before `abort` |
 | `kill_pid` / `process_alive` | take the child out from under the app, and check |
 
+Those last two signal their children through **bash's `kill` builtin**
+(`testing::send_signal`) rather than a `kill` binary. The image this crate ships and
+tests inside installs no procps, and a `Command::new("kill")` that cannot even spawn
+answers `false` — the same answer as "that process is gone" — so every "the harness
+did not kill that child" assertion here was unsatisfiable, and the cleanup in
+`Drop for Fakes` leaked every fake it owned (looprs-2v6). bash is already a hard
+requirement of this suite: both fakes are bash scripts.
+
 The `tests/warning_gate.rs` tests are `#[ignore]`d because they invoke cargo from
 inside cargo (own `CARGO_TARGET_DIR`, cold build) — see that file's header.
 
@@ -308,6 +316,36 @@ ready list contradicts (a ticket still `in_progress` after its worker settled), 
 `Fakes::refuse_claim_for(id)` refuses the claim for **one** ticket while every other
 claim keeps working — the shape a live foreign claim has, which is not the same thing
 as `Fakes::refuse_claim` failing every claim, and must not be tested as if it were.
+
+### An epic comes after its children (looprs-lpw)
+
+`bd ready` orders by priority and blockers, not by containment, so a planner's epic —
+written first, usually at P1 — comes back **above** its own children. The loop worked
+it, read a paragraph of intent, and left the work underneath. A bead that another
+workable bead in the same ready list names as its parent is now walked past, and comes
+back when nothing is left under it:
+
+- `session::beads::tests::hierarchy::an_epic_is_worked_after_its_children`
+- `session::beads::tests::hierarchy::a_parent_is_deferred_while_any_of_its_children_is_workable`
+- `session::beads::tests::hierarchy::a_parent_with_nothing_left_under_it_is_worked`
+- `session::beads::tests::hierarchy::a_deep_hierarchy_is_worked_from_the_bottom_up`
+- `session::beads::tests::hierarchy::a_child_a_human_took_out_of_the_loop_does_not_hold_its_parent_down`
+- `session::beads::tests::hierarchy::the_re_work_guard_still_answers_under_a_parent`
+- `session::beads::tests::hierarchy::a_refusal_under_a_parent_says_why_the_parent_was_not_taken`
+- `session::beads::tests::hierarchy::nothing_is_deferred_for_children_the_read_cannot_show`
+- reads: `services::bd::tests::a_child_row_names_its_parent_and_a_parent_row_says_nothing_below_it`,
+  `services::bd::tests::a_row_with_no_parent_field_is_flat_work_not_a_parse_failure`,
+  `services::bd::tests::the_ready_read_asks_bd_for_the_whole_board`
+- wording: `session::beads::tests::notes_tests::the_children_first_note_names_the_parent_the_child_and_the_count`,
+  `session::beads::tests::notes_tests::the_children_first_note_lists_up_to_the_cap_and_counts_the_rest`
+
+The two `services::bd` payload tests are transcriptions of `bd` 1.3.1 output rather
+than invented shapes, and they carry the reason the rule reads children and not
+parents: the epic's own ready row reports `dependent_count: 0` while `bd show` on the
+same bead reports 1, so parentage is only readable from the child's `parent` field.
+`the_ready_read_asks_bd_for_the_whole_board` is the other half — an unpaginated ready
+list is not a completeness nicety here, it is what stops a truncated page from
+promoting an epic over the children on the board with it (closing ADR-0007 F2).
 
 ### Out-of-band notification (the completion edge)
 
@@ -662,6 +700,28 @@ pass spent what it spent; a total that drops on a keystroke is a total nobody
 trusts), and the planner (it holds no claim, so its spend lands in the window of
 the first bead that follows it rather than being zeroed away).
 
+**The room is not the bill: `ctx`.** A second token figure, and the only one on
+the row that gets *smaller*. `↑↓` is what the window has spent and it never rolls
+back — deliberately, per the three non-clears above. `ctx` is what the model is
+carrying, measured from the same `usage` record (`input + cache_read + cache_write
++ output`: the prompt that call sent plus the answer it wrote) and replaced, not
+added, by each measurement. The reason it exists at all is a bug report: after a
+compaction freed 150k → 32k the row was still showing the pre-compaction figure,
+which is right about the bill and wrong about everything else. So a successful
+`compaction_end` writes pi's own `estimatedTokensAfter` straight over it, and the
+number falls when the card closes rather than waiting for the next call to measure
+the smaller prompt. An **aborted or failed** compaction freed nothing and therefore
+changes nothing; neither does one that reported no figures.
+
+| claim | where |
+| --- | --- |
+| the context figure is measured off the authoritative `usage`, **replaces** the last one, and counts the cache buckets | `app::tests::token_window::the_context_figure_is_measured_off_the_same_usage_record` |
+| a successful compaction drops it to pi's estimate, and leaves the bill alone | `app::tests::token_window::a_successful_compaction_drops_the_context_figure` |
+| a cancelled, failed or figure-less compaction moves nothing | `app::tests::token_window::a_cancelled_or_failed_compaction_leaves_the_context_figure_alone` |
+| a new generation or a new claim clears it, same as the window | `app::tests::token_window::a_new_generation_or_claim_clears_the_context_figure` |
+| `ctx` prints only when measured, never as `ctx 0` | `app::tests::token_window::the_row_prints_a_context_figure_only_when_there_is_one`, `components::status::tests::the_context_figure_is_printed_with_its_label_once_measured` |
+| the room outranks the bill on the width ladder — the in/out pair surrenders first | `components::status::tests::the_context_figure_outlives_the_in_out_pair` |
+
 **Dropped bytes are gone from the row.** They were ADR-0002's scrollback-integrity
 signal for the buffer cap, and that signal still exists where the loss happens — at
 the marker row at the top of the band, which reads
@@ -693,6 +753,7 @@ finished row in the scrollback, `✓ context compacted · threshold · 150.0k �
 | the card is drawn in the frame's card band, and the two endings draw differently | `main::tests::a_live_compaction_is_drawn_in_the_card_band`, `main::tests::a_cancelled_and_a_failed_compaction_are_drawn_differently` |
 | an `end` whose `start` never arrived is recorded rather than swallowed | `app::tests::token_window::a_compaction_end_with_no_open_card_is_recorded_anyway` |
 | closing the card releases everything that queued up behind it | `app::tests::token_window::closing_the_compaction_card_releases_what_came_behind_it` |
+| the status row's `ctx` figure falls to pi's estimate when the card closes, and a freed-nothing ending leaves it where it was | `app::tests::token_window::a_successful_compaction_drops_the_context_figure`, `app::tests::token_window::a_cancelled_or_failed_compaction_leaves_the_context_figure_alone` |
 | a missing `reason` leaves no dangling separator on the row | `components::compaction::tests::no_reason_at_all_leaves_no_trailing_separator` |
 
 **A card left open when the session dies is a bug with teeth.** A `!done` entry

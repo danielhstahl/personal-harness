@@ -231,6 +231,28 @@ pub struct Bead {
     pub status: BeadStatusFallback,
     #[serde(default)]
     pub issue_type: BeadIssueType,
+    /// The id of this bead's parent, when it is a child in a hierarchy (`bd create
+    /// --parent <id>`, and the `id.N` ids that come with it).
+    ///
+    /// Measured on `bd` 1.3.1, an epic with one open child reports
+    /// `dependency_count: 0, dependent_count: 0` on its `ready` row and
+    /// `dependent_count: 1` for the same bead from `bd show` — the counts are
+    /// populated per-verb, so a parent read off `ready` looks childless. The
+    /// children-before-their-parent rule (looprs-lpw) is built from the child side
+    /// for exactly that reason: every child names its parent, on every read.
+    ///
+    /// (A child's `ready` row also carries the same fact as a
+    /// `dependencies[]` entry of `type: "parent-child"`. `parent` is read instead
+    /// because it is a string on the row rather than a list to walk, and because a
+    /// dependency list has other, unrelated members.)
+    ///
+    /// `None` means "this row does not say it is anybody's child", which is *not*
+    /// the same claim as "this bead has no children" — a parent's own row never
+    /// says anything about what hangs below it. A `bd` that stopped writing the
+    /// field would degrade to today's behaviour (work in `bd`'s own order) rather
+    /// than to a guess from id shapes.
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 /// `status` as a *value* that can be absent. A missing status is not "open" — it
@@ -267,6 +289,15 @@ impl Bead {
     }
     pub fn needs_human(&self) -> bool {
         self.status().needs_human()
+    }
+    /// The parent this bead was created under, `None` for a top-level bead.
+    pub fn parent(&self) -> Option<&str> {
+        self.parent.as_deref()
+    }
+    /// Is this bead the child of `id`?
+    #[allow(dead_code)] // consumers: services::bd::tests, which pins the parent read
+    pub fn is_child_of(&self, id: &str) -> bool {
+        self.parent.as_deref() == Some(id)
     }
 }
 
@@ -657,12 +688,22 @@ fn parse_truncation(stdout: &str) -> Option<JournalTruncated> {
     }
 }
 
-/// `bd ready --json` — the beads the loop may pick up, in bd's own priority order.
+/// `bd ready --limit 0 --json` — the beads the loop may pick up, in bd's own
+/// priority order.
 ///
 /// `Ok(vec![])` means the board is genuinely empty. It does *not* mean "bd could
 /// not tell us": that is `Err`, and the caller must not render it as empty.
+///
+/// `--limit 0` is load-bearing, and it is here for two reasons rather than one.
+/// looprs-037's standing rule is the first: `bd ready` defaults to 100 rows, so
+/// a busy board silently truncates (ADR-0007 F2 asked for exactly this).
+/// The hierarchy rule (looprs-lpw) is the second and the sharper one: the loop
+/// decides "is this epic's work still unfinished?" by looking for the epic's
+/// children *in this very list*, so a page that cuts off mid-epic does not just
+/// read short — it re-promotes the epic above work that is sitting on the board.
+/// A truncated ready list would be a wrong decision, not merely an incomplete one.
 pub async fn ready_with(bin: &str) -> Result<Vec<Bead>, BdError> {
-    beads(bin, &["ready", "--json"]).await
+    beads(bin, &["ready", "--limit", "0", "--json"]).await
 }
 
 /// `bd list --status <status> --json --limit 0` — every bead in one lifecycle
@@ -911,6 +952,63 @@ mod tests {
         let got = serde_json::from_str::<BdList>(src).unwrap().into_vec();
         assert_eq!(got[0].status(), BeadStatus::Unknown);
         assert!(!got[0].is_closed());
+    }
+
+    /// A hierarchy, as `bd ready` actually returns it: the epic first (higher
+    /// priority, created first), the children after it, each naming its parent.
+    /// This is the payload looprs-lpw is built on, taken from `bd` 1.3.1 rather
+    /// than imagined.
+    #[test]
+    fn a_child_row_names_its_parent_and_a_parent_row_says_nothing_below_it() {
+        let src = r#"{"data":[
+            {"id":"l-1","title":"Epic: the container","status":"open","issue_type":"epic","dependency_count":0,"dependent_count":0},
+            {"id":"l-1.1","title":"the actual work","status":"open","issue_type":"task","parent":"l-1"}
+        ],"schema_version":1}"#;
+        let got = serde_json::from_str::<BdList>(src).expect(src).into_vec();
+        assert_eq!(
+            got[0].parent(),
+            None,
+            "a parent's own row never mentions its children"
+        );
+        assert_eq!(got[1].parent(), Some("l-1"), "every child names its parent");
+        assert!(got[1].is_child_of("l-1"));
+        assert!(!got[0].is_child_of("l-1"), "a bead is not its own parent");
+    }
+
+    /// Forward/back-compatibility, the same rule as every other optional field:
+    /// a `bd` that does not write `parent` degrades to "nobody's child", which the
+    /// loop reads as flat work — today's behaviour — rather than as a failure or a
+    /// guess from the shape of the id.
+    #[test]
+    fn a_row_with_no_parent_field_is_flat_work_not_a_parse_failure() {
+        let src = r#"[{"id":"l-2.7","title":"looks like a child, says nothing"}]"#;
+        let got = serde_json::from_str::<BdList>(src).unwrap().into_vec();
+        assert_eq!(got[0].parent(), None);
+    }
+
+    /// **The ready read is not paginated (looprs-lpw, closing ADR-0007 F2).**
+    /// `bd ready` defaults to 100 rows. On a busy board that is not merely a short
+    /// list: the loop decides whether an epic still has work under it by looking for
+    /// that epic's children *in this list*, so a page cut at 100 silently promotes
+    /// an epic above children that are sitting on the board.
+    #[tokio::test]
+    async fn the_ready_read_asks_bd_for_the_whole_board() {
+        let fakes = Fakes::new(
+            "bd-ready-unlimited",
+            crate::testing::PiFake::Started,
+            BdFake::Ok,
+            ONE_BEADED_BOARD,
+        );
+        ready_with(fakes.bd_bin()).await.unwrap();
+        let lines = fakes.bd_log();
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("ready"))
+            .unwrap_or_else(|| panic!("expected `bd ready … --json`: {lines:?}"));
+        assert!(
+            line.contains("--limit 0"),
+            "a truncated ready list is not a short list, it is a wrong pick: {line}"
+        );
     }
 
     #[test]

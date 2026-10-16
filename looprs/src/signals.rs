@@ -188,11 +188,10 @@ mod tests {
             let send = tokio::spawn(async {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 // `kill(2)` through the shell: this crate carries no libc
-                // dependency, and the test only needs the signal delivered.
-                let _ = std::process::Command::new("kill")
-                    .arg("-TERM")
-                    .arg(std::process::id().to_string())
-                    .status();
+                // dependency, and the test only needs the signal delivered. The
+                // builtin, not a `kill` binary — see
+                // [`crate::testing::send_signal`] for why there is nothing to exec.
+                let _ = crate::testing::send_signal("-TERM", std::process::id());
             });
             let got = tokio::time::timeout(std::time::Duration::from_secs(5), sig.recv()).await;
             assert_eq!(
