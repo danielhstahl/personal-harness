@@ -11,12 +11,13 @@ NAME="$(printf '%s' "$SLUG" | tr -cs 'a-zA-Z0-9._-' '-' | sed 's/^[-_.]*//')"
 VOLUME="beads-data-$SLUG"
 BASENAME=$(basename "$PWD")
 BD_PREFIX="${BASENAME:0:4}"
-docker volume create $VOLUME  >/dev/null
-GIT_USER_NAME="$(git config user.name || true)"
-GIT_USER_NAME="${GIT_USER_NAME:-$USER}"
+: ${EMAIL_SUFFIX:="danielhstahl.com"}
 
-GIT_USER_EMAIL="$(git config user.email || true)"
-GIT_USER_EMAIL="${GIT_USER_EMAIL:-$USER@example.com}"
+docker volume create $VOLUME  >/dev/null
+
+# add .transcripts to gitignore if it doesn't exist in .gitignore already
+grep -qxF '.transcripts/' .gitignore || echo '.transcripts/' >> .gitignore
+mkdir -p .transcripts
 
 # looprs is PID 1 in the container (the entrypoint `exec`s it), so the container
 # lives exactly as long as looprs does. Belt and braces: name it, and stop it by
@@ -42,10 +43,11 @@ docker run --rm -it \
   --init \
   -v "$PWD:/workspace" \
   --add-host=host.docker.internal:host-gateway \
-  -v $HOME/.pi/agent/models.json:/home/appuser/.pi/agent/models.json:ro \
-  -v $VOLUME:/home/appuser/.beads \
-  -e GIT_USER_NAME="$GIT_USER_NAME" \
-  -e GIT_USER_EMAIL="$GIT_USER_EMAIL" \
+  -v "$HOME/.pi/agent/models.json:/home/appuser/.pi/agent/models.json:ro" \
+  -v "$PWD/.transcripts:/home/appuser/.local/share/looprs/transcripts/" \
+  -v "$VOLUME:/home/appuser/.beads" \
+  -e GIT_USER_NAME="looprs" \
+  -e GIT_USER_EMAIL="looprs@${EMAIL_SUFFIX}" \
   -e LOOPRS_NTFY_URL="$NTFY_URL" \
   -e LOOPRS_NTFY_TOPIC="harness" \
   -e BD_PREFIX="$BD_PREFIX" \
