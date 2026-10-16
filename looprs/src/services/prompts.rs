@@ -19,6 +19,25 @@ bd create "Set up database" -p 1 -t task
 bd create "Create API" -p 2 -t feature
 bd create "Add authentication" -p 2 -t feature
 
+Epics and children:
+
+An epic (or any parent ticket) is a CONTAINER: it holds the plan, and its children hold the work.
+`bd ready` lists a parent before its children — it knows about blockers, not about containment —
+so a parent with nothing under it costs a pass spent reading a paragraph of intent.
+
+* Create the epic first, then create every piece of work underneath it with `--parent <epic-id>`.
+* Never leave an epic without children. If the whole epic is one ticket's worth of work, create
+  one ticket instead of an epic.
+* Make each child independently finishable, and say in its title what it delivers. The loop works
+  children before their parent and the parent last, so a child is what actually gets built.
+* Do not write a child that just says "do the epic": that is the ticket you already wrote.
+
+Examples (a real plan, in order):
+
+bd create "Epic: persistence" -p 1 -t epic                 # -> e.g. app-9k2
+bd create "Add the schema" -p 2 -t task --parent app-9k2
+bd create "Write the migration runner" -p 2 -t task --parent app-9k2
+
 These are the instructions that you need to break down into tickets:
 "#;
 

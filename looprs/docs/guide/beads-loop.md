@@ -102,6 +102,76 @@ The tests are listed in [docs/testing.md](../testing.md) under "Crash recovery";
 the rule lives in
 [`BeadsLoop::recover_in_progress`](../../src/session/beads/machine.rs).
 
+## An epic is worked after its children
+
+Ask for a subsystem and the planner writes a container first: an epic that holds the
+plan, at the sharpest priority, and the actual work as children underneath it. `bd
+ready` knows about *blockers*, not about containment, so it hands the epic back as
+the top of the list — and the loop used to take it, spend a metered pass reading a
+paragraph of intent, and leave the children untouched. Every pass after that was the
+same argument again (looprs-lpw).
+
+So a bead that another workable bead on the same ready list names as its parent goes
+to the back of the queue, out loud, and becomes workable again the moment nothing is
+left under it:
+
+```text
+bd ready
+   ├─ needs a human (blocked/deferred) → skipped, named
+   ├─ somebody's container, still → walked past, named, with the count holding it down
+   ├─ this loop already paid for it → refused, both ways out
+   ▼ otherwise
+   claim it and spawn the worker
+```
+
+Four edges worth knowing, because each is a board shape someone will hit:
+
+* **A hierarchy resolves bottom-up for free.** An epic, a child, and a subtask under
+  *that*: every parent defers to whatever hangs below it, so the leaf goes first and
+  the list re-sorts itself as each one closes. Nothing is sorted; the deferral is
+  re-derived from the ready list on every pass.
+* **The epic is deferred, not benched.** Once its children are closed the container is
+  the only thing left that needs a hand — the pass that decides whether the epic is
+  really finished, and closes it. A rule that made parents unworkable would leave
+  every epic open forever.
+* **A human's ticket does not hold its parent down.** A `blocked` or `deferred` child
+  is work this loop may not do, so an epic whose only children are a human's is as
+  workable as an epic with none.
+* **What the read cannot show, the loop does not guess.** Parentage comes from the
+  child row's `parent` field, never from the shape of an id (`looprs-x.4`), and a
+  parent whose children are *not* in the list — closed, held elsewhere,
+  never written — is workable, exactly as an unfamiliar status is workable.
+
+The field is the awkward part, and it is why this rule is built from the child side.
+Measured on `bd` 1.3.1, an epic with one open child reports `dependent_count: 0` on
+its `ready` row and `dependent_count: 1` for the same bead from `bd show`: the counts
+are filled in per-verb, so a parent read off `ready` looks childless. Every child,
+though, names its parent on every read. That is also why the ready read asks `bd`
+for `--limit 0` (looprs-037's rule, and
+[ADR-0007 F2](../adr/0007-kanban-board.md)): the loop decides "is this epic still
+unfinished?" by looking for the epic's children *in this list*, so a page cut at 100
+rows does not read short, it re-promotes an epic above work that is sitting on the
+board.
+
+Two things you will see, then. In the transcript, once per pass in which the rule
+changes the answer:
+
+```text
+beads: working looprs-x.1 before 1 parent ticket(s) whose children are still ready —
+a parent is a container and its children are the work, so it goes last:
+  looprs-x (Epic: persistence) — 2 child ticket(s) still ready
+```
+
+And in the planner's instructions
+([`services::prompts.rs`](../../src/services/prompts.rs)): create the epic, then
+create every piece of work under it with `--parent <epic-id>`, and never leave an
+epic without children — if the whole epic is one ticket's worth of work, write one
+ticket instead.
+
+The rule lives in
+[`BeadsLoop::pick_bead`](../../src/session/beads/machine.rs); the tests are indexed
+in [docs/testing.md](../testing.md#an-epic-comes-after-its-children-looprs-lpw).
+
 ## Reading the band while a pass runs
 
 You are looking at two independent reads of the same board: the **band** (the

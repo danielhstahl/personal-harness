@@ -121,6 +121,9 @@ pub(super) const MAX_PLAN_LISTED: usize = 20;
 /// How many skipped tickets get listed before the note truncates.
 pub(super) const MAX_SKIPPED_LISTED: usize = 5;
 
+/// How many deferred parents get listed before the note truncates.
+pub(super) const MAX_DEFERRED_LISTED: usize = 5;
+
 /// "Here is the plan, before anybody spends money on it."
 pub(super) fn plan_note(tickets: &[Bead]) -> String {
     let mut out = format!("beads: planner created {} ticket(s):", tickets.len());
@@ -180,6 +183,37 @@ pub(super) fn unverified_pass_note(claim: &ActiveBead, reason: &str) -> String {
         claim.id,
         clip(reason, 300)
     )
+}
+
+/// "An epic is not the work; what hangs under it is."
+///
+/// The children-before-parent rule (looprs-lpw) spoken out loud. It has to be said
+/// because the silent version looks like a bug from the outside: the ready list
+/// clearly had `looprs-x` on top and the loop went and worked `looprs-x.4`, which
+/// is exactly what a loop that picked the wrong ticket looks like. The sentence
+/// names the ticket it passed over, the one it took instead, and — per parent — how
+/// many children are still holding it down, which is the number that says how much
+/// longer the epic waits.
+///
+/// `chosen` goes first; every parent in `deferred` waits, with the count of the
+/// children holding it down.
+pub(super) fn children_first_note(chosen: &Bead, deferred: &[(Bead, usize)]) -> String {
+    let mut out = format!(
+        "beads: working {} before {} parent ticket(s) whose children are still ready — a parent is a container and its children are the work, so it goes last:",
+        chosen.id(),
+        deferred.len()
+    );
+    for (b, n) in deferred.iter().take(MAX_DEFERRED_LISTED) {
+        out.push_str(&format!(
+            "\n  {} ({}) — {n} child ticket(s) still ready",
+            b.id(),
+            clip(b.title(), 60)
+        ));
+    }
+    if let Some(rest) = deferred.len().checked_sub(MAX_DEFERRED_LISTED) {
+        out.push_str(&format!("\n  \u{2026} and {rest} more"));
+    }
+    out
 }
 
 /// The worker pushed this one to a human; the rest of the board is still the

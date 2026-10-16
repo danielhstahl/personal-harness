@@ -309,6 +309,36 @@ ready list contradicts (a ticket still `in_progress` after its worker settled), 
 claim keeps working — the shape a live foreign claim has, which is not the same thing
 as `Fakes::refuse_claim` failing every claim, and must not be tested as if it were.
 
+### An epic comes after its children (looprs-lpw)
+
+`bd ready` orders by priority and blockers, not by containment, so a planner's epic —
+written first, usually at P1 — comes back **above** its own children. The loop worked
+it, read a paragraph of intent, and left the work underneath. A bead that another
+workable bead in the same ready list names as its parent is now walked past, and comes
+back when nothing is left under it:
+
+- `session::beads::tests::hierarchy::an_epic_is_worked_after_its_children`
+- `session::beads::tests::hierarchy::a_parent_is_deferred_while_any_of_its_children_is_workable`
+- `session::beads::tests::hierarchy::a_parent_with_nothing_left_under_it_is_worked`
+- `session::beads::tests::hierarchy::a_deep_hierarchy_is_worked_from_the_bottom_up`
+- `session::beads::tests::hierarchy::a_child_a_human_took_out_of_the_loop_does_not_hold_its_parent_down`
+- `session::beads::tests::hierarchy::the_re_work_guard_still_answers_under_a_parent`
+- `session::beads::tests::hierarchy::a_refusal_under_a_parent_says_why_the_parent_was_not_taken`
+- `session::beads::tests::hierarchy::nothing_is_deferred_for_children_the_read_cannot_show`
+- reads: `services::bd::tests::a_child_row_names_its_parent_and_a_parent_row_says_nothing_below_it`,
+  `services::bd::tests::a_row_with_no_parent_field_is_flat_work_not_a_parse_failure`,
+  `services::bd::tests::the_ready_read_asks_bd_for_the_whole_board`
+- wording: `session::beads::tests::notes_tests::the_children_first_note_names_the_parent_the_child_and_the_count`,
+  `session::beads::tests::notes_tests::the_children_first_note_lists_up_to_the_cap_and_counts_the_rest`
+
+The two `services::bd` payload tests are transcriptions of `bd` 1.3.1 output rather
+than invented shapes, and they carry the reason the rule reads children and not
+parents: the epic's own ready row reports `dependent_count: 0` while `bd show` on the
+same bead reports 1, so parentage is only readable from the child's `parent` field.
+`the_ready_read_asks_bd_for_the_whole_board` is the other half — an unpaginated ready
+list is not a completeness nicety here, it is what stops a truncated page from
+promoting an epic over the children on the board with it (closing ADR-0007 F2).
+
 ### Out-of-band notification (the completion edge)
 
 Turn it on with `LOOPRS_NTFY_URL` + `LOOPRS_NTFY_TOPIC`; with either missing the

@@ -685,6 +685,7 @@ mod tests {
             title: title.to_string(),
             status: BeadStatusFallback::Known(status),
             issue_type: BeadIssueType::Task,
+            parent: None,
         }
     }
 

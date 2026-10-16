@@ -124,9 +124,11 @@ Four flags, each load-bearing:
 
 - **`--limit 0`** — mandatory, per looprs-037. `bd list` defaults to 50 rows and
   `bd ready` to 100; a truncated page makes the `+N more` marker wrong, and a
-  wrong `+N more` is worse than no marker. Note the rule is honoured by
-  `list_status_with` and **not** by `ready_with` today (`["ready", "--json"]`, no
-  limit) — the board does not use `ready_with`, and F2 records the gap.
+  wrong `+N more` is worse than no marker. The rule is honoured by
+  `list_status_with`, and since looprs-lpw by `ready_with` too
+  (`["ready", "--limit", "0", "--json"]`) — F2 is closed, and that ticket had a
+  sharper reason for it than truncation: the loop decides whether an epic still has
+  work under it by looking for its children in the ready list.
 - **`--all`** — without it `bd list` hides closed (and pinned) beads, so the
   Complete column would read empty forever.
 - **`--readonly`** — free, and it makes "the board cannot change the board" a
@@ -436,10 +438,15 @@ inside the frame.
   the band shows `?` where it should show `review`. Changing `Unknown` to carry
   its raw string touches `as_str()`, `Copy` and every `match` in the crate; it is
   a real ticket and it is **not** a reason to leave `Unknown` off the board today.
-- **F2 — `ready_with` has no `--limit 0`.** `bd ready` defaults to 100 and
-  `bd.rs:ready_with` passes no limit, so the loop's own planner view silently
-  truncates past 100 ready beads. The kanban board avoids the function entirely,
-  which fixes nothing for the loop. looprs-037's rule should be carried across.
+- **F2 — `ready_with` has no `--limit 0`.** **Closed by looprs-lpw.** `bd ready`
+  defaults to 100 and `bd.rs:ready_with` passed no limit, so the loop's own planner
+  view silently truncated past 100 ready beads. The kanban board avoids the function
+  entirely, which fixed nothing for the loop. looprs-lpw carried looprs-037's rule
+  across for a harder reason than this ADR had: the beads loop answers "does this
+  epic still have unfinished work under it?" by looking for the epic's children in
+  its own ready read, so a page cut at 100 rows does not read short — it promotes an
+  epic above children that are on the board (`services::bd::ready_with`, pinned by
+  `the_ready_read_asks_bd_for_the_whole_board`).
 - **F3 — the footer's "Ns ago" needs the poller's clock in the snapshot**
   (`fetched_at`), which looprs-5o4.2 already names. Nothing here adds to it.
 
