@@ -63,6 +63,208 @@ fn pi_tokens(app: &App) -> Tokens {
     app.view(TerminalType::Pi).unwrap().tokens
 }
 
+/// What the row would print for a mode's **context** right now — the room the
+/// model is carrying, not the bill. A mode with no view has measured nothing.
+fn context_of(app: &App, mode: TerminalType) -> Option<u64> {
+    app.view(mode).and_then(|v| v.context)
+}
+
+/// A finished `compaction_end` shaped the way pi shapes a successful one: both
+/// figures present, nothing aborted, no error.
+fn compacted(before: u64, after: u64) -> Msg {
+    Msg::Agent {
+        session: pi_id(),
+        event: PiEvent::CompactionEnd {
+            reason: Some(CompactionReason::Threshold),
+            aborted: false,
+            error_message: None,
+            result: Some(CompactionResult {
+                tokens_before: Some(before),
+                estimated_tokens_after: Some(after),
+            }),
+        },
+    }
+}
+
+/// The context figure, measured off the same `usage` record as the bill, and
+/// read off the row as `ctx N`.
+///
+/// Why a second number at all: `↑` is what the run has **spent** and it never
+/// goes down — that is deliberate, a cancelled pass spent what it spent. A
+/// compaction frees the *context*, which is a different thing, and before this
+/// existed the row had no figure for it, so the row sat showing the old high
+/// number after the run had just been made smaller (looprs-leg).
+#[test]
+fn the_context_figure_is_measured_off_the_same_usage_record() {
+    let (mut app, _rx) = app_with(TerminalType::Pi);
+    assert_eq!(
+        context_of(&app, TerminalType::Pi),
+        None,
+        "nothing measured yet, so nothing claimed"
+    );
+
+    // input + cache_read + cache_write make the prompt the call sent; the output
+    // is what the next call inherits. The cache buckets count: a cache read
+    // skips the re-tokenising, not the window.
+    app.update(ended(
+        pi_id(),
+        "assistant",
+        Some(usage(40_000, 1_200, 90_000, 2_000)),
+    ));
+    assert_eq!(context_of(&app, TerminalType::Pi), Some(133_200));
+
+    // A measurement replaces the last one; it does not accumulate. This is what
+    // separates the figure from `↑`, which adds.
+    app.update(ended(pi_id(), "assistant", Some(usage(500, 20, 0, 0))));
+    assert_eq!(context_of(&app, TerminalType::Pi), Some(520));
+
+    // A `usage`-less message measures nothing, and does not clear what was.
+    app.update(ended(pi_id(), "assistant", None));
+    assert_eq!(context_of(&app, TerminalType::Pi), Some(520));
+
+    assert!(
+        app.status_line(120).to_string().contains("ctx 520"),
+        "and the row says it: {:?}",
+        app.status_line(120).to_string()
+    );
+}
+
+/// **The compaction is what moves it, and it moves it by falling.**
+///
+/// This is the ticket: the summarisation finished, the transcript said so, and
+/// the status row kept the pre-compaction number anyway. pi's own estimate is
+/// used, so the fall happens when the card closes rather than waiting for the
+/// next call to measure it.
+#[test]
+fn a_successful_compaction_drops_the_context_figure() {
+    let (mut app, _rx) = app_with(TerminalType::Pi);
+    app.update(ended(
+        pi_id(),
+        "assistant",
+        Some(usage(148_000, 2_000, 0, 0)),
+    ));
+    assert_eq!(context_of(&app, TerminalType::Pi), Some(150_000));
+
+    app.update(compacted(150_000, 32_000));
+    assert_eq!(
+        context_of(&app, TerminalType::Pi),
+        Some(32_000),
+        "the room came down …"
+    );
+    assert!(
+        app.status_line(120).to_string().contains("ctx 32.0k"),
+        "… and the row says so: {:?}",
+        app.status_line(120).to_string()
+    );
+
+    // … and the bill is untouched by it. The tokens were spent; the compaction
+    // made room, it did not issue a refund.
+    assert_eq!(pi_tokens(&app).input, 148_000);
+}
+
+/// An aborted or failed compaction freed nothing, so it changes nothing. A
+/// number that drops on a cancel is a number nobody can trust — the same rule
+/// that keeps the bill from rolling back on `Esc`.
+#[test]
+fn a_cancelled_or_failed_compaction_leaves_the_context_figure_alone() {
+    let (mut app, _rx) = app_with(TerminalType::Pi);
+    app.update(ended(
+        pi_id(),
+        "assistant",
+        Some(usage(60_000, 1_000, 0, 0)),
+    ));
+    let before = context_of(&app, TerminalType::Pi);
+
+    for (label, ev) in [
+        (
+            "aborted",
+            PiEvent::CompactionEnd {
+                reason: Some(CompactionReason::Manual),
+                aborted: true,
+                error_message: None,
+                result: None,
+            },
+        ),
+        (
+            "failed",
+            PiEvent::CompactionEnd {
+                reason: Some(CompactionReason::Overflow),
+                aborted: false,
+                error_message: Some("provider refused the summary".into()),
+                result: None,
+            },
+        ),
+        (
+            "succeeded without figures",
+            PiEvent::CompactionEnd {
+                reason: Some(CompactionReason::Threshold),
+                aborted: false,
+                error_message: None,
+                result: Some(CompactionResult {
+                    tokens_before: None,
+                    estimated_tokens_after: None,
+                }),
+            },
+        ),
+    ] {
+        app.update(Msg::Agent {
+            session: pi_id(),
+            event: ev,
+        });
+        assert_eq!(
+            context_of(&app, TerminalType::Pi),
+            before,
+            "{label} must not move the context figure"
+        );
+    }
+}
+
+/// A new generation and a new claim both clear it, exactly as they clear the
+/// bill: the number belongs to the child that measured it.
+#[test]
+fn a_new_generation_or_claim_clears_the_context_figure() {
+    let (mut app, _rx) = app_with(TerminalType::Pi);
+    app.update(ended(pi_id(), "assistant", Some(usage(9_000, 100, 0, 0))));
+    assert!(context_of(&app, TerminalType::Pi).is_some());
+    app.update(Msg::SessionStatus {
+        session: SessionId::new(TerminalType::Pi, 2),
+        status: SessionStatus::Idle,
+    });
+    assert_eq!(
+        context_of(&app, TerminalType::Pi),
+        None,
+        "a respawned child has not measured anything yet"
+    );
+
+    let (mut beads, _rx) = app_with(TerminalType::Beads);
+    beads.update(ended(
+        beads_id(),
+        "assistant",
+        Some(usage(9_000, 100, 0, 0)),
+    ));
+    assert!(context_of(&beads, TerminalType::Beads).is_some());
+    beads.update(claim("A"));
+    assert_eq!(
+        context_of(&beads, TerminalType::Beads),
+        None,
+        "a claim buys a new worker, and a new worker's context is not the last one's"
+    );
+}
+
+/// The row prints the context figure **only when it has one**, and says nothing
+/// rather than `ctx 0` when it does not — an absent measurement is not a
+/// measurement of nothing.
+#[test]
+fn the_row_prints_a_context_figure_only_when_there_is_one() {
+    let (mut app, _rx) = app_with(TerminalType::Pi);
+    assert!(
+        !app.status_line(120).to_string().contains("ctx"),
+        "unmeasured is not zero"
+    );
+    app.update(ended(pi_id(), "assistant", Some(usage(1, 0, 0, 0))));
+    assert!(app.status_line(120).to_string().contains("ctx 1"));
+}
+
 /// The window adds every assistant message's usage, and nothing else adds.
 ///
 /// The two no-rows carry the weight. A `user` message's `message_end` is not

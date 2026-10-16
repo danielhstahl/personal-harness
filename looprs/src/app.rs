@@ -386,6 +386,10 @@ impl App {
             // nothing — carrying a dead child's total over would make a plain
             // respawn read like a runaway.
             v.tokens = Default::default();
+            // ...and neither is it holding the previous one's context: a new child
+            // starts a new conversation (or resumes one we have not measured yet),
+            // so the row says nothing until this child's own usage says something.
+            v.context = None;
         }
         v
     }
@@ -968,6 +972,7 @@ impl App {
             background: self.busy_background(),
             warm: self.warm_modes(),
             tokens: self.view(self.active).map(|v| v.tokens).unwrap_or_default(),
+            context: self.view(self.active).and_then(|v| v.context),
             spinner: self.row_spinner,
         }
         .line(width)
@@ -1228,6 +1233,9 @@ impl App {
                 // pass it describes.
                 if bead.is_some() {
                     v.tokens = Default::default();
+                    // The same fresh start for the context figure: a claim buys a
+                    // new worker, and a new worker's context is not the last one's.
+                    v.context = None;
                 }
                 v.active_bead = bead;
             }
@@ -1777,6 +1785,10 @@ fn apply_pi(view: &mut SessionView, ev: PiEvent) {
                 // needs, and cannot be double counted.
                 if let Some(u) = message.usage {
                     view.tokens.add(&u);
+                    // The same record measures the other question: this call's
+                    // prompt plus its answer is what the next call carries, which
+                    // is the closest thing to a measurement of "how full am I".
+                    view.measure_context(&u);
                 }
             }
             // The user's own words coming back from the child. The box echoed
@@ -1855,11 +1867,19 @@ fn apply_pi(view: &mut SessionView, ev: PiEvent) {
                 // pi reports the two figures on a successful compaction only when
                 // it has them; with either missing the card says "compacted" and
                 // stops rather than putting a made-up number on the row.
-                let freed = result
+                let figures = result
                     .as_ref()
-                    .and_then(|r| Some((r.tokens_before?, r.estimated_tokens_after?)))
+                    .and_then(|r| Some((r.tokens_before?, r.estimated_tokens_after?)));
+                let freed = figures
                     .map(|(before, after)| token_delta(before, after))
                     .unwrap_or_default();
+                // The row's context figure falls the moment the compaction lands,
+                // using pi's own estimate rather than waiting for the next call to
+                // measure the new, smaller prompt (looprs-leg). An `end` with no
+                // figures freed nothing we can name, so it changes nothing.
+                if let Some((_before, after)) = figures {
+                    view.context_compacted_to(after);
+                }
                 (CompactionState::Done, freed)
             };
             // The card closes and the live region hands the row back: whatever

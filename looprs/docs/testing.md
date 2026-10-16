@@ -700,6 +700,28 @@ pass spent what it spent; a total that drops on a keystroke is a total nobody
 trusts), and the planner (it holds no claim, so its spend lands in the window of
 the first bead that follows it rather than being zeroed away).
 
+**The room is not the bill: `ctx`.** A second token figure, and the only one on
+the row that gets *smaller*. `↑↓` is what the window has spent and it never rolls
+back — deliberately, per the three non-clears above. `ctx` is what the model is
+carrying, measured from the same `usage` record (`input + cache_read + cache_write
++ output`: the prompt that call sent plus the answer it wrote) and replaced, not
+added, by each measurement. The reason it exists at all is a bug report: after a
+compaction freed 150k → 32k the row was still showing the pre-compaction figure,
+which is right about the bill and wrong about everything else. So a successful
+`compaction_end` writes pi's own `estimatedTokensAfter` straight over it, and the
+number falls when the card closes rather than waiting for the next call to measure
+the smaller prompt. An **aborted or failed** compaction freed nothing and therefore
+changes nothing; neither does one that reported no figures.
+
+| claim | where |
+| --- | --- |
+| the context figure is measured off the authoritative `usage`, **replaces** the last one, and counts the cache buckets | `app::tests::token_window::the_context_figure_is_measured_off_the_same_usage_record` |
+| a successful compaction drops it to pi's estimate, and leaves the bill alone | `app::tests::token_window::a_successful_compaction_drops_the_context_figure` |
+| a cancelled, failed or figure-less compaction moves nothing | `app::tests::token_window::a_cancelled_or_failed_compaction_leaves_the_context_figure_alone` |
+| a new generation or a new claim clears it, same as the window | `app::tests::token_window::a_new_generation_or_claim_clears_the_context_figure` |
+| `ctx` prints only when measured, never as `ctx 0` | `app::tests::token_window::the_row_prints_a_context_figure_only_when_there_is_one`, `components::status::tests::the_context_figure_is_printed_with_its_label_once_measured` |
+| the room outranks the bill on the width ladder — the in/out pair surrenders first | `components::status::tests::the_context_figure_outlives_the_in_out_pair` |
+
 **Dropped bytes are gone from the row.** They were ADR-0002's scrollback-integrity
 signal for the buffer cap, and that signal still exists where the loss happens — at
 the marker row at the top of the band, which reads
@@ -731,6 +753,7 @@ finished row in the scrollback, `✓ context compacted · threshold · 150.0k �
 | the card is drawn in the frame's card band, and the two endings draw differently | `main::tests::a_live_compaction_is_drawn_in_the_card_band`, `main::tests::a_cancelled_and_a_failed_compaction_are_drawn_differently` |
 | an `end` whose `start` never arrived is recorded rather than swallowed | `app::tests::token_window::a_compaction_end_with_no_open_card_is_recorded_anyway` |
 | closing the card releases everything that queued up behind it | `app::tests::token_window::closing_the_compaction_card_releases_what_came_behind_it` |
+| the status row's `ctx` figure falls to pi's estimate when the card closes, and a freed-nothing ending leaves it where it was | `app::tests::token_window::a_successful_compaction_drops_the_context_figure`, `app::tests::token_window::a_cancelled_or_failed_compaction_leaves_the_context_figure_alone` |
 | a missing `reason` leaves no dangling separator on the row | `components::compaction::tests::no_reason_at_all_leaves_no_trailing_separator` |
 
 **A card left open when the session dies is a bug with teeth.** A `!done` entry

@@ -219,6 +219,32 @@ pub struct SessionView {
     ///   its spend lands in the window of the first bead that follows it — which
     ///   is the work it planned, and beats throwing away a pass that cost money.
     pub tokens: Tokens,
+    /// Tokens the model is **carrying** right now, for the status row — and the
+    /// only figure on that row that a compaction makes *smaller* (looprs-leg).
+    ///
+    /// This exists because `tokens` is a bill and this is a room, and the row used
+    /// to have only the bill. A compaction frees room without refunding anything,
+    /// so every number the row carried stayed at its pre-compaction size after one
+    /// — which reads as the row lying about work the transcript had just said was
+    /// done ("the context number is still at the high number from before
+    /// compaction"). The fix is not to make the bill go down; it is to show the
+    /// room as well.
+    ///
+    /// Two writers, both authoritative, and nothing between them:
+    ///
+    /// * [`Self::measure_context`] — an assistant `message_end`'s `usage`, the same
+    ///   record [`Tokens::add`] reads and for the same reason: the streaming copy
+    ///   of `usage` is cumulative for the half-built message and would grow with
+    ///   the square of the answer;
+    /// * [`Self::context_compacted_to`] — pi's own `estimatedTokensAfter`, applied
+    ///   the moment the compaction card closes, so the number falls *with* the
+    ///   compaction instead of waiting for the next call to measure it.
+    ///
+    /// `None` = never measured (a child that has reported no usage yet, or a fresh
+    /// generation/claim, which clears it alongside the window). The row prints
+    /// nothing for `None` rather than a `ctx 0` that reads as an empty context
+    /// when the truth is an unmeasured one.
+    pub context: Option<u64>,
     /// Dropped-line bookkeeping for the buffer cap (see [`DEFAULT_VIEW_BUFFER`]).
     ///
     /// Bytes, because that is the unit the cap is a cap in. The *visible* notice
@@ -338,6 +364,7 @@ impl SessionView {
             step: None,
             active_bead: None,
             tokens: Tokens::default(),
+            context: None,
             dropped: 0,
             source_skipped: 0,
             journal_continued: false,
@@ -517,6 +544,37 @@ impl SessionView {
     /// it (looprs-msj). It is a label now, not a lock.
     pub fn set_step(&mut self, step: BeadStep) {
         self.step = Some(step);
+    }
+
+    /// Record where the model's context stands, measured from one finished call.
+    ///
+    /// `input + cache_read + cache_write + output`: the prompt that call sent —
+    /// cache buckets included, because a cache read skips the re-tokenising cost,
+    /// not the context window — plus the answer it wrote, which the next call
+    /// inherits. It is an estimate of the next prompt rather than a measurement of
+    /// the last one, and the difference is tool output the harness cannot see;
+    /// pi's own figure for the same job is called *estimated* for that reason.
+    ///
+    /// An all-zero `usage` records nothing: `Some(0)` would print `ctx 0`, which
+    /// is the "absent is not zero" rule [`Tokens::is_empty`] already keeps.
+    pub fn measure_context(&mut self, u: &crate::wire::Usage) {
+        let n = u.input + u.cache_read + u.cache_write + u.output;
+        if n > 0 {
+            self.context = Some(n);
+        }
+    }
+
+    /// A compaction freed room: from now on the context is what pi says it is.
+    ///
+    /// Only ever called for a compaction that **succeeded and reported a figure**.
+    /// An aborted one (Esc) or a failed one freed nothing, and a number that
+    /// drops when nothing was freed is a number that teaches the user to ignore
+    /// it — the same reasoning that keeps the spend window from rolling back on
+    /// `Esc`.
+    pub fn context_compacted_to(&mut self, tokens: u64) {
+        if tokens > 0 {
+            self.context = Some(tokens);
+        }
     }
 
     /// How many bytes of this view's output the buffer cap has dropped.

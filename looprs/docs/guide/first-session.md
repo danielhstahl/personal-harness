@@ -75,6 +75,23 @@ is the whole reason the row exists rather than a colour on the input box: after 
 has nothing to report
 ([ADR-0002](../adr/0002-session-abstraction.md)).
 
+When the run has reported any usage, the row carries two kinds of token number, and
+they are not the same question:
+
+* **`↑in ↓out` — the bill.** What this window has spent, and it only ever goes up.
+  In Beads the window is the current ticket (a new claim starts a new bill); in Pi it
+  is the whole warm session. Cancelling a pass with `Esc` does not lower it, because
+  the tokens were bought.
+* **`ctx N` — the room.** How full the model's context is right now, and this is the
+  one that comes **down**: when a run compacts, the transcript gets
+  `✓ context compacted · threshold · 150.0k → 32.0k` and the row says `ctx 32.0k`
+  in the same breath. If a compaction ever leaves `ctx` where it was, that is a bug,
+  not a slow model.
+
+Neither appears until something has measured it. A run that has reported no usage
+prints no numbers at all rather than `↑0 ↓0`, which would read as "free" instead of
+"unmeasured".
+
 ## Getting out
 
 | where you are | how out | what happens |

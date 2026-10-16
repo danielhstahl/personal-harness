@@ -398,9 +398,11 @@ impl PiEvent {
 
 /// The `result` of a successful `compaction_end`.
 ///
-/// Two fields are modelled because two are rendered: the card prints what the
-/// compaction freed (`150k → 32k`), and that is the whole of what this harness
-/// wants from the record.
+/// Two fields are modelled because both are read: the card prints what the
+/// compaction freed (`150k → 32k`), and `estimated_tokens_after` is also what the
+/// status row's `ctx` figure falls to the moment the card closes — the one number
+/// on that row a compaction makes smaller (looprs-leg, see
+/// [`SessionView::context_compacted_to`](crate::session::view::SessionView::context_compacted_to)).
 ///
 /// What is deliberately **not** here: `summary`, `firstKeptEntryId` and the
 /// summarisation call's own `usage`. The first two live in the session file and
@@ -824,6 +826,11 @@ pub struct WireMessage {
 /// pieces independently, and a partial record is still worth counting for what it
 /// does carry.
 ///
+/// Two readers, both on the status row, asking different questions of the same
+/// record: the spend window adds it up ([`crate::session::view::Tokens::add`]),
+/// and the context figure keeps the last one of them
+/// ([`crate::session::view::SessionView::measure_context`]).
+///
 /// What is deliberately **not** modelled: `cost`, and the `cacheWrite1h` /
 /// `reasoning` splits. The row shows tokens, and a field with no reader is a
 /// dead-code allowance that answers nothing.
@@ -1200,7 +1207,7 @@ pub const WIRE_INVENTORY: &[WireRow] = &[
     },
     WireRow {
         group: "event", wire: "message_end", variant: "MessageEnd",
-        outcome: Outcome::Renders("seals the answer; the token window's one source"),
+        outcome: Outcome::Renders("seals the answer; the token window's and the status row's `ctx` figure, one source"),
         reader: Some("app::apply_pi — per role, see the roles table above"),
         waiting_on: None,
         note: "what this event means depends on its `role`, so this row is a pointer: the eight answers live in the roles table, not here",
@@ -1249,8 +1256,8 @@ pub const WIRE_INVENTORY: &[WireRow] = &[
     },
     WireRow {
         group: "event", wire: "compaction_end", variant: "CompactionEnd",
-        outcome: Outcome::Renders("the compaction card, closed: freed / cancelled / failed"),
-        reader: Some("app::apply_pi → SessionView::finish_compaction"),
+        outcome: Outcome::Renders("the compaction card, closed: freed / cancelled / failed; and the row's `ctx` figure on a success that reported its estimate"),
+        reader: Some("app::apply_pi → SessionView::finish_compaction / SessionView::context_compacted_to"),
         waiting_on: None,
         note: "three endings, three drawings — a cancel is not painted in failure's colour, because a cancel that looks like a crash teaches the wrong lesson about a key the user chose to press",
     },
