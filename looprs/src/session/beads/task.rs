@@ -13,14 +13,14 @@
 
 use crate::session::beads::guards::PassGate;
 
-use super::guards::{StepCause, abort_is_redundant, stall_timer_is_live};
+use super::guards::{abort_is_redundant, stall_timer_is_live};
 use super::machine::{BeadsLoop, PassOutcome, PlanCheck};
 use super::notes::{
     left_for_human_note, no_plan_note, not_closed_note, nothing_held_note, plan_note,
     unverifiable_note, unverified_pass_note,
 };
 
-use super::BeadsCmd;
+use super::{BeadsCmd, StepCause};
 
 use crate::session::{SessionStatus, cancel};
 
@@ -45,6 +45,12 @@ pub(super) struct BeadsTask {
     /// ([`BeadsCmd::WorkerSettled`]) or the worker's death, because the loop's
     /// own step cannot tell "still streaming" from "finished, and nobody has
     /// asked to advance yet".
+    ///
+    /// It is set at **both** doors a pass can come in through — [`Self::run_pending`]
+    /// for a worker, [`Self::submit`] for a planner — and not from
+    /// [`BeadsLoop::has_live_worker`] directly, because a settled child stays
+    /// alive until the next pass boundary reaps it and the loop must be free to
+    /// advance over a child that has already settled.
     pub(super) streaming: bool,
     /// `Esc` landed on the in-flight pass. The settle that follows is the abort
     /// unwinding, **not** a pass that finished, so it parks instead of taking the
@@ -89,6 +95,28 @@ impl BeadsTask {
     /// one level down.
     fn is_live(&self, serial: u64) -> bool {
         self.inner.worker_serial() == Some(serial)
+    }
+
+    /// A human instruction arrived in the beads box: put it to the planner.
+    ///
+    /// The one thing the caller cannot be trusted to remember is the flag, and
+    /// that is the whole reason this is a method rather than three lines in the
+    /// mailbox: [`BeadsTask::streaming`] is what the pass gate reads to decide
+    /// "a pass is in flight, do not open another", and a planner pass is a pass.
+    /// It used to be set only on the worker side (`run_pending`), so the gate
+    /// stayed open for the duration of a plan: a `Tab` out and back set
+    /// `pending`, the gate allowed, and [`BeadsLoop::next`] began by tearing down
+    /// the planner it was supposed to be protecting — the paid-for middle of a
+    /// plan thrown away by a keystroke (looprs-2v6). Set from the loop's own
+    /// answer rather than a literal so the failure cannot come back by
+    /// omission: no pass, no flag.
+    pub(super) async fn submit(&mut self, text: &str) {
+        if let Err(e) = self.inner.launch_create_tickets(text).await {
+            tracing::error!("planner pass failed: {e:#}");
+            self.inner.report_error(format!("planner: {e:#}"));
+            self.inner.set_step(StepCause::Awaiting);
+        }
+        self.streaming = self.inner.has_live_worker();
     }
 
     /// The pass in flight settled. This is the transition.
@@ -216,6 +244,12 @@ impl BeadsTask {
     async fn park_after(&mut self, note: Option<&str>, error: Option<&str>) {
         self.aborted = false;
         self.pending = false;
+        // No pass is in flight past this point, and the gate has to be told: the
+        // stall path arrives here with the flag *still set* — nothing settled and no
+        // stream closed, which is exactly why it stalled — and a park that leaves it
+        // set is a gate shut on a pass this call just reaped. `pending` goes false
+        // just above, so clearing it here starts nothing on its own.
+        self.streaming = false;
         self.inner.close().await;
         if let Some(text) = error {
             self.inner.report_error(text.to_string());

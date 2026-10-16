@@ -212,6 +212,17 @@ cwd, env and jobs, and a chat answer that got killed mid-stream is an answer you
 have to pay for twice
 ([`switch_away_policy`](../../src/session/mod.rs)).
 
+Rule 1 is a claim about **both** kinds of pass — a worker's and the planner's — and
+one of them used to slip through it. The gate in front of the next pass reads "a pass
+is in flight, do not open another" off a flag that only the worker side set, so a
+`Tab` out and back during a *plan* opened the gate, and starting that pass began by
+tearing down the planner it was meant to protect: a paid-for plan thrown away by a
+keystroke, and a loop that then read the board the planner had not yet written and
+reported *that* as the result
+(`tabbing_out_and_back_while_the_planner_runs_does_not_kill_it`, looprs-2v6). A
+worker pass could not be lost this way, which is exactly why the bug read as
+something the planner did rather than something a `Tab` did.
+
 The practical consequence, and the one that catches people: **`Tab` is not Cancel.**
 `Tab`ing away from a pass does not stop it. It finishes, and the next one does not
 start. If you wanted it stopped, that is `Esc`.

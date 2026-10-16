@@ -252,6 +252,72 @@ async fn a_handled_planner_prompt_waits_for_no_settle_that_never_comes() {
     assert_eq!(s.status(), SessionStatus::NotStarted);
 }
 
+/// A `Tab` out and back while the planner is still running must not cost the
+/// pass (looprs-2v6).
+///
+/// The gate in front of [`BeadsLoop::next`] refuses while a pass is in flight,
+/// and it reads that fact off the task's `streaming` flag — which the *worker*
+/// path set and the *planner* path never did. So a planner pass was invisible to
+/// the gate: re-entering the mode set `pending`, the gate opened, and `next()`
+/// began by `close()`-ing the planner that was mid-run. A worker pass could not
+/// be killed this way, which is exactly why the bug read as planner-specific.
+///
+/// The last block is the other half of the claim: the pass the Tab did *not*
+/// kill still owes its verdict, so the plan arrives instead of the board going
+/// quiet with the planner's work thrown away.
+#[tokio::test]
+async fn tabbing_out_and_back_while_the_planner_runs_does_not_kill_it() {
+    let fakes = Fakes::new("planner-tab", PiFake::Chat, BdFake::Ok, EMPTY_BOARD);
+    let (mut s, mut rx) = beads(&fakes, 1);
+    s.set_active(true).unwrap();
+    assert!(s.quiesce().await);
+    drain(&mut rx); // the "board empty" park note from entering the mode
+
+    let serial = start_planner(&mut s, "plan something").await;
+    let planner = fakes.pi_pids()[0];
+    assert!(
+        process_alive(planner),
+        "the planner is running before the Tab"
+    );
+
+    // Tab to Pi (or Bash), then Tab back.
+    s.set_active(false).unwrap();
+    assert!(s.quiesce().await);
+    s.set_active(true).unwrap();
+    assert!(s.quiesce().await);
+
+    assert!(
+        process_alive(planner),
+        "re-entering the mode killed the planner pass: that work is already paid for"
+    );
+    assert_eq!(
+        fakes.pi_spawns(),
+        1,
+        "re-entering the mode bought no second pass while the planner was live"
+    );
+    assert_eq!(
+        s.in_flight(),
+        Some(serial),
+        "and the planner is still the pass in flight"
+    );
+    assert_eq!(s.status(), SessionStatus::Running);
+    drain(&mut rx); // the park note from entering the mode, which is not the point here
+
+    // And the pass it protected still answers: the settle gets its verdict.
+    fakes.set_board(PLAN_TWO_TICKETS);
+    fakes.settle();
+    let msgs = drain_until(&mut rx, |m| m == "step:work").await;
+    assert!(
+        msgs.iter().any(|m| m.contains("planner created 2")),
+        "the plan the Tab was supposed to protect is still reported: {msgs:?}"
+    );
+    assert_eq!(
+        fakes.pi_spawns(),
+        2,
+        "planner, then the first planned ticket's worker"
+    );
+}
+
 /// Esc on the planner is a cancellation, not a verdict. Reporting "created no
 /// tickets" here would blame the planner for work the user just stopped, and
 /// would train them to ignore the message that matters.

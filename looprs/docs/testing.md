@@ -253,6 +253,14 @@ The levers a test has, once the fakes are up:
 | `Fakes::bd_log()` / `pi_commands()` / `pi_verbs()` | the command order, for "claim before spawn", `clear_queue` before `abort` |
 | `kill_pid` / `process_alive` | take the child out from under the app, and check |
 
+Those last two signal their children through **bash's `kill` builtin**
+(`testing::send_signal`) rather than a `kill` binary. The image this crate ships and
+tests inside installs no procps, and a `Command::new("kill")` that cannot even spawn
+answers `false` — the same answer as "that process is gone" — so every "the harness
+did not kill that child" assertion here was unsatisfiable, and the cleanup in
+`Drop for Fakes` leaked every fake it owned (looprs-2v6). bash is already a hard
+requirement of this suite: both fakes are bash scripts.
+
 The `tests/warning_gate.rs` tests are `#[ignore]`d because they invoke cargo from
 inside cargo (own `CARGO_TARGET_DIR`, cold build) — see that file's header.
 
