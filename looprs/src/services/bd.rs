@@ -758,13 +758,13 @@ pub async fn show_with(bin: &str, id: &str) -> Result<Option<Bead>, BdError> {
     Ok(found.into_iter().find(|b| b.id == id))
 }
 
-/// `bd update <id> --claim` — atomically take the bead (looprs-w7q).
+/// `bd update <id> --claim --force` — atomically take the bead (looprs-w7q).
 ///
 /// The harness claims *before* prompting the worker so that it knows, independent
 /// of the agent, which bead it is spending tokens on. stdout is deliberately not
 /// parsed: `--claim` answers with human prose, and exit code is the contract.
 pub async fn claim_with(bin: &str, id: &str) -> Result<(), BdError> {
-    run(bin, &["update", id, "--claim"]).await?;
+    run(bin, &["update", id, "--claim", "--force"]).await?;
     Ok(())
 }
 

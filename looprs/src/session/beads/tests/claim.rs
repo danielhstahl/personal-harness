@@ -39,11 +39,11 @@ async fn the_harness_claims_the_ticket_it_is_paying_for() {
 
     assert!(
         fakes.claimed("looprs-26r"),
-        "the harness must run `bd update <id> --claim` itself: {:?}",
+        "the harness must run `bd update <id> --claim --force` itself: {:?}",
         fakes.bd_log()
     );
     assert_eq!(
-        fakes.bd_call_count("update looprs-26r --claim"),
+        fakes.bd_call_count("update looprs-26r --claim --force"),
         1,
         "one claim per pass, not one per question about the pass: {:?}",
         fakes.bd_log()
