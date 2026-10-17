@@ -158,10 +158,12 @@ impl BeadsTask {
                     self.inner
                         .report_system(left_for_human_note(&claim, status));
                 }
+                // something went wrong (agent settled without ticket being closed)
+                // but we want to be robust to things going wrong.
+                // make a note, and continue on.  If in_progress, the next worker
+                // will pick the in_progress ticket (and ideally quickly close it)
                 PassOutcome::NotClosed(claim, status) => {
-                    self.park_after(None, Some(&not_closed_note(&claim, status)))
-                        .await;
-                    return;
+                    self.inner.report_system(not_closed_note(&claim, status));
                 }
                 PassOutcome::Unverifiable(claim, reason) => {
                     self.park_after(None, Some(&unverified_pass_note(&claim, &reason)))

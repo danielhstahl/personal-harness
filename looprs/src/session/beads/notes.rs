@@ -163,15 +163,11 @@ pub(super) fn unverifiable_note(stage: &str, reason: &str) -> String {
     )
 }
 
-/// "Worked it, did not close it, and I am not paying for that a second time."
-///
-/// Names both exits, because the point of stopping the loop is that a human now
-/// decides — and a stop that does not say what would unblock it just moves the
-/// confusion from the transcript to the terminal.
+/// "Worked it, did not close it, let's loop again"
 pub(super) fn not_closed_note(claim: &ActiveBead, status: BeadStatus) -> String {
     format!(
-        "beads: worked {} but `bd` says it is `{}`, not closed. The loop is stopped: `bd ready` hands this same ticket back, so another automatic pass would be a retry nobody asked for. Close it (`bd close {}`) or type a new instruction to let this loop work it again.",
-        claim.id, status, claim.id
+        "beads: worked {} but `bd` says it is `{}`, not closed. The loop will continue: `bd ready` hands this same ticket back.",
+        claim.id, status
     )
 }
 
