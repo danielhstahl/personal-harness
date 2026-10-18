@@ -10,7 +10,9 @@
 use crate::services::bd::{Bead, BeadStatus};
 use crate::session::BeadStep;
 
-use crate::session::beads::guards::{PassGate, abort_is_redundant, stall_timer_is_live};
+use crate::session::beads::guards::{
+    AutoResume, MAX_AUTO_RESUME, PassGate, abort_is_redundant, stall_timer_is_live,
+};
 use crate::session::beads::machine::Pick;
 
 use super::*;
@@ -306,6 +308,75 @@ fn a_stall_timer_only_answers_for_the_attempt_that_armed_it() {
         live_rows,
         vec![(true, false, 1, 1), (true, false, 2, 2)],
         "live means: aborted, not yet reported, and the timer carries the current attempt"
+    );
+}
+
+/// **The re-buy budget, as rows** (workspace-9th). The exception the re-work guard
+/// makes for an unexpected agent complete is a *counted* thing, and the two ways it
+/// could be wrong are both expensive: too generous and the loop buys an un-closable
+/// ticket forever, too tight and one hiccup parks a whole board on a human.
+///
+/// Walked as a loop rather than a table because the invariant is about a sequence:
+/// fail, grant, spend, repeat — which is exactly what a ticket that cannot be closed
+/// does, and exactly how many extra passes that costs.
+#[test]
+fn an_auto_resume_credit_is_counted_not_refilled() {
+    let mut credit = AutoResume::grant(None, "looprs-mid");
+    assert_eq!(
+        credit.left, MAX_AUTO_RESUME,
+        "a fresh credit is a whole budget"
+    );
+
+    let mut spends = 0;
+    while credit.spend("looprs-mid") {
+        spends += 1;
+        // Each spent re-buy ends the same way the first did, so the loop is asked
+        // for another grant. It must not hand out a fresh budget.
+        credit = AutoResume::grant(Some(&credit), "looprs-mid");
+    }
+    assert_eq!(
+        spends, MAX_AUTO_RESUME as usize,
+        "exactly the budget, however many times the pass fails"
+    );
+    assert_eq!(
+        AutoResume::grant(Some(&credit), "looprs-mid").left,
+        0,
+        "an exhausted credit stays exhausted"
+    );
+}
+
+/// **The credit names one ticket.** An exception that could be spent on any
+/// already-worked ticket is not an exception, it is the guard deleted — so these are
+/// the rows that keep it narrow.
+#[test]
+fn an_auto_resume_credit_belongs_to_the_ticket_that_earned_it() {
+    let mut credit = AutoResume::grant(None, "looprs-mid");
+
+    assert!(
+        !credit.spend("looprs-other"),
+        "another worked ticket cannot spend it"
+    );
+    assert_eq!(
+        credit.left, MAX_AUTO_RESUME,
+        "a refused spend costs nothing"
+    );
+    assert!(credit.spend("looprs-mid"), "the ticket that earned it can");
+
+    // A ticket that was never the one that failed is not what the credit is about,
+    // so buying a pass on it retires the credit rather than waiting for it.
+    assert!(credit.stale_for("looprs-other"), "different ticket: stale");
+    assert!(
+        !credit.stale_for("looprs-mid"),
+        "the same ticket: still about that one"
+    );
+
+    // And a failure on a different ticket replaces it: only one pass is ever in
+    // flight, so only the ticket that just failed can be the one owed a re-buy.
+    let replaced = AutoResume::grant(Some(&credit), "looprs-new");
+    assert_eq!(replaced.id, "looprs-new");
+    assert_eq!(
+        replaced.left, MAX_AUTO_RESUME,
+        "a new ticket means a new budget"
     );
 }
 

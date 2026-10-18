@@ -5,9 +5,10 @@
 [Living with a transcript](transcript.md).*
 
 This is the page about the mode that costs money. It covers what a pass is, what
-happens to a ticket when a session dies halfway through one, what the board is
-showing you while one runs, what `Tab` and `Esc` do mid-pass, how to tell finished
-from wedged, and the one thing you cannot do by accident.
+happens to a ticket when a session dies halfway through one, what happens when an
+agent finishes a pass without closing its ticket, what the board is showing you while
+one runs, what `Tab` and `Esc` do mid-pass, how to tell finished from wedged, and the
+one thing you cannot do by accident.
 
 The kanban band itself — the column mapping, what `⊘` and `?` mean, staleness, the
 row budget, `+N more` — is documented once, in
@@ -75,7 +76,8 @@ pass boundary
    │  bd list --status in_progress   (what `bd ready` cannot show)
    ├─ resumable → claim it → worker told "look before you write"
    ├─ someone else holds it → said out loud, walked past
-   ├─ this loop already paid for it → refused, same guard as a re-offered ticket
+   ├─ this loop already paid for it → refused, same guard as a re-offered ticket,
+   │    unless it is owed an automatic re-buy (see below)
    ▼  nothing in progress
    bd ready → the rest of the machine as above
 ```
@@ -93,14 +95,72 @@ What that means for you, in practice:
 * **`Esc` still means "do not spend on that one again".** An aborted or half-finished
   pass leaves the ticket `in_progress`, and re-entering the mode does not resume it:
   the re-work guard answers with the same refusal it uses for a re-offered ticket,
-  plus `bd close <id>` / type-an-instruction as its two ways out.
+  plus `bd close <id>` / type-an-instruction as its two ways out. `Esc` is a decision
+  about spending, so it earns no automatic re-buy — see the next section.
 * **A resumed pass is an ordinary pass.** Claimed, guarded, published to the status
   row and checked against the board afterwards like any other, so a resumed ticket
-  that never closes stops the loop instead of becoming a second way to spin.
+  that never closes stops the loop once its automatic re-buys are spent instead of
+  becoming a second way to spin.
 
 The tests are listed in [docs/testing.md](../testing.md) under "Crash recovery";
 the rule lives in
 [`BeadsLoop::recover_in_progress`](../../src/session/beads/machine.rs).
+
+## When an agent completes without closing its ticket
+
+The other way a pass ends is the ordinary one and the most confusing: the worker
+simply stops talking. `agent_settled` says "the run is over", and it says exactly
+the same thing whether the agent shipped the ticket, hit a provider error mid
+sentence, or did the whole job and never typed `bd close`. The board is the only
+thing that can tell those apart, so the loop asks it — and if the ticket is still
+open, it does **not** park and wait for you.
+
+```text
+worker settles
+   │  bd show <id>  → not closed, and nobody pressed Esc
+   ├─ say so: "worked <id> but `bd` says it is `in_progress`, not closed"
+   ├─ owe that ticket an automatic re-buy (2 per ticket, per instruction)
+   ▼  next part of the loop, immediately
+   pass boundary → the same ticket, resumed, with "do not start over" in its prompt
+```
+
+Two numbers and one exception are the whole design:
+
+* **Two re-buys per ticket, then the guard.** `MAX_AUTO_RESUME` is the knob (two, at
+  time of writing). A transient failure gets ridden out; a ticket that genuinely
+  cannot be closed costs three passes and then stops, with the same refusal and the
+  same two ways out as any other stop. Unbounded would be the runaway the re-work
+  guard exists to stop, and every pass is billed.
+* **The re-buy names a ticket.** It is owed to *the* ticket whose pass just ended, so
+  it cannot be spent on some other ticket this loop also worked, and it is retired
+  the moment the loop buys a pass on anything else.
+* **`Esc` is not covered.** A cancelled pass earns nothing, so the ticket you just
+  stopped stays stopped even if you `Tab` out and straight back in. That is the
+  difference between "the agent stopped by itself" and "a human stopped it", and it
+  is the reason the guard was kept rather than removed.
+
+You will see it as two lines, in this order:
+
+```text
+beads: worked looprs-26r but `bd` says it is `open`, not closed. The loop is not
+stopping: the same ticket gets an automatic re-buy, and when those run out the guard
+will stop it.
+beads: automatic re-buy 1 of 2 on looprs-26r — its last pass stopped without closing
+it, so the loop is finishing what it already paid for rather than parking on it.
+```
+
+The count is the part worth reading: `1 of 2` is a repair the loop chose, and `2 of
+2` is the last one before a human is needed again.
+
+What still parks the loop is everything that is *not* an agent completing: `bd`
+unreadable after a pass, a worker whose stream ended without ever settling (crash,
+`kill -9`, OOM), a planner that produced no tickets, and a ticket the worker
+handed to you as `blocked`. A crash is not a completion, and auto-restarting a
+worker that died is a respawn storm with a receipt.
+
+The rule lives in [`BeadsTask::worker_settled`](../../src/session/beads/task.rs)
+and [`AutoResume`](../../src/session/beads/guards.rs); the tests are indexed under
+"Automatic re-buys" in [docs/testing.md](../testing.md).
 
 ## An epic is worked after its children
 
@@ -119,7 +179,8 @@ left under it:
 bd ready
    ├─ needs a human (blocked/deferred) → skipped, named
    ├─ somebody's container, still → walked past, named, with the count holding it down
-   ├─ this loop already paid for it → refused, both ways out
+   ├─ this loop already paid for it → refused, both ways out, unless it is owed an
+   │    automatic re-buy ([above](#when-an-agent-completes-without-closing-its-ticket))
    ▼ otherwise
    claim it and spawn the worker
 ```
@@ -265,9 +326,11 @@ of dead transcript that otherwise reads as a hang.
 
 **A ticket that is never closed stops the loop instead of spinning.** That is a
 designed outcome, not a failure: `bd show <id>` answers "did the worker close it",
-and a pass that settled without closing is reported rather than retried forever. If
-your loop stopped with a ticket still open, that is the loop refusing to pay for the
-same ticket twice — go look at the ticket.
+a pass that settled without closing gets
+[`MAX_AUTO_RESUME`](../../src/session/beads/guards.rs) automatic re-buys, and when
+those are spent the loop stops rather than paying for the same ticket again. If your
+loop stopped with a ticket still open, it already tried twice — go look at the ticket
+(`bd show <id>`, and the transcript lines that named each re-buy).
 
 ## What gets announced, and when
 

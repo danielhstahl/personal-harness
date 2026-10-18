@@ -42,6 +42,7 @@ mod startup;
 mod tables;
 
 use super::*;
+use crate::session::beads::guards::MAX_AUTO_RESUME;
 use crate::session::cancel;
 
 use crate::session::TerminalType;
@@ -249,6 +250,36 @@ fn drain(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> Vec<String> {
 /// working while nothing is running is a loop that hid the input box forever.
 async fn drain_until_parked(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> Vec<String> {
     drain_until(rx, |line| line == "step:await").await
+}
+
+/// Settle the pass in flight until the loop really has parked, and say everything
+/// it said on the way there.
+///
+/// Needed since workspace-9th: a pass that settles without closing its ticket no
+/// longer stops the loop by itself, so the older `settle(); drain_until_parked()`
+/// shape would either time out or report a park that happened for a different
+/// reason than the test meant. This spends the ticket's whole automatic re-buy
+/// budget and one settle more, which is the sequence that ends in the guard, and
+/// returns the whole transcript of it so a caller can assert on the verdict *and*
+/// on how many passes it cost.
+async fn settle_until_parked(
+    s: &mut BeadsSession,
+    fakes: &Fakes,
+    rx: &mut mpsc::UnboundedReceiver<SessionEvent>,
+) -> Vec<String> {
+    for i in 0..MAX_AUTO_RESUME {
+        fakes.settle();
+        // Not `quiesce` alone: the fake polls its settle marker on a 10 ms tick, so a
+        // sync can overtake a settle that has not been consumed yet — and a second
+        // `settle()` written before the first is consumed is one marker eaten by one
+        // pass, leaving the *next* pass waiting for a trigger that already went out.
+        // A spawn count is process-level proof that the pass ended and the next one
+        // is live.
+        fakes.wait_for_pi_spawns(2 + i as usize).await;
+        assert!(s.quiesce().await, "the re-bought pass is live");
+    }
+    fakes.settle();
+    drain_until_parked(rx).await
 }
 
 fn has_error(msgs: &[String]) -> bool {

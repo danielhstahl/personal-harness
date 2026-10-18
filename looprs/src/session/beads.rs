@@ -77,10 +77,20 @@
 //!   ([`SessionEvent::ActiveBead`]), which is what lets the status row
 //!   (looprs-guh) name the active ticket without shelling out mid-frame;
 //! * when the worker settles, [`BeadsLoop::verify_worker_pass`] asks the board the
-//!   only question that matters — *did it close?* — and a ticket left open stops
-//!   the loop instead of buying another pass on itself, because `bd ready` hands
-//!   the same bead straight back and each pass is billed. That is the runaway this
+//!   only question that matters — *did it close?* — and a ticket left open is not
+//!   silently bought again and again: each one gets
+//!   [`MAX_AUTO_RESUME`](guards::MAX_AUTO_RESUME) automatic re-buys and then the
+//!   guard stops the loop, because `bd ready` hands the same bead straight back and
+//!   every pass past that is a bill with no plan behind it. That is the runaway this
 //!   ticket was filed for.
+//!
+//! An un-closed ticket is not one fact but two, and the loop tells them apart
+//! (workspace-9th): *the agent finished on its own* (an unexpected `agent_settled`
+//! with the ticket still open) is unfinished work the loop already paid for, so it
+//! goes straight on to the next part of itself and the same ticket gets another
+//! pass; *a human pressed `Esc`* is a decision about spending, and earns no re-buy
+//! at all. The budget is per ticket and per instruction ([`AutoResume`](guards::AutoResume)),
+//! which is what keeps "carry on" from becoming the runaway above.
 //!
 //! The guard releases on one thing only: a new instruction from a human, which in
 //! beads mode arrives through [`BeadsLoop::launch_create_tickets`]. Re-entering
@@ -102,7 +112,8 @@
 //!
 //! * the re-work guard still answers — a ticket *this* loop already paid a pass on is
 //!   refused with the guard's sentence, not quietly resumed after a Tab back into the
-//!   mode;
+//!   mode, unless it is owed one of its automatic re-buys (workspace-9th: an agent
+//!   that completed without closing gets the pass finished, an `Esc` gets nothing);
 //! * `bd` stays the arbiter of whose ticket it is: a claim it *refuses* is a live
 //!   claim elsewhere (a human in another terminal, a second loop), so that ticket is
 //!   walked past and said out loud, while a board that cannot answer at all stops the

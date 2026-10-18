@@ -9,6 +9,7 @@
 
 use crate::services::bd::BeadStatus;
 
+use crate::session::beads::guards::MAX_AUTO_RESUME;
 use crate::session::beads::machine::Pick;
 
 use super::*;
@@ -84,8 +85,12 @@ async fn a_claim_bd_refuses_buys_no_worker() {
 /// **The acceptance case: a fake `bd` that never closes the ticket proves the
 /// loop stops instead of spinning.** This is the runaway the ticket was filed
 /// for — the worker settles, `bd ready` returns the same open bead, another
-/// worker is bought, and nothing anywhere counts. One pass is spent, the loop
-/// says which ticket and why it stopped, and further nudges buy nothing.
+/// worker is bought, and nothing anywhere counts. What is spent is the ticket's
+/// own automatic re-buys, counted and named on the transcript (workspace-9th);
+/// after them the loop says which ticket and why it stopped, and further nudges
+/// buy nothing. Before this ticket the same sequence was unbounded, and before
+/// workspace-9th it was a hard stop after one pass — which made a one-off hiccup
+/// park the whole board on a human.
 #[tokio::test]
 async fn a_ticket_that_is_never_closed_stops_the_loop_instead_of_spinning() {
     let fakes = Fakes::new(
@@ -103,8 +108,14 @@ async fn a_ticket_that_is_never_closed_stops_the_loop_instead_of_spinning() {
     assert_eq!(fakes.pi_spawns(), 1, "one worker, claimed and prompted");
     drain(&mut rx);
 
-    fakes.settle();
-    let msgs = drain_until_parked(&mut rx).await;
+    // Spend the ticket's whole re-buy budget and one settle more: the sequence that
+    // ends in the guard rather than in another pass.
+    let msgs = settle_until_parked(&mut s, &fakes, &mut rx).await;
+    assert_eq!(
+        fakes.pi_spawns(),
+        1 + MAX_AUTO_RESUME as usize,
+        "the original pass plus exactly its automatic re-buys, and not one more: {msgs:?}"
+    );
     let err = last_error(&msgs).expect("an un-closed ticket is an error, not a shrug");
     assert!(err.contains("looprs-26r"), "{err}");
     assert!(err.contains("not closed"), "{err}");
@@ -112,22 +123,40 @@ async fn a_ticket_that_is_never_closed_stops_the_loop_instead_of_spinning() {
         err.contains("bd close looprs-26r"),
         "a stop that does not say what would unblock it just moves the confusion: {err}"
     );
-    assert!(!msgs.contains(&"step:work".to_string()), "{msgs:?}");
     assert_eq!(s.status(), SessionStatus::Idle, "waiting on a human");
+
+    // And what the retried workers were told. The board never had this ticket
+    // `in_progress` — `bd ready` kept offering it as ready work — so their prompts
+    // must say *this harness* had a pass on it, not invent a foreign session that
+    // left it half-done. Two different truths, and the worker only benefits from
+    // the one that is true.
+    let prompts = fakes.pi_prompts();
+    let prompt = prompts.last().expect("every pass was prompted");
+    assert!(
+        prompt.contains("worked a second time by THIS harness"),
+        "the retry is named as this harness's own: {prompt}"
+    );
+    assert!(
+        prompt.contains("do not start over"),
+        "and the work it may already have done is protected: {prompt}"
+    );
+    assert!(
+        !prompt.contains("ALREADY `in_progress`"),
+        "the board never said in_progress, so the prompt must not either: {prompt}"
+    );
 
     // And it *stays* stopped. The board never changed, so every later nudge
     // re-reads the same un-closed ticket and refuses again — three nudges,
-    // zero extra workers. Before this ticket the same sequence is unbounded.
+    // zero extra workers.
     for _ in 0..3 {
         s.set_active(true).unwrap();
         assert!(s.quiesce().await);
     }
     assert_eq!(
         fakes.pi_spawns(),
-        1,
-        "the guard held: no second pass on the ticket that was never closed"
+        1 + MAX_AUTO_RESUME as usize,
+        "the guard held: no further pass on the ticket that was never closed"
     );
-    assert_eq!(fakes.pi_prompts().len(), 1);
     assert_eq!(s.in_flight(), None);
 }
 
@@ -147,9 +176,14 @@ async fn a_new_instruction_is_the_acknowledgement_that_releases_the_guard() {
 
     s.set_active(true).unwrap();
     assert!(s.quiesce().await);
-    fakes.settle();
-    drain_until_parked(&mut rx).await;
-    assert_eq!(fakes.pi_spawns(), 1, "stopped by the guard");
+    // The ticket never closes, so the loop spends its automatic re-buys on it and
+    // then stops: the guard, not the budget, is what parks it.
+    settle_until_parked(&mut s, &fakes, &mut rx).await;
+    assert_eq!(
+        fakes.pi_spawns(),
+        1 + MAX_AUTO_RESUME as usize,
+        "stopped by the guard once the re-buys were spent"
+    );
 
     // The human acts: a fresh instruction, planned into real tickets.
     start_planner(&mut s, "here is what I actually want").await;
@@ -160,8 +194,9 @@ async fn a_new_instruction_is_the_acknowledgement_that_releases_the_guard() {
     let msgs = drain_until(&mut rx, |m| m == "step:work").await;
     assert_eq!(
         fakes.pi_spawns(),
-        3,
-        "the refused worker, the planner, and one worker after the acknowledgement: {msgs:?}"
+        3 + MAX_AUTO_RESUME as usize,
+        "the refused worker and its re-buys, the planner, and one worker after the \
+         acknowledgement: {msgs:?}"
     );
     assert!(fakes.claimed("looprs-101"), "{:?}", fakes.bd_log());
 }

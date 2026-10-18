@@ -73,6 +73,11 @@ async fn a_closed_ticket_is_announced_once_with_the_title_it_was_claimed_under()
 /// The pass the loop stops itself over — talked, settled, closed nothing — is
 /// the one a notifier would most confidently get wrong, because the transcript
 /// says "stopped" and the settle looks like any other.
+///
+/// Driven past the whole automatic re-buy budget (workspace-9th): none of those
+/// passes closed anything either, and a retry that announced would be worse than
+/// the one that stopped — an all-clear sent over and over about a ticket nobody
+/// finished.
 #[tokio::test]
 async fn a_ticket_that_was_never_closed_announces_nothing() {
     let fakes = Fakes::new(
@@ -86,8 +91,7 @@ async fn a_ticket_that_was_never_closed_announces_nothing() {
 
     s.set_active(true).unwrap();
     assert!(s.quiesce().await, "the pass started");
-    fakes.settle();
-    let msgs = drain_until_parked(&mut rx).await;
+    let msgs = settle_until_parked(&mut s, &fakes, &mut rx).await;
     assert!(
         has_error(&msgs),
         "the un-closed ticket was reported to the screen: {msgs:?}"
