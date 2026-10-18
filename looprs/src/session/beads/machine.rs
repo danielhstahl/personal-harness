@@ -11,10 +11,10 @@
 //! The loop is a backend, not UI state: it reports [`SessionEvent`] and never
 //! reaches into the App (ADR-0002 Q1).
 
-use super::guards::StepCause;
+use super::guards::{AutoResume, MAX_AUTO_RESUME, StepCause};
 use super::notes::{
-    Arrival, MAX_SKIPPED_LISTED, already_worked_note, children_first_note, held_elsewhere_note,
-    resume_already_worked_note, resume_note, worker_prompt,
+    Arrival, MAX_SKIPPED_LISTED, already_worked_note, auto_resume_note, children_first_note,
+    held_elsewhere_note, resume_already_worked_note, resume_note, worker_prompt,
 };
 
 use super::BeadsCmd;
@@ -83,6 +83,23 @@ pub struct BeadsLoop {
     /// human. That is deliberate: the guard exists to stop *automatic* re-work, and
     /// a typed instruction is the only deliberate thing the beads mode accepts.
     pub(super) worked: HashSet<String>,
+    /// The one ticket this loop may buy another automatic pass on, and how many
+    /// (workspace-9th).
+    ///
+    /// Set when a worker stopped talking with its ticket un-closed and no human
+    /// cancelled it — an unexpected agent complete, not a finished pass — and spent
+    /// by whichever boundary meets that ticket next ([`BeadsLoop::recover_in_progress`]
+    /// for the usual case, [`BeadsLoop::pick_bead`]'s refusal for the rare one where
+    /// the ticket fell back through `ready`). Kept separate from `worked` because they
+    /// answer different questions: `worked` says *may this be re-bought at all*, and
+    /// answers for the whole instruction; this says *this one, twice more, and then
+    /// no*, and answers for one ticket.
+    ///
+    /// A human `Esc` never reaches it: the abort parks the loop before this is ever
+    /// consulted, so the ticket a person just stopped stays stopped — which is the
+    /// half of the guard that a wholesale `Recovery::Refused` removal would have
+    /// thrown away along with the runaway bound.
+    auto_resume: Option<AutoResume>,
 }
 
 /// What one planner pass has to be checked against when it settles (looprs-k7v).
@@ -191,8 +208,16 @@ pub(super) enum Recovery {
     /// Nothing to resume: no ticket in progress, or every one of them belongs to a
     /// worker `bd` will not release it from — each of those said out loud.
     Nothing,
-    /// The in-progress ticket is one *this* loop already worked and did not close:
-    /// the re-work guard answers before a second pass is bought.
+    /// The in-progress ticket is one *this* loop already worked and did not close,
+    /// and its automatic re-buys are gone: the re-work guard answers before a
+    /// further pass is bought (looprs-w7q, bounded by
+    /// [`MAX_AUTO_RESUME`](super::guards::MAX_AUTO_RESUME)).
+    ///
+    /// This arm is load-bearing and not a leftover. It is what stops "carry on after
+    /// an unexpected agent complete" from being "buy the same ticket forever", and
+    /// it is what keeps a ticket a human stopped with `Esc` stopped — an `Esc` earns
+    /// no automatic re-buy, so the next time the loop looks for work this is the arm
+    /// it lands on.
     Refused(Bead),
 }
 
@@ -252,6 +277,7 @@ impl BeadsLoop {
             planning: None,
             claim: None,
             worked: HashSet::new(),
+            auto_resume: None,
         }
     }
 
@@ -338,6 +364,13 @@ impl BeadsLoop {
     ///    rules — including the one that works a child before the epic that merely
     ///    contains it (looprs-lpw).
     ///
+    /// Either boundary can also answer "one this loop already paid for", and at both
+    /// of them the same exception applies: an already-worked ticket is refused
+    /// *unless* this loop has an automatic re-buy left on it, which is the only way an
+    /// unexpected agent complete turns back into a running agent instead of a parked
+    /// loop (workspace-9th). The refusal is the rule; the exception names one ticket,
+    /// counts down, and is never earned by a human `Esc`.
+    ///
     /// The claim comes before the spawn in both branches because everything after a
     /// claim is paid for: the pass is only worth reporting, verifying and guarding
     /// once the harness actually holds the ticket. Spawn-first would mean a refused
@@ -354,13 +387,23 @@ impl BeadsLoop {
         }
 
         let beads = ready_with(&self.cfg.bd_bin).await?;
-        let bead = match self.pick_bead(&beads) {
+        let (bead, arrival) = match self.pick_bead(&beads) {
             Pick::Nothing => return Ok(WorkerPass::Idle),
-            Pick::AlreadyWorked(bead) => return Err(anyhow!(already_worked_note(&bead))),
-            Pick::Work(bead) => bead,
+            Pick::Work(bead) => (bead, Arrival::Fresh),
+            // The guard answered, and may be overruled once per earned re-buy. The
+            // board is offering this ticket as *ready* work, so the worker is told
+            // its own harness had a pass on it rather than that a foreign session
+            // left it `in_progress`, which is the thing `bd` would contradict.
+            Pick::AlreadyWorked(bead) => {
+                if self.spend_auto_resume(bead.id()) {
+                    (bead, Arrival::Retried)
+                } else {
+                    return Err(anyhow!(already_worked_note(&bead)));
+                }
+            }
         };
         let claim = self.take_claim(&bead).await?;
-        self.buy_worker(&claim, Arrival::Fresh).await
+        self.buy_worker(&claim, arrival).await
     }
 
     /// Take the claim on a fresh bead and record it, before anything is bought.
@@ -393,7 +436,52 @@ impl BeadsLoop {
     /// to already know about it.
     fn record_claim(&mut self, claim: ActiveBead) {
         self.worked.insert(claim.id.clone());
+        // An owed re-buy belongs to the ticket that just failed to close. Buying a
+        // pass on anything else retires it, so it cannot linger and authorise a
+        // re-buy long after the pass that earned it.
+        if let Some(owed) = &self.auto_resume
+            && owed.stale_for(&claim.id)
+        {
+            self.auto_resume = None;
+        }
         self.set_claim(Some(claim));
+    }
+
+    /// Owe this ticket one loop-bought re-buy, because the pass that had it stopped
+    /// talking without closing it (workspace-9th).
+    ///
+    /// The caller is the settle boundary, and only the half of it that was not a
+    /// human `Esc`: a cancelled pass is a person saying "do not spend on that one",
+    /// and earns nothing. Granting is not resetting ([`AutoResume::grant`]), so a
+    /// ticket whose retries keep failing runs out and the guard answers again.
+    pub(super) fn owe_auto_resume(&mut self, id: &str) {
+        self.auto_resume = Some(AutoResume::grant(self.auto_resume.as_ref(), id));
+    }
+
+    /// Spend one owed re-buy on `id`, saying so on the way past.
+    ///
+    /// The sentence is part of the spend rather than the callers' job for the same
+    /// reason every other move this loop makes is spoken: a ticket quietly worked a
+    /// second time is indistinguishable from a ticket worked once, and the number is
+    /// the part a reader needs — "automatic re-buy 1 of 2" says both that this is not
+    /// a runaway and when it stops being allowed.
+    pub(super) fn spend_auto_resume(&mut self, id: &str) -> bool {
+        let Some(owed) = self.auto_resume.as_mut() else {
+            return false;
+        };
+        if !owed.spend(id) {
+            return false;
+        }
+        let left = owed.left;
+        let attempt = MAX_AUTO_RESUME - left;
+        tracing::info!(
+            bead = %id,
+            attempt,
+            max = MAX_AUTO_RESUME,
+            "spending an automatic re-buy on a ticket whose pass did not close"
+        );
+        self.report_system(auto_resume_note(id, attempt, MAX_AUTO_RESUME));
+        true
     }
 
     /// Find the ticket a dead session left behind, and take it (looprs-hjo).
@@ -407,7 +495,12 @@ impl BeadsLoop {
     /// * **The re-work guard applies here too.** An in-progress ticket *this* loop
     ///   already spent a pass on is refused with the guard's own sentence, not
     ///   resumed: an `Esc`, a dead worker or a settle that closed nothing all leave
-    ///   the ticket in exactly this state, and re-buying it is still a human call.
+    ///   the ticket in exactly this state. One exception, counted: a pass that ended
+    ///   by itself without closing earns a loop-bought re-buy
+    ///   ([`BeadsLoop::owe_auto_resume`]), because that ticket is unfinished work the
+    ///   loop already paid for rather than a run a human refused. A human `Esc` earns
+    ///   none, so "the agent stopped talking on its own" keeps the loop running and
+    ///   "the human stopped it" still does not (workspace-9th).
     /// * **`bd` is the arbiter of whose ticket it is.** A claim it *refuses* means
     ///   another worker holds it — a human in another terminal, a second loop — so
     ///   this loop walks past it, out loud, and takes fresh work. A claim it cannot
@@ -425,7 +518,11 @@ impl BeadsLoop {
             anyhow!("could not read which tickets are in progress before taking new work: {e}")
         })?;
         for bead in unfinished {
-            if self.worked.contains(bead.id()) {
+            // Already worked by this loop, and no re-buy left to spend on it: the
+            // guard answers before a further pass is bought. Spent *here*, on this
+            // ticket only — an owed re-buy for some other ticket does not buy this
+            // one a pass.
+            if self.worked.contains(bead.id()) && !self.spend_auto_resume(bead.id()) {
                 return Ok(Recovery::Refused(bead));
             }
             match claim_with(&self.cfg.bd_bin, bead.id()).await {
@@ -510,6 +607,11 @@ impl BeadsLoop {
     ///    past the guard and re-buy a ticket this loop already paid for — and the
     ///    deferral is still said out loud, because a refusal on a child while its
     ///    epic sits on top of the list otherwise reads as a mispick.
+    ///    One exception, and it lives in the caller rather than here so this stays a
+    ///    pure function: a ticket the loop owes an automatic re-buy on (a pass that
+    ///    stopped talking without closing) is overridable, up to
+    ///    [`MAX_AUTO_RESUME`](super::guards::MAX_AUTO_RESUME) times
+    ///    (workspace-9th).
     /// 4. **Otherwise the first workable bead**, in `bd`'s own priority order.
     ///
     /// What is deliberately *not* a rule: an unknown status is workable. Skipping
@@ -789,6 +891,10 @@ impl BeadsLoop {
         // answerable to the guard, and nothing restarts a refused ticket on a
         // timer or on a Tab.
         self.worked.clear();
+        // A new instruction releases the re-work guard, and with it the exception to
+        // it: whatever re-buys an older pass owed are gone, because the human is
+        // back on the hook for deciding what gets worked.
+        self.auto_resume = None;
         self.close().await;
         let baseline: HashSet<String> = list_status_with(&self.cfg.bd_bin, "open")
             .await?

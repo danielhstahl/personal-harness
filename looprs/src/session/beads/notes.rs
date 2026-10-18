@@ -12,17 +12,23 @@ use crate::services::bd::{Bead, BeadStatus};
 use crate::services::prompts::{WORKER, generate_prompt};
 use crate::session::ActiveBead;
 
-/// How the ticket reached the worker being prompted (looprs-hjo).
+/// How the ticket reached the worker being prompted (looprs-hjo, workspace-9th).
 ///
-/// Two ways a ticket arrives, and the worker needs to know which: a fresh ticket is
+/// Three ways a ticket arrives, and the worker needs to know which: a fresh ticket is
 /// worked from nothing, an in-progress one may already be half done — by the session
-/// that was killed, crashed or cancelled while holding it. A worker told neither
-/// redoes the part that already shipped, or worse, throws it away.
+/// that was killed, crashed or cancelled while holding it — and a retried one was
+/// half done by this harness's own previous pass. A worker told neither redoes the
+/// part that already shipped, or worse, throws it away.
 pub(super) enum Arrival {
     /// Ready work, and this pass is the first pass on it.
     Fresh,
     /// The board already had it `in_progress` when this loop claimed it.
     Resumed,
+    /// The board offered it as ready work, but a pass *this loop* already bought
+    /// ended without closing it, and the loop spent an automatic re-buy on it
+    /// (workspace-9th). Neither of the two cases above: `bd` does not have it
+    /// `in_progress`, and no foreign session was ever holding it.
+    Retried,
 }
 
 /// The worker prompt: the standing instructions, plus the one ticket this worker
@@ -35,9 +41,10 @@ pub(super) enum Arrival {
 /// command list in `prompts::WORKER`: a prompt that advertises it invites the
 /// agent to shop.
 ///
-/// A resumed ticket adds one paragraph — [`resumed_note_for_worker`] — and nothing
-/// else changes. That is deliberate: a resumed pass is not a lesser pass, and it
-/// gets the same claim, the same guard and the same close-check as a fresh one.
+/// A resumed ticket adds one paragraph — [`resumed_note_for_worker`] — and a retried
+/// one adds [`retried_note_for_worker`]; nothing else changes. That is deliberate: a
+/// resumed pass is not a lesser pass, and it gets the same claim, the same guard and
+/// the same close-check as a fresh one.
 pub(super) fn worker_prompt(claim: &ActiveBead, arrival: Arrival) -> String {
     let mut instructions = format!(
         "Your assigned ticket: {id} — {title}\n\n\
@@ -49,8 +56,30 @@ pub(super) fn worker_prompt(claim: &ActiveBead, arrival: Arrival) -> String {
     );
     if let Arrival::Resumed = arrival {
         instructions.push_str(&resumed_note_for_worker(&claim.id));
+    } else if let Arrival::Retried = arrival {
+        instructions.push_str(&retried_note_for_worker(&claim.id));
     }
     generate_prompt(WORKER, &instructions)
+}
+
+/// The paragraph a worker gets when its own harness already bought a pass on this
+/// ticket and that pass did not close it (workspace-9th).
+///
+/// The same order as [`resumed_note_for_worker`] — look before writing — for a
+/// different reason: nobody else was ever holding this ticket, so saying so would
+/// point the agent at the wrong story. What it has to know is that the diff it is
+/// about to find in `git status` may be *this ticket's* unfinished work rather than
+/// somebody else's, and that starting over would throw it away.
+fn retried_note_for_worker(id: &str) -> String {
+    format!(
+        "\nThis ticket is being worked a second time by THIS harness: an earlier pass on it \
+         stopped talking before closing it, so part of the work may already exist in the \
+         working tree or in a recent commit. Do not assume nothing has been done. Before \
+         writing anything, find out what state it is in: `git status` and `git diff` for \
+         uncommitted work, `git log` for work that is already committed, and `bd show {id}` \
+         for notes that pass left. Then continue from there: do not start over, and do not \
+         redo what is already done.\n"
+    )
 }
 
 /// The paragraph a worker gets when the ticket handed to it was already
@@ -100,14 +129,35 @@ pub(super) fn held_elsewhere_note(bead: &Bead, reason: &str) -> String {
 ///
 /// The same rule as [`already_worked_note`], in the words this boundary has: nothing
 /// was `bd ready`-offered, because `ready` cannot see this ticket at all. It is
-/// still marked in progress from a pass *this* loop already paid for, and paying for
-/// it a second time is still not the loop's decision.
+/// still marked in progress from a pass *this* loop already paid for, and the loop is
+/// out of automatic re-buys on it — so the two ways out both belong to a human, and
+/// both get named.
+///
+/// Reached two ways, and the wording has to be true for both: a ticket whose
+/// automatic re-buys ran out ([`MAX_AUTO_RESUME`](super::guards::MAX_AUTO_RESUME)),
+/// and a ticket a human stopped with `Esc`, which never earned any.
 pub(super) fn resume_already_worked_note(bead: &Bead) -> String {
     format!(
-        "`bd` still holds {} `in_progress` from a pass this loop already paid for, and says it is `{}`, not closed. It will not be resumed a second time by itself: `bd close {}`, or type a new instruction to continue.",
+        "`bd` still holds {} `in_progress` from a pass this loop already paid for, and says it is `{}`, not closed. It will not be resumed by itself any more: `bd close {}`, or type a new instruction to continue.",
         bead.id(),
         bead.status(),
         bead.id()
+    )
+}
+
+/// "That pass ended without closing its ticket, so this loop is buying it another
+/// one — and here is which number this one is" (workspace-9th).
+///
+/// Said at the boundary that spends the re-buy, so the transcript says *why* a ticket
+/// is being worked twice before anybody reads it as the runaway this loop is guarded
+/// against. The count is the load-bearing part: "1 of 2" reads as a bounded repair,
+/// and a sentence without it reads as the loop having forgotten its own guard.
+pub(super) fn auto_resume_note(id: &str, attempt: u32, max: u32) -> String {
+    format!(
+        "beads: automatic re-buy {attempt} of {max} on {id} — its last pass stopped without closing it, so the loop is finishing what it already paid for rather than parking on it.",
+        attempt = attempt,
+        max = max,
+        id = id
     )
 }
 
@@ -163,10 +213,15 @@ pub(super) fn unverifiable_note(stage: &str, reason: &str) -> String {
     )
 }
 
-/// "Worked it, did not close it, let's loop again"
+/// "Worked it, did not close it, and the loop is not going to park on that."
+///
+/// The sentence the unexpected agent complete gets: the ticket did not close, the
+/// pass is over, and the loop is about to buy the same ticket another pass — with
+/// the bound named, because "we will keep trying" without a number is the runaway
+/// the guard exists for.
 pub(super) fn not_closed_note(claim: &ActiveBead, status: BeadStatus) -> String {
     format!(
-        "beads: worked {} but `bd` says it is `{}`, not closed. The loop will continue: `bd ready` hands this same ticket back.",
+        "beads: worked {} but `bd` says it is `{}`, not closed. The loop is not stopping: the same ticket gets an automatic re-buy, and when those run out the guard will stop it.",
         claim.id, status
     )
 }

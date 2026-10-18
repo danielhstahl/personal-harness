@@ -317,6 +317,35 @@ ready list contradicts (a ticket still `in_progress` after its worker settled), 
 claim keeps working — the shape a live foreign claim has, which is not the same thing
 as `Fakes::refuse_claim` failing every claim, and must not be tested as if it were.
 
+### Automatic re-buys — an agent that completes without closing (workspace-9th)
+
+`agent_settled` with the ticket still un-closed is an unfinished pass, not a finished
+one, so the loop buys that same ticket another pass instead of parking — up to
+`MAX_AUTO_RESUME` times, and never for a ticket a human stopped with `Esc`. The
+budget itself is a pure counter (`AutoResume` in `session/beads/guards.rs`), so it is
+enumerated as well as driven:
+
+- `session::beads::tests::resume::a_pass_that_did_not_close_its_ticket_buys_that_ticket_another_pass`
+- `session::beads::tests::resume::a_resumed_ticket_still_has_to_close`
+- `session::beads::tests::resume::a_ticket_a_human_cancelled_is_not_resumed_when_the_loop_comes_back`
+- `session::beads::tests::resume::a_re_buy_earned_by_one_ticket_does_not_buy_another_one`
+- `session::beads::tests::resume::a_ticket_this_loop_already_paid_for_is_not_resumed`
+- `session::beads::tests::claim::a_ticket_that_is_never_closed_stops_the_loop_instead_of_spinning`
+- `session::beads::tests::claim::a_new_instruction_is_the_acknowledgement_that_releases_the_guard`
+- pure: `session::beads::tests::tables::an_auto_resume_credit_is_counted_not_refilled`,
+  `session::beads::tests::tables::an_auto_resume_credit_belongs_to_the_ticket_that_earned_it`
+- wording: `session::beads::tests::notes_tests::the_auto_resume_note_says_which_re_buy_this_is`,
+  `session::beads::tests::notes_tests::the_not_closed_note_promises_a_re_buy_and_a_bound`,
+  `session::beads::tests::notes_tests::the_resume_guard_note_names_both_ways_out`
+
+Tests that need "and then it finally stopped" use the suite's
+`settle_until_parked` helper rather than one `Fakes::settle`: it spends the whole
+re-buy budget, waiting on **spawn counts** between settles because the fake `pi`
+polls its settle marker on a 10 ms tick and a `quiesce` alone can overtake a settle
+that has not been consumed yet. A test that wrote a second marker early would hand
+one marker to one pass and leave the next pass waiting for a trigger that had already
+been eaten.
+
 ### An epic comes after its children (looprs-lpw)
 
 `bd ready` orders by priority and blockers, not by containment, so a planner's epic —

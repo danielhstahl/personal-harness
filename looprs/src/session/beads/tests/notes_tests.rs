@@ -7,8 +7,9 @@
 use crate::services::bd::{Bead, BeadStatus};
 
 use crate::session::beads::notes::{
-    MAX_DEFERRED_LISTED, MAX_PLAN_LISTED, children_first_note, clip, held_elsewhere_note,
-    no_plan_note, plan_note, resume_already_worked_note, resume_note, unverifiable_note,
+    MAX_DEFERRED_LISTED, MAX_PLAN_LISTED, auto_resume_note, children_first_note, clip,
+    held_elsewhere_note, no_plan_note, not_closed_note, plan_note, resume_already_worked_note,
+    resume_note, unverifiable_note,
 };
 
 use super::*;
@@ -111,6 +112,31 @@ fn the_held_elsewhere_note_quotes_bd_and_calls_it_nothing_worse_than_it_is() {
     assert!(long.chars().count() < 400, "the reason is clipped: {long}");
 }
 
+/// The sentence a pass that did not close its ticket says (workspace-9th).
+///
+/// It has to promise a re-buy *and* a bound: "the loop is not stopping" without the
+/// second half is what a runaway reads like from the transcript, and the bound is the
+/// only reason the loop is allowed to keep going at all.
+#[test]
+fn the_not_closed_note_promises_a_re_buy_and_a_bound() {
+    let claim = crate::session::ActiveBead {
+        id: "looprs-mid".to_string(),
+        title: "half done".to_string(),
+    };
+    let note = not_closed_note(&claim, BeadStatus::InProgress);
+    assert!(note.contains("looprs-mid"), "{note}");
+    assert!(
+        note.contains("in_progress"),
+        "`bd`'s own word for the state, not a paraphrase: {note}"
+    );
+    assert!(note.contains("not closed"), "{note}");
+    assert!(note.contains("re-buy"), "the next pass is named: {note}");
+    assert!(
+        note.contains("guard") && note.contains("run out"),
+        "and so is the thing that stops it: {note}"
+    );
+}
+
 /// The guard at the resume boundary carries the same two exits as the one at the
 /// ready boundary — close it, or speak — because a stop with no way out is just a
 /// hang with a nicer message.
@@ -125,6 +151,30 @@ fn the_resume_guard_note_names_both_ways_out() {
     assert!(note.contains("not closed"), "{note}");
     assert!(note.contains("bd close looprs-mid"), "{note}");
     assert!(note.contains("new instruction"), "{note}");
+}
+
+/// The sentence a spent re-buy says (workspace-9th) has to carry its own number.
+///
+/// "Working it again" without a count is indistinguishable from the runaway the
+/// re-work guard exists to stop, and the whole point of bounding the automatic
+/// retries is that the transcript can say which one this is and when they run out.
+#[test]
+fn the_auto_resume_note_says_which_re_buy_this_is() {
+    let note = auto_resume_note("looprs-mid", 1, 2);
+    assert!(note.contains("looprs-mid"), "{note}");
+    assert!(note.contains("1 of 2"), "the count is the point: {note}");
+    assert!(
+        note.contains("without closing"),
+        "and why a second pass is being bought at all: {note}"
+    );
+    assert!(
+        !note.contains("error"),
+        "a repair the loop chose is not an error: {note}"
+    );
+    assert!(
+        auto_resume_note("looprs-mid", 2, 2).contains("2 of 2"),
+        "the last one is countable too"
+    );
 }
 
 /// The children-before-parent note (looprs-lpw) has to make a deferral legible:

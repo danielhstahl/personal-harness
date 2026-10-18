@@ -6,6 +6,11 @@
 //! tables rather than as trajectories — see the banner that was already written
 //! over the pass gate below, and `tables` in [`tests`](super::tests) for the
 //! enumeration it buys.
+//!
+//! The one exception is [`AutoResume`], and it is an exception in name only: it is
+//! a *value* the loop owns, not a read it performs. Its whole state is a ticket id
+//! and a counter, it is granted and spent through methods that take nothing from
+//! outside, and the tables test the budget against are no bigger than the type.
 
 use crate::session::BeadStep;
 
@@ -94,6 +99,90 @@ impl StepCause {
     /// the `match` above, and the test needs the list to walk the table.
     #[cfg(test)]
     pub const ALL: [StepCause; 3] = [StepCause::Planning, StepCause::Working, StepCause::Awaiting];
+}
+
+/// How many automatic re-buys one ticket is owed after a pass that stopped talking
+/// without closing it (workspace-9th).
+///
+/// A number rather than a bool, because the two failure modes on either side of it
+/// are both expensive and only a bound separates them:
+///
+/// * Too little (zero, i.e. the old hard stop): one transient `pi` failure — a
+///   provider error, a run that ran out of context mid-sentence, an agent that did
+///   the work and forgot to type `bd close` — parks the whole board until a human
+///   notices, which is what the loop was never supposed to need.
+/// * Too much (no bound): looprs-w7q's runaway comes straight back. A ticket that
+///   *cannot* be closed would be bought again and again, and every pass is billed.
+///
+/// So: two automatic re-buys per ticket per human instruction — enough to ride out a
+/// hiccup twice, small enough that the worst case is three passes on one ticket
+/// rather than an evening of them. One knob, and the tests name it.
+pub(super) const MAX_AUTO_RESUME: u32 = 2;
+
+/// The re-work guard's one exception, as a value.
+///
+/// The guard is "this loop already paid for that ticket, so it does not get another
+/// pass by itself". The exception is the case the guard was never about: the pass
+/// that ended *on its own* — `agent_settled` with the ticket still un-closed, and no
+/// human `Esc` anywhere near it. That is an unfinished pass, not a finished one, and
+/// the loop is allowed to finish what it started without waiting for a human.
+///
+/// Two things keep it an exception rather than a hole:
+///
+/// * **It names a ticket.** A credit that could be spent on *any* already-worked
+///   ticket is not an exception, it is the guard deleted — which is exactly what
+///   removing `Recovery::Refused` did, and the reason that arm is still here.
+/// * **It is spent, not remembered.** Each use decrements it, and a failing retry
+///   does not top it back up ([`AutoResume::grant`] is deliberately not a reset), so
+///   a ticket that cannot be closed runs out of exception and the guard answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AutoResume {
+    /// The ticket this exception was earned by.
+    pub(super) id: String,
+    /// How many automatic re-buys it still has.
+    pub(super) left: u32,
+}
+
+impl AutoResume {
+    /// Grant the exception for `id` after a pass on it ended without closing.
+    ///
+    /// Not a reset: a credit already held for this ticket keeps what it has left,
+    /// which is the whole bound. A credit held for a *different* ticket is replaced —
+    /// only one pass can be in flight at a time, so only the ticket that just failed
+    /// can be the one owed a re-buy.
+    pub(super) fn grant(current: Option<&Self>, id: &str) -> Self {
+        match current {
+            Some(held) if held.id == id => Self {
+                id: held.id.clone(),
+                left: held.left,
+            },
+            _ => Self {
+                id: id.to_string(),
+                left: MAX_AUTO_RESUME,
+            },
+        }
+    }
+
+    /// Spend one automatic re-buy on `id`, answering whether that ticket may be
+    /// bought again without a human.
+    ///
+    /// `false` for the wrong ticket *and* for an exhausted budget, and the caller does
+    /// not get to tell those apart: both are "the guard answers", and the guard's
+    /// sentence is the same in each.
+    pub(super) fn spend(&mut self, id: &str) -> bool {
+        if self.id != id || self.left == 0 {
+            return false;
+        }
+        self.left -= 1;
+        true
+    }
+
+    /// Is this credit about some *other* ticket? A credit is about the pass that just
+    /// failed, so buying a pass on anything else retires it: a stale credit must not
+    /// sit around authorising a re-buy three passes and one ticket later.
+    pub(super) fn stale_for(&self, id: &str) -> bool {
+        self.id != id
+    }
 }
 
 /// Can this `Esc` be acted on, or is one already in progress?
