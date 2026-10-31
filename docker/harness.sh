@@ -20,6 +20,14 @@ docker volume create $VOLUME  >/dev/null
 grep -qxF '.transcripts/' .gitignore || echo '.transcripts/' >> .gitignore
 mkdir -p .transcripts
 
+# add relevant fathom to gitignore if it doesn't exist in .gitignore already
+grep -qxF '.fathom/*' .gitignore || echo '.fathom/*' >> .gitignore
+grep -qxF '!.fathom/reviews/' .gitignore || echo '!.fathom/reviews/' >> .gitignore
+grep -qxF '!.fathom/ratchet.toml' .gitignore || echo '!.fathom/ratchet.toml' >> .gitignore
+grep -qxF '!.fathom/LAYOUT.md' .gitignore || echo '!.fathom/LAYOUT.md' >> .gitignore
+grep -qxF '.fathom/**/*.tmp' .gitignore || echo '.fathom/**/*.tmp' >> .gitignore
+grep -qxF '.fathom/**/*.sqlite3-*' .gitignore || echo '.fathom/**/*.sqlite3-*' >> .gitignore
+
 # looprs is PID 1 in the container (the entrypoint `exec`s it), so the container
 # lives exactly as long as looprs does. Belt and braces: name it, and stop it by
 # name if this script is ever interrupted, killed, or the docker client detaches
