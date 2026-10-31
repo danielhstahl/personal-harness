@@ -70,3 +70,9 @@ foreground command and looprs keeps running, which means the container keeps
 running too. From another terminal you can always ask the same orderly exit of the
 container directly: `docker stop <name>` sends `SIGTERM`, and looprs answers it
 with the same teardown `Ctrl-Q` takes.
+
+
+### Bugs
+
+* Possible bug: on long running sessions hitting `end` doesn't take you anywhere when scrolling (actually I think this was user error).
+* Session data is being stored in the (unmounted) ~/.pi/agent/sessions.  On a docker crash this is removed/deleted which may cause less context/more confusion for restarted agents. If looprs is continuing on an already-in-progress-ticket, should it run with `pi -c` to continue the previous session?  This would require actually mounting the volume on disk.  Answer: no.  Its safer for it to know to resume a previous ticket from empty memory.  It doesn't hurt to mount sessions on disk though if desired.

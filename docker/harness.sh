@@ -12,6 +12,7 @@ VOLUME="beads-data-$SLUG"
 BASENAME=$(basename "$PWD")
 BD_PREFIX="${BASENAME:0:4}"
 : ${EMAIL_SUFFIX:="danielhstahl.com"}
+: ${NTFY_URL:="https://ntfy.apps.danielhstahl.com"}
 
 docker volume create $VOLUME  >/dev/null
 
@@ -38,6 +39,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
+#session_storage=.pi/agent/sessions/"$NAME"
+#mkdir -p "$HOME/$session_storage"
+#-v "$HOME/$session_storage:/home/appuser/$session_storage" \
+# -e PI_CODING_AGENT_SESSION_DIR=/home/appuser/"$session_storage" \
+#
 docker run --rm -it \
   --name "$NAME" \
   --init \
