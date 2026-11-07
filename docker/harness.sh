@@ -58,6 +58,7 @@ docker run --rm -it \
   -v "$PWD:/workspace" \
   --add-host=host.docker.internal:host-gateway \
   -v "$HOME/.pi/agent/models.json:/home/appuser/.pi/agent/models.json:ro" \
+  -v "$HOME/.pi/agent/AGENTS.md:/home/appuser/.pi/agent/AGENTS.md:ro" \
   -v "$PWD/.transcripts:/home/appuser/.local/share/looprs/transcripts/" \
   -v "$VOLUME:/home/appuser/.beads" \
   -e GIT_USER_NAME="looprs" \
