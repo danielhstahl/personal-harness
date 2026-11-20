@@ -233,6 +233,77 @@ The rule lives in
 [`BeadsLoop::pick_bead`](../../src/session/beads/machine.rs); the tests are indexed
 in [docs/testing.md](../testing.md#an-epic-comes-after-its-children-looprs-lpw).
 
+## Adding instructions per role
+
+The standing text of both roles is in the binary
+([`services::prompts.rs`](../../src/services/prompts.rs)), and it is the same for
+every project on earth. Yours is not. Two questions come up over and over — *how*
+should a worker finish work in this repo (run the gate, add the test, format
+before committing), and *what shape* should a plan take here (one ticket per
+deliverable, an epic per subsystem, never a catch-all child) — and neither belongs in
+a constant in somebody else's tool.
+
+`AGENTS.md` is the usual place to try, and it is the wrong tool for two specific
+reasons. It reaches **every** session alike: the planner's rules land on the worker
+and the worker's land on the planner, which is how you end up with a worker told to
+"create tickets" and a planner told it already has one. And it is one file per repo
+with no way to say something to one role only.
+
+So the loop reads role instructions instead, from the project it is running in:
+
+```text
+<the directory you run looprs in>/.looprs/planner.md    ← instructions for the planner role
+<the directory you run looprs in>/.looprs/worker.md     ← instructions for the worker role
+```
+
+Write them like instructions, not like documentation: imperative, short, and about
+what this project adds. For example:
+
+```markdown
+<!-- .looprs/worker.md -->
+- Run `./scripts/check.sh` before committing; do not commit past a failure it reports.
+- Every new behaviour gets a test in the module that owns it, not a new file.
+- Keep `docs/` true: a page that a code change makes wrong is part of the change.
+```
+
+```markdown
+<!-- .looprs/planner.md -->
+- One ticket per deliverable. If two pieces land together, they are one ticket.
+- Say in the title what the ticket delivers, never what it touches.
+- No ticket without an acceptance sentence in its description.
+```
+
+Three layers feed one role's section, in this order: the project's file, the file
+named by that role's `…_FILE` knob, then the inline `…_INSTRUCTIONS` text. The knobs,
+their defaults and the `LOOPRS_INSTRUCTIONS_DIR` redirect are on
+[Configuration reference → Prompt instructions, per role](configuration.md#prompt-instructions-per-role)
+— this page is about what to put in them and what they cannot do.
+
+What a role file **cannot** do is take back the harness's own guarantees. The
+planner still has to write tickets rather than code, and the worker still works
+exactly one claimed ticket and closes it; those are not project preferences, they
+are the things the loop's guards can check. A file that tries is contradicted in the
+prompt itself — the section it produces says it *adds* and *replaces none* — so the
+worst a bad project file can do is add a rule the model follows inside those
+bounds.
+
+Where the section lands is deliberate. It goes **above** the request, never below it:
+the planner's standing text ends with "These are the instructions that you need to
+break down into tickets:", and rules placed after that line would be read as
+requirements to plan. So a pass reads standing text → project instructions → the
+words you typed (or, for a worker, the ticket it was given).
+
+Two ways to know it worked, both cheap:
+
+```sh
+grep 'role instructions' "$LOG"      # which files were read, or `none for either role`
+```
+
+and, in the transcript of the pass itself, the prompt is what the loop wrote to the
+child — a run that ignored your file is a run whose prompt has no section in it. If
+the log names a file you did not point at, `LOOPRS_INSTRUCTIONS_DIR` is set somewhere
+in the environment the loop inherited.
+
 ## Reading the band while a pass runs
 
 You are looking at two independent reads of the same board: the **band** (the

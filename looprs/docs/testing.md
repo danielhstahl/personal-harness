@@ -62,6 +62,23 @@ person:
 | `scripts/check.sh` | one command that means "this branch is mergeable" |
 | `tests/warning_gate.rs` (`--ignored`) | reachable from `cargo test` without leaving the cargo mindset |
 
+Two more jobs run on every push beside that gate, in
+`.github/workflows/quality.yml`, and both of them are the same trick — a thin
+workflow over a script whose logic can be exercised without a runner:
+
+| job | script | what it produces |
+| --- | --- | --- |
+| `coverage` | [`scripts/coverage.sh`](../scripts/coverage.sh) | `cargo llvm-cov` over the suite: `coverage/lcov.info`, `coverage/coverage-summary.json`, an HTML report, and one printed percentage. `--fail-under N` turns the report into a gate; with no flag it reports only, because the floor has to be set from a real run and not from a desk |
+| `benchmark` | [`scripts/benchmark.sh`](../scripts/benchmark.sh) | the cost of the gate itself — release build, suite seconds, test count, docs-gate milliseconds — as `metric name value unit` lines, and as JSON when a runner asked for evidence. No threshold on purpose: a runner timing is a fact about that runner, so drift between two saved runs (`--compare`) is the claim, not an absolute |
+
+Both scripts carry a `--self-test` that needs only `python3` — the summary read and
+the gate's three verdicts for coverage, the metric emitter, the test counter and the
+drift report for benchmark — so the checks the workflows depend on are testable in a
+checkout with no toolchain, no nightly and no network. Neither re-measures what
+[`spikes/`](../spikes/README.md) already owns: the spikes measure the app against a
+real corpus and refuse to run without one, which is exactly what a runner cannot
+supply.
+
 The docs step is new with the docs site and follows the same shape on purpose: the
 half a prose review catches is not checkable, but a dead link, an undocumented knob
 and a drifted table all are, and a docs rule that is not checked has a half-life of
@@ -160,8 +177,23 @@ size that was typed. It is cheap and it generalises: the check needs no baseline
 no filesystem knowledge beyond the two rows it is comparing, so it will still be
 true of the eighth and ninth ADR that quote a total.
 
-CI runs `scripts/check.sh` (`.github/workflows/looprs-gate.yml`, at the repo root,
-path-filtered to `pi-beads/looprs/**`).
+CI runs `scripts/check.sh` from the `run_looprs_tests` job of
+`.github/workflows/test.yml` at the repo root — the same file, so "passes locally"
+and "passes in CI" are one statement. The two jobs AGENTS.md asks for that the gate
+file does not carry live beside it in
+[`.github/workflows/quality.yml`](../../.github/workflows/quality.yml): `coverage`
+and `benchmark`. All three share one rule about where cargo puts its artifacts
+(`scripts/lib/rust-target.sh`): the workspace's `target/` on a real runner, and
+`$TMPDIR` when the workspace is a mounted filesystem — because under `act`, rustc dies
+of `SIGBUS` writing into the bind mount, and a build that cannot finish measures
+nothing.
+
+Two more things are true of `act` and not of GitHub Actions, and both bit the first runs
+of these jobs: the runner hands `ACTMCP_EVIDENCE_OUT` as a **directory** it created for
+the run, so a script writes a named file inside it rather than appending to the path;
+and there is **no artifact backend**, so each job uploads its report only when one
+exists. A job that is red because a local runner has nowhere to put an artifact is a job
+nobody reads.
 
 The one warning that is not ours: `nix v0.28.0` future-incompatibility, pulled in by
 `portable-pty`. It is a note, not a failure. It is documented in
@@ -375,6 +407,51 @@ same bead reports 1, so parentage is only readable from the child's `parent` fie
 `the_ready_read_asks_bd_for_the_whole_board` is the other half — an unpaginated ready
 list is not a completeness nicety here, it is what stops a truncated page from
 promoting an epic over the children on the board with it (closing ADR-0007 F2).
+
+### Per-role project instructions (workspace-cw4)
+
+The loop's two roles take different instructions, and the person running the loop —
+not the binary — owns what each one says. Each role's additional text is read from the
+project, layered **between** the standing role text and the pass's own request, and
+added rather than substituted, so the harness's guarantees survive it
+([guide → Adding instructions per role](guide/beads-loop.md#adding-instructions-per-role),
+[knobs](guide/configuration.md#prompt-instructions-per-role)):
+
+- `services::instructions::tests::a_project_gives_each_role_its_own_instructions` —
+  `.looprs/planner.md` and `.looprs/worker.md`, read separately, each naming its own
+  source
+- `services::instructions::tests::all_three_layers_stack_in_the_documented_order` —
+  project file, then the role's `…_FILE`, then the inline text, joined in that order
+- `services::instructions::tests::the_instructions_directory_can_be_moved` /
+  `a_named_file_adds_to_the_project_file_in_order` /
+  `inline_text_lands_last_and_names_its_variable` — one knob per layer, and the
+  project's own file is *not* consulted once `LOOPRS_INSTRUCTIONS_DIR` replaces it
+- `services::instructions::tests::a_named_file_that_cannot_be_read_is_warned_about` —
+  a knob that was turned and did not take says so; the same test pair shows an absent
+  project file staying silent, which is the common case
+- `services::instructions::tests::an_over_long_role_file_is_cut_at_the_ceiling_and_says_so`
+  and `the_cut_lands_on_a_character_boundary` — 64 KiB per role, because the text is
+  billed on every pass, and a cut that split a character would be paid for forever
+- `services::instructions::tests::the_environment_configures_the_role_instructions_it_is_read_from`
+  — `from_env`, the one read of the process environment, exercised under
+  `cargo test -- --ignored` (it mutates the shared environment, which is why it is
+  ignored; every other test goes through the pure `resolve` and reads no environment
+  at all)
+- `services::prompts::tests::the_project_section_goes_between_the_role_text_and_the_request`
+  — the ordering, including the planner's trailer staying glued to the request;
+  `with_no_project_instructions_the_prompt_is_the_old_two_parts` is the byte-for-byte
+  claim that nothing changed for a run that configures nothing
+- wording: `session::beads::tests::notes_tests::the_worker_prompt_puts_project_instructions_before_the_ticket_it_assigns`,
+  `session::beads::tests::notes_tests::a_run_with_no_project_instructions_gets_the_prompt_it_always_got`
+
+End to end, through the real loop and a fake `pi` that logs what it was sent:
+
+- `session::beads::tests::planner::each_role_gets_its_own_project_instructions_and_not_the_other_s`
+  — both halves, per prompt: the planner never receives the worker's line and the
+  worker never receives the planner's, and the worker's prompt still carries the
+  claim and the no-work-discovery rule
+- `session::beads::tests::planner::a_project_with_no_role_files_gets_the_prompts_it_always_got`
+  — no `.looprs` anywhere means no section, no blank heading, no reordering
 
 ### Out-of-band notification (the completion edge)
 

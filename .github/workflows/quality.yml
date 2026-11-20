@@ -1,0 +1,104 @@
+# The two jobs AGENTS.md requires and `test.yml` did not carry: **code coverage** and
+# **a benchmark**. Both are thin: every decision lives in a script under `looprs/
+# scripts/` so it can be run, and its logic self-tested, without a runner —
+# `./scripts/coverage.sh --self-test` and `./scripts/benchmark.sh --self-test` need
+# nothing but python3, and the same scripts are what a human runs locally.
+#
+# Both trigger on `push` for the same reason `test.yml` does, and both stay cheap
+# enough to run on every commit: coverage is one instrumented run of the suite CI
+# already runs, and the benchmark measures the gate itself.
+name: quality
+
+on: push
+
+jobs:
+  coverage:
+    name: line coverage (cargo llvm-cov)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./looprs
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same explicit toolchain action `test.yml` uses, plus the two components
+      # llvm-cov instruments through. AGENTS.md's rule is an explicit action per
+      # language dependency rather than an `apt-get` of a toolchain nobody pinned.
+      - name: install rust with llvm-tools
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: cache cargo target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./looprs
+
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # The script owns everything interesting: the flag set, where the outputs go,
+      # how the percentage is summed out of the lcov, and what an empty lcov means
+      # (an error, never a zero).
+      - name: coverage
+        run: ./scripts/coverage.sh
+
+      # act has no artifact backend: upload-artifact fails there with "Unable to get the
+      # ACTIONS_RUNTIME_TOKEN env variable", which is a fact about the runner and not
+      # about the code under test — it turned a green coverage run into a red job. The
+      # measurement is the point, so the upload is skipped when there is nowhere to
+      # upload to, and act sees the job pass on the numbers themselves.
+      - name: is there an artifact backend
+        id: artifact_backend
+        run: echo "have=$([ "${ACT:-}" = "true" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+
+      - name: upload the report
+        if: always() && steps.artifact_backend.outputs.have == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            looprs/coverage/lcov.info
+            looprs/coverage/coverage-summary.json
+          if-no-files-found: warn
+
+  benchmark:
+    name: gate cost (build + suite + docs)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./looprs
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust with rustfmt and clippy
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache cargo target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./looprs
+
+      # Deliberately no threshold: a timing on a shared runner is a fact about the
+      # runner, and a benchmark that goes red when a runner is busy is a benchmark
+      # that gets deleted. The numbers land in the log, in the artifact, and — under
+      # act — in the run's benchmark evidence file.
+      - name: benchmark
+        run: ./scripts/benchmark.sh --metrics metrics.jsonl
+
+      # act has no artifact backend: upload-artifact fails there with "Unable to get the
+      # ACTIONS_RUNTIME_TOKEN env variable", which is a fact about the runner and not
+      # about the code under test — it turned a green coverage run into a red job. The
+      # measurement is the point, so the upload is skipped when there is nowhere to
+      # upload to, and act sees the job pass on the numbers themselves.
+      - name: is there an artifact backend
+        id: artifact_backend
+        run: echo "have=$([ "${ACT:-}" = "true" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+
+      - name: upload the metrics
+        if: always() && steps.artifact_backend.outputs.have == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-metrics
+          path: looprs/metrics.jsonl
+          if-no-files-found: warn

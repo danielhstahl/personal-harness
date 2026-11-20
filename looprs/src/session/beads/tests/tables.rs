@@ -48,6 +48,11 @@ fn bare_loop() -> (BeadsLoop, mpsc::UnboundedReceiver<SessionEvent>) {
         // anything, and a clipboard reached through a default would make
         // that a matter of luck.
         clipboard: Arc::new(crate::services::clipboard::Noop),
+        // And the same for the project's role instructions: these tables are
+        // step machines and guards, and a `.looprs` in whatever directory the
+        // suite happens to run from must not be able to change a prompt-shaped
+        // assertion (workspace-cw4).
+        role_instructions: Default::default(),
     };
     (
         BeadsLoop::new(SessionId::new(TerminalType::Beads, 0), tx, ctl_tx, cfg),

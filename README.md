@@ -45,6 +45,26 @@ The agent follows this state machine:
 * State 4: Start new session (no persisted context).  If a previous session left a `bead` "in progress", claim and continue that one first (`bd ready` cannot show an in-progress bead, so this is checked separately).  Otherwise select the top "ready" `bead` and "claim" it.  Work `bead`.  Go to State 5.
 * State 5: "Close" `bead`.  Commit work.  Use `bd remember` to store anything that future agents may need.  Go to State 1.
 
+### Instructions per role
+
+`AGENTS.md` is how you usually tell an agent about your project, and it reaches every
+session alike: the planner's rules land on the worker and the worker's land on the
+planner, and there is no way to say one thing to each role.  So looprs reads
+per-role instructions instead, from the project it is pointed at:
+
+```text
+.looprs/planner.md      # extra instructions for the planner role
+.looprs/worker.md       # extra instructions for the worker role
+```
+
+Those are the per-project home (in the container that is the mounted project, so no
+extra `-v`).  For text that lives outside the project there is
+`LOOPRS_PLANNER_FILE` / `LOOPRS_WORKER_FILE` and the inline
+`LOOPRS_PLANNER_INSTRUCTIONS` / `LOOPRS_WORKER_INSTRUCTIONS`.  All of it is *added*
+to the role's standing prompt and replaces none of it, so the loop's own guarantees —
+one claimed ticket per worker, closed before the next pass — survive whatever a
+project file says.  [Full behaviour and the knobs](./looprs/docs/guide/beads-loop.md#adding-instructions-per-role).
+
 ## Docker image
 [docker](./docker) contains the docker file that wraps this agent, and is strongly recommended for isolation.  Use it with the [harness.sh](./docker/harness.sh) shell script or stand-alone with 
 

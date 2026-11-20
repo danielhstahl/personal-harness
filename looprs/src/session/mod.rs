@@ -424,6 +424,22 @@ pub struct SessionConfig {
     /// what ~550 tests build, and a default that could block would turn every
     /// test with no UI draining the far end into a hang.
     pub output_budget: crate::bus::Budget,
+    /// The project's additional instructions per beads role
+    /// ([`services::instructions`](crate::services::instructions)), resolved once at
+    /// startup.
+    ///
+    /// Here rather than read at prompt time because of the crate's no-environment
+    /// rule: the loop composes prompts inside a session task, and a prompt that
+    /// re-read the filesystem would make a run's instructions changeable mid-pass
+    /// by whoever edited a file. `main` resolves it once; every pass of a run gets
+    /// the same instructions, and changing them means restarting like every other
+    /// knob here.
+    ///
+    /// The default is **empty**, on the same rule as the notifier and the clipboard:
+    /// only `main` builds the real value, so the several hundred tests that use
+    /// `SessionConfig::default()` cannot be changed by what happens to sit in a
+    /// `.looprs` directory.
+    pub role_instructions: crate::services::instructions::RoleInstructions,
 }
 
 impl Default for SessionConfig {
@@ -435,6 +451,7 @@ impl Default for SessionConfig {
             notifier: Arc::new(crate::services::notification::Noop),
             clipboard: Arc::new(crate::services::clipboard::Noop),
             output_budget: crate::bus::Budget::unbounded(),
+            role_instructions: crate::services::instructions::RoleInstructions::default(),
             alt_screen_hosted: crate::teardown::Mode::alt_screen_claimed(),
         }
     }

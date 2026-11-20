@@ -354,19 +354,74 @@ impl RawRun {
 /// Fails only on the two things that mean "there is no answer at all": the
 /// process could not be started, or it never finished. A non-zero exit is an
 /// *answer* and comes back in the [`RawRun`] for the caller to read.
-async fn run_raw(bin: &str, args: &[&str]) -> Result<RawRun, BdError> {
-    let spawned = Command::new(bin)
-        .args(args)
-        .env("BD_JSON_ENVELOPE", "1")
-        // stdin is closed, not inherited: an interactive `bd` prompt must not be
-        // able to steal keystrokes from the TUI.
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn();
+/// `ETXTBSY` — the kernel's answer to "run this file" while somebody still holds it
+/// open for writing. The same number on linux and macOS; anywhere else it never matches,
+/// which is the safe direction (no retries, same behaviour as before).
+const ETXTBSY: i32 = 26;
 
-    let child = match spawned {
+/// How many times to ask again after a busy answer, and how long to sit between asks.
+/// Total worst-case added latency: 80ms, against a `bd` call that is routinely slower
+/// than that anyway.
+const TEXT_BUSY_ATTEMPTS: usize = 5;
+const TEXT_BUSY_PAUSE: Duration = Duration::from_millis(20);
+
+/// Whether a failed spawn means "the binary is there and is being written this instant".
+fn is_text_busy(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(ETXTBSY)
+}
+
+/// Whether to ask again: the busy error, and an attempt left to ask with. The budget is
+/// an argument and not the constant, so a test can hold a file busy longer than
+/// production would ever wait, and the loop is bounded by the number in the call.
+fn retry_text_busy(err: &std::io::Error, attempt: usize, attempts: usize) -> bool {
+    is_text_busy(err) && attempt < attempts
+}
+
+/// Spawn `bd`, asking again if the answer was that the file was busy.
+///
+/// The condition is transient by definition — the writer is one `close()` away — and it
+/// is not only a test-harness thing. `bd` is a binary somebody else installs and
+/// upgrades: `uv tool upgrade beeds` or a `cargo install` finishing while a loop is live
+/// replaces the file at the moment the loop runs it. Before this, that moment was
+/// reported as ``cannot run `bd`: Text file busy (is it installed?)`` — a sentence that
+/// is false, and one that ended a session over a package manager's write. Anything other
+/// than busy (no such file, no permission) is returned untouched on the first try, so
+/// the ordinary failure path is no slower than it was.
+async fn spawn_bd(bin: &str, args: &[&str]) -> Result<tokio::process::Child, std::io::Error> {
+    spawn_bd_aware(bin, args, TEXT_BUSY_ATTEMPTS, TEXT_BUSY_PAUSE).await
+}
+
+/// The same, with the retry budget spelled out so a test can hold the file busy longer
+/// than production would ever wait.
+async fn spawn_bd_aware(
+    bin: &str,
+    args: &[&str],
+    attempts: usize,
+    pause: Duration,
+) -> Result<tokio::process::Child, std::io::Error> {
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        let spawned = Command::new(bin)
+            .args(args)
+            .env("BD_JSON_ENVELOPE", "1")
+            // stdin is closed, not inherited: an interactive `bd` prompt must not be
+            // able to steal keystrokes from the TUI.
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn();
+        match spawned {
+            Ok(child) => return Ok(child),
+            Err(e) if retry_text_busy(&e, attempt, attempts) => tokio::time::sleep(pause).await,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+async fn run_raw(bin: &str, args: &[&str]) -> Result<RawRun, BdError> {
+    let child = match spawn_bd(bin, args).await {
         Ok(c) => c,
         Err(e) => {
             return Err(BdError::Unavailable {
@@ -772,6 +827,73 @@ pub async fn claim_with(bin: &str, id: &str) -> Result<(), BdError> {
 mod tests {
     use super::*;
     use crate::testing::{BdFake, EMPTY_BOARD, Fakes, ONE_BEADED_BOARD};
+
+    /// The reason the retry exists, forced rather than hoped for. A file held open for
+    /// writing answers `execve` with `ETXTBSY`; a spawn told the binary is busy must
+    /// wait for the writer and then run it, not announce that it is not installed.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_binary_being_written_waits_and_runs_rather_than_being_reported_missing() {
+        static BUSY_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = BUSY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("looprs-busy-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("bd");
+        std::fs::write(&bin, "#!/bin/sh\necho hello-from-the-fake-bd\n").unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        // Hold it open the way an installer does: mid-write, handle still open.
+        let holder = std::fs::OpenOptions::new().write(true).open(&bin).unwrap();
+        match Command::new(&bin).stdin(Stdio::null()).spawn() {
+            // A filesystem that allows the exec is not the case under test; say so
+            // rather than pass for the wrong reason.
+            Ok(mut c) => {
+                let _ = c.kill().await;
+                panic!("this filesystem did not answer ETXTBSY, so nothing was forced");
+            }
+            Err(e) => assert!(is_text_busy(&e), "expected a busy answer, got {e}"),
+        }
+        drop(holder);
+
+        // The writer is gone; a call with a budget wide enough to cross a retry runs it.
+        let child = spawn_bd_aware(bin.to_str().unwrap(), &[], 50, Duration::from_millis(5))
+            .await
+            .expect("the retry must run the binary once the writer lets go");
+        let out = child.wait_with_output().await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("hello-from-the-fake-bd"),
+            "the retried spawn did not run the binary"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Which failures are worth asking again about. A missing binary is not: waiting
+    /// installs nothing, and the ordinary failure path must stay as fast as it was.
+    #[test]
+    fn only_a_busy_answer_is_asked_again() {
+        let busy = std::io::Error::from_raw_os_error(ETXTBSY);
+        let missing = std::io::Error::from_raw_os_error(2); // ENOENT
+        assert!(is_text_busy(&busy), "busy is the case the retry is for");
+        assert!(!is_text_busy(&missing), "no such file is not busy");
+        assert!(
+            retry_text_busy(&busy, 1, TEXT_BUSY_ATTEMPTS),
+            "busy with attempts left is asked again"
+        );
+        assert!(
+            !retry_text_busy(&busy, TEXT_BUSY_ATTEMPTS, TEXT_BUSY_ATTEMPTS),
+            "the loop is bounded; it cannot hang on a file somebody never closes"
+        );
+        assert!(
+            !retry_text_busy(&missing, 1, TEXT_BUSY_ATTEMPTS),
+            "a missing binary is reported now, not after a wait"
+        );
+        assert!(
+            !retry_text_busy(&busy, 1, 0),
+            "a budget of zero means no asking again, whatever the error was"
+        );
+    }
 
     /// The three outcomes looprs-037 refuses to conflate, as three distinct tests.
     #[tokio::test]

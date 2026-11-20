@@ -60,7 +60,8 @@
 # question about prose, so that part prints rather than fails; run without
 # `--gate` for the full list.
 #
-# CI runs exactly this file (.github/workflows/looprs-gate.yml at the repo root), so
+# CI runs exactly this file (the `run_looprs_tests` job of
+# `.github/workflows/test.yml` at the repo root), so
 # "passes locally" and "passes in CI" are the same statement. `cargo test --test
 # warning_gate -- --ignored` runs steps 1 and 2 from inside cargo, for when the
 # tests are already what you wanted.
@@ -76,6 +77,9 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+# shellcheck source=lib/rust-target.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/rust-target.sh"
+pick_cargo_target_dir
 
 echo "==> cargo fmt --check"
 cargo fmt --check

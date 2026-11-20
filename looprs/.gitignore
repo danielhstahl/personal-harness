@@ -14,3 +14,6 @@ __pycache__/
 
 # The generated docs site (ADR-0008 Q3: built, not committed).
 docs/_site/
+
+# The coverage job's outputs (scripts/coverage.sh): built, never committed.
+coverage/
