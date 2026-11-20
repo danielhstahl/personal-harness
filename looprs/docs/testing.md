@@ -62,6 +62,23 @@ person:
 | `scripts/check.sh` | one command that means "this branch is mergeable" |
 | `tests/warning_gate.rs` (`--ignored`) | reachable from `cargo test` without leaving the cargo mindset |
 
+Two more jobs run on every push beside that gate, in
+`.github/workflows/quality.yml`, and both of them are the same trick — a thin
+workflow over a script whose logic can be exercised without a runner:
+
+| job | script | what it produces |
+| --- | --- | --- |
+| `coverage` | [`scripts/coverage.sh`](../scripts/coverage.sh) | `cargo llvm-cov` over the suite: `coverage/lcov.info`, `coverage/coverage-summary.json`, an HTML report, and one printed percentage. `--fail-under N` turns the report into a gate; with no flag it reports only, because the floor has to be set from a real run and not from a desk |
+| `benchmark` | [`scripts/benchmark.sh`](../scripts/benchmark.sh) | the cost of the gate itself — release build, suite seconds, test count, docs-gate milliseconds — as `metric name value unit` lines, and as JSON when a runner asked for evidence. No threshold on purpose: a runner timing is a fact about that runner, so drift between two saved runs (`--compare`) is the claim, not an absolute |
+
+Both scripts carry a `--self-test` that needs only `python3` — the summary read and
+the gate's three verdicts for coverage, the metric emitter, the test counter and the
+drift report for benchmark — so the checks the workflows depend on are testable in a
+checkout with no toolchain, no nightly and no network. Neither re-measures what
+[`spikes/`](../spikes/README.md) already owns: the spikes measure the app against a
+real corpus and refuse to run without one, which is exactly what a runner cannot
+supply.
+
 The docs step is new with the docs site and follows the same shape on purpose: the
 half a prose review catches is not checkable, but a dead link, an undocumented knob
 and a drifted table all are, and a docs rule that is not checked has a half-life of
@@ -160,8 +177,12 @@ size that was typed. It is cheap and it generalises: the check needs no baseline
 no filesystem knowledge beyond the two rows it is comparing, so it will still be
 true of the eighth and ninth ADR that quote a total.
 
-CI runs `scripts/check.sh` (`.github/workflows/looprs-gate.yml`, at the repo root,
-path-filtered to `pi-beads/looprs/**`).
+CI runs `scripts/check.sh` from the `run_looprs_tests` job of
+`.github/workflows/test.yml` at the repo root — the same file, so "passes locally"
+and "passes in CI" are one statement. The two jobs AGENTS.md asks for that the gate
+file does not carry live beside it in
+[`.github/workflows/quality.yml`](../../.github/workflows/quality.yml): `coverage`
+and `benchmark`.
 
 The one warning that is not ours: `nix v0.28.0` future-incompatibility, pulled in by
 `portable-pty`. It is a note, not a failure. It is documented in
