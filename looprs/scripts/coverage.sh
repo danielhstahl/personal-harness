@@ -30,6 +30,8 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 crate="$(dirname "$here")"
 out="$crate/coverage"
+# shellcheck source=lib/rust-target.sh
+. "$here/lib/rust-target.sh"
 
 fail_under=""
 self_test=0
@@ -171,6 +173,19 @@ if [ "$self_test" = "1" ]; then
   [ "$(wc -l < "$tmp/evidence.jsonl" | tr -d ' ')" = "1" ] \
     || { echo "self-test: the metric must land as exactly one evidence line" >&2; exit 1; }
 
+
+  # The build-directory rule (lib/rust-target.sh), which is a real crash and not a
+  # preference: under a runner that mounts the workspace, cargo must not be pointed at
+  # the mount, and a choice the caller made must survive.
+  got="$(ACT=true CARGO_TARGET_DIR= TMPDIR="$tmp" bash -c "cd '$crate' && . '$here/lib/rust-target.sh' && pick_cargo_target_dir && printf %s \"\$CARGO_TARGET_DIR\"")"
+  case "$got" in
+    "$tmp"/*) : ;;
+    *) echo "self-test: under a mounted-workspace runner the build dir must leave the workspace, got: $got" >&2; exit 1 ;;
+  esac
+  got="$(CARGO_TARGET_DIR=/somewhere/else TMPDIR="$tmp" bash -c ". '$here/lib/rust-target.sh' && pick_cargo_target_dir && printf %s \"\$CARGO_TARGET_DIR\"")"
+  [ "$got" = "/somewhere/else" ] \
+    || { echo "self-test: an explicit CARGO_TARGET_DIR must not be overwritten, got: $got" >&2; exit 1; }
+
   echo "coverage self-test: ok (lcov read, empty export refused, three gate verdicts, derived summary, evidence line)"
   exit 0
 fi
@@ -193,6 +208,10 @@ It instruments through the `llvm-tools-preview` component of the toolchain.
 MSG
   exit 3
 fi
+
+# Under a runner that mounts the workspace, the instrumented build goes on the
+# container's own disk; see lib/rust-target.sh.
+pick_cargo_target_dir
 
 mkdir -p "$out"
 echo "==> cargo llvm-cov: instrumented build, whole suite, lcov into $out/lcov.info"

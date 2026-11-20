@@ -182,7 +182,11 @@ CI runs `scripts/check.sh` from the `run_looprs_tests` job of
 and "passes in CI" are one statement. The two jobs AGENTS.md asks for that the gate
 file does not carry live beside it in
 [`.github/workflows/quality.yml`](../../.github/workflows/quality.yml): `coverage`
-and `benchmark`.
+and `benchmark`. All three share one rule about where cargo puts its artifacts
+(`scripts/lib/rust-target.sh`): the workspace's `target/` on a real runner, and
+`$TMPDIR` when the workspace is a mounted filesystem — because under `act`, rustc dies
+of `SIGBUS` writing into the bind mount, and a build that cannot finish measures
+nothing.
 
 The one warning that is not ours: `nix v0.28.0` future-incompatibility, pulled in by
 `portable-pty`. It is a note, not a failure. It is documented in

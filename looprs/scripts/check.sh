@@ -77,6 +77,9 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+# shellcheck source=lib/rust-target.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/rust-target.sh"
+pick_cargo_target_dir
 
 echo "==> cargo fmt --check"
 cargo fmt --check

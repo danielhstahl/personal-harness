@@ -36,6 +36,8 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 crate="$(dirname "$here")"
+# shellcheck source=lib/rust-target.sh
+. "$here/lib/rust-target.sh"
 
 cold=0
 self_test=0
@@ -169,6 +171,19 @@ if [ "${self_test}" = "1" ]; then
     exit 1
   fi
 
+
+  # The build-directory rule (lib/rust-target.sh), which is a real crash and not a
+  # preference: under a runner that mounts the workspace, cargo must not be pointed at
+  # the mount, and a choice the caller made must survive.
+  got="$(ACT=true CARGO_TARGET_DIR= TMPDIR="$tmp" bash -c "cd '$crate' && . '$here/lib/rust-target.sh' && pick_cargo_target_dir && printf %s \"\$CARGO_TARGET_DIR\"")"
+  case "$got" in
+    "$tmp"/*) : ;;
+    *) echo "self-test: under a mounted-workspace runner the build dir must leave the workspace, got: $got" >&2; exit 1 ;;
+  esac
+  got="$(CARGO_TARGET_DIR=/somewhere/else TMPDIR="$tmp" bash -c ". '$here/lib/rust-target.sh' && pick_cargo_target_dir && printf %s \"\$CARGO_TARGET_DIR\"")"
+  [ "$got" = "/somewhere/else" ] \
+    || { echo "self-test: an explicit CARGO_TARGET_DIR must not be overwritten, got: $got" >&2; exit 1; }
+
   echo "benchmark self-test: ok (emitter and its sinks, test counter, drift report, four refusals)"
   exit 0
 fi
@@ -183,6 +198,9 @@ fi
 # ───────────────────────────── the measurement ─────────────────────────────
 
 cd "$crate"
+# Decided before anything is timed, and printed when it redirects: under a runner that
+# mounts the workspace, cargo's build dir belongs on the container's own disk.
+pick_cargo_target_dir
 target_dir="${CARGO_TARGET_DIR:-$crate/target}"
 export CARGO_TARGET_DIR="$target_dir"
 BENCH_METRICS="${metrics_file:-$(mktemp)}"
