@@ -38,13 +38,22 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       # The script owns everything interesting: the flag set, where the outputs go,
-      # how the percentage is read out of llvm-cov's JSON summary, and what a summary
-      # it cannot read means (an error, never a zero).
+      # how the percentage is summed out of the lcov, and what an empty lcov means
+      # (an error, never a zero).
       - name: coverage
         run: ./scripts/coverage.sh
 
+      # act has no artifact backend: upload-artifact fails there with "Unable to get the
+      # ACTIONS_RUNTIME_TOKEN env variable", which is a fact about the runner and not
+      # about the code under test — it turned a green coverage run into a red job. The
+      # measurement is the point, so the upload is skipped when there is nowhere to
+      # upload to, and act sees the job pass on the numbers themselves.
+      - name: is there an artifact backend
+        id: artifact_backend
+        run: echo "have=$([ "${ACT:-}" = "true" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+
       - name: upload the report
-        if: always()
+        if: always() && steps.artifact_backend.outputs.have == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: coverage
@@ -77,8 +86,17 @@ jobs:
       - name: benchmark
         run: ./scripts/benchmark.sh --metrics metrics.jsonl
 
+      # act has no artifact backend: upload-artifact fails there with "Unable to get the
+      # ACTIONS_RUNTIME_TOKEN env variable", which is a fact about the runner and not
+      # about the code under test — it turned a green coverage run into a red job. The
+      # measurement is the point, so the upload is skipped when there is nowhere to
+      # upload to, and act sees the job pass on the numbers themselves.
+      - name: is there an artifact backend
+        id: artifact_backend
+        run: echo "have=$([ "${ACT:-}" = "true" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+
       - name: upload the metrics
-        if: always()
+        if: always() && steps.artifact_backend.outputs.have == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-metrics

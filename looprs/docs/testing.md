@@ -188,6 +188,13 @@ and `benchmark`. All three share one rule about where cargo puts its artifacts
 of `SIGBUS` writing into the bind mount, and a build that cannot finish measures
 nothing.
 
+Two more things are true of `act` and not of GitHub Actions, and both bit the first runs
+of these jobs: the runner hands `ACTMCP_EVIDENCE_OUT` as a **directory** it created for
+the run, so a script writes a named file inside it rather than appending to the path;
+and there is **no artifact backend**, so each job uploads its report only when one
+exists. A job that is red because a local runner has nowhere to put an artifact is a job
+nobody reads.
+
 The one warning that is not ours: `nix v0.28.0` future-incompatibility, pulled in by
 `portable-pty`. It is a note, not a failure. It is documented in
 [ADR-0001](adr/0001-bash-terminal-state-pty.md) rather than silenced, because the
