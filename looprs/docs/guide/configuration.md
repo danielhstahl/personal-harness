@@ -11,7 +11,7 @@ table indexes it. [`./scripts/docs_check.sh`](../../scripts/docs_check.sh) compa
 the defaults wherever two pages state them and fails on a disagreement, so the
 exception cannot rot into a contradiction.
 
-**30 `LOOPRS_*` variables are read by `src/`** — 29 until `LOOPRS_WARM_HIGHLIGHT` arrived with `looprs-00u.16`. That count is not from the docs:
+**35 `LOOPRS_*` variables are read by `src/`** — 29 until `LOOPRS_WARM_HIGHLIGHT` arrived with `looprs-00u.16`, and 30 until the five role-instruction knobs arrived with `workspace-cw4`. That count is not from the docs:
 `./scripts/docs_check.py --list-knobs` prints them with the `file:line` of every
 read, and the gate that keeps this page complete is a step of
 [`./scripts/check.sh`](../../scripts/check.sh).
@@ -30,7 +30,7 @@ you is that **changing a variable means restarting the app**.
 The grep index, the resolved paths and the level each diagnostic needs is
 [`./operator.md`](operator.md#3-the-log); this page owns the knobs and their
 defaults. Every resolved choice is logged once at startup — `grep -E 'logging:
-|kanban board|clipboard:|notifications|highlight warm' "$LOG"` prints the whole resolved set,
+|kanban board|clipboard:|notifications|highlight warm|role instructions' "$LOG"` prints the whole resolved set,
 where `$LOG` is
 
 ```sh
@@ -124,6 +124,47 @@ This is the knob that decides *when* the cost lands, not how big it is: the
 that state is, what the pure-Rust regex engine costs against the C one, and the
 four measured triggers that would flip the choice:
 [ADR-0009](../adr/0009-highlighter-warm-start-and-the-regex-backend.md).
+
+## Prompt instructions, per role
+
+The beads loop buys two kinds of pass, and the instructions a person wants to give
+them are different: the planner is told to write better tickets, the worker is told
+how this project wants its work done. `AGENTS.md` cannot make that split — the
+engine hands it to every session alike — and hardcoding role text into the binary
+would make it the same for every project. So each role reads its own additional
+instructions out of the project it is pointed at, and
+[`services::instructions`](../../src/services/instructions.rs) resolves them.
+
+| knob | default | values | what it changes | set at | read in |
+| --- | --- | --- | --- | --- | --- |
+| `LOOPRS_INSTRUCTIONS_DIR` | `.looprs` under the working directory | a path, relative or absolute | the directory the role files are read from: `planner.md` and `worker.md`. Set it to point a loop at a shared set of rules instead of the project's own | startup | [`RoleInstructions::resolve`](../../src/services/instructions.rs) |
+| `LOOPRS_PLANNER_FILE` | *(unset)* | a path | a second file of planner instructions, layered **after** `planner.md` — for text that lives outside the project | startup | same |
+| `LOOPRS_WORKER_FILE` | *(unset)* | a path | the same, for the worker | startup | same |
+| `LOOPRS_PLANNER_INSTRUCTIONS` | *(unset)* | text | instructions typed straight into the environment, layered last. For the one-off that does not deserve a file | startup | same |
+| `LOOPRS_WORKER_INSTRUCTIONS` | *(unset)* | text | the same, for the worker | startup | same |
+
+Three things about the resolution are behaviour, not implementation:
+
+* **They add; they never replace.** The composed prompt is standing role text, then
+  the project's instructions, then this pass's request or ticket
+  ([`prompts::compose`](../../src/services/prompts.rs)). The worker is still told
+  which single ticket it owns and what it owes back, and the added section says in
+  words that it replaces none of that — a project file does not get to reopen work
+  discovery, because that is the race the loop's guards exist to close.
+* **A layer that was named and could not be read is a warning**, not a shrug: the
+  knobs above exist to be turned, and `grep 'role instructions' "$LOG"` prints the
+  resolved sources — or `none for either role`, which is the answer to "did my file
+  get read?" without needing a second run.
+* **One role's instructions, one role's prompt.** The planner never receives the
+  worker's rules and vice versa; both halves are pinned per prompt by
+  `each_role_gets_its_own_project_instructions_and_not_the_other_s`.
+
+Up to **64 KiB per role** is used, and a file past it is cut at a character boundary
+with a warning naming the file: these strings go into every pass, so an unbounded
+read is a file of any size billed on any size run.
+
+The worked example, and what each role's file should and should not contain, is
+[Driving the Beads loop → Adding instructions per role](beads-loop.md#adding-instructions-per-role).
 
 ## Clipboard and mouse
 

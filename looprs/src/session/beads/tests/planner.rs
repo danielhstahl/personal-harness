@@ -342,3 +342,104 @@ async fn an_aborted_planner_is_cancelled_not_reported_as_an_empty_plan() {
     assert_eq!(fakes.pi_spawns(), 1);
     assert!(!msgs.contains(&"step:work".to_string()), "{msgs:?}");
 }
+
+// ---------------- what the project says to each role (workspace-cw4) ----------------
+
+/// **The acceptance case for the feature.** A project gives the planner and the
+/// worker different instructions, from files in its own tree, and each one arrives
+/// in that role's prompt and nowhere else.
+///
+/// The negative halves are the ones that would ship silently: a planner that got
+/// the worker's rules would plan as though it were working, and a worker that got
+/// the planner's would be told to write tickets it is not allowed to write. So
+/// each prompt is checked for what must *not* be in it as well as what must be.
+#[tokio::test]
+async fn each_role_gets_its_own_project_instructions_and_not_the_other_s() {
+    let fakes = Fakes::new("plan-roles", PiFake::Chat, BdFake::Ok, EMPTY_BOARD);
+    let notes = role_instructions(
+        "ONE TICKET PER DELIVERABLE, NEVER MORE.",
+        "RUN THE GATE BEFORE COMMITTING.",
+    );
+    assert!(
+        !notes.is_empty() && notes.warnings().is_empty(),
+        "the fixture resolved: {notes:?}"
+    );
+    let (mut s, mut rx) = beads_with_notes(&fakes, 1, notes);
+    s.set_active(true).unwrap();
+    assert!(s.quiesce().await);
+    drain(&mut rx);
+
+    start_planner(&mut s, "two tickets, please").await;
+    fakes.set_board(PLAN_TWO_TICKETS);
+    fakes.settle();
+    drain_until(&mut rx, |m| m == "step:work").await;
+
+    let prompts = fakes.pi_prompts();
+    assert_eq!(prompts.len(), 2, "one planner, one worker: {prompts:?}");
+    let (planner, worker) = (&prompts[0], &prompts[1]);
+    assert!(
+        planner.contains("ONE TICKET PER DELIVERABLE") && !planner.contains("RUN THE GATE"),
+        "the planner got its own rules only: {planner}"
+    );
+    assert!(
+        worker.contains("RUN THE GATE") && !worker.contains("ONE TICKET PER DELIVERABLE"),
+        "the worker got its own rules only: {worker}"
+    );
+    // Each section names the file it came from, so a rule in a transcript can be
+    // traced back to the line in the project that produced it.
+    assert!(planner.contains(".looprs/planner.md"), "{planner}");
+    assert!(worker.contains(".looprs/worker.md"), "{worker}");
+    // The request still arrives as the request: the project's rules are not what
+    // the planner is being asked to break down. (The fake logs one command per
+    // line, so the prompt's newlines reach a test escaped — see `one_line` in
+    // `tests/fixtures/fake_pi_chat.py`.)
+    assert!(
+        planner.ends_with("break down into tickets:\\ntwo tickets, please"),
+        "the human's words still come last: {planner}"
+    );
+    // And the harness's own guarantees are untouched by either file.
+    assert!(
+        worker.contains("Your assigned ticket: looprs-101 — first planned ticket"),
+        "{worker}"
+    );
+    assert!(
+        worker.contains("must not go looking for other work"),
+        "a project note does not get to reopen work-discovery: {worker}"
+    );
+}
+
+/// The same loop with no `.looprs` anywhere gets the prompts it always got: the
+/// feature is additive, and an absent project file must not leave a heading, a
+/// blank section or a change of order behind.
+#[tokio::test]
+async fn a_project_with_no_role_files_gets_the_prompts_it_always_got() {
+    let fakes = Fakes::new("plan-no-roles", PiFake::Chat, BdFake::Ok, EMPTY_BOARD);
+    let (mut s, mut rx) = beads(&fakes, 1);
+    s.set_active(true).unwrap();
+    assert!(s.quiesce().await);
+    drain(&mut rx);
+
+    start_planner(&mut s, "two tickets, please").await;
+    fakes.set_board(PLAN_TWO_TICKETS);
+    fakes.settle();
+    drain_until(&mut rx, |m| m == "step:work").await;
+
+    let prompts = fakes.pi_prompts();
+    assert_eq!(prompts.len(), 2, "planner and worker, as ever: {prompts:?}");
+    for prompt in &prompts {
+        assert!(
+            !prompt.contains("Additional instructions"),
+            "nothing configured, nothing added: {prompt}"
+        );
+    }
+    assert!(
+        prompts[0].ends_with("break down into tickets:\\ntwo tickets, please"),
+        "{}",
+        prompts[0]
+    );
+    assert!(
+        prompts[1].contains("Your assigned ticket: looprs-101"),
+        "{}",
+        prompts[1]
+    );
+}

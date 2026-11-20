@@ -31,7 +31,7 @@ use crate::services::bd::{
 };
 use crate::services::notification::BeadDone;
 use crate::services::pi::PiRpc;
-use crate::services::prompts::{PLANNER, generate_prompt};
+use crate::services::prompts::{Role, compose};
 use crate::session::{ActiveBead, BeadStep, SessionConfig, SessionEvent, SessionId};
 
 use crate::wire::{AssistantEvent, PiEvent, parse};
@@ -561,7 +561,14 @@ impl BeadsLoop {
         // drops here and kill_on_drop reaps it, so a failed pass cannot leave an
         // orphan behind.
         let worker = self.spawn_worker(&[])?;
-        let disposition = worker.rpc.prompt(&worker_prompt(claim, arrival)).await?;
+        let disposition = worker
+            .rpc
+            .prompt(&worker_prompt(
+                claim,
+                arrival,
+                self.cfg.role_instructions.worker(),
+            ))
+            .await?;
         if disposition == "handled" {
             // pi took the prompt but started no run, so no `agent_settled` will ever
             // arrive to advance the loop. Do not hold an idle session open.
@@ -906,7 +913,11 @@ impl BeadsLoop {
         let worker = self.spawn_worker(&args)?;
         let said = worker.said.clone();
         self.set_step(StepCause::Planning);
-        let prompt = generate_prompt(PLANNER, instructions);
+        let prompt = compose(
+            Role::Planner,
+            self.cfg.role_instructions.planner(),
+            instructions,
+        );
         let disposition = worker.rpc.prompt(&prompt).await?;
         if disposition == "handled" {
             // pi took the prompt but started no run, so there is no settle coming

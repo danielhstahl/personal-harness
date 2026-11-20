@@ -376,6 +376,51 @@ same bead reports 1, so parentage is only readable from the child's `parent` fie
 list is not a completeness nicety here, it is what stops a truncated page from
 promoting an epic over the children on the board with it (closing ADR-0007 F2).
 
+### Per-role project instructions (workspace-cw4)
+
+The loop's two roles take different instructions, and the person running the loop —
+not the binary — owns what each one says. Each role's additional text is read from the
+project, layered **between** the standing role text and the pass's own request, and
+added rather than substituted, so the harness's guarantees survive it
+([guide → Adding instructions per role](guide/beads-loop.md#adding-instructions-per-role),
+[knobs](guide/configuration.md#prompt-instructions-per-role)):
+
+- `services::instructions::tests::a_project_gives_each_role_its_own_instructions` —
+  `.looprs/planner.md` and `.looprs/worker.md`, read separately, each naming its own
+  source
+- `services::instructions::tests::all_three_layers_stack_in_the_documented_order` —
+  project file, then the role's `…_FILE`, then the inline text, joined in that order
+- `services::instructions::tests::the_instructions_directory_can_be_moved` /
+  `a_named_file_adds_to_the_project_file_in_order` /
+  `inline_text_lands_last_and_names_its_variable` — one knob per layer, and the
+  project's own file is *not* consulted once `LOOPRS_INSTRUCTIONS_DIR` replaces it
+- `services::instructions::tests::a_named_file_that_cannot_be_read_is_warned_about` —
+  a knob that was turned and did not take says so; the same test pair shows an absent
+  project file staying silent, which is the common case
+- `services::instructions::tests::an_over_long_role_file_is_cut_at_the_ceiling_and_says_so`
+  and `the_cut_lands_on_a_character_boundary` — 64 KiB per role, because the text is
+  billed on every pass, and a cut that split a character would be paid for forever
+- `services::instructions::tests::the_environment_configures_the_role_instructions_it_is_read_from`
+  — `from_env`, the one read of the process environment, exercised under
+  `cargo test -- --ignored` (it mutates the shared environment, which is why it is
+  ignored; every other test goes through the pure `resolve` and reads no environment
+  at all)
+- `services::prompts::tests::the_project_section_goes_between_the_role_text_and_the_request`
+  — the ordering, including the planner's trailer staying glued to the request;
+  `with_no_project_instructions_the_prompt_is_the_old_two_parts` is the byte-for-byte
+  claim that nothing changed for a run that configures nothing
+- wording: `session::beads::tests::notes_tests::the_worker_prompt_puts_project_instructions_before_the_ticket_it_assigns`,
+  `session::beads::tests::notes_tests::a_run_with_no_project_instructions_gets_the_prompt_it_always_got`
+
+End to end, through the real loop and a fake `pi` that logs what it was sent:
+
+- `session::beads::tests::planner::each_role_gets_its_own_project_instructions_and_not_the_other_s`
+  — both halves, per prompt: the planner never receives the worker's line and the
+  worker never receives the planner's, and the worker's prompt still carries the
+  claim and the no-work-discovery rule
+- `session::beads::tests::planner::a_project_with_no_role_files_gets_the_prompts_it_always_got`
+  — no `.looprs` anywhere means no section, no blank heading, no reordering
+
 ### Out-of-band notification (the completion edge)
 
 Turn it on with `LOOPRS_NTFY_URL` + `LOOPRS_NTFY_TOPIC`; with either missing the

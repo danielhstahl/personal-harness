@@ -9,7 +9,7 @@
 
 use crate::services::bd::{Bead, BeadStatus};
 
-use crate::services::prompts::{WORKER, generate_prompt};
+use crate::services::prompts::{Role, RoleNotes, compose};
 use crate::session::ActiveBead;
 
 /// How the ticket reached the worker being prompted (looprs-hjo, workspace-9th).
@@ -31,21 +31,31 @@ pub(super) enum Arrival {
     Retried,
 }
 
-/// The worker prompt: the standing instructions, plus the one ticket this worker
-/// owns and the fact that the harness has already claimed it.
+/// The worker prompt: the standing instructions, plus the project's additional
+/// instructions for the worker role (if any), plus the one ticket this worker owns
+/// and the fact that the harness has already claimed it.
 ///
 /// The claim is stated rather than assumed, because the alternative — telling the
 /// agent to go find work — is a race with every other hand on the board, and the
 /// worker would end up doing (and billing) a different ticket than the one the
 /// loop reports, guards and verifies. Hence `bd ready` is gone from the worker's
-/// command list in `prompts::WORKER`: a prompt that advertises it invites the
+/// standing text for exactly that reason: a prompt that advertises it invites the
 /// agent to shop.
+///
+/// `notes` go between the two, and are a supplement rather than a replacement
+/// ([`compose`](crate::services::prompts::compose)): a project may say *how* it
+/// wants work done, and gets told back that the ticket it works and the close it
+/// owes are not its to change.
 ///
 /// A resumed ticket adds one paragraph — [`resumed_note_for_worker`] — and a retried
 /// one adds [`retried_note_for_worker`]; nothing else changes. That is deliberate: a
 /// resumed pass is not a lesser pass, and it gets the same claim, the same guard and
 /// the same close-check as a fresh one.
-pub(super) fn worker_prompt(claim: &ActiveBead, arrival: Arrival) -> String {
+pub(super) fn worker_prompt(
+    claim: &ActiveBead,
+    arrival: Arrival,
+    notes: Option<&RoleNotes>,
+) -> String {
     let mut instructions = format!(
         "Your assigned ticket: {id} — {title}\n\n\
          The harness has already run `bd update {id} --claim`, so this ticket is yours. \
@@ -59,7 +69,7 @@ pub(super) fn worker_prompt(claim: &ActiveBead, arrival: Arrival) -> String {
     } else if let Arrival::Retried = arrival {
         instructions.push_str(&retried_note_for_worker(&claim.id));
     }
-    generate_prompt(WORKER, &instructions)
+    compose(Role::Worker, notes, &instructions)
 }
 
 /// The paragraph a worker gets when its own harness already bought a pass on this

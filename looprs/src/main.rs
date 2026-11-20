@@ -40,6 +40,7 @@ use components::toast::ToastOverlay;
 
 use crate::services::board_poller;
 use crate::services::clipboard;
+use crate::services::instructions;
 use crate::services::logging;
 use crate::services::notification;
 use crate::session::router::{Router, SHUTDOWN_GRACE};
@@ -214,6 +215,20 @@ async fn run(
     // which is what keeps ~300 tests off the network by construction rather than
     // by nobody remembering to unset `LOOPRS_NTFY_URL`.
     let clipboard = clipboard::clipboard_from_env();
+    // The project's additional instructions per beads role (workspace-cw4), on the
+    // same rule as the two sinks above: resolved once, here, and handed down.
+    // A session does not get to choose what it is told, and re-reading the files
+    // per pass would let an edit mid-run change what the *next* pass of the same
+    // instruction hears — which is exactly the kind of move-underneath-a-pass
+    // change the loop's guards refuse to reason about.
+    let role_instructions = instructions::RoleInstructions::from_env();
+    // Said out loud, including when it is "none": a person who just wrote
+    // `.looprs/worker.md` and sees no change needs the log to answer "was it read?"
+    // without a second run.
+    tracing::info!(
+        roles = role_instructions.describe().as_str(),
+        "role instructions: additional per-role prompt text (planner + worker) resolved from the project"
+    );
     let cfg = SessionConfig {
         notifier: notification::notifier_from_env(),
         // The same rule as the notifier, and the same reason for stating it:
@@ -226,6 +241,7 @@ async fn run(
         // Handed down here, at the one place the real config is built, so a
         // session cannot choose its own ceiling (looprs-6cj).
         output_budget: app_tx.budget(),
+        role_instructions,
         ..SessionConfig::default()
     };
     // The kanban board's own task (looprs-5o4.2), on the same rule as the two

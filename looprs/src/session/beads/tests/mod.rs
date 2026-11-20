@@ -28,6 +28,8 @@
 use crate::wire::PiEvent;
 
 use crate::services::bd::Bead;
+use crate::services::instructions::RoleInstructions;
+use crate::services::prompts::RoleNotes;
 use crate::session::BeadStep;
 
 mod announce;
@@ -154,14 +156,64 @@ const CRASH_LEFT_ONE_IN_PROGRESS: &str = r#"{
 }"#;
 
 fn fakes_cfg(fakes: &Fakes) -> SessionConfig {
+    fakes_cfg_with(fakes, RoleInstructions::default())
+}
+
+/// [`fakes_cfg`], with a project's role instructions in the config.
+///
+/// Built through [`RoleInstructions::resolve`] with an empty environment rather
+/// than by hand, so the loop under test is handed exactly the shape `main` hands
+/// it — same type, same way of being filled.
+fn fakes_cfg_with(fakes: &Fakes, notes: RoleInstructions) -> SessionConfig {
     SessionConfig {
         pi_bin: fakes.pi_bin().to_string(),
         bd_bin: fakes.bd_bin().to_string(),
         // The recorder, not `Noop`: the completion edge is as observable here
         // as the `bd` log is, and a test that cannot see it cannot pin it.
         notifier: Arc::new(fakes.notifier.clone()),
+        role_instructions: notes,
         ..Default::default()
     }
+}
+
+/// A beads session whose config carries project role instructions, so a test can
+/// watch them reach a prompt (workspace-cw4).
+fn beads_with_notes(
+    fakes: &Fakes,
+    generation: u64,
+    notes: RoleInstructions,
+) -> (BeadsSession, mpsc::UnboundedReceiver<SessionEvent>) {
+    BeadsSession::build(
+        SessionId::new(TerminalType::Beads, generation),
+        &fakes_cfg_with(fakes, notes),
+    )
+    .expect("beads session must start")
+}
+
+/// One role's notes, as a project file would have produced them.
+fn role_notes(text: &str, source: &str) -> RoleNotes {
+    RoleNotes::new(text, vec![source.to_string()])
+}
+
+/// Both roles' instructions, read out of a real temporary project directory.
+///
+/// Not assembled by hand: `resolve` is the only thing that fills this type, so a
+/// test that hands the loop something `main` could never have produced is testing
+/// a shape that does not ship. The directory goes away as soon as the read is
+/// done — the text is already in the value.
+fn role_instructions(planner: &str, worker: &str) -> RoleInstructions {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "looprs-role-notes-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(dir.join(".looprs")).expect("temp project dir");
+    std::fs::write(dir.join(".looprs/planner.md"), planner).expect("planner.md");
+    std::fs::write(dir.join(".looprs/worker.md"), worker).expect("worker.md");
+    let resolved = RoleInstructions::resolve(&dir, &|_| None);
+    let _ = std::fs::remove_dir_all(&dir);
+    resolved
 }
 
 /// A bare loop, with its two output streams held open by the test.

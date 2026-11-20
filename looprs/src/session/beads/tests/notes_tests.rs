@@ -7,9 +7,9 @@
 use crate::services::bd::{Bead, BeadStatus};
 
 use crate::session::beads::notes::{
-    MAX_DEFERRED_LISTED, MAX_PLAN_LISTED, auto_resume_note, children_first_note, clip,
+    Arrival, MAX_DEFERRED_LISTED, MAX_PLAN_LISTED, auto_resume_note, children_first_note, clip,
     held_elsewhere_note, no_plan_note, not_closed_note, plan_note, resume_already_worked_note,
-    resume_note, unverifiable_note,
+    resume_note, unverifiable_note, worker_prompt,
 };
 
 use super::*;
@@ -218,4 +218,78 @@ fn the_children_first_note_lists_up_to_the_cap_and_counts_the_rest() {
     );
     assert!(note.contains("and 2 more"), "{note}");
     assert_eq!(note.lines().count(), MAX_DEFERRED_LISTED + 2, "{note}");
+}
+
+// ---------------- the worker's prompt, with the project's own rules in it (workspace-cw4) ----------------
+
+/// **The role split, at the sentence level.** The project's worker instructions go
+/// between the standing text and the assignment: the ticket paragraph is the most
+/// specific thing in the prompt and stays last, and the project rules read as
+/// standing rules where they belong.
+#[test]
+fn the_worker_prompt_puts_project_instructions_before_the_ticket_it_assigns() {
+    let claim = crate::session::ActiveBead {
+        id: "looprs-77".to_string(),
+        title: "the one ticket".to_string(),
+    };
+    let notes = role_notes(
+        "Run ./scripts/check.sh before committing.",
+        ".looprs/worker.md",
+    );
+    let prompt = worker_prompt(&claim, Arrival::Fresh, Some(&notes));
+    let section = prompt
+        .find("Additional instructions for the WORKER role")
+        .unwrap_or_else(|| panic!("the project's instructions are missing: {prompt}"));
+    let ticket = prompt
+        .find("Your assigned ticket: looprs-77 — the one ticket")
+        .expect("the ticket is still assigned");
+    assert!(
+        section < ticket,
+        "the project rules are standing, the ticket is the specific: {prompt}"
+    );
+    assert!(
+        prompt.contains("Run ./scripts/check.sh before committing."),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(".looprs/worker.md"),
+        "the prompt says where the rule came from: {prompt}"
+    );
+    // The guarantee a project file is not allowed to win against is still on the page.
+    assert!(
+        prompt.contains("must not go looking for other work"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("replace none of them"),
+        "and the prompt says which way round they go: {prompt}"
+    );
+}
+
+/// Nothing configured — the shape every run had before this existed. No section,
+/// and the resumed paragraph still arrives where it always did, because the two
+/// features do not get to interfere with one another.
+#[test]
+fn a_run_with_no_project_instructions_gets_the_prompt_it_always_got() {
+    let claim = crate::session::ActiveBead {
+        id: "looprs-77".to_string(),
+        title: "the one ticket".to_string(),
+    };
+    let plain = worker_prompt(&claim, Arrival::Fresh, None);
+    assert!(!plain.contains("Additional instructions"), "{plain}");
+    assert!(plain.contains("Your assigned ticket: looprs-77"), "{plain}");
+
+    let resumed = worker_prompt(
+        &claim,
+        Arrival::Resumed,
+        Some(&role_notes("RULE", "somewhere.md")),
+    );
+    assert!(
+        resumed.contains("ALREADY `in_progress`"),
+        "a resumed pass keeps its paragraph whatever the project said: {resumed}"
+    );
+    assert!(
+        resumed.find("RULE").expect("the note") < resumed.find("Your assigned ticket").unwrap(),
+        "{resumed}"
+    );
 }
