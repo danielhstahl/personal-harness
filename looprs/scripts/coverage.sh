@@ -129,7 +129,17 @@ PY
 # One metric line for a runner that asked for evidence, and nothing when it did not.
 publish() {
   [ -z "${ACTMCP_EVIDENCE_OUT:-}" ] && return 0
-  printf '{"metric":"line_coverage_pct","value":%s,"unit":"percent"}\n' "$1" >> "$ACTMCP_EVIDENCE_OUT"
+  local line
+  line=$(printf '{"metric":"line_coverage_pct","value":%s,"unit":"percent"}\n' "$1")
+  # A sink that exists as a *directory* is the act runner's own evidence dir, which it
+  # creates before the job starts and scrapes after; a file sink is a hand-set one. A
+  # redirect cannot append into a directory, and the first act run of this job found out
+  # with `Is a directory` after a successful build.
+  if [ -d "$ACTMCP_EVIDENCE_OUT" ]; then
+    printf '%s\n' "$line" >> "$ACTMCP_EVIDENCE_OUT/coverage.jsonl"
+  else
+    printf '%s\n' "$line" >> "$ACTMCP_EVIDENCE_OUT"
+  fi
 }
 
 if [ "$self_test" = "1" ]; then
@@ -172,6 +182,12 @@ if [ "$self_test" = "1" ]; then
   ACTMCP_EVIDENCE_OUT="$tmp/evidence.jsonl" publish "$got"
   [ "$(wc -l < "$tmp/evidence.jsonl" | tr -d ' ')" = "1" ] \
     || { echo "self-test: the metric must land as exactly one evidence line" >&2; exit 1; }
+  # The runner hands a *directory* (`.evidence/incoming/<run id>`), not a file; the line
+  # goes into one named file inside it rather than failing on the redirect.
+  mkdir -p "$tmp/evidence-dir"
+  ACTMCP_EVIDENCE_OUT="$tmp/evidence-dir" publish "$got"
+  [ "$(wc -l < "$tmp/evidence-dir/coverage.jsonl" | tr -d ' ')" = "1" ] \
+    || { echo "self-test: a directory sink must collect the metric in one named file" >&2; exit 1; }
 
 
   # The build-directory rule (lib/rust-target.sh), which is a real crash and not a

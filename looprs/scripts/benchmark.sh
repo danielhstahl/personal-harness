@@ -75,12 +75,28 @@ emit() {
     echo "benchmark.sh: metric $name had no value; refusing to report it as 0" >&2
     return 1
   fi
+  local line
+  line=$(printf '{"metric":"%s","value":%s,"unit":"%s"}\n' "$name" "$value" "$unit")
   printf 'metric %s %s %s\n' "$name" "$value" "$unit"
-  [ -n "${ACTMCP_EVIDENCE_OUT:-}" ] &&
-    printf '{"metric":"%s","value":%s,"unit":"%s"}\n' "$name" "$value" "$unit" >> "$ACTMCP_EVIDENCE_OUT"
-  [ -n "${BENCH_METRICS:-}" ] &&
-    printf '{"metric":"%s","value":%s,"unit":"%s"}\n' "$name" "$value" "$unit" >> "$BENCH_METRICS"
+  [ -n "${ACTMCP_EVIDENCE_OUT:-}" ] && write_evidence "$ACTMCP_EVIDENCE_OUT" benchmark-metrics.jsonl "$line"
+  [ -n "${BENCH_METRICS:-}" ] && printf '%s\n' "$line" >> "$BENCH_METRICS"
   return 0
+}
+
+# Append one line to a sink that may be a file or a directory.
+#
+# The act runner hands `ACTMCP_EVIDENCE_OUT` as a *directory* it created before the job
+# started (`.evidence/incoming/<run id>`), and the first act run of this job died right
+# after a successful build with `Is a directory` — a redirect cannot append into a
+# directory. A hand-set sink is a file, and a path that does not exist yet is a file too;
+# only a directory that exists gets a file named inside it.
+write_evidence() {
+  local sink="$1" name="$2" line="$3"
+  if [ -d "$sink" ]; then
+    printf '%s\n' "$line" >> "$sink/$name"
+  else
+    printf '%s\n' "$line" >> "$sink"
+  fi
 }
 
 # The test count, summed over every `test result: ok.` summary line.
@@ -140,6 +156,15 @@ if [ "${self_test}" = "1" ]; then
     || { echo "self-test: each metric must land as exactly one line in the metrics file" >&2; exit 1; }
   cmp -s "$tmp/act.jsonl" "$tmp/mine.jsonl" \
     || { echo "self-test: the evidence sink and the metrics file must carry the same records" >&2; exit 1; }
+  # A sink that is a *directory* — what the act runner hands over, because it creates
+  # `.evidence/incoming/<run id>` before the job starts. The records go into one named
+  # file inside it; a redirect cannot append to a directory, and the first act run of
+  # this job failed that way, after a successful build.
+  mkdir -p "$tmp/evidence-dir"
+  ACTMCP_EVIDENCE_OUT="$tmp/evidence-dir" BENCH_METRICS= emit test_count 932 tests
+  ACTMCP_EVIDENCE_OUT="$tmp/evidence-dir" BENCH_METRICS= emit docs_check_ms 812 milliseconds
+  [ "$(wc -l < "$tmp/evidence-dir/benchmark-metrics.jsonl" | tr -d ' ')" = "2" ] \
+    || { echo "self-test: a directory sink must collect the records in one named file" >&2; exit 1; }
   if emit test_suite_secs "" seconds 2>/dev/null; then
     echo "self-test: a metric with no value must be refused, not reported as 0" >&2
     exit 1
